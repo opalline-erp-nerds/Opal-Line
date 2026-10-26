@@ -33,6 +33,7 @@ import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockC
 import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
 import { escapeHtml } from '../htmlEscape'
 import { routeParam } from '../lib/routeParams'
+import { planSalesReturn } from '../salesReturns'
 
 export const dbRouter = Router()
 
@@ -1953,72 +1954,87 @@ dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), a
 dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const [invoice] = await db!.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
-    if (!invoice) return res.status(404).json({ error: 'Invoice not found' })
-    const invItems = await db!.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, invoice.id))
-    if (invItems.length === 0) return res.status(400).json({ error: 'Invoice has no line items to return' })
-
     // Return spec: explicit items list (partial) or whole invoice
     const requested: Array<{ sku?: string; qty: number }> = Array.isArray(req.body?.items) && req.body.items.length > 0
       ? req.body.items
-      : invItems.map((it) => ({ sku: it.sku ?? undefined, qty: it.qty ?? 1 }))
-    const qtyBySku = new Map<string, number>()
-    for (const r of requested) {
-      if (r.sku && Number(r.qty) > 0) qtyBySku.set(r.sku, (qtyBySku.get(r.sku) ?? 0) + Number(r.qty))
-    }
-    const returnItems = invItems
-      .filter((it) => it.sku && qtyBySku.has(it.sku))
-      .map((it) => {
-        const sku = it.sku as string
-        const qty = Math.min(qtyBySku.get(sku) ?? 0, it.qty ?? 1)
-        return {
-          product: it.product, sku, qty,
-          amount: Math.round(((it.amount ?? 0) * qty) / (it.qty || 1) * 100) / 100,
-        }
-      })
-      .filter((it) => it.qty > 0)
-    if (returnItems.length === 0) return res.status(400).json({ error: 'No matching items to return (SKU + qty required)' })
-
-    const amount = Math.round(returnItems.reduce((a, it) => a + (it.amount ?? 0), 0) * 100) / 100
+      : []
     const restock = req.body?.restock !== false
-    if (restock) {
-      for (const it of returnItems) {
-        const [prod] = await db!.select({ id: s.products.id, stock: s.products.stock }).from(s.products).where(eq(s.products.sku, it.sku!)).limit(1)
-        if (prod) {
-          await db!.update(s.products).set({ stock: (prod.stock ?? 0) + it.qty }).where(eq(s.products.id, prod.id))
+
+    // Everything that moves stock or money runs in one transaction with the
+    // invoice row locked, so two returns against the same invoice serialise:
+    // both can never read the same "already returned" totals and credit the
+    // customer (and restock the shelf) twice.
+    const outcome = await db!.transaction(async (tx) => {
+      const [invoice] = await tx
+        .select()
+        .from(s.salesInvoices)
+        .where(eq(s.salesInvoices.id, routeParam(req.params.id)))
+        .limit(1)
+        .for('update')
+      if (!invoice) return { ok: false as const, status: 404, error: 'Invoice not found' }
+      const invItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, invoice.id))
+      if (invItems.length === 0) return { ok: false as const, status: 400, error: 'Invoice has no line items to return' }
+
+      // What earlier credit notes against this invoice already took back.
+      const prior = await tx
+        .select({ returnItems: s.salesReturns.returnItems })
+        .from(s.salesReturns)
+        .where(eq(s.salesReturns.invoiceId, invoice.id))
+
+      const planned = planSalesReturn({ invoiceItems: invItems, requested, priorReturns: prior })
+      if (!planned.ok) return { ok: false as const, status: 400, error: planned.error }
+
+      const now = new Date()
+      const ym = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`
+      let number = `CR${ym}-${Math.floor(100000 + Math.random() * 900000)}`
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const [dup] = await tx.select({ id: s.salesReturns.id }).from(s.salesReturns).where(eq(s.salesReturns.number, number)).limit(1)
+        if (!dup) break
+        number = `CR${ym}-${Math.floor(100000 + Math.random() * 900000)}`
+      }
+
+      // Restock inside the same transaction as the credit note: the goods and
+      // the paperwork can never disagree if one of the writes fails.
+      if (restock) {
+        for (const it of planned.items) {
+          const [prod] = await tx
+            .select({ id: s.products.id, stock: s.products.stock })
+            .from(s.products)
+            .where(eq(s.products.sku, it.sku))
+            .limit(1)
+            .for('update')
+          if (prod) {
+            await tx.update(s.products).set({ stock: (prod.stock ?? 0) + it.qty }).where(eq(s.products.id, prod.id))
+          }
         }
       }
-    }
 
-    const now = new Date()
-    const ym = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`
-    let number = `CR${ym}-${Math.floor(100000 + Math.random() * 900000)}`
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const [dup] = await db!.select({ id: s.salesReturns.id }).from(s.salesReturns).where(eq(s.salesReturns.number, number)).limit(1)
-      if (!dup) break
-      number = `CR${ym}-${Math.floor(100000 + Math.random() * 900000)}`
-    }
+      const [ret] = await tx.insert(s.salesReturns).values({
+        id: randomUUID(),
+        number,
+        invoiceId: invoice.id,
+        creditNoteNumber: number,
+        restocked: restock,
+        returnItems: planned.items,
+        order: invoice.shopifyOrder,
+        customer: invoice.customer,
+        items: planned.items.reduce((a, it) => a + it.qty, 0),
+        amount: planned.amount,
+        status: 'processed',
+        date: now.toISOString(),
+      }).returning()
 
-    const [ret] = await db!.insert(s.salesReturns).values({
-      id: randomUUID(),
-      number,
-      invoiceId: invoice.id,
-      creditNoteNumber: number,
-      restocked: restock,
-      returnItems,
-      order: invoice.shopifyOrder,
-      customer: invoice.customer,
-      items: returnItems.reduce((a, it) => a + it.qty, 0),
-      amount,
-      status: 'processed',
-      date: now.toISOString(),
-    }).returning()
+      // Accounting trail: negative payment against the invoice
+      await tx.insert(s.payments).values({
+        id: randomUUID(), ref: number, invoice: invoice.number, customer: invoice.customer,
+        amount: -planned.amount, method: 'Credit Note', gateway: 'return', status: 'refunded', date: now.toISOString(),
+      })
 
-    // Accounting trail: negative payment against the invoice
-    await db!.insert(s.payments).values({
-      id: randomUUID(), ref: number, invoice: invoice.number, customer: invoice.customer,
-      amount: -amount, method: 'Credit Note', gateway: 'return', status: 'refunded', date: now.toISOString(),
+      return { ok: true as const, invoice, ret, number, amount: planned.amount, itemCount: planned.items.length }
     })
+
+    if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error })
+    const { invoice, ret, number, amount, itemCount } = outcome
 
     recordCrud('sales-returns', 'Created', req, ret)
     // Give back the points earned on the value being returned.
@@ -2033,12 +2049,15 @@ dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), asyn
         }),
       )
       .catch(() => undefined)
-    if (invoice.id) await insertOrderEvent(invoice.id, 'Return Processed', `Credit note ${number} — ${returnItems.length} item(s), ₹${amount.toLocaleString('en-IN')}${restock ? ', restocked' : ''}`, actorFromRequest(req).userId ?? 'system')
+    if (invoice.id) await insertOrderEvent(invoice.id, 'Return Processed', `Credit note ${number} — ${itemCount} item(s), ₹${amount.toLocaleString('en-IN')}${restock ? ', restocked' : ''}`, actorFromRequest(req).userId ?? 'system')
     void import('../statusNotifications').then((m) => m.notifyReturnProcessed({ customer: invoice.customer, invoiceNumber: invoice.number, amount, restocked: restock, creditNoteNumber: number })).catch(() => undefined)
     res.json({ return: ret, creditNoteNumber: number, amount, restocked: restock })
   } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    const cause = (err as { cause?: unknown })?.cause instanceof Error ? (err as Error & { cause: Error }).cause.message : ''
     logger.error({ err }, 'invoice return failed')
-    res.status(500).json({ error: 'Failed to process return' })
+    const isDuplicate = /unique|duplicate key/i.test(`${msg} ${cause}`)
+    res.status(isDuplicate ? 400 : 500).json({ error: isDuplicate ? 'That credit note number already exists — retry the return' : 'Failed to process return' })
   }
 })
 

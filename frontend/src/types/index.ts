@@ -967,7 +967,8 @@ export interface SalesReturn {
   customer: string
   items: number
   amount: number
-  status: 'pending' | 'approved' | 'refunded' | 'rejected'
+  /** `processed` is what the invoice return workflow writes for a credit note. */
+  status: 'pending' | 'approved' | 'refunded' | 'rejected' | 'processed'
   date: string
 }
 
