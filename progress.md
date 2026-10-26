@@ -14,7 +14,7 @@
 - **[run]** live click-through on the dev stack (Vite 47195 + backend 47191, Chromium via Playwright): login → `/silver-rate` → drawer (chips `160 → +1 → 161.00 → −0.5 → 160.50 → Reset → 160`), review step, Schedule mode, schedule review, and 390 px mobile (no page overflow; the history table scrolls 720 px inside a 356 px viewport; Restore absent on current rows). Screenshots in `test-results/silver-rate-visual/` (gitignored). Two fixes came out of the screenshots: the amber banner stacks its button under the text on phones, and the sparkline is no longer hidden below `sm`.
 - **Uncommitted**: `frontend/src/pages/SilverRate.tsx` (M) + `frontend/src/pages/SilverRate.test.tsx` (??). Also still staged in the tree from before this session: `backend/src/db/bootstrap.ts` + `backend/src/db/upgrade.test.ts` (the product-variants column work — the user's own, untouched apart from the new silver `ALTER` noted in B).
 
-### B. Update-pipeline tracker + rate-update history log (user request 2026-10-26) — IN PROGRESS
+### B. Update-pipeline tracker + rate-update history log (user request 2026-10-26) — BUILT, verified, committed `57cd1e9`
 
 Built around the **real** flow, read out to the user first: every entry point (direct update, approved staff request, auto fetch / scheduler) funnels into `applySilverRate` (`backend/src/shopify.ts`), which runs **optional Sync catalog from Shopify → Save new rate → Reprice products → Match to Shopify → Push prices to Shopify**; failures stop the run and later steps are never marked complete. Nothing per-step is persisted today — only `silver_rates.sync_status`.
 
@@ -29,9 +29,15 @@ DONE:
 - `frontend/src/pages/SilverRate.tsx` — review step shows the grey "This update will" checklist which turns live (`Update pipeline`) while the apply runs, the result screen renders the final pipeline + Complete, the history card gained **From/To date filters** (IST days, client-side, Clear button, "No updates in this date range."), a **Steps** dot column and a **View** action per row — **[tc]** frontend tsc 0, oxlint 0.
 - **[run]** live click-through (dev stack, Chromium): 6-row history, From/To filter (2026-10-26 → 3 rows; 2020-01-01→2020-01-02 → empty-range message; Clear → 6 rows), View dialog opens with the details grid and the legacy fallback note, review step shows the 5-step checklist. Screenshots in `test-results/silver-rate-visual/log-*.png`.
 
+COMMITS (all on `master`, not pushed):
+- `c45f9f2` refactor(silver-rate): rebuild the page around one update drawer (part A).
+- `780feb9` feat(variants): upgrade legacy colour-only product_variants tables — **the user's own staged work**, committed first so `bootstrap.ts` could then be committed cleanly (their patch was parked in `/tmp` and re-applied, never mixed into the pipeline commit).
+- `57cd1e9` feat(silver-rate): track every rate update as a step-by-step pipeline (part B — 11 files, +945/−110).
+
 STILL TO DO:
-1. **Commit** — blocked on one decision: `backend/src/db/bootstrap.ts` holds BOTH the user's staged product_variants column work AND this session's `step_log` ALTER, so committing that file cleanly needs their work committed first (or explicitly included). Everything else (`schema.ts`, `migrate.ts`, `shopify.ts`, the two frontend files, `progress.md`) is ready to commit as `feat(silver-rate)` once that's settled. Suggest asking whether to commit the variants work as its own commit first.
-2. **Live pipeline with real data** — no rate update has been run since the backend landed, so no row carries a `step_log` yet (the View dialog shows the legacy note for all six). A run at the current rate with sync-first off would reprice to identical prices so `push` is skipped (no Shopify writes) — needs the user's OK. Note the user applied ₹160 → ₹161 at 10:18 UTC today themselves (row 6, `chandru`, synced), before this backend code was live.
+1. **Live pipeline with real data** — no rate update has been run since the backend landed, so no row carries a `step_log` yet (the View dialog shows the legacy note for all six rows). A run at the current rate with sync-first off would reprice to identical prices so `push` is skipped (no Shopify writes) — needs the user's OK. The user applied ₹160 → ₹161 at 10:18 UTC today themselves (row 6, `chandru`, synced), before this backend code was live, so their **next** update will be the first with a full step log.
+2. The dev stack is still up (Vite 47195 background process, backend 47191 on `tsx watch` — it reloaded the new code, and `step_log` is already applied to `127.0.0.1:47194/opal_line`).
+3. Nothing has been pushed; the three commits sit on local `master`.
 
 Notes / gotchas:
 - Vite dev server left running on 127.0.0.1:47195 (background process from the click-through); the backend on 47191 was already running.
@@ -49,7 +55,7 @@ Notes / gotchas:
 
 ### Pending work (carried forward, priority order)
 
-0. **[ACTIVE] Silver Rate pipeline tracker + rate-update history log (2026-10-26)** — the `step_log` migration is in the tree; `applySilverRate` step logging, the frontend pipeline/View/date-filter and all verification are still to do. See CURRENT TASK 2026-10-26 part B. Nothing committed yet (the Silver Rate page redesign from part A is also uncommitted).
+0. **Silver Rate pipeline tracker + rate-update history log (2026-10-26)** — **DONE, committed** `c45f9f2` (page redesign), `780feb9` (the user's product_variants upgrade), `57cd1e9` (step_log + pipeline + View dialog + date filter). Only open item: one real rate update to see a live pipeline and a row with a populated `step_log` — see CURRENT TASK 2026-10-26 part B.
 1. **Catalogue damage (PENDING #1)** — read-only report first, then wait for approval: which Shopify store the 15:17 sync pulled from, before/after counts from the pre-copy backup + `sync_logs`, restore plan for real products/stock/49 orphaned `stock_levels` rows, then make the sync non-destructive. No DB writes until approved.
 2. **Approved fixes A–E (PENDING #3, after #1)** — voided-order count consistency, "Last sync" from `sync_logs`, GST basis subtitle, orphan `stock_levels` cleanup (show → back up → delete), commit `backend/src/shopify.ts`.
 3. **Item 1b — Total Stock (Weight) sanity** — NOT STARTED.
