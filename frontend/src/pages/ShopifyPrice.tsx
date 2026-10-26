@@ -21,6 +21,7 @@ const statusBadge: Record<SyncPriceStatus, { label: string; variant: 'success' |
   update: { label: 'Price change', variant: 'warning' },
   updated: { label: 'Pushed', variant: 'info' },
   'no-match': { label: 'No SKU match', variant: 'muted' },
+  skipped: { label: 'Over Shopify cap', variant: 'muted' },
 }
 
 export default function ShopifyPricePage() {

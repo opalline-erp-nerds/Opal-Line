@@ -28,6 +28,15 @@ import { encrypt, decrypt,  encryptSecret } from '../lib/crypto'
 import { isConfigured as isShopifyConfigured, config as shopifyConfig, normalizeShopDomain } from '../config'
 import { upsertEnvVar } from '../lib/envfile'
 import { logger } from '../logger'
+import {
+  AGING_BUCKETS,
+  ageInDays,
+  agingBucketDefinition,
+  agingBucketForDays,
+  fifoEntryDate,
+  toAgingIso,
+  type AgingBucketKey,
+} from '../lib/stockAging'
 import { invoiceTotals } from '../invoiceTotals'
 import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
 import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
@@ -121,7 +130,7 @@ function sanitize(body: Record<string, unknown>, table: any): Record<string, unk
       if (!Number.isFinite(n) || n < 0) throw new Error('Reorder level cannot be negative')
       out.reorderLevel = Math.floor(n)
     }
-    for (const priceField of ['sellingPrice', 'compareAtPrice', 'costPrice', 'silverRate', 'makingCharge'] as const) {
+    for (const priceField of ['sellingPrice', 'compareAtPrice', 'costPrice', 'silverRate', 'makingCharge', 'fixedPieceRate'] as const) {
       if (out[priceField] !== undefined) {
         const n = Number(out[priceField])
         if (!Number.isFinite(n) || n < 0) throw new Error(`${priceField} cannot be negative`)
@@ -1212,6 +1221,51 @@ export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number):
     .filter((it) => String(it.sku) !== '' || String(it.product) !== '')
 }
 
+/**
+ * Piece-rate override for invoice lines, given the fixed piece rates keyed by
+ * lowercased SKU.
+ *
+ * A Piece Rate Product bills at its fixed rate × qty: the silver-rate
+ * calculation (weight × rate + making charge) that normally produces the line
+ * amount does not apply, so the components are cleared with it and the invoice
+ * header sums (silverValue / makingCharge) stay consistent with the total.
+ */
+export function applyPieceRateItems<T extends Record<string, unknown>>(
+  items: T[],
+  fixedRatesBySku: Map<string, number>,
+): T[] {
+  if (fixedRatesBySku.size === 0) return items
+  return items.map((it) => {
+    const fixed = fixedRatesBySku.get(String(it.sku ?? '').trim().toLowerCase())
+    if (fixed == null || !(fixed > 0)) return it
+    return { ...it, silverRate: 0, makingCharge: 0, amount: round2(fixed * num(it.qty, 1)) } as T
+  })
+}
+
+/**
+ * Loads the fixed piece rates for an invoice's SKUs and rewrites every line
+ * that belongs to a Piece Rate Product. Returns the items untouched when no
+ * line maps to one, so ordinary invoices never pay for the lookup.
+ */
+export async function applyPieceRateInvoiceItems<T extends Record<string, unknown>>(
+  items: T[],
+  client: any = db,
+): Promise<T[]> {
+  if (items.length === 0 || !client) return items
+  const skus = [...new Set(items.map((it) => String(it.sku ?? '').trim()).filter(Boolean))]
+  if (skus.length === 0) return items
+  const rows = await client
+    .select({ sku: s.products.sku, fixedPieceRate: s.products.fixedPieceRate })
+    .from(s.products)
+    .where(and(inArray(s.products.sku, skus), eq(s.products.pieceRateProduct, true)))
+  const rates = new Map<string, number>()
+  for (const r of rows) {
+    const rate = Number(r.fixedPieceRate)
+    if (Number.isFinite(rate) && rate > 0) rates.set(String(r.sku ?? '').trim().toLowerCase(), rate)
+  }
+  return applyPieceRateItems(items, rates)
+}
+
 // Duplicate an existing invoice into a fresh draft (same items/customer, new number, no payment)
 dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
@@ -1291,7 +1345,6 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
   if (!requireDb(res)) return
   try {
     const body = req.body ?? {}
-
     // Fetch the authoritative silver rate from Silver Rate Management for new pricing.
     const latestRate = await getLatestSilverRate()
     if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
@@ -1299,7 +1352,7 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     }
     const silverRate = latestRate.rate
 
-    const items = normalizeInvoiceItems(body.items, silverRate)
+    const items = await applyPieceRateInvoiceItems(normalizeInvoiceItems(body.items, silverRate))
     const clean = sanitize(body, s.salesInvoices)
     delete clean.id
     delete clean.items
@@ -1397,7 +1450,7 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     const row = await db!.transaction(async (tx) => {
       const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
       if (!existing) return null
-      const items = normalizeInvoiceItems(body.items, silverRate)
+      const items = await applyPieceRateInvoiceItems(normalizeInvoiceItems(body.items, silverRate), tx)
       if (items.length > 0) {
         // First, restore old stock
         const oldItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
@@ -2490,6 +2543,144 @@ async function logResend(entry: typeof s.notificationLog.$inferSelect, ok: boole
     })
   } catch { /* non-fatal */ }
 }
+
+// ─── Aging unsold stock: how long the units still on hand have been held ─────
+//
+// The balance on products.stock says nothing about age. This rebuilds it from
+// the append-only stock ledger with FIFO: the units that entered first are the
+// ones that sold first, so the oldest remaining lot is the entry date of the
+// stock still on the shelf. That is what the 30/60/90/180 bands are based on —
+// a restock does not make an old balance look fresh.
+//
+// "Last sold" is the newest sale across both channels the shop bills through:
+// counter invoices and Shopify order line items. A cancelled/refunded document
+// is not a sale, so it is excluded exactly like the reorder engine does.
+dbRouter.get('/inventory/aging', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const allProducts = await db!.select().from(s.products)
+    const inStock = allProducts.filter((p) => p.trackInventory !== false && Math.floor(Number(p.stock ?? 0)) > 0)
+
+    // Only inflows matter: total outflow is derived from the balance, which is
+    // the number the rest of the ERP already trusts. Reading every movement of
+    // every product would also drag in years of history for sold-out SKUs.
+    const inflowRows = await db!.execute(sql`
+      SELECT sm.product_id AS product_id, sm.date AS date, sm.qty AS qty
+      FROM stock_movements sm
+      JOIN products p ON p.id = sm.product_id
+      WHERE p.stock > 0 AND sm.qty > 0
+      ORDER BY sm.product_id ASC, sm.date ASC, sm.id ASC
+    `)
+    const lotsByProduct = new Map<string, Array<{ date: unknown; qty: unknown }>>()
+    for (const row of inflowRows as unknown as Array<Record<string, unknown>>) {
+      const productId = String(row.product_id ?? '')
+      if (!productId) continue
+      const lots = lotsByProduct.get(productId)
+      if (lots) lots.push({ date: row.date, qty: row.qty })
+      else lotsByProduct.set(productId, [{ date: row.date, qty: row.qty }])
+    }
+
+    const soldRows = await db!.execute(sql`
+      SELECT sku, max(last_sold) AS last_sold FROM (
+        SELECT lower(trim(it.sku)) AS sku, i.date AS last_sold
+        FROM sales_invoice_items it
+        JOIN sales_invoices i ON i.id = it.invoice_id
+        WHERE it.sku IS NOT NULL AND trim(it.sku) <> ''
+          AND coalesce(i.status, '') NOT IN ('cancelled', 'refunded')
+        UNION ALL
+        SELECT lower(trim(li->>'sku')) AS sku, so.date AS last_sold
+        FROM sales_orders so
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE WHEN jsonb_typeof(so.line_items) = 'array' THEN so.line_items ELSE '[]'::jsonb END
+        ) AS li
+        WHERE so.line_items IS NOT NULL
+          AND coalesce(so.status, '') NOT IN ('cancelled')
+          AND li->>'sku' IS NOT NULL AND trim(li->>'sku') <> ''
+      ) sold
+      GROUP BY sku
+    `)
+    const lastSoldBySku = new Map<string, string>()
+    for (const row of soldRows as unknown as Array<Record<string, unknown>>) {
+      const sku = String(row.sku ?? '').trim().toLowerCase()
+      const lastSold = toAgingIso(row.last_sold)
+      if (!sku || !lastSold) continue
+      const existing = lastSoldBySku.get(sku)
+      if (!existing || lastSold > existing) lastSoldBySku.set(sku, lastSold)
+    }
+
+    const now = new Date()
+    const rows = inStock.map((p) => {
+      const quantity = Math.max(0, Math.floor(Number(p.stock ?? 0)))
+      // Pre-ledger balances (or a ledger that cannot explain the balance) fall
+      // back to the product record so the row still gets an age instead of
+      // silently disappearing from the report.
+      const stockEntryDate = fifoEntryDate({ stock: quantity, inflows: lotsByProduct.get(p.id) ?? [] })
+        ?? toAgingIso(p.createdAt)
+      const daysInStock = ageInDays(stockEntryDate, now) ?? 0
+      const agingBucket = agingBucketForDays(daysInStock)
+      return {
+        id: p.id,
+        name: p.name,
+        sku: p.sku,
+        category: p.category,
+        quantity,
+        stock: quantity,
+        stockEntryDate,
+        lastSoldDate: lastSoldBySku.get(String(p.sku ?? '').trim().toLowerCase()) ?? null,
+        daysInStock,
+        agingBucket,
+        agingStatus: agingBucketDefinition(agingBucket).label,
+        stockValue: Math.round(quantity * Number(p.sellingPrice ?? 0) * 100) / 100,
+      }
+    })
+    rows.sort((a, b) => b.daysInStock - a.daysInStock || a.name.localeCompare(b.name))
+
+    const buckets = AGING_BUCKETS.map((bucket) => {
+      const matching = rows.filter((row) => row.agingBucket === bucket.key)
+      return {
+        key: bucket.key,
+        label: bucket.label,
+        tone: bucket.tone,
+        count: matching.length,
+        quantity: matching.reduce((sum, row) => sum + row.quantity, 0),
+        value: Math.round(matching.reduce((sum, row) => sum + row.stockValue, 0) * 100) / 100,
+      }
+    })
+    const totals = {
+      products: rows.length,
+      quantity: rows.reduce((sum, row) => sum + row.quantity, 0),
+      value: Math.round(rows.reduce((sum, row) => sum + row.stockValue, 0) * 100) / 100,
+      neverSold: rows.filter((row) => !row.lastSoldDate).length,
+    }
+
+    // The page filters locally for instant feedback; the API accepts the same
+    // filters so reports/exports can request a subset without the catalogue.
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : ''
+    const category = typeof req.query.category === 'string' ? req.query.category.trim() : ''
+    const bucketRaw = typeof req.query.bucket === 'string' ? req.query.bucket.trim() : ''
+    if (bucketRaw && !AGING_BUCKETS.some((bucket) => bucket.key === bucketRaw)) {
+      return res.status(400).json({ error: `Unknown aging bucket: ${bucketRaw}` })
+    }
+    const bucket = bucketRaw as AgingBucketKey | ''
+    const data = rows.filter((row) => {
+      const matchesQuery = !q || row.name.toLowerCase().includes(q) || row.sku.toLowerCase().includes(q)
+      const matchesCategory = !category || row.category === category
+      const matchesBucket = !bucket || row.agingBucket === bucket
+      return matchesQuery && matchesCategory && matchesBucket
+    })
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      data,
+      buckets,
+      totals,
+      filters: { q, category, bucket },
+    })
+  } catch (err) {
+    logger.error({ err }, 'aging unsold stock failed')
+    res.status(500).json({ error: 'Failed to load aging unsold stock' })
+  }
+})
 
 // ─── Auto reorder suggestions: sales velocity vs. stock on hand ─────────────
 dbRouter.get('/inventory/reorder-suggestions', requirePermission('inventory', 'view'), async (_req, res) => {

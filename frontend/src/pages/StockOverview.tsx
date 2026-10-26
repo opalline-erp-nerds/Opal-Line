@@ -1,7 +1,7 @@
 ﻿import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { Boxes, Gem, Lightbulb, Package, PackageX, Search, TrendingUp, Weight } from 'lucide-react'
+import { Boxes, Clock, Download, Gem, Lightbulb, Package, PackageX, Search, TrendingUp, Weight } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -13,8 +13,18 @@ import { StatCard } from '@/components/ui/stat-card'
 import { DataTable } from '@/components/ui/data-table'
 import { dbApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
-import type { Product, ReorderSuggestion, SilverRate, StockCategory } from '@/types'
-import { formatCurrency, formatNumber, formatWeight } from '@/lib/format'
+import type {
+  Product,
+  ReorderSuggestion,
+  SilverRate,
+  StockAgingBucket,
+  StockAgingBucketKey,
+  StockAgingRow,
+  StockCategory,
+} from '@/types'
+import { formatCurrency, formatDate, formatNumber, formatWeight } from '@/lib/format'
+import { agingBadgeVariant, filterAgingRows, formatDaysInStock } from '@/lib/stockAging'
+import { cn } from '@/lib/utils'
 
 interface OverviewStats {
   totalProducts: number
@@ -220,6 +230,8 @@ export default function StockOverviewPage() {
           </CardContent>
         </Card>
       </div>
+
+      <AgingUnsoldStockCard />
     </div>
   )
 }
@@ -295,6 +307,205 @@ function ReorderSuggestionsCard() {
               )}
             </div>
           )}
+        </CardContent>
+      )}
+    </Card>
+  )
+}
+
+/** Aging Unsold Stock: FIFO age of the units still on hand, with search/filters. */
+function AgingUnsoldStockCard() {
+  const [rows, setRows] = useState<StockAgingRow[]>([])
+  const [buckets, setBuckets] = useState<StockAgingBucket[]>([])
+  const [totals, setTotals] = useState<{ products: number; quantity: number; value: number; neverSold: number } | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [open, setOpen] = useState(true)
+  const [query, setQuery] = useState('')
+  const [category, setCategory] = useState('')
+  const [bucket, setBucket] = useState<StockAgingBucketKey | ''>('')
+
+  useEffect(() => {
+    dbApi.getStockAging()
+      .then((res) => {
+        setRows(res.data ?? [])
+        setBuckets(res.buckets ?? [])
+        setTotals(res.totals ?? null)
+      })
+      .catch(() => setError('Aging data could not be loaded right now.'))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const categories = useMemo(
+    () => [...new Set(rows.map((r) => r.category).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    [rows],
+  )
+  const filtered = useMemo(() => filterAgingRows(rows, { query, category, bucket }), [rows, query, category, bucket])
+  const hasFilters = Boolean(query.trim() || category || bucket)
+
+  const columns = useMemo<ColumnDef<StockAgingRow>[]>(
+    () => [
+      {
+        accessorKey: 'name',
+        header: 'Product',
+        meta: { headerClassName: 'min-w-[200px]' },
+        cell: ({ row }) => (
+          <Link to={`/inventory/products/${row.original.id}`} className="group flex items-center gap-2.5">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+              <Gem className="h-4 w-4" />
+            </div>
+            <span className="truncate font-medium text-foreground group-hover:text-primary-700">{row.original.name}</span>
+          </Link>
+        ),
+      },
+      {
+        accessorKey: 'sku',
+        header: 'SKU',
+        cell: ({ row }) => <span className="font-mono text-xs text-muted-foreground">{row.original.sku}</span>,
+      },
+      {
+        accessorKey: 'quantity',
+        header: 'Quantity',
+        meta: { align: 'right' as const },
+        cell: ({ row }) => <span className="tabular-nums">{formatNumber(row.original.quantity)} pcs</span>,
+      },
+      {
+        accessorKey: 'stockEntryDate',
+        header: 'Stock Entry Date',
+        cell: ({ row }) => <span className="text-muted-foreground">{formatDate(row.original.stockEntryDate)}</span>,
+      },
+      {
+        accessorKey: 'lastSoldDate',
+        header: 'Last Sold Date',
+        cell: ({ row }) =>
+          row.original.lastSoldDate ? (
+            <span className="text-muted-foreground">{formatDate(row.original.lastSoldDate)}</span>
+          ) : (
+            <span className="text-muted-foreground/70">Never sold</span>
+          ),
+      },
+      {
+        accessorKey: 'daysInStock',
+        header: 'Days in Stock',
+        meta: { align: 'right' as const },
+        cell: ({ row }) => <span className="tabular-nums">{formatDaysInStock(row.original.daysInStock)}</span>,
+      },
+      {
+        accessorKey: 'agingStatus',
+        header: 'Aging Status',
+        meta: { align: 'center' as const },
+        cell: ({ row }) => (
+          <Badge variant={agingBadgeVariant(row.original.agingBucket)} dot>{row.original.agingStatus}</Badge>
+        ),
+      },
+    ],
+    [],
+  )
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between space-y-0">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <Clock className="h-4 w-4 text-warning-600 dark:text-warning-400" /> Aging Unsold Stock
+        </CardTitle>
+        <div className="flex items-center gap-2.5">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => exportTable('aging-unsold-stock.csv', columns, filtered)}
+            disabled={loading || filtered.length === 0}
+          >
+            <Download className="h-3.5 w-3.5" /> Export
+          </Button>
+          <button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => setOpen((o) => !o)}>
+            {open ? 'Hide' : `Show (${rows.length})`}
+          </button>
+        </div>
+      </CardHeader>
+      {open && (
+        <CardContent className="space-y-4">
+          <p className="text-xs text-muted-foreground">
+            
+            {totals ? ` ${formatNumber(totals.products)} in-stock products · ${formatNumber(totals.neverSold)} never sold.` : ''}
+          </p>
+
+          {error && <p className="text-xs text-red-600 dark:text-red-400">{error}</p>}
+
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
+            {buckets.map((b) => {
+              const active = bucket === b.key
+              return (
+                <button
+                  key={b.key}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => setBucket((current) => (current === b.key ? '' : b.key))}
+                  className={cn(
+                    'rounded-lg border p-3 text-left transition-colors',
+                    active
+                      ? 'border-primary bg-primary-50/60 ring-1 ring-primary/20 dark:bg-primary-50/20'
+                      : 'bg-card hover:bg-muted/40',
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{b.label}</span>
+                    <Badge variant={agingBadgeVariant(b.key)}>{formatNumber(b.count)}</Badge>
+                  </div>
+                  <p className="mt-1 text-lg font-semibold tabular-nums text-foreground">
+                    {formatNumber(b.quantity)} <span className="text-xs font-normal text-muted-foreground">pcs</span>
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">{formatCurrency(b.value, { compact: true })} retail value</p>
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2.5">
+            <div className="relative min-w-[220px] flex-1">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                placeholder="Search product name or SKU..."
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="pl-9"
+              />
+            </div>
+            <Select
+              options={[{ value: '', label: 'All Categories' }, ...categories.map((c) => ({ value: c, label: c }))]}
+              value={category}
+              onValueChange={setCategory}
+              className="w-[150px]"
+            />
+            <Select
+              options={[{ value: '', label: 'All Ages' }, ...buckets.map((b) => ({ value: b.key, label: b.label }))]}
+              value={bucket}
+              onValueChange={(value) => setBucket(value as StockAgingBucketKey | '')}
+              className="w-[140px]"
+            />
+            {hasFilters && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setQuery('')
+                  setCategory('')
+                  setBucket('')
+                }}
+              >
+                Clear
+              </Button>
+            )}
+            <span className="text-xs text-muted-foreground sm:ml-auto">
+              <span className="font-semibold text-foreground">{filtered.length}</span> of {rows.length} products
+            </span>
+          </div>
+
+          <DataTable
+            columns={columns}
+            data={filtered}
+            loading={loading}
+            emptyMessage="No in-stock products match your filters"
+          />
         </CardContent>
       )}
     </Card>

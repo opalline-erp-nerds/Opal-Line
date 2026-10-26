@@ -48,6 +48,7 @@ import type {
   SalesReturn,
   SilverRate,
   SilverHistoryDays,
+  SilverHistoryRange,
   SilverRatePoint,
   ProfitAnalytics,
   StockCategory,
@@ -56,12 +57,19 @@ import type {
   SyncLog,
   TopCategory,
   TopProduct,
+  OrderSummary,
+  SupplierPaymentsWidget,
+  PurchaseOrdersWidget,
+  CustomerPaymentsWidget,
+  SalesOrdersWidget,
+  RecentInvoicesWidget,
   User,
   ConnectionSettings,
   DbStatus,
   Customer360,
   OrderFullDetail,
   ReorderSuggestion,
+  StockAgingResponse,
   Shipment,
   NotificationLogEntry,
 } from '@/types'
@@ -87,6 +95,19 @@ function rangePath(path: string, range?: DashboardRangeInput | string): string {
         })()
   return `${path}?${q.toString()}`
 }
+
+/** Append optional widget filters to an already-built path (range included). */
+function filterPath(path: string, filters: Record<string, string | undefined>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value) params.set(key, value)
+  }
+  const query = params.toString()
+  if (!query) return path
+  return `${path}${path.includes('?') ? '&' : '?'}${query}`
+}
+
+type WidgetFilters = { q?: string; status?: string }
 
 export const dbApi = {
   getSilverRate: async (): Promise<SilverRate> => {
@@ -170,10 +191,23 @@ export const dbApi = {
       pendingPayments: number
       totalOrders: number
       totalInvoices: number
+      lastSyncAt: string | null
     }>(rangePath('/db/dashboard/summary', range)),
   getSalesOverview: (range: DashboardRangeInput | string = 'week'): Promise<SalesOverviewPoint[]> => request(rangePath('/db/dashboard/sales-overview', range)),
   getTopProducts: (range?: DashboardRangeInput): Promise<TopProduct[]> => request(rangePath('/db/dashboard/top-products', range)),
   getTopCategory: (range?: DashboardRangeInput): Promise<TopCategory[]> => request(rangePath('/db/dashboard/top-category', range)),
+  getOrderSummary: (grain: 'week' | 'month' | 'year', month: string): Promise<OrderSummary> =>
+    request(`/db/dashboard/order-summary?grain=${grain}&month=${encodeURIComponent(month)}`),
+  getSupplierPayments: (range?: DashboardRangeInput, filters?: WidgetFilters): Promise<SupplierPaymentsWidget> =>
+    request(filterPath(rangePath('/db/dashboard/supplier-payments', range), { q: filters?.q, status: filters?.status })),
+  getCustomerPayments: (range?: DashboardRangeInput, filters?: WidgetFilters): Promise<CustomerPaymentsWidget> =>
+    request(filterPath(rangePath('/db/dashboard/customer-payments', range), { q: filters?.q, status: filters?.status })),
+  getPurchaseOrdersWidget: (range?: DashboardRangeInput): Promise<PurchaseOrdersWidget> =>
+    request(rangePath('/db/dashboard/purchase-orders', range)),
+  getSalesOrdersWidget: (range?: DashboardRangeInput): Promise<SalesOrdersWidget> =>
+    request(rangePath('/db/dashboard/sales-orders', range)),
+  getRecentInvoices: (range?: DashboardRangeInput): Promise<RecentInvoicesWidget> =>
+    request(rangePath('/db/dashboard/recent-invoices', range)),
   getProductMargins: (months = 12): Promise<{ months: number; rows: Array<{ sku: string; name: string; qty: number; revenue: number; cost: number; profit: number; marginPct: number }>; totals: { revenue: number; cost: number; profit: number; marginPct: number } }> =>
     request(`/db/reports/product-margins?months=${months}`),
   getProfitAnalytics: (months = 12): Promise<ProfitAnalytics> =>
@@ -189,15 +223,21 @@ export const dbApi = {
   getAgingInvoices: (bucket: AgingBucket['key']): Promise<{ bucket: string; invoices: AgingInvoice[] }> =>
     request(`/db/dashboard/aging/invoices?bucket=${encodeURIComponent(bucket)}`),
   // One point per IST calendar day, backfilled server-side, for the given
-  // window (the chart owns this range — the page-wide filter does not drive it).
-  getSilverRateHistory: (days: SilverHistoryDays = 7): Promise<SilverRatePoint[]> =>
-    request<{ days: number; points: SilverRatePoint[] }>(`/db/dashboard/silver-history?days=${days}`).then(
+  // preset window or inclusive custom range (the chart owns this range — the
+  // page-wide filter does not drive it).
+  getSilverRateHistory: (window: SilverHistoryDays | SilverHistoryRange = 7): Promise<SilverRatePoint[]> => {
+    const query =
+      typeof window === 'number'
+        ? `days=${window}`
+        : `from=${encodeURIComponent(window.from)}&to=${encodeURIComponent(window.to)}`
+    return request<{ days: number; points: SilverRatePoint[] }>(`/db/dashboard/silver-history?${query}`).then(
       (res) => res.points,
-    ),
+    )
+  },
   getLowStock: (): Promise<LowStockItem[]> => request('/db/dashboard/low-stock'),
   getRecentActivities: (
     range?: DashboardRangeInput | string,
-    params?: { limit?: number; cursor?: string | null },
+    params?: { limit?: number; cursor?: string | null; latest?: boolean },
   ): Promise<{ items: Activity[]; total: number; nextCursor: string | null }> => {
     const query = new URLSearchParams()
     if (typeof range === 'string') {
@@ -209,6 +249,7 @@ export const dbApi = {
     }
     if (typeof params?.limit === 'number') query.set('limit', String(params.limit))
     if (params?.cursor) query.set('cursor', params.cursor)
+    if (params?.latest) query.set('scope', 'latest')
     const qs = query.toString()
     return request(qs ? `/db/dashboard/activities?${qs}` : '/db/dashboard/activities')
   },
@@ -375,6 +416,8 @@ export const dbApi = {
     }),
   reorderSuggestions: () =>
     request<{ data: ReorderSuggestion[]; generatedAt: string }>('/db/inventory/reorder-suggestions'),
+  /** Stock on hand with FIFO age, last-sold date and 30/60/90/180+ bands. */
+  getStockAging: () => request<StockAgingResponse>('/db/inventory/aging'),
   getCustomers: () => list<Customer>('/db/customers', PAGED),
   /** Bounded type-ahead behind the invoice comboboxes (debounced by caller). */
   searchCustomers: (q: string): Promise<Customer[]> =>

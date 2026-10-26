@@ -95,6 +95,15 @@ test(
       assert.equal(actRow.detail, 'from activity_logs')
       const audRow = body[idx(`${marker}-aud`)]
       assert.equal(audRow.detail, 'from audit_logs')
+
+      // The dashboard widget asks for scope=latest: the date filter is ignored
+      // there, so an older row is still in the feed (the activity page keeps
+      // its range filter).
+      const latestRes = await get('/dashboard/activities?period=today&scope=latest')
+      assert.equal(latestRes.status, 200)
+      const latestBody = Array.isArray(latestRes.body) ? latestRes.body : latestRes.body?.items
+      const latestTitles: string[] = latestBody.map((r: { title: string }) => String(r.title))
+      assert.ok(latestTitles.some((t) => t.includes(`${marker}-old`)), 'scope=latest ignores the date filter')
     } finally {
       const { inArray } = await import('drizzle-orm')
       await db!.delete(schema.activityLogs).where(inArray(schema.activityLogs.id, [activityId]))

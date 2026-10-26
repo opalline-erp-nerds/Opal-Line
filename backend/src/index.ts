@@ -950,7 +950,11 @@ app.post('/api/v1/shopify/products/:id/pull', requirePermission('shopify', 'edit
 
     const price = Number(shop.price)
     await dbh.update(dbMod.schema.products).set({
-      sellingPrice: Number.isFinite(price) ? price : local.sellingPrice,
+      // A Piece Rate Product's price is fixed — a Shopify pull may refresh
+      // stock and the title, but never the selling price.
+      sellingPrice: local.pieceRateProduct
+        ? local.sellingPrice
+        : Number.isFinite(price) ? price : local.sellingPrice,
       stock: Number.isFinite(shop.inventoryQuantity) ? shop.inventoryQuantity : local.stock,
       name: shop.title || local.name,
       image: shop.image ?? local.image,
@@ -1063,7 +1067,15 @@ async function handleSilverRateChange(
       userId: actor.userId,
       ip: actor.ip,
     })
-    return { status: result.ok ? 200 : 502, body: { ...result, direct: true } }
+    // "Applied" means the rate row was written and products were repriced.
+    // The only thing that can still fail after that is the follow-up Shopify
+    // price push (ok stays false, errors/steps carry the detail, and the rate
+    // row records syncStatus: 'failed' for a retry) — the approval route below
+    // already judges the outcome that way, so mapping a push failure to a 502
+    // here made an update that did land look like a rejected request.
+    const rateSaved = (result.steps ?? []).some((s) => s.key === 'rate' && s.status === 'done')
+    const applied = result.ok || rateSaved || (result.affected ?? 0) > 0
+    return { status: applied ? 200 : 502, body: { ...result, direct: true } }
   }
 
   // Staff member → queue a pending request for Admin / Super Admin approval.
