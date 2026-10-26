@@ -31,7 +31,7 @@
     --secondary: 220 22% 94%;
     --secondary-foreground: 222 47% 14%;
     --muted: 220 24% 95%;
-    --muted-foreground: 233 12% 59%;
+    --muted-foreground: 233 12% 42%;
     --accent: 43 78% 94%;
     --accent-foreground: 35 62% 24%;
     --destructive: 0 72% 45%;
@@ -207,14 +207,14 @@
 @media print {
   /* Printing always happens on white paper — force light palette even in dark mode */
   html.dark {
-    --background: 220 33% 98%;
-    --foreground: 222 47% 11%;
+    --background: 218 50% 97%;
+    --foreground: 224 42% 20%;
     --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
+    --card-foreground: 224 42% 20%;
     --popover: 0 0% 100%;
     --popover-foreground: 222 47% 11%;
     --muted: 220 24% 95%;
-    --muted-foreground: 220 12% 42%;
+    --muted-foreground: 233 12% 42%;
     --secondary: 220 22% 94%;
     --secondary-foreground: 222 47% 14%;
     --border: 220 18% 87%;
