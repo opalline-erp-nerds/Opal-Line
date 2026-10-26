@@ -45,6 +45,8 @@ async function main() {
   await client.unsafe(`ALTER TABLE "silver_rates" ADD COLUMN IF NOT EXISTS "source" text;`)
   await client.unsafe(`ALTER TABLE "silver_rates" ADD COLUMN IF NOT EXISTS "sync_status" text;`)
   await client.unsafe(`ALTER TABLE "silver_rates" ADD COLUMN IF NOT EXISTS "approved_by" text;`)
+  // Per-step record of each rate update (pipeline tracker + View dialog).
+  await client.unsafe(`ALTER TABLE "silver_rates" ADD COLUMN IF NOT EXISTS "step_log" jsonb;`)
   await client.unsafe(`
     CREATE TABLE IF NOT EXISTS "silver_rate_requests" (
       "id" text PRIMARY KEY,

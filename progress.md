@@ -1,5 +1,45 @@
 # Progress Log
 
+## CURRENT TASK (2026-10-26, in progress) — Silver Rate page: redesign (done) + update-pipeline tracker & history log (part-built)
+
+### A. Silver Rate Management page redesign — DONE, verified, **NOT COMMITTED**
+
+- `frontend/src/pages/SilverRate.tsx` rewritten (1,739 lines) + new `frontend/src/pages/SilverRate.test.tsx` (6 SSR tests). Every API call, permission gate (`canApprove` / `isApprover`) and existing dialog preserved — UI and component structure only:
+  - amber **"Rate source not configured"** banner with an *Open settings* link at the top (was grey text inside the auto-rate card);
+  - **hero card** (large ₹rate, coloured change chip, last updated, inline SVG sparkline of the last 5 rates) beside a **status card** (Shopify sync / products repriced / pending approvals);
+  - **three compact cards in one row** (Approvals · Scheduled · Auto rate), each badge + one line + one action; the expanded approvals list and the queued-schedule list render below only when non-empty (Auto rate keeps *Fetch now* / *Edit schedule* in a ⋯ menu);
+  - **"Update Silver Rate" and "Schedule rate change" merged into one drawer** with an Apply now / Schedule `Tabs` toggle, rate input + chips (−1 / −0.5 / +0.5 / +1 / Reset), date+time only in Schedule mode, a summary grid (current, change, products affected, when it reaches Shopify) and the primary buttons *Review prices* / *Review and schedule*;
+  - **history table** Date | Rate (old → new) | Change | Approved by | Shopify | Restore (hidden on the current row) inside an `overflow-x-auto` wrapper; the "Total value shift" / "Avg price change" tiles are gone.
+- **[run]** `tsc -b --force` 0, oxlint 0 warnings on both files, **87/87** frontend tests, encoding check pass.
+- **[run]** live click-through on the dev stack (Vite 47195 + backend 47191, Chromium via Playwright): login → `/silver-rate` → drawer (chips `160 → +1 → 161.00 → −0.5 → 160.50 → Reset → 160`), review step, Schedule mode, schedule review, and 390 px mobile (no page overflow; the history table scrolls 720 px inside a 356 px viewport; Restore absent on current rows). Screenshots in `test-results/silver-rate-visual/` (gitignored). Two fixes came out of the screenshots: the amber banner stacks its button under the text on phones, and the sparkline is no longer hidden below `sm`.
+- **Uncommitted**: `frontend/src/pages/SilverRate.tsx` (M) + `frontend/src/pages/SilverRate.test.tsx` (??). Also still staged in the tree from before this session: `backend/src/db/bootstrap.ts` + `backend/src/db/upgrade.test.ts` (the product-variants column work — the user's own, untouched apart from the new silver `ALTER` noted in B).
+
+### B. Update-pipeline tracker + rate-update history log (user request 2026-10-26) — IN PROGRESS
+
+Built around the **real** flow, read out to the user first: every entry point (direct update, approved staff request, auto fetch / scheduler) funnels into `applySilverRate` (`backend/src/shopify.ts`), which runs **optional Sync catalog from Shopify → Save new rate → Reprice products → Match to Shopify → Push prices to Shopify**; failures stop the run and later steps are never marked complete. Nothing per-step is persisted today — only `silver_rates.sync_status`.
+
+Decisions taken with the user: show **5 steps + the optional "Sync catalog" step** when sync-first is on; **persist a `step_log` jsonb** on `silver_rates`; date filter **client-side** over the loaded rows.
+
+DONE:
+- `backend/src/db/schema.ts` — `SilverRateStepRecord` / `SilverRateStepLog` types + `stepLog: jsonb('step_log')` on `silverRates` — **[tc]** backend tsc 0, oxlint 0.
+- `backend/src/db/bootstrap.ts` **and** `backend/src/db/migrate.ts` — idempotent `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS step_log jsonb` in the silver section of both migration paths — **[tc]**; the column is **already applied to the dev DB** (`127.0.0.1:47194/opal_line`, via `npx tsx src/db/migrate.ts`; that run applied every statement then lingered past the 180 s tool timeout — re-runnable, all statements are `IF NOT EXISTS`).
+- `backend/src/shopify.ts` — `applySilverRate` now records every step (key/label/status/startedAt/finishedAt/detail/error) and persists it with `sync_status` on **this run's** row (the id is captured at insert; the old code re-queried "the latest row"). The reprice loop is wrapped: a throw now marks the step failed, **releases the stuck `running: true` progress flag** (the drawer used to spin forever), stops before the Shopify steps and returns partial counts. The sync-first call and `recordAudit` are guarded the same way, and the catch around match/push now blames the step that actually failed — **[run]** backend suite 447 tests, 424 pass, 0 fail, 23 skipped (DB-gated).
+- `frontend/src/lib/silverRatePipeline.ts` (new, pure) + `.test.ts` — phase → step mapping (`syncing/repricing/matching/pushing/done`, `syncFirst`), result/step_log → steps, `plannedSteps`, `pipelineSucceeded`. The tests caught a real bug: steps after a failure were being marked done — fixed so a failure stops the run — **[run]** 9/9 lib tests, frontend 97/97.
+- `frontend/src/components/dashboard/silver-rate-pipeline.tsx` (new) — `SilverRatePipeline` (green ✓ / red ✗ with the error / spinner / grey pending, optional "Complete" row), `StepDots` for log rows, `RateUpdateDetailDialog` (who/when/old→new/change/source/Shopify + steps with timestamps + repriced/matched/pushed/skipped counts, degrading to a note for rows written before step tracking), plus `ViewUpdateButton` / `SyncStatusBadge`.
+- `frontend/src/pages/SilverRate.tsx` — review step shows the grey "This update will" checklist which turns live (`Update pipeline`) while the apply runs, the result screen renders the final pipeline + Complete, the history card gained **From/To date filters** (IST days, client-side, Clear button, "No updates in this date range."), a **Steps** dot column and a **View** action per row — **[tc]** frontend tsc 0, oxlint 0.
+- **[run]** live click-through (dev stack, Chromium): 6-row history, From/To filter (2026-10-26 → 3 rows; 2020-01-01→2020-01-02 → empty-range message; Clear → 6 rows), View dialog opens with the details grid and the legacy fallback note, review step shows the 5-step checklist. Screenshots in `test-results/silver-rate-visual/log-*.png`.
+
+STILL TO DO:
+1. **Commit** — blocked on one decision: `backend/src/db/bootstrap.ts` holds BOTH the user's staged product_variants column work AND this session's `step_log` ALTER, so committing that file cleanly needs their work committed first (or explicitly included). Everything else (`schema.ts`, `migrate.ts`, `shopify.ts`, the two frontend files, `progress.md`) is ready to commit as `feat(silver-rate)` once that's settled. Suggest asking whether to commit the variants work as its own commit first.
+2. **Live pipeline with real data** — no rate update has been run since the backend landed, so no row carries a `step_log` yet (the View dialog shows the legacy note for all six). A run at the current rate with sync-first off would reprice to identical prices so `push` is skipped (no Shopify writes) — needs the user's OK. Note the user applied ₹160 → ₹161 at 10:18 UTC today themselves (row 6, `chandru`, synced), before this backend code was live.
+
+Notes / gotchas:
+- Vite dev server left running on 127.0.0.1:47195 (background process from the click-through); the backend on 47191 was already running.
+- Existing history rows have no `step_log`, so the View dialog must degrade gracefully (who / when / old→new rate + sync status only).
+- `GET /db/silver-rates` selects all columns, so the new field flows through with no route change; `paginate` caps the window at 200 rows, which is why the date filter is client-side.
+
+---
+
 ## CURRENT TASK (2026-10-23) — Docs push + pending-work log
 
 - Added the eight reference docs to `docs/` — `AGENTS.md`, `ARCHITECTURE.md`, `CODE_STYLE.md`, `DESIGN_SYSTEM.md`, `PRD.md`, `README.md` (docs index), `SECURITY.md`, `TESTING.md` — and pushed them to `origin/chandru2` together with this log.
@@ -9,6 +49,7 @@
 
 ### Pending work (carried forward, priority order)
 
+0. **[ACTIVE] Silver Rate pipeline tracker + rate-update history log (2026-10-26)** — the `step_log` migration is in the tree; `applySilverRate` step logging, the frontend pipeline/View/date-filter and all verification are still to do. See CURRENT TASK 2026-10-26 part B. Nothing committed yet (the Silver Rate page redesign from part A is also uncommitted).
 1. **Catalogue damage (PENDING #1)** — read-only report first, then wait for approval: which Shopify store the 15:17 sync pulled from, before/after counts from the pre-copy backup + `sync_logs`, restore plan for real products/stock/49 orphaned `stock_levels` rows, then make the sync non-destructive. No DB writes until approved.
 2. **Approved fixes A–E (PENDING #3, after #1)** — voided-order count consistency, "Last sync" from `sync_logs`, GST basis subtitle, orphan `stock_levels` cleanup (show → back up → delete), commit `backend/src/shopify.ts`.
 3. **Item 1b — Total Stock (Weight) sanity** — NOT STARTED.

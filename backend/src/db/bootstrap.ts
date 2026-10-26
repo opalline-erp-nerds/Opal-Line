@@ -1635,6 +1635,9 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS source text`,
       `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS sync_status text`,
       `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS approved_by text`,
+      // Per-step record of each rate update (timestamps, counts, error text)
+      // behind the pipeline tracker + history View dialog.
+      `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS step_log jsonb`,
       `CREATE TABLE IF NOT EXISTS silver_rate_requests (
         id text PRIMARY KEY,
         rate numeric,

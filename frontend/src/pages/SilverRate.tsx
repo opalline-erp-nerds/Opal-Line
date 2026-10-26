@@ -42,8 +42,16 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { useSilverRate } from '@/lib/silver-rate-context'
+import {
+  RateUpdateDetailDialog,
+  SilverRatePipeline,
+  StepDots,
+  SyncStatusBadge,
+  ViewUpdateButton,
+} from '@/components/dashboard/silver-rate-pipeline'
+import { pipelineSucceeded, plannedSteps, stepsFromPhase, stepsFromResult, stepsFromStepLog } from '@/lib/silverRatePipeline'
 import type { PendingRateChange, Product, SilverRate, SilverRateAutoStatus, SilverRateProgress, SilverRateRequestRow, SilverRateRow } from '@/types'
-import { formatCurrency, formatDateTime, formatWeight } from '@/lib/format'
+import { formatCurrency, formatDateTime, formatWeight, istDateKey } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 interface SilverUpdateResult {
@@ -97,6 +105,10 @@ export default function SilverRatePage() {
   // Products repriced by the most recent apply/fetch in this session; falls
   // back to the catalog size (that is what the last apply covered).
   const [lastRepriced, setLastRepriced] = useState<number | null>(null)
+  // History log: From/To date filter + the "View" dialog for one update.
+  const [fromDate, setFromDate] = useState('')
+  const [toDate, setToDate] = useState('')
+  const [viewRow, setViewRow] = useState<SilverRateRow | null>(null)
   // One-off scheduled rate changes: a rate + a specific date/time applied
   // automatically then (queue lives in settings.scheduled_rate_changes).
   // Guided dialog state — rate → when → preview, plus edit-in-place.
@@ -509,6 +521,45 @@ export default function SilverRatePage() {
 
   const repriced = lastRepriced ?? products.length
 
+  /** Live pipeline while an apply runs (driven by the progress polling). */
+  const liveSteps = useMemo(
+    () =>
+      rateProgress
+        ? stepsFromPhase({
+            progress: {
+              phase: rateProgress.phase,
+              label: rateProgress.label,
+              total: rateProgress.total,
+              error: rateProgress.error,
+            },
+            syncFirst,
+          })
+        : [],
+    [rateProgress, syncFirst],
+  )
+
+  /** Final pipeline for the run just applied: result.steps + the row's step log. */
+  const finalSteps = useMemo(() => {
+    if (result?.steps && result.steps.length > 0) {
+      const appliedRow = history.find((h) => h.rate === result.rate) ?? null
+      return stepsFromResult(result.steps, appliedRow?.stepLog ?? null)
+    }
+    const newest = history[0]
+    return newest?.stepLog ? stepsFromStepLog(newest.stepLog) : []
+  }, [result, history])
+
+  /** History rows narrowed by the From/To filter (IST calendar days). */
+  const filteredHistory = useMemo(() => {
+    if (!fromDate && !toDate) return history
+    return history.filter((h) => {
+      const day = istDateKey(h.updatedAt)
+      if (!day) return true
+      if (fromDate && day < fromDate) return false
+      if (toDate && day > toDate) return false
+      return true
+    })
+  }, [history, fromDate, toDate])
+
   const autoLine = !autoStatus
     ? 'Auto-rate status unavailable.'
     : autoStatus.lastError
@@ -888,16 +939,56 @@ export default function SilverRatePage() {
 
       {/* ── History ─────────────────────────────────────────────────────── */}
       <Card>
-        <CardHeader>
-          <div className="flex items-center gap-2">
-            <History className="h-4 w-4 text-muted-foreground" />
-            <CardTitle className="text-sm">Rate history</CardTitle>
+        <CardHeader className="flex-row flex-wrap items-end justify-between gap-3 space-y-0">
+          <div>
+            <div className="flex items-center gap-2">
+              <History className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-sm">Rate history</CardTitle>
+            </div>
+            <CardDescription className="mt-0.5">
+              Every rate change, with the steps each update went through.
+            </CardDescription>
           </div>
-          <CardDescription>Every rate change is logged with the admin who approved it.</CardDescription>
+          <div className="flex flex-wrap items-end gap-2">
+            <div className="space-y-1">
+              <Label htmlFor="history-from" className="text-[11px] uppercase tracking-wide">From</Label>
+              <Input
+                id="history-from"
+                type="date"
+                value={fromDate}
+                max={toDate || undefined}
+                onChange={(e) => setFromDate(e.target.value)}
+                className="h-8 w-36"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="history-to" className="text-[11px] uppercase tracking-wide">To</Label>
+              <Input
+                id="history-to"
+                type="date"
+                value={toDate}
+                min={fromDate || undefined}
+                onChange={(e) => setToDate(e.target.value)}
+                className="h-8 w-36"
+              />
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8"
+              disabled={!fromDate && !toDate}
+              onClick={() => {
+                setFromDate('')
+                setToDate('')
+              }}
+            >
+              Clear
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="p-0">
           <div className="overflow-x-auto">
-            <Table className="min-w-[720px]">
+            <Table className="min-w-[860px]">
               <TableHeader>
                 <TableRow>
                   <TableHead>Date</TableHead>
@@ -905,18 +996,19 @@ export default function SilverRatePage() {
                   <TableHead>Change</TableHead>
                   <TableHead>Approved by</TableHead>
                   <TableHead className="text-center">Shopify</TableHead>
+                  <TableHead className="text-center">Steps</TableHead>
                   <TableHead className="text-center">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {history.length === 0 ? (
+                {filteredHistory.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
-                      No rate history yet.
+                    <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
+                      {history.length === 0 ? 'No rate history yet.' : 'No updates in this date range.'}
                     </TableCell>
                   </TableRow>
                 ) : (
-                  history.map((h) => {
+                  filteredHistory.map((h) => {
                     const prev = h.previousRate ?? currentRate.previousRate
                     const diff = Math.round((h.rate - prev) * 100) / 100
                     const source = h.source ?? 'legacy'
@@ -943,16 +1035,20 @@ export default function SilverRatePage() {
                           </div>
                         </TableCell>
                         <TableCell className="text-center">
-                          <Badge variant={h.syncStatus === 'synced' ? 'success' : h.syncStatus === 'failed' ? 'danger' : 'muted'} dot>
-                            {h.syncStatus === 'synced' ? 'Synced' : h.syncStatus === 'failed' ? 'Failed' : h.syncStatus === 'skipped' ? 'Skipped' : '—'}
-                          </Badge>
+                          <SyncStatusBadge status={h.syncStatus} />
                         </TableCell>
                         <TableCell className="text-center">
-                          {h.rate !== currentRate.rate ? (
-                            <Button variant="ghost" size="sm" className="h-7 gap-1 px-2 text-primary" onClick={() => rollbackTo(h.rate)}>
-                              <Undo2 className="h-3.5 w-3.5" /> Restore
-                            </Button>
-                          ) : null}
+                          <StepDots steps={h.stepLog ? stepsFromStepLog(h.stepLog) : []} />
+                        </TableCell>
+                        <TableCell className="text-center">
+                          <div className="flex items-center justify-center gap-1">
+                            <ViewUpdateButton onClick={() => setViewRow(h)} />
+                            {h.rate !== currentRate.rate ? (
+                              <Button variant="ghost" size="sm" className="h-7 gap-1 px-2 text-primary" onClick={() => rollbackTo(h.rate)}>
+                                <Undo2 className="h-3.5 w-3.5" /> Restore
+                              </Button>
+                            ) : null}
+                          </div>
                         </TableCell>
                       </TableRow>
                     )
@@ -1028,6 +1124,14 @@ export default function SilverRatePage() {
           </p>
         </div>
       </AppDialog>
+
+      <RateUpdateDetailDialog
+        row={viewRow}
+        open={viewRow !== null}
+        onOpenChange={(open) => {
+          if (!open) setViewRow(null)
+        }}
+      />
 
       {/* ── One drawer: apply now or schedule ───────────────────────────── */}
       <AppDialog
@@ -1300,6 +1404,15 @@ export default function SilverRatePage() {
                 <div>
                   <div className="mb-2 flex items-center justify-between gap-2">
                     <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {processing ? 'Update pipeline' : 'This update will'}
+                    </p>
+                  </div>
+                  <SilverRatePipeline steps={processing ? liveSteps : plannedSteps(syncFirst)} />
+                </div>
+
+                <div>
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                       Preview — {products.length} products
                     </p>
                     <Badge variant="warning">{formatCurrency(totalDelta)} total shift</Badge>
@@ -1402,33 +1515,9 @@ export default function SilverRatePage() {
                 {result && !result.ok ? 'Silver rate saved, but Shopify sync had errors' : 'Price update approved & synced'}
               </p>
             )}
-            {result?.steps && result.steps.length > 0 ? (
+            {finalSteps.length > 0 ? (
               <div className="w-full max-w-md space-y-2 py-2 text-left">
-                {result.steps.map((s) => (
-                  <div key={s.key} className="flex items-start gap-2.5 rounded-lg border px-3 py-2">
-                    {s.status === 'done' ? (
-                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-success-700" />
-                    ) : s.status === 'failed' ? (
-                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
-                    ) : (
-                      <CircleDollarSign className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                    )}
-                    <div className="min-w-0">
-                      <p className="text-[13px] font-semibold text-foreground">{s.label}</p>
-                      {s.detail ? <p className="text-xs text-muted-foreground">{s.detail}</p> : null}
-                    </div>
-                    <span
-                      className={cn(
-                        'ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide',
-                        s.status === 'done' && 'bg-success-50 text-success-700',
-                        s.status === 'failed' && 'bg-red-50 text-red-600 dark:text-red-400',
-                        s.status === 'skipped' && 'bg-muted text-muted-foreground',
-                      )}
-                    >
-                      {s.status}
-                    </span>
-                  </div>
-                ))}
+                <SilverRatePipeline steps={finalSteps} complete={pipelineSucceeded(finalSteps)} />
               </div>
             ) : (
               <p className="max-w-sm text-sm text-muted-foreground">

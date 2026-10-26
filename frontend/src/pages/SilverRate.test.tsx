@@ -71,6 +71,14 @@ test('history table wraps in an overflow container with the slim columns', () =>
   assert.match(html, /No rate history yet\./)
 })
 
+test('the history log offers a date filter and a View action per row', () => {
+  const html = renderPage()
+  assert.match(html, /id="history-from"/, 'From date input renders')
+  assert.match(html, /id="history-to"/, 'To date input renders')
+  assert.match(html, /No rate history yet\./)
+  assert.doesNotMatch(html, />View</, 'no View action without rows')
+})
+
 test('removed impact tiles and the closed drawer render nothing', () => {
   const html = renderPage()
   assert.doesNotMatch(html, /Total Value Shift/i, 'placeholder tile removed')
