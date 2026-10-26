@@ -74,7 +74,7 @@ const quickActions: { label: string; icon: LucideIcon; path: string; module: str
 export default function DashboardPage() {
   const navigate = useNavigate()
   const { currentUser } = useAuth()
-  // Security snapshot is Admin / Super Admin only â€” the endpoint 403s for
+  // Security snapshot is Admin / Super Admin only — the endpoint 403s for
   // everyone else, so don't even fetch it (and never render the card).
   const securityAdmin = currentUser?.role === 'Admin' || currentUser?.role === 'Super Admin'
 const [kpis, setKpis] = useState<KpiCardData[]>([])
@@ -117,7 +117,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
     try {
       sessionStorage.setItem(RANGE_STORAGE_KEY, JSON.stringify({ period, range: customRange }))
     } catch {
-      /* storage unavailable â€” the range just won't persist */
+      /* storage unavailable — the range just won't persist */
     }
   }, [period, customRange])
 
@@ -165,7 +165,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
         return {}
       }
 
-      // KPIs: fulfilled â†’ real data, rejected â†’ error state
+      // KPIs: fulfilled → real data, rejected → error state
       const kpis = kpisResult.status === 'fulfilled' ? kpisResult.value : []
       const kpisError = kpisResult.status === 'rejected' ? 'Couldn\'t load sales data' : null
 
@@ -296,7 +296,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       />
 
       <div className="hidden print:block">
-        <h1 className="text-lg font-bold text-foreground">Opal Line Billing â€” Dashboard</h1>
+        <h1 className="text-lg font-bold text-foreground">Opal Line Billing — Dashboard</h1>
         <p className="text-xs text-muted-foreground">
           Generated {new Date().toLocaleString('en-IN')} Â· {resolveClientRange(period, customRange).rangeText}
         </p>
@@ -359,7 +359,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                   <EmptyState
                     icon={TrendingUp}
                     title="Nothing to report yet"
-                    description="Add products, set today's silver rate or create your first invoice â€” the dashboard fills up as you work."
+                    description="Add products, set today's silver rate or create your first invoice — the dashboard fills up as you work."
                     action={
                       <Button size="sm" variant="soft-primary" onClick={() => navigate('/inventory/products')}>
                         Add Products
@@ -390,7 +390,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                   <EmptyState
                     icon={ShoppingBag}
                     title="No orders imported yet"
-                    description="Run Orders Sync to import your paid Shopify orders â€” invoices and sales will appear here automatically."
+                    description="Run Orders Sync to import your paid Shopify orders — invoices and sales will appear here automatically."
                     action={
                       <Button size="sm" variant="soft-primary" onClick={() => navigate('/shopify/orders')}>
                         Run Orders Sync
@@ -721,7 +721,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                               {expanded ? (
                                 <div className="mt-2 space-y-1.5 rounded-md border bg-muted/30 p-2">
                                   {list === 'loading' ? (
-                                    <p className="py-1 text-center text-[11.5px] text-muted-foreground">Loading invoicesâ€¦</p>
+                                    <p className="py-1 text-center text-[11.5px] text-muted-foreground">Loading invoices…</p>
                                   ) : list && list.length > 0 ? (
                                     list.map((inv) => (
                                       <div key={inv.id} className="flex items-center justify-between gap-2 text-[11.5px]">
@@ -1159,7 +1159,7 @@ function ConnectionBanner({ rate, shopifyStatus }: { rate: number | null; shopif
         </div>
         <div className="leading-tight">
           <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">Silver Rate</p>
-          <p className="text-sm font-bold text-foreground">{rate != null ? `â‚¹${rate.toFixed(2)} / gm` : 'â€”'}</p>
+          <p className="text-sm font-bold text-foreground">{rate != null ? `₹${rate.toFixed(2)} / gm` : '—'}</p>
         </div>
       </div>
       <div className="h-8 w-px bg-border" />

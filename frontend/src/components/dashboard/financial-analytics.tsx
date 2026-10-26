@@ -11,15 +11,15 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { AGING_COLORS, EXPENSE, INCOME, LOSS, PROFIT, SLICE_COLORS, inr } from '@/components/charts/chart-theme'
-import { ExpenseDonutChart, IncomeExpenseChart, NetProfitChart, ReceivableAgingChart } from '@/components/charts/financial-charts'
+import { AGING_COLORS, EXPENSE, INCOME, SLICE_COLORS, inr } from '@/components/charts/chart-theme'
+import { ExpenseDonutChart, IncomeExpenseChart, ReceivableAgingChart } from '@/components/charts/financial-charts'
 
 /**
- * Financial Analytics — four chart cards that own their data and range.
+ * Financial Analytics — three chart cards that own their data and range.
  *
  * The section deliberately does NOT follow the page-wide filter: it fetches
  * itself (default Last 12 Months) so users can compare a wide financial
- * window while the KPI cards above stay on Today. Cards 1, 3 and 4 share one
+ * window while the KPI cards above stay on Today. Cards 1 and 3 share one
  * range dropdown; the Receivable Summary is point-in-time ("As of now").
  */
 
@@ -98,7 +98,7 @@ export function FinancialAnalytics() {
         </TooltipProvider>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
         {/* ── Income vs Expense ─────────────────────────────────────────── */}
         <Card>
           <CardHeader className="flex-row items-center justify-between space-y-0">
@@ -119,7 +119,20 @@ export function FinancialAnalytics() {
                       {compactCurrency(data.netRevenue)}
                     </p>
                   </div>
-                  <DeltaText trend={data.netRevenueTrend} delta={data.netRevenueDelta} suffix={data.prevLabel} />
+                  <div className="flex flex-col items-end gap-1.5">
+                    <span
+                      className={cn(
+                        'whitespace-nowrap rounded-full px-2 py-0.5 text-[10.5px] font-semibold tabular-nums',
+                        data.net < 0
+                          ? 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300'
+                          : 'bg-success-50 text-success-700 dark:bg-success-700/20 dark:text-success-300',
+                      )}
+                    >
+                      Net {data.net < 0 ? '−' : '+'}
+                      {compactCurrency(Math.abs(data.net))}
+                    </span>
+                    <DeltaText trend={data.netRevenueTrend} delta={data.netRevenueDelta} suffix={data.prevLabel} />
+                  </div>
                 </div>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
                   {compactCurrency(data.sales)} invoiced
@@ -210,47 +223,6 @@ export function FinancialAnalytics() {
                       </div>
                     ))}
                   </div>
-                </div>
-              </>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* ── Net Profit ────────────────────────────────────────────────── */}
-        <Card>
-          <CardHeader className="flex-row items-center justify-between space-y-0">
-            <CardTitle className="text-sm">Net Profit</CardTitle>
-            <RangeSelect value={range} onChange={setRange} />
-          </CardHeader>
-          <CardContent>
-            {error ? (
-              <CardError onRetry={reload} />
-            ) : loading || !data ? (
-              <CardSkeleton />
-            ) : (
-              <>
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <p className="text-xs text-muted-foreground">Income − expenses</p>
-                    <p
-                      className={cn(
-                        'mt-0.5 text-lg font-semibold tabular-nums',
-                        data.net < 0 ? 'text-red-600 dark:text-red-400' : 'text-foreground',
-                      )}
-                    >
-                      {compactCurrency(data.net)}
-                    </p>
-                  </div>
-                </div>
-                <div className="mt-3 flex items-center gap-4 text-[11px]">
-                  <LegendDot color={PROFIT} label="Surplus" />
-                  <LegendDot color={LOSS} label="Deficit" />
-                </div>
-                <div className="mt-2">
-                  <NetProfitChart
-                    points={data.points}
-                    emptyMessage={isBlank(data.points) ? 'No income or expenses in this period' : undefined}
-                  />
                 </div>
               </>
             )}

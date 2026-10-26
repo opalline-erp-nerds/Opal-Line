@@ -1,30 +1,24 @@
-﻿import { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { resolveClientRange, rangeToQuery } from '@/lib/dashboardRange'
 import {
-  ArrowDownRight,
-  ArrowUpRight,
   ArrowRight,
   Banknote,
   Boxes,
   Calendar,
   ChevronDown,
-  CircleDollarSign,
   Clock,
   CloudCog,
   FileText,
   Gem,
   IndianRupee,
   Landmark,
-  Minus,
-  Package,
   PackageX,
   Plus,
   Repeat,
   ShieldAlert,
   ShoppingBag,
   ShoppingCart,
-  Sparkles,
   Tag,
   TrendingUp,
   Users,
@@ -37,6 +31,7 @@ import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { StatusPill } from '@/components/ui/status-pill'
 import { StatCard } from '@/components/ui/stat-card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -44,19 +39,26 @@ import { FinancialAnalytics } from '@/components/dashboard/financial-analytics'
 import { SalesOverviewChart } from '@/components/charts/sales-overview-chart'
 import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
 import { PaymentDonutChart } from '@/components/charts/payment-donut-chart'
+import { StatusDonutChart } from '@/components/charts/dashboard-widget-charts'
+import { SERIES_COLORS } from '@/components/charts/chart-theme'
+import {
+  CustomerPaymentsCard,
+  OrderSummaryCard,
+  PurchaseOrdersCard,
+  RecentInvoicesCard,
+  SalesOrdersCard,
+  SupplierPaymentsCard,
+} from '@/components/dashboard/summary-widgets'
+import { productImageSrc } from '@/lib/product-image'
 import { dbApi } from '@/lib/api'
 import { shopifyApi } from '@/lib/api'
 import type {
   Activity,
-  AgingBucket,
-  AgingInvoice,
   AnalyticsStat,
   KpiCardData,
   LowStockItem,
   PaymentStatusSegment,
-  ReceivablesAging,
   SalesOverviewPoint,
-  SilverRate,
   TopCategory,
   TopProduct,
   PeriodKey,
@@ -64,7 +66,7 @@ import type {
   RangeQuery,
 } from '@/types'
 import type { ShopifyStatus } from '@/types/shopify'
-import { compactCurrency, formatCurrency, formatDate, formatDateTime, formatPieces, formatWeight } from '@/lib/format'
+import { compactCurrency, formatCurrency, formatDateTime, formatPieces, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 const kpiIcons: Record<string, LucideIcon> = {
@@ -74,14 +76,6 @@ const kpiIcons: Record<string, LucideIcon> = {
   'trending-up': TrendingUp,
   clock: Clock,
   'package-x': PackageX,
-}
-
-const productIcons: Record<string, LucideIcon> = {
-  chain: ShoppingBag,
-  ring: Gem,
-  bracelet: CircleDollarSign,
-  pendant: Sparkles,
-  earrings: Package,
 }
 
 const activityIcons: Record<Activity['type'], { icon: LucideIcon; className: string }> = {
@@ -112,12 +106,8 @@ const quickActions: { label: string; icon: LucideIcon; path: string; module: str
 
 export default function DashboardPage() {
   const navigate = useNavigate()
-  const { currentUser } = useAuth()
-  // Security snapshot is Admin / Super Admin only ΓÇö the endpoint 403s for
-  // everyone else, so don't even fetch it (and never render the card).
-  const securityAdmin = currentUser?.role === 'Admin' || currentUser?.role === 'Super Admin'
-const [kpis, setKpis] = useState<KpiCardData[]>([])
-  const [summary, setSummary] = useState<Record<string, string | number> | null>(null)
+  const [kpis, setKpis] = useState<KpiCardData[]>([])
+  const [summary, setSummary] = useState<Record<string, string | number | null> | null>(null)
   const [salesData, setSalesData] = useState<SalesOverviewPoint[]>([])
   const [topProducts, setTopProducts] = useState<TopProduct[]>([])
   const [topProductsError, setTopProductsError] = useState<string | null>(null)
@@ -125,14 +115,9 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [topCategoryError, setTopCategoryError] = useState<string | null>(null)
   const [paymentStatus, setPaymentStatus] = useState<{ segments: PaymentStatusSegment[]; total: number } | null>(null)
   const [paymentStatusError, setPaymentStatusError] = useState<string | null>(null)
-  const [silverRate, setSilverRate] = useState<SilverRate | null>(null)
   const [lowStock, setLowStock] = useState<LowStockItem[]>([])
   const [activities, setActivities] = useState<Activity[]>([])
   const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
-  const [security, setSecurity] = useState<{ failedLogins: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> } | null>(null)
-  const [aging, setAging] = useState<ReceivablesAging | null>(null)
-  const [expandedBucket, setExpandedBucket] = useState<AgingBucket['key'] | null>(null)
-  const [bucketInvoices, setBucketInvoices] = useState<Partial<Record<AgingBucket['key'], AgingInvoice[] | 'loading'>>>({})
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [period, setPeriod] = useState<PeriodKey>(() => loadStoredRange()?.period ?? 'today')
@@ -146,7 +131,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
     try {
       sessionStorage.setItem(RANGE_STORAGE_KEY, JSON.stringify({ period, range: customRange }))
     } catch {
-      /* storage unavailable ΓÇö the range just won't persist */
+      /* storage unavailable — the range just won't persist */
     }
   }, [period, customRange])
 
@@ -163,12 +148,9 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       dbApi.getTopProducts(range),
       dbApi.getTopCategory(range),
       dbApi.getPaymentStatus(range),
-      dbApi.getSilverRate(),
       dbApi.getLowStock(),
-      dbApi.getRecentActivities(range),
+      dbApi.getRecentActivities(range, { latest: true }),
       dbApi.getAnalyticsStats(range),
-      securityAdmin ? dbApi.getDashboardSecurity(range) : Promise.resolve(null),
-      dbApi.getReceivablesAging(),
       shopifyApi.getStatus(),
     ]).then((results) => {
       if (cancelled) return
@@ -178,13 +160,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       const topProductsResult = results[3]
       const topCategoryResult = results[4]
       const paymentStatusResult = results[5]
-      const silverRateResult = results[6]
-      const lowStockResult = results[7]
-      const activitiesResult = results[8]
-      const analyticsResult = results[9]
-      const securityResult = results[10]
-      const agingResult = results[11]
-      const shopifyStatusResult = results[12]
+      const lowStockResult = results[6]
+      const activitiesResult = results[7]
+      const analyticsResult = results[8]
+      const shopifyStatusResult = results[9]
 
       // Helper: if fulfilled, return value; if rejected, log error and return default
       const safe = (result: PromiseSettledResult<any>): any => {
@@ -193,7 +172,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
         return {}
       }
 
-      // KPIs: fulfilled ΓåÆ real data, rejected ΓåÆ error state
+      // KPIs: fulfilled → real data, rejected → error state
       const kpis = kpisResult.status === 'fulfilled' ? kpisResult.value : []
       const kpisError = kpisResult.status === 'rejected' ? 'Couldn\'t load sales data' : null
 
@@ -214,6 +193,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
         pendingPayments: summary.pendingPayments ?? 0,
         totalOrders: summary.totalOrders ?? 0,
         totalInvoices: summary.totalInvoices ?? 0,
+        lastSyncAt: summary.lastSyncAt ?? null,
       }
 
       // Sales Overview
@@ -231,9 +211,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       const paymentStatus = paymentStatusResult.status === 'fulfilled' ? paymentStatusResult.value : { segments: [], total: 0 }
       const paymentStatusError = paymentStatusResult.status === 'rejected' ? 'Couldn\'t load payment status' : null
 
-      // Silver Rate
-      const silverRate = silverRateResult.status === 'fulfilled' ? silverRateResult.value : null
-
       // Low Stock
       const lowStock = lowStockResult.status === 'fulfilled' ? lowStockResult.value : []
 
@@ -242,12 +219,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
 
       // Analytics
       const analytics = analyticsResult.status === 'fulfilled' ? analyticsResult.value : []
-
-      // Security
-      const security = securityResult.status === 'fulfilled' ? securityResult.value : null
-
-      // Aging
-      const aging = agingResult.status === 'fulfilled' ? agingResult.value : null
 
       // Shopify Status
       const shopifyStatus = shopifyStatusResult.status === 'fulfilled' ? shopifyStatusResult.value : null
@@ -262,12 +233,9 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       setTopCategoryError(topCategoryError ?? null)
       setPaymentStatus(paymentStatus)
       setPaymentStatusError(paymentStatusError ?? null)
-      setSilverRate(silverRate)
       setLowStock(lowStock)
       setActivities(Array.isArray(activities) ? activities : [])
       setAnalytics(analytics)
-      setSecurity(security)
-      setAging(aging)
       setShopifyStatus(shopifyStatus)
       // If critical widgets (KPIs or summary) had errors, mark DB as unreachable
       if (kpisResult.status === 'rejected' || summaryResult.status === 'rejected') {
@@ -283,23 +251,9 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
     return () => {
       cancelled = true
     }
-  }, [period, customRange, securityAdmin])
+  }, [period, customRange])
 
-  // Receivables aging drill-down: lazily fetch (and cache) the invoices behind
-  // a bucket the first time it is expanded.
-  const toggleBucket = (key: AgingBucket['key']) => {
-    if (expandedBucket === key) {
-      setExpandedBucket(null)
-      return
-    }
-    setExpandedBucket(key)
-    if (bucketInvoices[key]) return
-    setBucketInvoices((prev) => ({ ...prev, [key]: 'loading' }))
-    dbApi
-      .getAgingInvoices(key)
-      .then((r) => setBucketInvoices((prev) => ({ ...prev, [key]: r.invoices })))
-      .catch(() => setBucketInvoices((prev) => ({ ...prev, [key]: [] })))
-  }
+  const range = rangeToQuery(period, customRange) as RangeQuery
 
   return (
     <div className="print-area mx-auto w-full max-w-[1600px] space-y-6 px-4 py-4 sm:py-6 lg:px-6">
@@ -321,13 +275,16 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       />
 
       <div className="hidden print:block">
-        <h1 className="text-lg font-bold text-foreground">Opal Line Billing ΓÇö Dashboard</h1>
+        <h1 className="text-lg font-bold text-foreground">Opal Line Billing — Dashboard</h1>
         <p className="text-xs text-muted-foreground">
-          Generated {new Date().toLocaleString('en-IN')} ┬╖ {resolveClientRange(period, customRange).rangeText}
+          Generated {new Date().toLocaleString('en-IN')} · {resolveClientRange(period, customRange).rangeText}
         </p>
       </div>
 
-                <ConnectionBanner rate={silverRate?.rate ?? null} shopifyStatus={shopifyStatus} />
+      <ConnectionBanner
+        lastSyncAt={typeof summary?.lastSyncAt === 'string' ? summary.lastSyncAt : null}
+        shopifyStatus={shopifyStatus}
+      />
 
       {dbError ? (
         <Card className="mb-6">
@@ -347,7 +304,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
         <DashboardSkeleton />
       ) : (
         <>
-{kpisError ? (
+          {kpisError ? (
               <Card>
                 <CardContent>
                   <EmptyState
@@ -374,7 +331,8 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                     delta={kpi.delta}
                     deltaLabel={kpi.deltaLabel}
                     support={kpi.rangeLabel}
-                    accent={kpi.accent as 'purple'}
+                    accent={kpi.accent}
+                    variant="gradient"
                   />
                 ))}
               </div>
@@ -384,7 +342,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                   <EmptyState
                     icon={TrendingUp}
                     title="Nothing to report yet"
-                    description="Add products, set today's silver rate or create your first invoice ΓÇö the dashboard fills up as you work."
+                    description="Add products, set today's silver rate or create your first invoice — the dashboard fills up as you work."
                     action={
                       <Button size="sm" variant="soft-primary" onClick={() => navigate('/inventory/products')}>
                         Add Products
@@ -395,16 +353,15 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </Card>
             ))}
 
-          {summary ? <OperationalStrip summary={summary} /> : null}
+          {summary ? <OperationalStrip summary={summary} analytics={analytics} /> : null}
 
-          {/* Self-fetching: independent of the page-wide range above. */}
-          <FinancialAnalytics />
-
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-            <Card className="xl:col-span-1">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+            <Card className="lg:col-span-2">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
-                  <CardTitle className="text-sm">Sales Overview</CardTitle>
+                  <CardTitle className="flex items-center gap-2 text-sm">
+                    <TrendingUp className="h-4 w-4 text-primary-700" /> Sales Overview
+                  </CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">{resolveClientRange(period, customRange).rangeText}</p>
                 </div>
               </CardHeader>
@@ -415,7 +372,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                   <EmptyState
                     icon={ShoppingBag}
                     title="No orders imported yet"
-                    description="Run Orders Sync to import your paid Shopify orders ΓÇö invoices and sales will appear here automatically."
+                    description="Run Orders Sync to import your paid Shopify orders — invoices and sales will appear here automatically."
                     action={
                       <Button size="sm" variant="soft-primary" onClick={() => navigate('/shopify/orders')}>
                         Run Orders Sync
@@ -432,85 +389,12 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
 
-            <Card className="xl:col-span-1">
+            <Card className="lg:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
-                  <CardTitle className="text-sm">Top Selling Products</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
-                </div>
-                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
-                  View All <ArrowRight className="h-3.5 w-3.5" />
-                </Button>
-              </CardHeader>
-              <CardContent className="p-0">
-                {topProductsError ? (
-              <Card>
-                <CardContent>
-                  <EmptyState
-                    icon={ShieldAlert}
-                    title="Couldn't load top products"
-                    description="There was an error fetching top selling products. Please try again."
-                    action={
-                      <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
-                        Retry
-                      </Button>
-                    }
-                  />
-                </CardContent>
-              </Card>
-            ) : (topProducts.length > 0 ? (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Product</TableHead>
-                      <TableHead className="text-right">Qty</TableHead>
-                      <TableHead className="text-right">Weight</TableHead>
-                      <TableHead className="text-right">Revenue</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {topProducts.map((p) => {
-                      const Icon = productIcons[p.icon] ?? Package
-                      return (
-                        <TableRow key={p.id} className="border-b-0">
-                          <TableCell>
-                            <div className="flex items-center gap-2.5">
-                              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                                <Icon className="h-4 w-4" />
-                              </div>
-                              <div>
-                                <p className="font-medium text-foreground">{p.name}</p>
-                                <p className="text-[11px] text-muted-foreground">{p.sku}</p>
-                              </div>
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-right font-medium tabular-nums">{formatNumber(p.qty)}</TableCell>
-                          <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(p.weight)}</TableCell>
-                          <TableCell className="text-right font-semibold tabular-nums text-foreground">{compactCurrency(p.revenue)}</TableCell>
-                        </TableRow>
-                      )
-                    })}
-                  </TableBody>
-                </Table>
-                ) : (
-                  <EmptyState
-                    icon={ShoppingBag}
-                    title="No sales recorded yet"
-                    description="Your best sellers will appear here once the first invoice is raised."
-                    action={
-                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/sales/invoices')}>
-                        Create Invoice
-                      </Button>
-                    }
-                  />
-                ))}
-              </CardContent>
-            </Card>
-
-            <Card className="xl:col-span-1">
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="text-sm">Payment Status</CardTitle>
+                  <CardTitle className="flex items-center gap-2 text-sm">
+                    <IndianRupee className="h-4 w-4 text-primary-700" /> Payment Status
+                  </CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">Invoices grouped by payment state</p>
                 </div>
                 <Badge variant="muted" className="text-[10px]">{formatCurrency(paymentStatus?.total ?? 0, { compact: true })}</Badge>
@@ -569,14 +453,120 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
             </Card>
           </div>
 
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-            <Card className="xl:col-span-1">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+            <Card className="lg:col-span-5 lg:row-span-2">
+              <CardHeader className="flex-row items-center justify-between space-y-0">
+                <div>
+                  <CardTitle className="text-sm">Top Selling Products</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
+                </div>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/reports/sales')}>
+                  View All <ArrowRight className="h-3.5 w-3.5" />
+                </Button>
+              </CardHeader>
+              <CardContent>
+                {topProductsError ? (
+                  <Card>
+                    <CardContent>
+                      <EmptyState
+                        icon={ShieldAlert}
+                        title="Couldn't load top products"
+                        description="There was an error fetching top selling products. Please try again."
+                        action={
+                          <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
+                            Retry
+                          </Button>
+                        }
+                      />
+                    </CardContent>
+                  </Card>
+                ) : topProducts.length > 0 ? (
+                  <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                    {topProducts.map((p, index) => {
+                      const max = topProducts[0]?.revenue || 1
+                      const image = productImageSrc(p)
+                      return (
+                        <div
+                          key={p.id}
+                          className="rounded-xl border border-border/70 bg-muted/20 p-2.5 transition-colors hover:bg-muted/40"
+                        >
+                          <div className="flex items-center gap-2">
+                            <div className="relative flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                              {image ? (
+                                <img src={image} alt={p.name} className="h-full w-full object-cover" loading="lazy" />
+                              ) : (
+                                <Gem className="h-4 w-4" />
+                              )}
+                              <span className="absolute left-0 top-0 rounded-br-md bg-foreground/70 px-1 text-[9px] font-bold leading-4 text-background">
+                                {index + 1}
+                              </span>
+                            </div>
+                            <div className="min-w-0">
+                              <p className="truncate text-[12px] font-medium text-foreground">{p.name}</p>
+                              <p className="truncate text-[10px] text-muted-foreground">{p.sku}</p>
+                            </div>
+                          </div>
+                          <div className="mt-2 flex items-baseline justify-between gap-2">
+                            <span className="text-[12.5px] font-semibold tabular-nums text-foreground">
+                              {compactCurrency(p.revenue)}
+                            </span>
+                            <span className="text-[10px] text-muted-foreground">{formatNumber(p.qty)} pcs</span>
+                          </div>
+                          <div className="mt-1.5 flex items-center gap-2">
+                            <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+                              <div
+                                className="h-full rounded-full"
+                                style={{
+                                  width: `${Math.max(4, Math.round((p.revenue / max) * 100))}%`,
+                                  background: SERIES_COLORS[0],
+                                }}
+                              />
+                            </div>
+                            <span className="shrink-0 text-[9.5px] tabular-nums text-muted-foreground">
+                              {formatWeight(p.weight)}
+                            </span>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <EmptyState
+                    icon={ShoppingBag}
+                    title="No sales recorded yet"
+                    description="Your best sellers will appear here once the first invoice is raised."
+                    action={
+                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/sales/invoices')}>
+                        Create Invoice
+                      </Button>
+                    }
+                  />
+                )}
+              </CardContent>
+            </Card>
+
+            <div className="grid grid-cols-1 gap-4 lg:col-span-7 lg:row-span-2 lg:grid-cols-7">
+              <div className="lg:col-span-4">
+                <SupplierPaymentsCard range={range} />
+              </div>
+              <div className="lg:col-span-3">
+                <PurchaseOrdersCard range={range} />
+              </div>
+              <div className="lg:col-span-4">
+                <CustomerPaymentsCard range={range} />
+              </div>
+              <div className="lg:col-span-3">
+                <SalesOrdersCard range={range} />
+              </div>
+            </div>
+
+            <Card className="lg:col-span-4">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="text-sm">Top Selling Category</CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">Revenue grouped by product category</p>
                 </div>
-                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
               </CardHeader>
@@ -597,25 +587,41 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                 </CardContent>
               </Card>
             ) : (topCategory.length > 0 ? (
-                  <div className="space-y-3">
-                    {topCategory.map((c) => {
-                      const max = topCategory[0]?.revenue || 1
-                      return (
-                        <div key={c.category} className="space-y-1">
-                          <div className="flex items-center justify-between gap-2 text-[12px]">
-                            <span className="truncate font-medium text-foreground">{c.category}</span>
-                            <span className="shrink-0 font-semibold tabular-nums text-foreground">{compactCurrency(c.revenue)}</span>
-                          </div>
-                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                            <div className="h-full rounded-full bg-primary-500" style={{ width: `${Math.max(4, Math.round((c.revenue / max) * 100))}%` }} />
-                          </div>
-                          <p className="text-[10.5px] text-muted-foreground">
-                            {formatNumber(c.qty)} pcs ┬╖ {formatWeight(c.weight)}
-                          </p>
+                  (() => {
+                    const total = topCategory.reduce((sum, c) => sum + c.revenue, 0)
+                    const slices = topCategory.map((c, index) => ({
+                      name: c.category,
+                      value: c.revenue,
+                      color: SERIES_COLORS[index % SERIES_COLORS.length],
+                    }))
+                    return (
+                      <div className="grid grid-cols-1 items-center gap-3 sm:grid-cols-2">
+                        <StatusDonutChart
+                          data={slices}
+                          centerLabel="Revenue"
+                          centerValue={compactCurrency(total)}
+                          height={180}
+                        />
+                        <div className="space-y-2">
+                          {slices.map((slice, index) => (
+                            <div key={slice.name} className="flex items-center gap-2 text-[11.5px]">
+                              <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: slice.color }} />
+                              <span className="truncate text-muted-foreground">{slice.name}</span>
+                              <span className="ml-auto font-semibold tabular-nums text-foreground">
+                                {compactCurrency(slice.value)}
+                              </span>
+                              <span className="w-8 text-right tabular-nums text-muted-foreground">
+                                {total > 0 ? `${Math.round((slice.value / total) * 100)}%` : '0%'}
+                              </span>
+                              <span className="hidden text-[10px] text-muted-foreground sm:inline">
+                                {formatNumber(topCategory[index]?.qty ?? 0)} pcs
+                              </span>
+                            </div>
+                          ))}
                         </div>
-                      )
-                    })}
-                  </div>
+                      </div>
+                    )
+                  })()
                 ) : (
                   <EmptyState
                     icon={Tag}
@@ -626,15 +632,24 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
 
-            <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
+            <div className="lg:col-span-8">
+              <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
+            </div>
+          </div>
 
-            <Card className="xl:col-span-1">
+          <OrderSummaryCard />
+
+          {/* Self-fetching: independent of the page-wide range above. */}
+          <FinancialAnalytics />
+
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <Card>
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="text-sm">Low Stock Alert</CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">At or below their reorder level</p>
                 </div>
-                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/inventory/low-stock')}>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/inventory/low-stock')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
               </CardHeader>
@@ -650,8 +665,18 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {lowStock.slice(0, 5).map((l) => (
-                      <TableRow key={l.id} className="border-b-0">
+                    {lowStock.slice(0, 5).map((l) => {
+                      const critical = l.stock === 0 || l.status === 'critical'
+                      return (
+                      <TableRow
+                        key={l.id}
+                        className={cn(
+                          'border-b-0',
+                          critical
+                            ? 'bg-red-50/60 hover:bg-red-50 dark:bg-red-500/10 dark:hover:bg-red-500/15'
+                            : 'bg-amber-50/40 hover:bg-amber-50 dark:bg-amber-500/10 dark:hover:bg-amber-500/15',
+                        )}
+                      >
                         <TableCell>
                           <div className="flex items-center gap-2.5">
                             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-warning-50 text-warning-700">
@@ -666,12 +691,11 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                         <TableCell className="text-right font-semibold tabular-nums text-red-600 dark:text-red-400">{formatPieces(l.stock)}</TableCell>
                         <TableCell className="text-right tabular-nums text-muted-foreground">{formatPieces(l.reorderLevel)}</TableCell>
                         <TableCell className="text-center">
-                          <Badge variant={l.stock === 0 || l.status === 'critical' ? 'danger' : 'warning'} dot>
-                            {l.stock === 0 ? 'Out of Stock' : l.status === 'critical' ? 'Critical' : 'Low'}
-                          </Badge>
+                          <StatusPill status={l.stock === 0 ? 'Out of Stock' : l.status === 'critical' ? 'Critical' : 'Low'} />
                         </TableCell>
                       </TableRow>
-                    ))}
+                      )
+                    })}
                   </TableBody>
                 </Table>
                 ) : (
@@ -689,174 +713,33 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
 
-            <Card className="xl:col-span-1">
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="text-sm">Receivables Aging</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Outstanding by due date</p>
-                </div>
-                {aging && aging.overdueCount > 0 ? (
-                  <Badge variant="warning" className="text-[10px]">{compactCurrency(aging.overdueTotal)} overdue</Badge>
-                ) : aging && aging.invoiceCount > 0 ? (
-                  <Badge variant="success" className="text-[10px]">Nothing overdue</Badge>
-                ) : null}
-              </CardHeader>
-              <CardContent>
-                {aging ? (
-                  aging.invoiceCount > 0 ? (
-                    <>
-                      <div className="space-y-3">
-                        {aging.buckets.map((b) => {
-                          const list = bucketInvoices[b.key]
-                          const expanded = expandedBucket === b.key
-                          return (
-                            <div key={b.key}>
-                              <button
-                                type="button"
-                                onClick={() => toggleBucket(b.key)}
-                                aria-expanded={expanded}
-                                className="flex w-full items-center gap-2 rounded-sm text-left text-[12px] hover:bg-muted/50"
-                              >
-                                <span
-                                  className={cn(
-                                    'h-2 w-2 rounded-full',
-                                    b.key === 'current' && 'bg-success',
-                                    b.key === 'd1_30' && 'bg-amber-500',
-                                    b.key === 'd31_60' && 'bg-orange-500',
-                                    b.key === 'd60plus' && 'bg-destructive',
-                                  )}
-                                />
-                                <span className="text-muted-foreground">{b.label}</span>
-                                <span className="ml-auto font-semibold tabular-nums text-foreground">{compactCurrency(b.value)}</span>
-                                <span className="w-14 text-right tabular-nums text-muted-foreground">{b.count} inv</span>
-                                <ChevronDown className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', expanded ? '' : '-rotate-90')} />
-                              </button>
-                              <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
-                                <div
-                                  className={cn(
-                                    'h-full rounded-full',
-                                    b.key === 'current' && 'bg-success',
-                                    b.key === 'd1_30' && 'bg-amber-500',
-                                    b.key === 'd31_60' && 'bg-orange-500',
-                                    b.key === 'd60plus' && 'bg-destructive',
-                                  )}
-                                  style={{ width: `${aging.total > 0 ? Math.max(2, Math.round((b.value / aging.total) * 100)) : 0}%` }}
-                                />
-                              </div>
-                              {expanded ? (
-                                <div className="mt-2 space-y-1.5 rounded-md border bg-muted/30 p-2">
-                                  {list === 'loading' ? (
-                                    <p className="py-1 text-center text-[11.5px] text-muted-foreground">Loading invoicesΓÇª</p>
-                                  ) : list && list.length > 0 ? (
-                                    list.map((inv) => (
-                                      <div key={inv.id} className="flex items-center justify-between gap-2 text-[11.5px]">
-                                        <div className="min-w-0">
-                                          <p className="truncate font-medium text-foreground">{inv.customer || inv.number}</p>
-                                          <p className="truncate text-muted-foreground">
-                                            {inv.number}
-                                            {inv.dueDate ? ` ┬╖ due ${formatDate(inv.dueDate)}` : ' ┬╖ no due date'}
-                                          </p>
-                                        </div>
-                                        <div className="shrink-0 text-right">
-                                          <p className="font-semibold tabular-nums text-foreground">{compactCurrency(inv.outstanding ?? inv.grandTotal)}</p>
-                                          {inv.outstanding != null && inv.outstanding < inv.grandTotal ? (
-                                            <p className="text-[10.5px] text-muted-foreground">of {compactCurrency(inv.grandTotal)}</p>
-                                          ) : null}
-                                          {inv.daysOverdue > 0 ? (
-                                            <p className="text-[10.5px] font-medium text-red-600 dark:text-red-400">{inv.daysOverdue}d overdue</p>
-                                          ) : (
-                                            <p className="text-[10.5px] text-muted-foreground">not due</p>
-                                          )}
-                                        </div>
-                                      </div>
-                                    ))
-                                  ) : (
-                                    <p className="py-1 text-center text-[11.5px] text-muted-foreground">No invoices in this bucket.</p>
-                                  )}
-                                </div>
-                              ) : null}
-                            </div>
-                          )
-                        })}
-                      </div>
-                      <Button variant="soft-primary" className="mt-4 w-full" size="sm" onClick={() => navigate('/reports/dues')}>
-                        View Dues
-                      </Button>
-                    </>
-                  ) : (
-                    <EmptyState
-                      icon={Clock}
-                      title="No outstanding receivables"
-                      description="Invoices awaiting payment will be grouped here by how overdue they are."
-                    />
-                  )
-                ) : (
-                  <p className="py-6 text-center text-sm text-muted-foreground">Aging snapshot unavailable.</p>
-                )}
-              </CardContent>
-            </Card>
+            <RecentInvoicesCard range={range} />
+          </div>
 
-            {securityAdmin ? (
-            <Card className="xl:col-span-1">
-              <CardHeader>
-                <CardTitle className="text-sm flex items-center gap-2">
-                  <ShieldAlert className="h-4 w-4 text-muted-foreground" /> Security
-                </CardTitle>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">Failed logins and account lockouts</p>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                {security ? (
-                  <>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="rounded-lg border p-3">
-                        <p className="text-2xl font-bold text-foreground">{security.failedLogins}</p>
-                        <p className="text-[11px] text-muted-foreground">Failed logins ┬╖ {resolveClientRange(period, customRange).rangeText}</p>
-                      </div>
-                      <div className="rounded-lg border p-3">
-                        <p className={`text-2xl font-bold ${security.lockedAccounts > 0 ? 'text-destructive' : 'text-foreground'}`}>{security.lockedAccounts}</p>
-                        <p className="text-[11px] text-muted-foreground">Locked accounts</p>
-                      </div>
-                    </div>
-                    {security.recent.length > 0 ? (
-                      <div className="space-y-1.5">
-                        <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Recent failures</p>
-                        {security.recent.map((r, i) => (
-                          <div key={i} className="flex items-center justify-between gap-2 text-[12px]">
-                            <span className="truncate font-medium text-foreground">{r.entity || 'Unknown user'}</span>
-                            <span className="shrink-0 text-muted-foreground">{r.timestamp ? new Date(r.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : ''}</span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-[12px] text-muted-foreground">No failed logins recorded.</p>
-                    )}
-                  </>
-                ) : (
-                  <p className="text-sm text-muted-foreground">Security snapshot unavailable.</p>
-                )}
-              </CardContent>
-            </Card>
-            ) : null}
-
-            <Card className="xl:col-span-1">
-              <CardHeader>
+          <Card>
+            <CardHeader className="flex-row items-center justify-between space-y-0">
+              <div>
                 <CardTitle className="text-sm">Recent Activities</CardTitle>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoice, payment and sync events</p>
-              </CardHeader>
-              <CardContent className="p-0">
-                <div className="relative h-[400px] overflow-y-auto px-5 pb-5">
-                  {activities.length === 0 ? (
-                    <EmptyState
-                      icon={Repeat}
-                      title="No activity yet"
-                      description="Invoice, payment and sync events will show up here as you work."
-                    />
-                  ) : (
-                  activities.map((a, i) => {
+              </div>
+              <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/system/activity')}>
+                View All <ArrowRight className="h-3.5 w-3.5" />
+              </Button>
+            </CardHeader>
+            <CardContent className="p-0">
+              <div className="relative px-5 pb-5">
+                {activities.length === 0 ? (
+                  <EmptyState
+                    icon={Repeat}
+                    title="No activity yet"
+                    description="Invoice, payment and sync events will show up here as you work."
+                  />
+                ) : (
+                  activities.slice(0, 8).map((a, i) => {
                     const cfg = activityIcons[a.type]
                     return (
                       <div key={a.id} className="relative flex gap-3 pb-4 last:pb-0">
-                        {i < activities.length - 1 ? (
+                        {i < Math.min(activities.length, 8) - 1 ? (
                           <span className="absolute left-[15px] top-8 h-[calc(100%-28px)] w-px bg-border" />
                         ) : null}
                         <div className={cn('z-10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full', cfg.className)}>
@@ -866,25 +749,18 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                           <p className="text-[13px] font-medium leading-snug text-foreground">{a.title}</p>
                           {a.detail ? <p className="text-[11.5px] text-muted-foreground">{a.detail}</p> : null}
                           <div className="mt-0.5 flex items-center gap-2 text-[10.5px] text-muted-foreground">
-                            <span className="font-medium text-primary-700">by {a.actor}</span>
-                            <span>┬╖</span>
+                            <span className="font-medium text-link">by {a.actor}</span>
+                            <span>·</span>
                             <span>{a.time}</span>
                           </div>
                         </div>
                       </div>
                     )
                   })
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
-            {analytics.map((s) => (
-              <AnalyticsCard key={s.label} stat={s} />
-            ))}
-          </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
         </>
       )}
     </div>
@@ -1106,67 +982,33 @@ function PeriodSelect({
   )
 }
 
-function AnalyticsCard({ stat }: { stat: AnalyticsStat }) {
-  return (
-    <Card className="p-4 shadow-kpi">
-      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{stat.label}</p>
-      <p className="mt-1.5 text-base font-bold tabular-nums text-foreground">{stat.value}</p>
-      {stat.delta ? (
-        <span
-          className={cn(
-            'mt-1 flex items-center gap-0.5 text-[11px] font-semibold',
-            stat.trend === 'up' && 'text-success-700',
-            stat.trend === 'down' && 'text-red-600 dark:text-red-400',
-            stat.trend === 'flat' && 'text-muted-foreground',
-          )}
-        >
-          {stat.trend === 'up' ? (
-            <ArrowUpRight className="h-3 w-3" />
-          ) : stat.trend === 'down' ? (
-            <ArrowDownRight className="h-3 w-3" />
-          ) : (
-            <Minus className="h-3 w-3" />
-          )}
-          {stat.delta}
-          {stat.prevLabel ? <span className="font-normal text-muted-foreground">┬╖ {stat.prevLabel}</span> : null}
-        </span>
-      ) : stat.rangeLabel ? (
-        <span className="mt-1 block text-[11px] text-muted-foreground">{stat.rangeLabel}</span>
-      ) : null}
-    </Card>
-  )
-}
-
-function ConnectionBanner({ rate, shopifyStatus }: { rate: number | null; shopifyStatus: ShopifyStatus | null }) {
-  const lastSyncAt = shopifyStatus
+function ConnectionBanner({
+  lastSyncAt,
+  shopifyStatus,
+}: {
+  lastSyncAt: string | null
+  shopifyStatus: ShopifyStatus | null
+}) {
+  const fallbackSync = shopifyStatus
     ? Object.values(shopifyStatus.lastSync ?? {})
         .filter(Boolean)
         .sort()
         .pop() ?? null
     : null
+  const syncedAt = lastSyncAt ?? fallbackSync
   return (
     <Card className="flex flex-wrap items-center gap-x-6 gap-y-2 border-primary-100 bg-gradient-to-r from-primary-50/70 via-card to-card px-4 py-3">
-      <div className="flex items-center gap-2">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-600 text-white shadow-sm">
-          <Tag className="h-4 w-4" />
-        </div>
-        <div className="leading-tight">
-          <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">Silver Rate</p>
-          <p className="text-sm font-bold text-foreground">{rate != null ? `Γé╣${rate.toFixed(2)} / gm` : 'ΓÇö'}</p>
-        </div>
-      </div>
-      <div className="h-8 w-px bg-border" />
-      <StatusPill healthy={Boolean(shopifyStatus?.configured)} label="Shopify" sublabel={shopifyStatus?.configured ? 'Connected' : 'Not configured'} />
-      <StatusPill healthy label="System" sublabel="Healthy" />
+      <ConnectionPill healthy={Boolean(shopifyStatus?.configured)} label="Shopify" sublabel={shopifyStatus?.configured ? 'Connected' : 'Not configured'} />
+        <ConnectionPill healthy label="System" sublabel="Healthy" />
       <div className="ml-auto hidden items-center gap-1.5 text-xs text-muted-foreground md:flex">
         <CloudCog className="h-3.5 w-3.5 text-info-700" />
-        Last sync: {lastSyncAt ? formatDateTime(lastSyncAt) : 'Never'}
+        Last sync: {syncedAt ? formatDateTime(syncedAt) : 'Never'}
       </div>
     </Card>
   )
 }
 
-function StatusPill({ healthy, label, sublabel }: { healthy: boolean; label: string; sublabel: string }) {
+function ConnectionPill({ healthy, label, sublabel }: { healthy: boolean; label: string; sublabel: string }) {
   return (
     <div className="flex items-center gap-2">
       <span className="relative flex h-2 w-2">
@@ -1203,7 +1045,14 @@ function QuickActions() {
   )
 }
 
-function OperationalStrip({ summary }: { summary: Record<string, string | number> }) {
+function OperationalStrip({
+  summary,
+  analytics,
+}: {
+  summary: Record<string, string | number | null>
+  analytics: AnalyticsStat[]
+}) {
+  const statValue = (label: string) => analytics.find((s) => s.label === label)?.value ?? '—'
   const items: { label: string; value: string; icon: LucideIcon; tint: string }[] = [
     { label: 'Total Products', value: `${summary.totalProducts}`, icon: Gem, tint: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300' },
     { label: 'Total Customers', value: `${summary.totalCustomers}`, icon: Users, tint: 'bg-info-50 text-info-700' },
@@ -1212,10 +1061,13 @@ function OperationalStrip({ summary }: { summary: Record<string, string | number
     { label: 'Total Stock (Wt)', value: formatWeight(Number(summary.totalStockWeight)), icon: ScaleIcon, tint: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300' },
     { label: "Today's Expenses", value: compactCurrency(Number(summary.todayExpenses)), icon: Wallet, tint: 'bg-warning-50 text-warning-700' },
     { label: 'Pending Payments', value: compactCurrency(Number(summary.pendingPayments)), icon: Clock, tint: 'bg-red-50 text-red-600 dark:text-red-400' },
+    { label: 'Avg Order Value', value: statValue('Average Order Value'), icon: IndianRupee, tint: 'bg-success-50 text-success-700' },
+    { label: 'Return Rate', value: statValue('Return Rate'), icon: Repeat, tint: 'bg-info-50 text-info-700' },
+    { label: 'Inventory Value', value: statValue('Inventory Value'), icon: Boxes, tint: 'bg-warning-50 text-warning-700' },
   ]
   return (
     <Card className="divide-y divide-border overflow-hidden">
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3 px-4 py-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-3 px-4 py-3 sm:grid-cols-3 lg:grid-cols-5">
         {items.map((it, i) => (
           <div key={it.label} className={cn('flex items-center gap-2.5', i < items.length - 1 && 'xl:border-r xl:border-border/70 xl:pr-4')}>
             <div className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-md', it.tint)}>
@@ -1257,6 +1109,7 @@ function DashboardSkeleton() {
     </div>
   )
 }
+
 
 
 
