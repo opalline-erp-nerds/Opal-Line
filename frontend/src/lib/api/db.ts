@@ -57,6 +57,12 @@ import type {
   SyncLog,
   TopCategory,
   TopProduct,
+  OrderSummary,
+  SupplierPaymentsWidget,
+  PurchaseOrdersWidget,
+  CustomerPaymentsWidget,
+  SalesOrdersWidget,
+  RecentInvoicesWidget,
   User,
   ConnectionSettings,
   DbStatus,
@@ -88,6 +94,19 @@ function rangePath(path: string, range?: DashboardRangeInput | string): string {
         })()
   return `${path}?${q.toString()}`
 }
+
+/** Append optional widget filters to an already-built path (range included). */
+function filterPath(path: string, filters: Record<string, string | undefined>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value) params.set(key, value)
+  }
+  const query = params.toString()
+  if (!query) return path
+  return `${path}${path.includes('?') ? '&' : '?'}${query}`
+}
+
+type WidgetFilters = { q?: string; status?: string }
 
 export const dbApi = {
   getSilverRate: async (): Promise<SilverRate> => {
@@ -175,6 +194,18 @@ export const dbApi = {
   getSalesOverview: (range: DashboardRangeInput | string = 'week'): Promise<SalesOverviewPoint[]> => request(rangePath('/db/dashboard/sales-overview', range)),
   getTopProducts: (range?: DashboardRangeInput): Promise<TopProduct[]> => request(rangePath('/db/dashboard/top-products', range)),
   getTopCategory: (range?: DashboardRangeInput): Promise<TopCategory[]> => request(rangePath('/db/dashboard/top-category', range)),
+  getOrderSummary: (grain: 'week' | 'month' | 'year', month: string): Promise<OrderSummary> =>
+    request(`/db/dashboard/order-summary?grain=${grain}&month=${encodeURIComponent(month)}`),
+  getSupplierPayments: (range?: DashboardRangeInput, filters?: WidgetFilters): Promise<SupplierPaymentsWidget> =>
+    request(filterPath(rangePath('/db/dashboard/supplier-payments', range), { q: filters?.q, status: filters?.status })),
+  getCustomerPayments: (range?: DashboardRangeInput, filters?: WidgetFilters): Promise<CustomerPaymentsWidget> =>
+    request(filterPath(rangePath('/db/dashboard/customer-payments', range), { q: filters?.q, status: filters?.status })),
+  getPurchaseOrdersWidget: (range?: DashboardRangeInput): Promise<PurchaseOrdersWidget> =>
+    request(rangePath('/db/dashboard/purchase-orders', range)),
+  getSalesOrdersWidget: (range?: DashboardRangeInput): Promise<SalesOrdersWidget> =>
+    request(rangePath('/db/dashboard/sales-orders', range)),
+  getRecentInvoices: (range?: DashboardRangeInput): Promise<RecentInvoicesWidget> =>
+    request(rangePath('/db/dashboard/recent-invoices', range)),
   getProductMargins: (months = 12): Promise<{ months: number; rows: Array<{ sku: string; name: string; qty: number; revenue: number; cost: number; profit: number; marginPct: number }>; totals: { revenue: number; cost: number; profit: number; marginPct: number } }> =>
     request(`/db/reports/product-margins?months=${months}`),
   getProfitAnalytics: (months = 12): Promise<ProfitAnalytics> =>

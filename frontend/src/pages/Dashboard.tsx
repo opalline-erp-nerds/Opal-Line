@@ -9,7 +9,6 @@ import {
   Boxes,
   Calendar,
   ChevronDown,
-  CircleDollarSign,
   Clock,
   CloudCog,
   FileText,
@@ -17,14 +16,12 @@ import {
   IndianRupee,
   Landmark,
   Minus,
-  Package,
   PackageX,
   Plus,
   Repeat,
   ShieldAlert,
   ShoppingBag,
   ShoppingCart,
-  Sparkles,
   Tag,
   TrendingUp,
   Users,
@@ -44,6 +41,17 @@ import { FinancialAnalytics } from '@/components/dashboard/financial-analytics'
 import { SalesOverviewChart } from '@/components/charts/sales-overview-chart'
 import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
 import { PaymentDonutChart } from '@/components/charts/payment-donut-chart'
+import { StatusDonutChart } from '@/components/charts/dashboard-widget-charts'
+import { SERIES_COLORS } from '@/components/charts/chart-theme'
+import {
+  CustomerPaymentsCard,
+  OrderSummaryCard,
+  PurchaseOrdersCard,
+  RecentInvoicesCard,
+  SalesOrdersCard,
+  SupplierPaymentsCard,
+} from '@/components/dashboard/summary-widgets'
+import { productImageSrc } from '@/lib/product-image'
 import { dbApi } from '@/lib/api'
 import { shopifyApi } from '@/lib/api'
 import type {
@@ -71,14 +79,6 @@ const kpiIcons: Record<string, LucideIcon> = {
   'trending-up': TrendingUp,
   clock: Clock,
   'package-x': PackageX,
-}
-
-const productIcons: Record<string, LucideIcon> = {
-  chain: ShoppingBag,
-  ring: Gem,
-  bracelet: CircleDollarSign,
-  pendant: Sparkles,
-  earrings: Package,
 }
 
 const activityIcons: Record<Activity['type'], { icon: LucideIcon; className: string }> = {
@@ -261,6 +261,8 @@ export default function DashboardPage() {
       cancelled = true
     }
   }, [period, customRange])
+
+  const range = rangeToQuery(period, customRange) as RangeQuery
 
   return (
     <div className="print-area mx-auto w-full max-w-[1600px] space-y-6 px-4 py-4 sm:py-6 lg:px-6">
@@ -463,8 +465,20 @@ export default function DashboardPage() {
             </Card>
           </div>
 
+          <OrderSummaryCard />
+
           {/* Self-fetching: independent of the page-wide range above. */}
           <FinancialAnalytics />
+
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+            <SupplierPaymentsCard range={range} />
+            <PurchaseOrdersCard range={range} />
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+            <CustomerPaymentsCard range={range} />
+            <SalesOrdersCard range={range} />
+          </div>
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             <Card className="xl:col-span-1">
@@ -477,7 +491,7 @@ export default function DashboardPage() {
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
               </CardHeader>
-              <CardContent className="p-0">
+              <CardContent>
                 {topProductsError ? (
                   <Card>
                     <CardContent>
@@ -494,39 +508,41 @@ export default function DashboardPage() {
                     </CardContent>
                   </Card>
                 ) : topProducts.length > 0 ? (
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Product</TableHead>
-                        <TableHead className="text-right">Qty</TableHead>
-                        <TableHead className="text-right">Weight</TableHead>
-                        <TableHead className="text-right">Revenue</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {topProducts.map((p) => {
-                        const Icon = productIcons[p.icon] ?? Package
-                        return (
-                          <TableRow key={p.id} className="border-b-0">
-                            <TableCell>
-                              <div className="flex items-center gap-2.5">
-                                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                                  <Icon className="h-4 w-4" />
-                                </div>
-                                <div>
-                                  <p className="font-medium text-foreground">{p.name}</p>
-                                  <p className="text-[11px] text-muted-foreground">{p.sku}</p>
-                                </div>
-                              </div>
-                            </TableCell>
-                            <TableCell className="text-right font-medium tabular-nums">{formatNumber(p.qty)}</TableCell>
-                            <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(p.weight)}</TableCell>
-                            <TableCell className="text-right font-semibold tabular-nums text-foreground">{compactCurrency(p.revenue)}</TableCell>
-                          </TableRow>
-                        )
-                      })}
-                    </TableBody>
-                  </Table>
+                  <div className="space-y-3">
+                    {topProducts.map((p) => {
+                      const max = topProducts[0]?.revenue || 1
+                      const image = productImageSrc(p)
+                      return (
+                        <div key={p.id} className="flex items-center gap-3">
+                          <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                            {image ? (
+                              <img src={image} alt={p.name} className="h-full w-full object-cover" loading="lazy" />
+                            ) : (
+                              <Gem className="h-4 w-4" />
+                            )}
+                          </div>
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex items-center justify-between gap-2 text-[12px]">
+                              <span className="truncate font-medium text-foreground">{p.name}</span>
+                              <span className="shrink-0 font-semibold tabular-nums text-foreground">{compactCurrency(p.revenue)}</span>
+                            </div>
+                            <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                              <div
+                                className="h-full rounded-full"
+                                style={{
+                                  width: `${Math.max(4, Math.round((p.revenue / max) * 100))}%`,
+                                  background: SERIES_COLORS[0],
+                                }}
+                              />
+                            </div>
+                            <p className="text-[10.5px] text-muted-foreground">
+                              {p.sku} · {formatNumber(p.qty)} pcs · {formatWeight(p.weight)}
+                            </p>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
                 ) : (
                   <EmptyState
                     icon={ShoppingBag}
@@ -569,25 +585,41 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
             ) : (topCategory.length > 0 ? (
-                  <div className="space-y-3">
-                    {topCategory.map((c) => {
-                      const max = topCategory[0]?.revenue || 1
-                      return (
-                        <div key={c.category} className="space-y-1">
-                          <div className="flex items-center justify-between gap-2 text-[12px]">
-                            <span className="truncate font-medium text-foreground">{c.category}</span>
-                            <span className="shrink-0 font-semibold tabular-nums text-foreground">{compactCurrency(c.revenue)}</span>
-                          </div>
-                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                            <div className="h-full rounded-full bg-primary-500" style={{ width: `${Math.max(4, Math.round((c.revenue / max) * 100))}%` }} />
-                          </div>
-                          <p className="text-[10.5px] text-muted-foreground">
-                            {formatNumber(c.qty)} pcs · {formatWeight(c.weight)}
-                          </p>
+                  (() => {
+                    const total = topCategory.reduce((sum, c) => sum + c.revenue, 0)
+                    const slices = topCategory.map((c, index) => ({
+                      name: c.category,
+                      value: c.revenue,
+                      color: SERIES_COLORS[index % SERIES_COLORS.length],
+                    }))
+                    return (
+                      <div className="grid grid-cols-1 items-center gap-3 sm:grid-cols-2">
+                        <StatusDonutChart
+                          data={slices}
+                          centerLabel="Revenue"
+                          centerValue={compactCurrency(total)}
+                          height={180}
+                        />
+                        <div className="space-y-2">
+                          {slices.map((slice, index) => (
+                            <div key={slice.name} className="flex items-center gap-2 text-[11.5px]">
+                              <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: slice.color }} />
+                              <span className="truncate text-muted-foreground">{slice.name}</span>
+                              <span className="ml-auto font-semibold tabular-nums text-foreground">
+                                {compactCurrency(slice.value)}
+                              </span>
+                              <span className="w-8 text-right tabular-nums text-muted-foreground">
+                                {total > 0 ? `${Math.round((slice.value / total) * 100)}%` : '0%'}
+                              </span>
+                              <span className="hidden text-[10px] text-muted-foreground sm:inline">
+                                {formatNumber(topCategory[index]?.qty ?? 0)} pcs
+                              </span>
+                            </div>
+                          ))}
                         </div>
-                      )
-                    })}
-                  </div>
+                      </div>
+                    )
+                  })()
                 ) : (
                   <EmptyState
                     icon={Tag}
@@ -663,6 +695,7 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
+            <RecentInvoicesCard range={range} />
           </div>
 
           <Card>
