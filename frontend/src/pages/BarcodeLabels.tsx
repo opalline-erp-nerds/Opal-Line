@@ -31,7 +31,6 @@ import {
   computeGrid,
   configFromPreset,
   expandLabels,
-  LABEL_PRESETS,
   MM_TO_PX,
   PAGE_SIZES,
   clamp,
@@ -60,13 +59,13 @@ function loadConfig(): LabelConfig {
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<LabelConfig>
       if (parsed && typeof parsed === 'object' && typeof parsed.widthMm === 'number') {
-        return { ...configFromPreset(parsed.presetKey ?? 'zlabel-50x30'), ...parsed }
+        return { ...configFromPreset(parsed.presetKey ?? 'label-50x40'), ...parsed }
       }
     }
   } catch {
     // fall through to defaults
   }
-  return configFromPreset('zlabel-50x30')
+  return configFromPreset('label-50x40')
 }
 
 function toLabelProduct(p: Product): LabelProduct {
@@ -77,6 +76,7 @@ function toLabelProduct(p: Product): LabelProduct {
     price: p.sellingPrice ?? 0,
     weight: p.netWeight || undefined,
     category: p.category,
+    collection: p.collection || undefined,
     huid: p.huid || undefined,
   }
 }
@@ -148,9 +148,8 @@ export default function BarcodeLabelsPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [duplicates, setDuplicates] = useState<Set<string>>(new Set())
   const [cfg, setCfg] = useState<LabelConfig>(loadConfig)
-  const [, setPresets] = useState<LabelPreset[]>(FALLBACK_LABEL_PRESETS)
+  const [presets, setPresets] = useState<LabelPreset[]>(FALLBACK_LABEL_PRESETS)
   const [generating, setGenerating] = useState(false)
-  const [brand, setBrand] = useState('')
 
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('all')
@@ -203,9 +202,6 @@ export default function BarcodeLabelsPage() {
         setPresets(FALLBACK_LABEL_PRESETS)
         toast.error(`${message}; using the bundled reference templates`)
       }),
-      dbApi.getSettings().then((s) => {
-        if (active && s?.businessName) setBrand(s.businessName)
-      }).catch(() => undefined),
     ]).finally(() => {
       if (active) setLoading(false)
     })
@@ -336,7 +332,7 @@ export default function BarcodeLabelsPage() {
       showWeight: cfg.showWeight,
       showQR: cfg.showQr,
       copies: cfg.copies,
-      brandName: brand,
+      brandName: 'OPAL LINE',
       width: cfg.widthMm,
       height: cfg.heightMm,
       columns: grid.columns,
@@ -435,7 +431,7 @@ export default function BarcodeLabelsPage() {
                 <label className="text-xs font-medium text-muted-foreground">Preset</label>
                 <Select
                   className="mt-1"
-                  options={LABEL_PRESETS.map((p) => ({ value: p.key, label: p.label }))}
+                  options={(presets.length ? presets : FALLBACK_LABEL_PRESETS).map((p) => ({ value: p.key, label: p.label }))}
                   value={cfg.presetKey}
                   onValueChange={applyPreset}
                 />
