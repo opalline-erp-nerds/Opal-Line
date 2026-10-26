@@ -481,25 +481,39 @@ export default function DashboardPage() {
                     </CardContent>
                   </Card>
                 ) : topProducts.length > 0 ? (
-                  <div className="space-y-3">
-                    {topProducts.map((p) => {
+                  <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                    {topProducts.map((p, index) => {
                       const max = topProducts[0]?.revenue || 1
                       const image = productImageSrc(p)
                       return (
-                        <div key={p.id} className="flex items-center gap-3">
-                          <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                            {image ? (
-                              <img src={image} alt={p.name} className="h-full w-full object-cover" loading="lazy" />
-                            ) : (
-                              <Gem className="h-4 w-4" />
-                            )}
-                          </div>
-                          <div className="min-w-0 flex-1 space-y-1">
-                            <div className="flex items-center justify-between gap-2 text-[12px]">
-                              <span className="truncate font-medium text-foreground">{p.name}</span>
-                              <span className="shrink-0 font-semibold tabular-nums text-foreground">{compactCurrency(p.revenue)}</span>
+                        <div
+                          key={p.id}
+                          className="rounded-xl border border-border/70 bg-muted/20 p-2.5 transition-colors hover:bg-muted/40"
+                        >
+                          <div className="flex items-center gap-2">
+                            <div className="relative flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                              {image ? (
+                                <img src={image} alt={p.name} className="h-full w-full object-cover" loading="lazy" />
+                              ) : (
+                                <Gem className="h-4 w-4" />
+                              )}
+                              <span className="absolute left-0 top-0 rounded-br-md bg-foreground/70 px-1 text-[9px] font-bold leading-4 text-background">
+                                {index + 1}
+                              </span>
                             </div>
-                            <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                            <div className="min-w-0">
+                              <p className="truncate text-[12px] font-medium text-foreground">{p.name}</p>
+                              <p className="truncate text-[10px] text-muted-foreground">{p.sku}</p>
+                            </div>
+                          </div>
+                          <div className="mt-2 flex items-baseline justify-between gap-2">
+                            <span className="text-[12.5px] font-semibold tabular-nums text-foreground">
+                              {compactCurrency(p.revenue)}
+                            </span>
+                            <span className="text-[10px] text-muted-foreground">{formatNumber(p.qty)} pcs</span>
+                          </div>
+                          <div className="mt-1.5 flex items-center gap-2">
+                            <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
                               <div
                                 className="h-full rounded-full"
                                 style={{
@@ -508,9 +522,9 @@ export default function DashboardPage() {
                                 }}
                               />
                             </div>
-                            <p className="text-[10.5px] text-muted-foreground">
-                              {p.sku} · {formatNumber(p.qty)} pcs · {formatWeight(p.weight)}
-                            </p>
+                            <span className="shrink-0 text-[9.5px] tabular-nums text-muted-foreground">
+                              {formatWeight(p.weight)}
+                            </span>
                           </div>
                         </div>
                       )

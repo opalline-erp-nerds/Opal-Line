@@ -364,7 +364,7 @@ dashboardRouter.get('/dashboard/top-products', async (req, res) => {
       ))
       .groupBy(sql`lower(${schema.salesInvoiceItems.sku})`)
       .orderBy(sql`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0)), 0) desc`)
-      .limit(5)
+      .limit(8)
 
     res.json(
       rows.map((r) => ({
