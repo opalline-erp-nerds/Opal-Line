@@ -98,7 +98,7 @@ async function persistLog(entry: {
   shopifyId?: string | null
   direction: 'in' | 'out'
   action: string
-  status: 'success' | 'failed'
+  status: 'success' | 'failed' | 'skipped'
   error?: string
   retry?: boolean
 }) {
@@ -1379,6 +1379,23 @@ async function setVariantPrice(variantId: number, price: number) {
   }
 }
 
+/**
+ * Shopify caps the price a single variant may carry at $10,000.00 USD on
+ * development (trial) stores — a price above that is rejected with
+ * 422 `{"price":["can't exceed $10,000.00 USD"]}`. The install computes selling
+ * prices in its own currency (INR), so heavy-weight silver items legitimately
+ * carry price values above 10,000; those are a valid LOCAL price but can never
+ * be accepted by this Shopify store. Exported so tests can share the boundary
+ * with the pre-push guards in applyPriceSync / pushProductPriceToShopify.
+ */
+export const SHOPIFY_MAX_VARIANT_PRICE = 10000
+
+/** True when a variant price would be rejected by Shopify's $10,000 USD cap. */
+export function exceedsShopifyPriceCap(value: unknown): boolean {
+  const n = Number(value)
+  return Number.isFinite(n) && n > SHOPIFY_MAX_VARIANT_PRICE
+}
+
 export async function applyPriceSync(onProgress?: (done: number, total: number) => void) {
   const pending = store.price.filter((p) => p.status === 'update')
   if (!(await acquireSyncLock('price'))) return { ok: false, message: 'A sync is already in progress' }
@@ -1393,6 +1410,19 @@ export async function applyPriceSync(onProgress?: (done: number, total: number) 
       if (!p.variantId) {
         p.status = 'no-match'
         skipped++
+        continue
+      }
+      // A local price above Shopify's variant cap can never be accepted — push
+      // failures would only burn API calls and mark every silver-rate run
+      // "failed". Skip this row safely, keep it out of the retry queue and let
+      // the other (valid) products continue syncing.
+      if (exceedsShopifyPriceCap(p.targetPrice)) {
+        p.status = 'skipped'
+        skipped++
+        const label = p.sku || p.title || `variant ${p.variantId}`
+        const message = `Skipped ${label}: price ${p.targetPrice.toFixed(2)} exceeds Shopify's $10,000 USD variant cap`
+        addLog('price', 'skipped', 1, message)
+        await persistLog({ entity: 'Price', shopifyId: p.sku, direction: 'out', action: 'Price Update (skipped: over Shopify price cap)', status: 'skipped', error: message })
         continue
       }
       try {
@@ -1452,6 +1482,16 @@ export async function pushProductPriceToShopify(localProductId: string): Promise
   if (!Number.isFinite(price) || price <= 0) {
     releaseSyncLock()
     return { ok: false, updated: 0, skipped: 0, errors: [`${row.sku} has no valid selling price`] }
+  }
+  // Same cap guard as the batch push: an over-cap local price is valid here
+  // (price computed in the install's currency) but Shopify would answer 422.
+  // Report a deliberate skip — never a failed push — and leave the local
+  // pricing untouched.
+  if (exceedsShopifyPriceCap(price)) {
+    const message = `Skipped ${row.sku}: price ${price.toFixed(2)} exceeds Shopify's $10,000 USD variant cap`
+    addLog('price', 'skipped', 1, message)
+    await persistLog({ entity: 'Price', shopifyId: row.sku, direction: 'out', action: 'Price Update (skipped: over Shopify price cap)', status: 'skipped', error: message })
+    return { ok: true, updated: 0, skipped: 1, errors: [], message }
   }
   const compareAt = Number(row.compareAtPrice)
 
@@ -2764,7 +2804,13 @@ export async function applySilverRate(
   }
 
   const rows = await db
-    .select({ id: schema.products.id, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge, sellingPrice: schema.products.sellingPrice })
+    .select({
+      id: schema.products.id,
+      netWeight: schema.products.netWeight,
+      makingCharge: schema.products.makingCharge,
+      sellingPrice: schema.products.sellingPrice,
+      pieceRateProduct: schema.products.pieceRateProduct,
+    })
     .from(schema.products)
 
   const snapshotAt = previous?.updatedAt ?? now
@@ -2783,6 +2829,9 @@ export async function applySilverRate(
   let recomputed = 0
   setSilverRateProgress({ phase: 'repricing', label: `Repricing ${rows.length} product(s) from the new rate`, done: 0, total: rows.length })
   for (const row of rows) {
+    // Piece Rate Products carry a fixed price per piece — a silver-rate change
+    // must never recompute (and thereby overwrite) their selling price.
+    if (row.pieceRateProduct) continue
     const netWeight = Number(row.netWeight)
     const makingCharge = Number(row.makingCharge)
     if (!netWeight || netWeight <= 0) continue

@@ -55,6 +55,14 @@ export const products = pgTable('products', {
   supplierId: text('supplier_id'),
   silverRate: numericNumber('silver_rate'),
   sellingPrice: numericNumber('selling_price'),
+  /**
+   * Piece Rate Product: sellingPrice is a fixed price per piece instead of a
+   * silver-rate calculation. Silver-rate changes and Shopify syncs must never
+   * recompute or overwrite the price of such a product.
+   */
+  pieceRateProduct: boolean('piece_rate_product').notNull().default(false),
+  /** Fixed piece rate (₹/pc) used when pieceRateProduct is set. */
+  fixedPieceRate: numericNumber('fixed_piece_rate'),
   compareAtPrice: numericNumber('compare_at_price'),
   /**
    * Weighted-average cost per unit, maintained from purchase invoices so

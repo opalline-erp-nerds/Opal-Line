@@ -51,6 +51,9 @@ interface ProductForm {
   gst: string
   silverRate: string
   sellingPrice: string
+  /** Piece-rate pricing: a fixed price per piece instead of the silver formula. */
+  pieceRateProduct: boolean
+  fixedPieceRate: string
   compareAtPrice: string
   stock: string
   reorderLevel: string
@@ -114,6 +117,8 @@ const EMPTY_FORM: ProductForm = {
   gst: '3',
   silverRate: '',
   sellingPrice: '',
+  pieceRateProduct: false,
+  fixedPieceRate: '',
   compareAtPrice: '',
   stock: '',
   reorderLevel: '5',
@@ -143,6 +148,9 @@ function fromProduct(p: Product): ProductForm {
     gst: p.gst != null ? String(p.gst) : '3',
     silverRate: p.silverRate != null ? String(p.silverRate) : '',
     sellingPrice: p.sellingPrice != null ? String(p.sellingPrice) : '',
+    pieceRateProduct: p.pieceRateProduct ?? false,
+    // 0 (or a cleared value) reads as "not set" so the input starts empty.
+    fixedPieceRate: p.fixedPieceRate != null && p.fixedPieceRate > 0 ? String(p.fixedPieceRate) : '',
     compareAtPrice: p.compareAtPrice != null ? String(p.compareAtPrice) : '',
     stock: p.stock != null ? String(p.stock) : '',
     reorderLevel: p.reorderLevel != null ? String(p.reorderLevel) : '5',
@@ -183,6 +191,8 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, 
     gst: parseFloat(form.gst) || null,
     silverRate,
     sellingPrice,
+    pieceRateProduct: form.pieceRateProduct,
+    fixedPieceRate: parseFloat(form.fixedPieceRate) || null,
     compareAtPrice: parseFloat(form.compareAtPrice) || null,
     stock: parseInt(form.stock, 10) || 0,
     reorderLevel: parseInt(form.reorderLevel, 10) || 0,
@@ -361,22 +371,21 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       : mode === 'add' && duplicateOf
         ? {
             ...fromProduct(duplicateOf),
-            // Duplicate keeps the descriptive fields but clears the unique
-            // one: a fresh SKU is generated like any new product, and the
-            // copy is not pushed to Shopify until asked.
             name: `${duplicateOf.name} (Copy)`,
             sku: generateSku(productsRef.current, duplicateOf.category ?? EMPTY_FORM.category, codeSettingsRef.current),
             pushToShopify: false,
           }
         : {
             ...EMPTY_FORM,
-            // New products get a category-based SKU up front (settings format,
-            // e.g. OL-RNG-001); saving re-checks and the duplicate panel offers
-            // a fresh code if anything still collides.
             sku: generateSku(productsRef.current, EMPTY_FORM.category, codeSettingsRef.current),
           }
-    const p = computePrice(initial)
-    if (Number.isFinite(p)) initial.sellingPrice = String(Math.round(p * 100) / 100)
+    const fixedInitial = parseFloat(initial.fixedPieceRate)
+    if (initial.pieceRateProduct && Number.isFinite(fixedInitial) && fixedInitial > 0) {
+      initial.sellingPrice = String(fixedInitial)
+    } else {
+      const p = computePrice(initial)
+      if (Number.isFinite(p)) initial.sellingPrice = String(Math.round(p * 100) / 100)
+    }
     lastGenerated.current = mode === 'add' ? { sku: initial.sku } : null
     // Defer the reset out of the effect body (react/set-state-in-effect).
     queueMicrotask(() => {
@@ -499,19 +508,47 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   }, [open, mode, product])
 
   const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
-    const next = { ...form, [key]: value }
-    const p = computePrice(next)
-    if (Number.isFinite(p)) {
-      const rounded = String(Math.round(p * 100) / 100)
-      next.sellingPrice = rounded
-      // The auto-calculated price flows through to every variant that still
-      // carries it; variant prices the user edited individually stay put.
-      if (variants.length > 0 && form.sellingPrice !== rounded) {
-        setVariants((vs) => vs.map((v) => (v.price === form.sellingPrice ? { ...v, price: rounded } : v)))
+    setForm((f) => {
+      const next = { ...f, [key]: value }
+      // Piece-rate prices are fixed — the silver formula must never overwrite them.
+      if (next.pieceRateProduct) return next
+      const p = computePrice(next)
+      if (Number.isFinite(p)) {
+        const rounded = String(Math.round(p * 100) / 100)
+        next.sellingPrice = rounded
+        // The auto-calculated price flows through to every variant that still
+        // carries it; variant prices the user edited individually stay put.
+        if (variants.length > 0 && f.sellingPrice !== rounded) {
+          setVariants((vs) => vs.map((v) => (v.price === f.sellingPrice ? { ...v, price: rounded } : v)))
+        }
       }
-    }
-    setForm(next)
+      return next
+    })
   }
+
+  // Toggling the checkbox / editing the fixed rate: the selling price follows
+  // the fixed rate while piece-rate is on, and falls back to the silver
+  // calculation when it is switched off.
+  const setPieceRate = (enabled: boolean) =>
+    setForm((f) => {
+      const next = { ...f, pieceRateProduct: enabled }
+      if (enabled) {
+        const fixed = parseFloat(next.fixedPieceRate)
+        if (Number.isFinite(fixed) && fixed > 0) next.sellingPrice = String(fixed)
+        return next
+      }
+      const p = computePrice(next)
+      if (Number.isFinite(p)) next.sellingPrice = String(Math.round(p * 100) / 100)
+      return next
+    })
+
+  const setFixedPieceRate = (value: string) =>
+    setForm((f) => {
+      const next = { ...f, fixedPieceRate: value }
+      const fixed = parseFloat(value)
+      if (next.pieceRateProduct && Number.isFinite(fixed) && fixed > 0) next.sellingPrice = String(fixed)
+      return next
+    })
 
   const categorySelectOptions = useMemo(() => {
     // One curated default for now; categories the user added inline join the
@@ -547,8 +584,13 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       .map((c) => ({ value: c, label: c }))
   }, [collectionChoices, form.collection])
 
+  const pieceRateNum = parseFloat(form.fixedPieceRate)
+  const isPieceRate = form.pieceRateProduct
+  const pieceRateValid = Number.isFinite(pieceRateNum) && pieceRateNum > 0
   const computed = computePrice(form)
-  const hasAutoPrice = Number.isFinite(computed)
+  // A piece-rate product prices from its fixed rate; everything else keeps
+  // the silver-rate formula exactly as before.
+  const hasAutoPrice = isPieceRate ? pieceRateValid : Number.isFinite(computed)
   const sellingLocked = hasAutoPrice
 
   // ── Shopify-style options → variants ────────────────────────────────────
@@ -700,15 +742,30 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       setError('Title and SKU are required')
       return
     }
-    const silverRate = parseFloat(form.silverRate)
-    if (!Number.isFinite(silverRate) || silverRate <= 0) {
-      setError('A valid silver rate (₹/gm) is required to price the product')
-      return
-    }
-    const sellingPrice = parseFloat(form.sellingPrice) || computePrice(form)
-    if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) {
-      setError('A valid selling price is required')
-      return
+    const parsedRate = parseFloat(form.silverRate)
+    let sellingPrice: number
+    let silverRate: number
+    if (form.pieceRateProduct) {
+      // Piece-rate product: the fixed rate IS the price. Silver rate and the
+      // weight formula are not part of its pricing (rate kept for display).
+      const fixed = parseFloat(form.fixedPieceRate)
+      if (!Number.isFinite(fixed) || fixed <= 0) {
+        setError('A valid fixed piece rate (₹) is required for a piece-rate product')
+        return
+      }
+      sellingPrice = fixed
+      silverRate = Number.isFinite(parsedRate) && parsedRate > 0 ? parsedRate : Number(product?.silverRate) || 0
+    } else {
+      if (!Number.isFinite(parsedRate) || parsedRate <= 0) {
+        setError('A valid silver rate (₹/gm) is required to price the product')
+        return
+      }
+      silverRate = parsedRate
+      sellingPrice = parseFloat(form.sellingPrice) || computePrice(form)
+      if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) {
+        setError('A valid selling price is required')
+        return
+      }
     }
     setSaving(true)
     setError('')
@@ -1097,13 +1154,40 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           <div className="space-y-3">
             <SectionTitle title="Weight & pricing" />
             <div className="grid grid-cols-3 gap-3">
+              <div className="col-span-3 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2">
+                <input
+                  id="piece-rate-product"
+                  type="checkbox"
+                  checked={form.pieceRateProduct}
+                  onChange={(e) => setPieceRate(e.target.checked)}
+                  className="h-4 w-4 cursor-pointer accent-primary-600"
+                />
+                <Label htmlFor="piece-rate-product" className="cursor-pointer text-sm font-medium">
+                  Piece Rate Product
+                </Label>
+                <span className="text-[11px] text-muted-foreground">
+                  Price at a fixed rate per piece instead of the silver-rate calculation.
+                </span>
+              </div>
+              {form.pieceRateProduct ? (
+                <Field label="Fixed Piece Rate (₹)">
+                  <Input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={form.fixedPieceRate}
+                    onChange={(e) => setFixedPieceRate(e.target.value)}
+                    placeholder="e.g. 450 per piece"
+                  />
+                </Field>
+              ) : null}
               <Field label="Stone weight (g)">
                 <Input type="number" step="0.01" value={form.stoneWeight} onChange={(e) => set('stoneWeight', e.target.value)} />
               </Field>
               <Field label="Net weight (g)">
                 <Input aria-label="Net weight" type="number" step="0.01" value={form.netWeight} onChange={(e) => setPricing('netWeight', e.target.value)} />
               </Field>
-              <Field label="Silver rate (₹/g) *">
+              <Field label={isPieceRate ? 'Silver rate (₹/g)' : 'Silver rate (₹/g) *'}>
                 <Input aria-label="Silver rate" type="number" step="0.01" value={form.silverRate} onChange={(e) => setPricing('silverRate', e.target.value)} />
               </Field>
               <Field label="Making charge (₹/g)">
@@ -1120,7 +1204,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                   value={form.sellingPrice}
                   onChange={(e) => set('sellingPrice', e.target.value)}
                   disabled={sellingLocked}
-                  placeholder={hasAutoPrice ? 'Auto-calculated' : 'Enter price'}
+                  placeholder={isPieceRate ? 'Fixed piece rate' : hasAutoPrice ? 'Auto-calculated' : 'Enter price'}
                 />
               </Field>
               <Field label="Compare-at price (₹)">
@@ -1183,7 +1267,21 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                 </p>
               ) : null}
             </div>
-            {hasAutoPrice ? (
+            {isPieceRate ? (
+              pieceRateValid ? (
+                <p className="text-[11px] text-muted-foreground">
+                  Fixed piece rate{' '}
+                  <span className="font-semibold text-foreground">
+                    ₹{pieceRateNum.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                  </span>{' '}
+                  per piece is used as the selling price — silver rate changes and Shopify sync never overwrite it.
+                </p>
+              ) : (
+                <p className="text-[11px] text-muted-foreground">
+                  Enter a fixed piece rate to price this product. Silver rate changes and Shopify sync will never overwrite it.
+                </p>
+              )
+            ) : hasAutoPrice ? (
               <p className="text-[11px] text-muted-foreground">
                 Auto price from rate × net weight + making + GST: <span className="font-semibold text-foreground">₹{computed.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
               </p>

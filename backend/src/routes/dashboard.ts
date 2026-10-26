@@ -966,33 +966,16 @@ dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
       .from(schema.silverRates)
       .orderBy(asc(schema.silverRates.updatedAt))
 
-    // Last rate recorded on each IST day (rows arrive oldest first → later wins).
-    const byDay = new Map<string, number>()
+    const points: Array<{ date: string; rate: number }> = []
     for (const row of rows) {
       if (row.rate == null) continue
-      // drizzle mode:'string' types this as string, but the driver may hand
-      // back a Date for timestamptz — accept either.
       const raw = row.updatedAt as string | Date | null
       if (raw == null) continue
       const when = raw instanceof Date ? raw : parseTimestamp(raw)
       if (Number.isNaN(when.getTime())) continue
-      byDay.set(istDayKey(when), Number(row.rate))
-    }
-    const entries = [...byDay.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-
-    const points: Array<{ date: string; rate: number }> = []
-    let carry: number | null = null
-    let i = 0
-    while (i < entries.length && entries[i][0] < start) {
-      carry = entries[i][1]
-      i += 1
-    }
-    for (let day = start; day <= end; day = shiftIsoDay(day, 1)) {
-      while (i < entries.length && entries[i][0] === day) {
-        carry = entries[i][1]
-        i += 1
-      }
-      if (carry != null) points.push({ date: day, rate: carry })
+      const day = istDayKey(when)
+      if (day < start || day > end) continue
+      points.push({ date: when.toISOString(), rate: Number(row.rate) })
     }
 
     res.json({ days, points })

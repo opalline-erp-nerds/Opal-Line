@@ -301,6 +301,8 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         supplier_id text,
         silver_rate numeric,
         selling_price numeric,
+        piece_rate_product boolean NOT NULL DEFAULT false,
+        fixed_piece_rate numeric,
         compare_at_price numeric,
         cost_price numeric,
         stock integer,
@@ -1676,6 +1678,10 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS order_id text`,
       `CREATE INDEX IF NOT EXISTS purchase_invoices_order_id_idx ON purchase_invoices (order_id)`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_price numeric`,
+      // Piece Rate Product: a fixed price per piece that silver-rate changes
+      // and Shopify syncs must never recompute. Off for every existing row.
+      `ALTER TABLE products ADD COLUMN IF NOT EXISTS piece_rate_product boolean NOT NULL DEFAULT false`,
+      `ALTER TABLE products ADD COLUMN IF NOT EXISTS fixed_piece_rate numeric`,
       `ALTER TABLE purchase_returns ADD COLUMN IF NOT EXISTS invoice_id text`,
       `CREATE INDEX IF NOT EXISTS purchase_returns_invoice_id_idx ON purchase_returns (invoice_id)`,
       `CREATE TABLE IF NOT EXISTS purchase_return_items (

@@ -132,6 +132,9 @@ async function main() {
   await client.unsafe(`ALTER TABLE "purchase_invoices" ADD COLUMN IF NOT EXISTS "order_id" text;`)
   await client.unsafe(`CREATE INDEX IF NOT EXISTS "purchase_invoices_order_id_idx" ON "purchase_invoices" ("order_id");`)
   await client.unsafe(`ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "cost_price" numeric;`)
+  // Piece Rate Product — fixed price per piece, never recomputed from the silver rate
+  await client.unsafe(`ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "piece_rate_product" boolean NOT NULL DEFAULT false;`)
+  await client.unsafe(`ALTER TABLE "products" ADD COLUMN IF NOT EXISTS "fixed_piece_rate" numeric;`)
   await client.unsafe(`ALTER TABLE "purchase_returns" ADD COLUMN IF NOT EXISTS "invoice_id" text;`)
   await client.unsafe(`CREATE INDEX IF NOT EXISTS "purchase_returns_invoice_id_idx" ON "purchase_returns" ("invoice_id");`)
   await client.unsafe(`

@@ -36,11 +36,6 @@ const shiftDay = (dayKey: string, deltaDays: number) => {
   return d.toISOString().slice(0, 10)
 }
 
-const dayRange = (start: string, end: string) => {
-  const keys: string[] = []
-  for (let k = start; k <= end; k = shiftDay(k, 1)) keys.push(k)
-  return keys
-}
 
 test(
   'silver history backfills one point per IST day across the 7/30/90 windows',
@@ -80,9 +75,6 @@ test(
         assert.equal(res.status, 200, `${path} responded ${res.status}`)
         return (await res.json()) as { days: number; points: Array<{ date: string; rate: number }> }
       }
-      const rateOn = (payload: { points: Array<{ date: string; rate: number }> }, date: string) =>
-        payload.points.find((p) => p.date === date)?.rate
-
       const before = await get('/dashboard/silver-history?days=90')
       assert.equal(
         before.points.length,
@@ -96,28 +88,18 @@ test(
       const d7 = await get('/dashboard/silver-history?days=7')
       assert.equal(d7.days, 7)
       assert.deepEqual(
-        d7.points.map((p) => p.date),
-        dayRange(shiftDay(today, -6), today),
-        'days=7 must return the seven IST days ending today, ascending',
+        d7.points.map((p) => p.rate),
+        [98, 99],
+        'days=7 must return only actual saved rates inside the window',
       )
-      assert.equal(rateOn(d7, shiftDay(today, -6)), 91, 'pre-window rate carries into the window')
-      assert.equal(rateOn(d7, shiftDay(today, -3)), 91, 'days without an update keep the carried rate')
-      assert.equal(rateOn(d7, twoDaysAgo), 99, 'the later same-day update wins')
-      assert.equal(rateOn(d7, shiftDay(today, -1)), 99)
-      assert.equal(rateOn(d7, today), 99, 'today falls back to the last known rate')
 
       // ── 30 days: window starts ten days back, values fully determined ───
       const d30 = await get('/dashboard/silver-history?days=30')
       assert.equal(d30.days, 30)
       assert.deepEqual(
-        d30.points.map((p) => p.date),
-        dayRange(tenDaysAgo, today),
-        'days=30 must start at the first recorded rate (nothing older exists)',
-      )
-      assert.deepEqual(
         d30.points.map((p) => p.rate),
-        [91, 91, 91, 91, 91, 91, 91, 91, 99, 99, 99],
-        'the 98-row must be invisible: 99 supersedes it on its IST day',
+        [91, 98, 99],
+        'days=30 must return every actual saved rate in the window',
       )
 
       // ── 90 days behaves like 30 when nothing older exists ───────────────

@@ -9,7 +9,7 @@ import {
   YAxis,
 } from 'recharts'
 import type { SilverRatePoint } from '@/types'
-import { rateDayLabel } from '@/lib/format'
+import { rateAxisLabel } from '@/lib/format'
 import { SERIES_COLORS, useChartTheme } from './chart-theme'
 import { ChartTooltipBox } from './chart-tooltip'
 
@@ -70,7 +70,7 @@ export function SilverRateChart({
         tick={{ fill: theme.axis, fontSize: 11 }}
         dy={6}
         minTickGap={24}
-        tickFormatter={(v: string) => rateDayLabel(v)}
+        tickFormatter={(v: string) => rateAxisLabel(v)}
       />
       <YAxis
         domain={domain as [number, number]}
@@ -87,7 +87,7 @@ export function SilverRateChart({
           const p = payload[0].payload as SilverRatePoint
           return (
             <ChartTooltipBox
-              title={rateDayLabel(String(label))}
+              title={rateAxisLabel(String(label))}
               rows={[{ label: 'Rate', value: `₹${p.rate.toFixed(2)} / gm`, color }]}
             />
           )

@@ -119,6 +119,8 @@ export default function ProductDetailPage() {
   }
 
   const rate = silverRate?.rate ?? product.silverRate ?? 0
+  const isPieceRate = product.pieceRateProduct === true
+  const pieceRate = Number(product.fixedPieceRate ?? 0) || product.sellingPrice
   const gallerySrcs = productImageGallery(product)
   const mainIdx = Math.min(galleryIdx, Math.max(gallerySrcs.length - 1, 0))
   const netWeight = product.netWeight ?? 0
@@ -311,22 +313,43 @@ export default function ProductDetailPage() {
             <Card>
               <CardHeader>
                 <CardTitle className="text-sm">Price Breakdown</CardTitle>
-                <CardDescription>At current silver rate ₹{rate}/gm</CardDescription>
+                <CardDescription>
+                  {isPieceRate ? 'Piece Rate Product — fixed price per piece' : `At current silver rate ₹${rate}/gm`}
+                </CardDescription>
               </CardHeader>
               <CardContent className="space-y-2.5">
-                <PriceRow label="Silver Value" value={formatCurrency(silverValue)} />
-                <PriceRow label="Making Charge" value={formatCurrency(makingTotal)} />
-                <Separator />
-                <PriceRow label="Subtotal" value={formatCurrency(subtotal)} />
-                <PriceRow label={`GST @ 3%`} value={formatCurrency(gstAmount)} />
-                <Separator />
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-semibold text-foreground">Final Price</span>
-                  <span className="text-lg font-bold text-primary-700">{formatCurrency(subtotal + gstAmount)}</span>
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  Listed on Shopify: {formatCurrency(product.sellingPrice)}
-                </p>
+                {isPieceRate ? (
+                  <>
+                    <PriceRow
+                      label="Fixed Piece Rate"
+                      value={`₹${pieceRate.toLocaleString('en-IN', { maximumFractionDigits: 2 })} / pc`}
+                    />
+                    <Separator />
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-semibold text-foreground">Final Price</span>
+                      <span className="text-lg font-bold text-primary-700">{formatCurrency(product.sellingPrice)}</span>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">
+                      Silver rate changes and Shopify sync never recompute this price.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <PriceRow label="Silver Value" value={formatCurrency(silverValue)} />
+                    <PriceRow label="Making Charge" value={formatCurrency(makingTotal)} />
+                    <Separator />
+                    <PriceRow label="Subtotal" value={formatCurrency(subtotal)} />
+                    <PriceRow label={`GST @ 3%`} value={formatCurrency(gstAmount)} />
+                    <Separator />
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-semibold text-foreground">Final Price</span>
+                      <span className="text-lg font-bold text-primary-700">{formatCurrency(subtotal + gstAmount)}</span>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">
+                      Listed on Shopify: {formatCurrency(product.sellingPrice)}
+                    </p>
+                  </>
+                )}
               </CardContent>
             </Card>
           </div>
@@ -340,6 +363,8 @@ export default function ProductDetailPage() {
                 rate={rate}
                 makingCharge={product.makingCharge}
                 sellingPrice={product.sellingPrice}
+                pieceRateProduct={isPieceRate}
+                fixedPieceRate={pieceRate}
               />
             </CardContent>
           </Card>
@@ -656,7 +681,26 @@ function StockHistory({ sku, productName }: { sku: string; productName: string }
   )
 }
 
-function PricingEngine({ netWeight, rate, makingCharge, sellingPrice }: { netWeight: number; rate: number; makingCharge: number; sellingPrice: number }) {
+function PricingEngine({ netWeight, rate, makingCharge, sellingPrice, pieceRateProduct, fixedPieceRate }: { netWeight: number; rate: number; makingCharge: number; sellingPrice: number; pieceRateProduct?: boolean; fixedPieceRate?: number }) {
+  // Piece Rate Product: the price is fixed per piece, so the silver-rate
+  // breakdown below does not describe it — show the fixed rate instead.
+  if (pieceRateProduct) {
+    return (
+      <div className="space-y-2.5">
+        <p className="text-sm font-semibold">Pricing Engine</p>
+        <PriceRow label="Pricing mode" value="Piece rate (fixed per piece)" />
+        <PriceRow
+          label="Fixed Piece Rate"
+          value={`₹${(Number(fixedPieceRate) || sellingPrice).toLocaleString('en-IN', { maximumFractionDigits: 2 })} / pc`}
+        />
+        <Separator />
+        <PriceRow label="Selling price" value={formatCurrency(sellingPrice)} />
+        <p className="text-[11px] text-muted-foreground">
+          Fixed price per piece — silver rate changes and Shopify sync never recompute it.
+        </p>
+      </div>
+    )
+  }
   const sv = netWeight * rate
   const mc = netWeight * makingCharge
   const sub = sv + mc
