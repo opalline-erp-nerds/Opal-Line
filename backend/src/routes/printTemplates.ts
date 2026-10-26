@@ -71,7 +71,6 @@ export interface PrintDesignerConfig {
   labelFrontName: boolean
   labelFrontRate: boolean
   labelBackSku: boolean
-  labelBackBarcode: boolean
   labelBackName: boolean
   labelFrontSku?: boolean
   labelBackCompany?: boolean
@@ -134,7 +133,6 @@ export function defaultPrintConfig(_docType: PrintDocType): PrintDesignerConfig 
     labelFrontName: true,
     labelFrontRate: true,
     labelBackSku: true,
-    labelBackBarcode: true,
     labelBackName: false,
     labelFrontSku: true,
     labelBackCompany: true,
@@ -230,7 +228,6 @@ export function sanitizePrintConfig(input: unknown): { config: PrintDesignerConf
     labelFrontName: raw.labelFrontName !== false,
     labelFrontRate: raw.labelFrontRate !== false,
     labelBackSku: raw.labelBackSku !== false,
-    labelBackBarcode: raw.labelBackBarcode !== false,
     labelBackName: raw.labelBackName === true,
     labelFrontSku: raw.labelFrontSku !== false,
     labelBackCompany: raw.labelBackCompany !== false,
@@ -309,16 +306,14 @@ export function sampleDocument(docType: PrintDocType): Record<string, unknown> {
       items: [
         {
           product: '92.5 Sterling Silver Pendant',
-          sku: 'SL-PD-001',
-          barcode: '8901234567890',
+          sku: 'OL-PND-001',
           qty: 10,
           weight: 2.8,
           sellingPrice: 3250.5,
         },
         {
           product: '92.5 Sterling Silver Ring',
-          sku: 'SL-RG-002',
-          barcode: '8901234567906',
+          sku: 'OL-RNG-001',
           qty: 8,
           weight: 1.95,
           sellingPrice: 2450.0,

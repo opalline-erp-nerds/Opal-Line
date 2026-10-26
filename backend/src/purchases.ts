@@ -1064,3 +1064,34 @@ async function mintPurchaseInvoiceNumber(): Promise<string> {
   throw new Error('could not mint a purchase invoice number')
 }
 
+/**
+ * Next supplier invoice number when recreating a cancelled one: keep
+ * everything up to the LAST digit run and bump that run, preserving width
+ * (INV-005 → INV-006, PI-2026-0007 → PI-2026-0008). A number with no digits
+ * at all falls back to a dated suffix.
+ *
+ * The trailing run is located with /(\d+)(\D*)$/ plus index arithmetic rather
+ * than a splitting pattern: every splitting attempt is either too greedy
+ * (a greedy prefix steals the run down to its last digit: PI-2026-0019 →
+ * PI-2026-00110) or too lazy (a lazy \D* prefix cannot cross a digit, so
+ * multi-run numbers like the minted PI-YYYY-NNNN shape never matched and
+ * fell through to the date-suffix fallback).
+ *
+ * Pure and synchronous — the route owns the clash-retry loop.
+ */
+export function bumpPurchaseInvoiceNumber(number: string, bump = 1): string {
+  const trimmed = String(number ?? '').trim()
+  const tail = trimmed.match(/(\d+)(\D*)$/)
+  if (!tail || tail.index == null) {
+    const now = new Date()
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+    return bump === 1 ? `${trimmed}-${stamp}` : `${trimmed}-${stamp}-${bump}`
+  }
+  const digits = tail[1]
+  const next = String(Number(digits) + bump)
+  // padStart only pads, never truncates: on overflow (9999 + 1 = 10000) the
+  // widened result must win, or we'd emit a mangled extra-digit prefix.
+  const width = Math.max(digits.length, next.length)
+  return `${trimmed.slice(0, tail.index)}${next.padStart(width, '0')}${tail[2]}`
+}
+

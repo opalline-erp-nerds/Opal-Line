@@ -68,7 +68,7 @@ export default function StockOverviewPage() {
     const q = query.trim().toLowerCase()
     return products.filter((p) => {
       const status = p.stock === 0 ? 'out' : p.stock <= p.reorderLevel ? 'low' : 'ok'
-      const matchQ = !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q) || (p.barcode ?? '').toLowerCase().includes(q)
+      const matchQ = !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q)
       const matchCategory = !category || p.category === category
       const matchStock = !stockStatus || status === stockStatus
       return matchQ && matchCategory && matchStock
@@ -193,7 +193,7 @@ export default function StockOverviewPage() {
               <div className="relative min-w-[220px] flex-1">
                 <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
-                  placeholder="Search name, SKU, barcode..."
+                  placeholder="Search name or SKU..."
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   className="pl-9"

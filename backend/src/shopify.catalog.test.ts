@@ -206,3 +206,118 @@ describe('applyLiveCatalog (product pull SKU reconciliation)', () => {
     assert.ok((row.netWeight as number) > 0)
   })
 })
+
+describe('normalizeProduct (Shopify-style options & variants)', () => {
+  test('a multi-variant listing keeps every variant and sums the parent stock', () => {
+    const p = shopify.normalizeProduct({
+      id: 555,
+      title: 'Ring Sizer',
+      product_type: 'Rings',
+      tags: '',
+      options: [
+        { id: 1, name: 'Size', values: [{ value: 'S' }, { value: 'M' }] },
+        { id: 2, name: 'Finish', values: [{ value: 'Matte' }] },
+      ],
+      variants: [
+        { id: 11, title: 'S / Matte', option1: 'S', option2: 'Matte', option3: null, sku: 'RING-S-MAT', barcode: 'B1', price: '100', compare_at_price: '120', inventory_quantity: 3, inventory_item_id: 9001 },
+        { id: 12, title: 'M / Matte', option1: 'M', option2: 'Matte', option3: null, sku: 'RING-M-MAT', barcode: 'B2', price: '110', compare_at_price: null, inventory_quantity: 5, inventory_item_id: 9002 },
+      ],
+    })
+    assert.deepEqual(p.options, [
+      { name: 'Size', values: ['S', 'M'] },
+      { name: 'Finish', values: ['Matte'] },
+    ])
+    assert.equal(p.variants?.length, 2)
+    assert.equal(p.variants?.[1].sku, 'RING-M-MAT')
+    assert.equal(p.variants?.[0].inventoryItemId, 9001)
+    // The parent's stock is the rollup of its variants (local model).
+    assert.equal(p.inventoryQuantity, 8)
+    // Default-variant fields still come from the first variant.
+    assert.equal(p.sku, 'RING-S-MAT')
+    assert.equal(p.price, '100')
+    assert.equal(p.compareAtPrice, '120')
+  })
+
+  test('a simple single-variant listing has no options and keeps its own count', () => {
+    const p = shopify.normalizeProduct({
+      id: 1,
+      title: 'Plain',
+      variants: [{ id: 9, sku: 'PLAIN-1', price: '50', inventory_quantity: 4 }],
+    })
+    assert.deepEqual(p.options, [])
+    assert.equal(p.variants?.length, 1)
+    assert.equal(p.inventoryQuantity, 4)
+  })
+})
+
+describe('applyLiveCatalog (variant sync)', () => {
+  /** fakeCatalog plus a recording saveVariants hook. */
+  function variantAwareCatalog(initial: CatalogRow[]) {
+    const base = fakeCatalog(initial)
+    const variantCalls: Array<{ productId: string; options: unknown; variants: unknown }> = []
+    const io: CatalogApplyIo = {
+      ...base.io,
+      async saveVariants(productId, options, variants) {
+        variantCalls.push({ productId, options, variants })
+      },
+    }
+    return { ...base, io, variantCalls }
+  }
+
+  test('a variant listing saves its options + variants through the io', async () => {
+    const existing = localRow({ id: 'row-v', sku: 'RING-S-MAT', shopifyId: '555', stock: 8, netWeight: 5 })
+    const { io, variantCalls, insertCalls } = variantAwareCatalog([existing])
+    const live = liveProduct({
+      id: 555,
+      sku: 'RING-S-MAT',
+      options: [{ name: 'Size', values: ['S', 'M'] }],
+      variants: [
+        { id: 11, title: 'S', option1: 'S', option2: null, option3: null, sku: 'RING-S-MAT', barcode: null, price: '100', compareAtPrice: null, inventoryQuantity: 3, inventoryItemId: 1 },
+        { id: 12, title: 'M', option1: 'M', option2: null, option3: null, sku: 'RING-M-MAT', barcode: null, price: '100', compareAtPrice: null, inventoryQuantity: 5, inventoryItemId: 2 },
+      ],
+    })
+
+    const result = await shopify.applyLiveCatalog([live], [existing], 92.8, io)
+
+    assert.deepEqual(result, { created: 0, updated: 1 })
+    assert.equal(insertCalls.length, 0)
+    assert.equal(variantCalls.length, 1, 'saveVariants fires once for the variant listing')
+    assert.equal(variantCalls[0].productId, 'row-v')
+    assert.equal((variantCalls[0].variants as SyncProduct['variants'])?.length, 2)
+  })
+
+  test('a pushed variant product matches its local row by shopifyId, not SKU', async () => {
+    // After a variant push the local parent keeps ITS sku; the Shopify
+    // product carries the first variant's SKU — SKU-only matching would
+    // insert a duplicate product under RING-S-MAT.
+    const parent = localRow({ id: 'row-parent', sku: 'RING', shopifyId: '777', netWeight: 5, stock: 8 })
+    const { io, variantCalls, insertCalls } = variantAwareCatalog([parent])
+    const live = liveProduct({
+      id: 777,
+      sku: 'RING-S-MAT', // a VARIANT sku, not the parent's
+      options: [{ name: 'Size', values: ['S', 'M'] }],
+      variants: [
+        { id: 21, title: 'S', option1: 'S', option2: null, option3: null, sku: 'RING-S-MAT', barcode: null, price: '100', compareAtPrice: null, inventoryQuantity: 2, inventoryItemId: 1 },
+        { id: 22, title: 'M', option1: 'M', option2: null, option3: null, sku: 'RING-M-MAT', barcode: null, price: '100', compareAtPrice: null, inventoryQuantity: 3, inventoryItemId: 2 },
+      ],
+    })
+
+    const result = await shopify.applyLiveCatalog([live], [parent], 92.8, io)
+
+    assert.deepEqual(result, { created: 0, updated: 1 })
+    assert.equal(insertCalls.length, 0, 'no duplicate insert under the variant SKU')
+    assert.equal(variantCalls.length, 1)
+    assert.equal(variantCalls[0].productId, 'row-parent')
+  })
+
+  test('a simple listing never wipes local variants', async () => {
+    const existing = localRow({ id: 'row-x', sku: 'KEEP-1', netWeight: 5 })
+    const { io, variantCalls } = variantAwareCatalog([existing])
+    const live = liveProduct({ id: 31, sku: 'KEEP-1' }) // no options
+
+    const result = await shopify.applyLiveCatalog([live], [existing], 92.8, io)
+
+    assert.deepEqual(result, { created: 0, updated: 1 })
+    assert.equal(variantCalls.length, 0, 'saveVariants must not fire for a simple product')
+  })
+})

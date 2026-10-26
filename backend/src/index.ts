@@ -6,12 +6,14 @@ import cookieParser from 'cookie-parser'
 import { randomBytes, randomUUID, createHmac, timingSafeEqual } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { and, desc, eq, ne, or, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
-import { applyPriceSync, applySilverRate, createShopifyDraftOrder, ensureSynced, getLatestSilverRate, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
+import { applyPriceSync, applySilverRate, createShopifyDraftOrder, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
+import { round2 } from './routes/db'
+import { buildPricedOrder, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
-import { applyStockMovement, resolveMovementLocation, levelAt } from './stock'
+import { deductOrderLineStock, resolveMovementLocation, restoreOrderLineStock } from './stock'
 import { authRouter } from './routes/auth'
 import { dbRouter } from './routes/db'
 import { dashboardRouter } from './routes/dashboard'
@@ -313,15 +315,10 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
               const sku = String(li.sku ?? '').trim()
               const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
               if (!sku || qty <= 0) continue
-              const [p] = await tx
-                .select({ id: schema.products.id })
-                .from(schema.products)
-                .where(eq(schema.products.sku, sku))
-                .limit(1)
-                .for('update')
-              if (!p) continue
-              await applyStockMovement({ sku, qty, type: 'sale_return_in', refType: 'sales_order', locationId, tx })
-              itemsRestored += qty
+              // Resolves variant SKUs through product_variants; an unresolvable
+              // SKU (product deleted since the sale) restores nothing, as before.
+              const restored = await restoreOrderLineStock({ tx, locationId, sku, qty })
+              if (restored) itemsRestored += qty
             }
             await tx
               .update(schema.salesOrders)
@@ -1017,6 +1014,13 @@ app.post('/api/v1/silver/update', requirePermission('silver-rate', 'edit'), vali
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(502).json({ error: message })
   }
+})
+
+// Live progress of an in-flight silver-rate apply — the Silver Rate page
+// polls this while its update request is running, so the wizard shows which
+// phase (sync → reprice → match → push) is running instead of a frozen spinner.
+app.get('/api/v1/silver/update/progress', requirePermission('silver-rate', 'view'), (_req, res) => {
+  res.json(getSilverRateProgress())
 })
 
 // ─── Silver rate approval workflow: staff submit, Admin/Super Admin decide ───
@@ -1761,11 +1765,45 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
   const payment = rawPayment === 'Online' || rawPayment === 'online' ? 'paid' : (rawPayment ?? 'pending')
   const fulfillment = rawFulfillment === 'pending' ? 'unfulfilled' : (rawFulfillment ?? 'unfulfilled')
 
-  const value = items.reduce((sum: number, li: { price: number; quantity: number }) => sum + (Number.isFinite(li.price) ? li.price : 0) * li.quantity, 0)
-  const itemCount = items.reduce((sum: number, li: { quantity: number }) => sum + li.quantity, 0)
+  // Get the current applied silver rate from Silver Rate Management
+  const latestRate = await getLatestSilverRate()
+  if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
+    return res.status(400).json({ error: 'Current silver rate is not available. Please update the rate in Silver Rate Management before creating orders.' })
+  }
+  const silverRate = latestRate.rate
+
+  if (!db) {
+    return res.status(503).json({ error: 'Database unavailable' })
+  }
+
+  // Calculate item prices using the current silver rate and product data
+  // Load product data (netWeight, makingCharge) keyed by SKU
+  const productData = await db
+    .select({
+      sku: schema.products.sku,
+      netWeight: schema.products.netWeight,
+      makingCharge: schema.products.makingCharge,
+    })
+    .from(schema.products)
+    .where(inArray(schema.products.sku, items.map((li: { sku?: string; productSku?: string }) => String(li.productSku ?? li.sku ?? '')).filter(Boolean)))
+  // Price the lines with the authoritative silver rate — canonical invoice
+  // formula, extracted so the per-unit convention is unit-testable. Each
+  // line's stored price is PER-UNIT and GST-inclusive: every consumer (the
+  // edit dialog's subtotal, the print doc, the update handler's value)
+  // multiplies it by quantity exactly once.
+  const priced = buildPricedOrder(items as ValidatedOrderItem[], productData, silverRate)
+  const itemsWithCalculatedPrice = priced.lines
+  const value = priced.grandTotal
+  const itemCount = priced.itemCount
 
   const now = new Date()
   const internalId = `MO-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}-${now.getTime().toString().slice(-6)}`
+
+  // For Shopify draft order, we need GST-inclusive prices
+  const shopifyLineItems = itemsWithCalculatedPrice.map((li: typeof itemsWithCalculatedPrice[0]) => ({
+    ...li,
+    price: round2(li.amount * 1.03), // Convert line subtotal to GST-inclusive price
+  }))
 
   let draft: { ok: boolean; draftId?: string; name?: string; customerId?: string; errors: string[]; message?: string } | null = null
   let shopifyId = internalId
@@ -1780,7 +1818,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       shippingAddress,
       note: note ?? `Manual order created from Opal Line ERP (${internalId})`,
       tags: 'manual-order',
-      lineItems: items,
+      lineItems: shopifyLineItems,
     })
     if (draft.ok && draft.name) shopifyId = draft.name
   }
@@ -1798,21 +1836,17 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       // Where this order was rung up. Absent means the default store, which is
       // where such orders already went before locations existed.
       const locationId = await resolveMovementLocation(reqLocation as string | undefined, tx as never)
-      for (const li of items) {
-        const sku = String(li.sku ?? '').trim()
-        const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-        if (!sku || qty <= 0) continue
-        const [row] = await tx.select({ id: schema.products.id }).from(schema.products).where(eq(schema.products.sku, sku)).limit(1).for('update')
-        if (!row) continue
-        // Availability is checked AT this location, not against the global
-        // rollup: a chain can hold 12 units while the shop actually taking the
-        // sale has 2, and the sale would drive that shop negative.
-        const current = await levelAt(tx as never, row.id, locationId)
-        if (current - qty < 0) {
-          throw new Error(`Insufficient stock for SKU ${sku} at this location: available ${current}, requested ${qty}`)
-        }
-        await applyStockMovement({ sku, qty: -qty, type: 'sale_out', refType: 'sales_order', locationId, tx })
-        affectedProductIds.push(row.id)
+      for (const li of itemsWithCalculatedPrice) {
+        // Resolves variant SKUs through product_variants (their stock is a
+        // counter the parent rollup mirrors), checks availability AT this
+        // location and rejects unknown SKUs instead of silently skipping them.
+        const deducted = await deductOrderLineStock({
+          tx,
+          locationId,
+          sku: String(li.sku ?? ''),
+          qty: Number(li.quantity ?? 0),
+        })
+        if (deducted) affectedProductIds.push(deducted.productId)
       }
 
       const [row] = await tx
@@ -1832,7 +1866,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
           tags: 'manual-order',
           currency: 'INR',
           discount: 0,
-          lineItems: items,
+          lineItems: itemsWithCalculatedPrice,
           billingAddress: billingAddress ?? null,
           shippingAddress: shippingAddress ?? null,
           locationId,
@@ -1980,23 +2014,24 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
         // which is exactly where its movements already went.
         const locationId = await resolveMovementLocation(existing.locationId as string | null, tx as never)
         for (const oi of oldItems) {
-          const sku = String(oi?.sku ?? '').trim()
-          const qty = Math.max(0, Math.floor(Number(oi?.quantity ?? 0)))
-          if (!sku || qty <= 0) continue
-          await applyStockMovement({ sku, qty, type: 'sale_return_in', refType: 'sales_order', locationId, tx })
+          // Restore resolves variant SKUs too, so editing a variant line gives
+          // its stock back instead of deducting the new line on top of an
+          // unrestored old one (the silent double deduction).
+          await restoreOrderLineStock({
+            tx,
+            locationId,
+            sku: String(oi?.sku ?? ''),
+            qty: Number(oi?.quantity ?? 0),
+          })
         }
         for (const li of mappedLineItems) {
-          const sku = String(li.sku ?? '').trim()
-          const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-          if (!sku || qty <= 0) continue
-          const [row] = await tx.select({ id: schema.products.id }).from(schema.products).where(eq(schema.products.sku, sku)).limit(1).for('update')
-          if (!row) continue
-          const current = await levelAt(tx as never, row.id, locationId)
-          if (current - qty < 0) {
-            throw new Error(`Insufficient stock for SKU ${sku} at this location: available ${current}, requested ${qty}`)
-          }
-          await applyStockMovement({ sku, qty: -qty, type: 'sale_out', refType: 'sales_order', locationId, tx })
-          affectedProductIds.push(row.id)
+          const deducted = await deductOrderLineStock({
+            tx,
+            locationId,
+            sku: String(li.sku ?? ''),
+            qty: Number(li.quantity ?? 0),
+          })
+          if (deducted) affectedProductIds.push(deducted.productId)
         }
         const [u] = await tx
           .update(schema.salesOrders)

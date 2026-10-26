@@ -183,7 +183,7 @@ test('section renders its header and per-card skeletons before the first fetch r
   assert.ok(html.includes('Live from Orders, Invoices &amp; Expenses'), 'section provenance chip')
   assert.ok(html.includes('Income vs Expense'), 'card 1 title')
   assert.ok(html.includes('Receivable Summary') && html.includes('As of now'), 'card 2 is point-in-time')
-  assert.ok(html.includes('Top Expense') && html.includes('Net Profit'), 'cards 3 and 4 titles')
+  assert.ok(html.includes('Top Expense') && !html.includes('Net Profit'), 'card 3 title, Net Profit folded into Income vs Expense')
   assert.ok(html.includes('Last 12 Months'), 'the section defaults to Last 12 Months')
   assert.ok(html.includes('animate-pulse'), 'cards start as skeletons while loading')
 })

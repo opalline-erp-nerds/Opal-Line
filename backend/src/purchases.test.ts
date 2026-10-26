@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   agingBucketFor,
   balanceOf,
+  bumpPurchaseInvoiceNumber,
   computeTcs,
   normalizeOrderLines,
   normalizePurchaseItems,
@@ -186,5 +187,37 @@ describe('normalizeReturnLines / returnLineTotals', () => {
 
   it('ignores a non-array payload', () => {
     assert.deepEqual(normalizeReturnLines(null), [])
+  })
+})
+
+describe('bumpPurchaseInvoiceNumber', () => {
+  it('bumps the last digit run, preserving width and padding', () => {
+    assert.equal(bumpPurchaseInvoiceNumber('INV-005'), 'INV-006')
+    assert.equal(bumpPurchaseInvoiceNumber('PI-2026-0041'), 'PI-2026-0042')
+    assert.equal(bumpPurchaseInvoiceNumber('PI-2026-0009'), 'PI-2026-0010')
+    // The whole trailing run must advance as one number — bumping only its
+    // last digit would turn these into PI-2026-00110 / PI-2026-00910.
+    assert.equal(bumpPurchaseInvoiceNumber('PI-2026-0019'), 'PI-2026-0020')
+    assert.equal(bumpPurchaseInvoiceNumber('PI-2026-0099'), 'PI-2026-0100')
+  })
+
+  it('only bumps the final run in a multi-run number', () => {
+    // The year must stay put — only the sequence part advances.
+    assert.equal(bumpPurchaseInvoiceNumber('PI-2026-1999'), 'PI-2026-2000')
+    assert.equal(bumpPurchaseInvoiceNumber('PI-2025-9999'), 'PI-2025-10000')
+  })
+
+  it('bumps by more than one when retrying past a clash', () => {
+    assert.equal(bumpPurchaseInvoiceNumber('PI-2026-0041', 3), 'PI-2026-0044')
+  })
+
+  it('keeps a non-numeric suffix in place', () => {
+    assert.equal(bumpPurchaseInvoiceNumber('INV-005-A'), 'INV-006-A')  })
+
+  it('falls back to a dated suffix when the number has no digits', () => {
+    const bumped = bumpPurchaseInvoiceNumber('PROFORMA')
+    assert.match(bumped, /^PROFORMA-\d{8}$/)
+    // A retried bump on a digit-less number gets its own disambiguator.
+    assert.match(bumpPurchaseInvoiceNumber('PROFORMA', 2), /^PROFORMA-\d{8}-2$/)
   })
 })

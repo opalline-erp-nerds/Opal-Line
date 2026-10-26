@@ -88,13 +88,6 @@ export function findVariantById(product: Pick<Product, 'variants'> | null | unde
   return productVariants(product).find((v) => v.id === variantId) ?? null
 }
 
-/** Exact, case-insensitive barcode match against the product's variants. */
-export function findVariantByBarcode(product: Pick<Product, 'variants'> | null | undefined, code: string): ProductVariant | null {
-  const wanted = code.trim().toLowerCase()
-  if (!wanted) return null
-  return productVariants(product).find((v) => (v.barcode ?? '').trim().toLowerCase() === wanted) ?? null
-}
-
 /** Exact, case-insensitive SKU match against the product's variants. */
 export function findVariantBySku(product: Pick<Product, 'variants'> | null | undefined, code: string): ProductVariant | null {
   const wanted = code.trim().toLowerCase()
@@ -109,21 +102,16 @@ export interface ProductCodeMatch {
 }
 
 /**
- * Barcode/SKU scan resolution, in the order the counter expects: product
- * barcode → variant barcode → product SKU → variant SKU. A variant match
- * returns the parent product plus the variant so callers can fill the line
- * with the variant's SKU, price and stock.
+ * Scan resolution, in the order the counter expects: product SKU → variant
+ * SKU. Labels carry a QR code encoding ONLY the SKU, so an exact SKU match is
+ * the single scannable identity — there is no barcode lookup any more. A
+ * variant match returns the parent product plus the variant so callers can
+ * fill the line with the variant's SKU, price and stock.
  */
 export function matchProductByCode(products: Product[], rawCode: string): ProductCodeMatch | null {
   const code = rawCode.trim()
   if (!code) return null
   const wanted = code.toLowerCase()
-  const byProductBarcode = products.find((p) => (p.barcode ?? '').trim().toLowerCase() === wanted)
-  if (byProductBarcode) return { product: byProductBarcode, variant: null }
-  for (const p of products) {
-    const v = findVariantByBarcode(p, wanted)
-    if (v) return { product: p, variant: v }
-  }
   const bySku = products.find((p) => (p.sku ?? '').trim().toLowerCase() === wanted)
   if (bySku) return { product: bySku, variant: null }
   for (const p of products) {

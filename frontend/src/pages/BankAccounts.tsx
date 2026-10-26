@@ -8,14 +8,8 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { todayIST } from '@/lib/format'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { dbApi } from '@/lib/api'
 import type { BankAccount, LedgerEntry } from '@/types'
@@ -29,6 +23,8 @@ export default function BankAccountsPage() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [form, setForm] = useState({ name: '', bank: '', accountNumber: '', balance: '', ifsc: '' })
+  // Snapshot of the form as it opened, for the unsaved-changes close guard.
+  const [baseline, setBaseline] = useState('')
 
   const load = useCallback(() => {
     Promise.all([dbApi.getBankAccounts(), dbApi.getLedgerEntries()]).then(([acc, led]) => {
@@ -40,13 +36,16 @@ export default function BankAccountsPage() {
   useEffect(load, [load])
 
   const openDialog = (account?: BankAccount) => {
+    let next
     if (account) {
       setEditing(account)
-      setForm({ name: account.name, bank: account.bank, accountNumber: account.accountNumber || '', balance: String(account.balance), ifsc: account.ifsc || '' })
+      next = { name: account.name, bank: account.bank, accountNumber: account.accountNumber || '', balance: String(account.balance), ifsc: account.ifsc || '' }
     } else {
       setEditing(null)
-      setForm({ name: '', bank: '', accountNumber: '', balance: '', ifsc: '' })
+      next = { name: '', bank: '', accountNumber: '', balance: '', ifsc: '' }
     }
+    setForm(next)
+    setBaseline(JSON.stringify(next))
     setError('')
     setDialogOpen(true)
   }
@@ -178,12 +177,23 @@ export default function BankAccountsPage() {
         ))}
       </div>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{editing ? 'Edit Bank Account' : 'Add Bank Account'}</DialogTitle>
-            <DialogDescription>{editing ? 'Update the bank or settlement account details.' : 'Register a bank or settlement account for reconciliation.'}</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        size="sm"
+        isDirty={dialogOpen && JSON.stringify(form) !== baseline}
+        title={editing ? 'Edit Bank Account' : 'Add Bank Account'}
+        description={editing ? 'Update the bank or settlement account details.' : 'Register a bank or settlement account for reconciliation.'}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+            <Button onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+              {editing ? 'Save Changes' : 'Add Account'}
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="grid gap-4">
             <Field label="Account Name">
               <Input
@@ -227,15 +237,7 @@ export default function BankAccountsPage() {
             </Field>
             {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Add Account
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

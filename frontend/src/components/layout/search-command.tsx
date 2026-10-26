@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Barcode,
+  QrCode,
   FileText,
   Gem,
   LayoutDashboard,
@@ -117,7 +117,7 @@ export function SearchCommand({ open, onOpenChange }: SearchCommandProps) {
         module: 'inventory',
         path: (id: string) => `/inventory/products/${id}`,
         results: results.products
-          .filter((p) => match(p.name, p.sku, p.barcode))
+          .filter((p) => match(p.name, p.sku))
           .slice(0, 4)
           .map((p) => ({
             id: p.id,
@@ -270,7 +270,7 @@ export function SearchCommand({ open, onOpenChange }: SearchCommandProps) {
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search products, SKU, barcode, invoices, orders, customers..."
+            placeholder="Search products, SKU, invoices, orders, customers..."
             className="h-8 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/70"
           />
           <kbd className="rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-semibold text-muted-foreground">
@@ -282,7 +282,7 @@ export function SearchCommand({ open, onOpenChange }: SearchCommandProps) {
           {query.trim() === '' ? (
             <div className="flex flex-col items-center gap-2 py-12 text-center">
               <div className="rounded-full bg-muted p-3">
-                <Barcode className="h-5 w-5 text-muted-foreground" />
+                <QrCode className="h-5 w-5 text-muted-foreground" />
               </div>
               <p className="text-sm font-medium text-foreground">Search the Opal Line ERP</p>
               <p className="text-xs text-muted-foreground">

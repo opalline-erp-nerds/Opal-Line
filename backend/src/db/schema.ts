@@ -75,8 +75,18 @@ export const products = pgTable('products', {
   tags: text('tags'),
   trackInventory: boolean('track_inventory').notNull().default(true),
   chargeOnTax: boolean('charge_on_tax').notNull().default(true),
+  /**
+   * Shopify-style option definitions on the parent product:
+   * `[{ name: 'Size', values: ['Small', 'Large'] }]`. Each combination of
+   * option values is a row in product_variants; NULL/empty = a simple
+   * (single-variant) product, exactly as before.
+   */
+  options: jsonb('options'),
   branchId: text('branch_id'),
-  createdAt: date('created_at'),
+  // Timestamp (not date): the products list is ordered newest-first and
+  // same-day creations must not tie. Existing date values upgrade to midnight
+  // through the idempotent bootstrap ALTER.
+  createdAt: timestamp('created_at', { mode: 'string' }),
 }, (table) => ({
   skuIdx: uniqueIndex('products_sku_idx').on(table.sku),
   shopifyIdIdx: index('products_shopify_id_idx').on(table.shopifyId),
@@ -87,6 +97,44 @@ export const products = pgTable('products', {
   barcodeIdx: index('products_barcode_idx').on(table.barcode).where(sql`${table.barcode} is not null and ${table.barcode} <> ''`),
   barcodeUniqueIdx: uniqueIndex('products_barcode_unique_idx').on(table.barcode).where(sql`${table.barcode} is not null and ${table.barcode} <> ''`),
   nameSearchIdx: index('products_name_search_idx').using('gin', sql`to_tsvector('english', ${table.name})`),
+}))
+
+/** Snapshot of a product's selling price whenever it is written. */
+export const productPriceHistory = pgTable('product_price_history', {
+  id: text('id').primaryKey(),
+  productId: text('product_id').notNull(),
+  sellingPrice: numericNumber('selling_price').notNull(),
+  recordedAt: ts('recorded_at').notNull(),
+}, (table) => ({
+  productRecordedIdx: index('product_price_history_product_recorded_idx').on(table.productId, table.recordedAt),
+}))
+
+/**
+ * Shopify-style variants: one row per option-value combination of the parent
+ * product (products.options holds the option definitions). products.stock is
+ * kept as the SUM of these rows' stock so every existing ledger, report and
+ * sale flow keeps working against the parent unchanged.
+ */
+export const productVariants = pgTable('product_variants', {
+  id: text('id').primaryKey(),
+  productId: text('product_id').notNull(),
+  /** "Small / Red" — the option values joined in option-definition order. */
+  title: text('title').notNull(),
+  /** Aligned with products.options: ['Small', 'Red']. */
+  optionValues: jsonb('option_values').notNull(),
+  sku: text('sku').notNull(),
+  barcode: text('barcode'),
+  sellingPrice: numericNumber('selling_price'),
+  compareAtPrice: numericNumber('compare_at_price'),
+  costPrice: numericNumber('cost_price'),
+  grossWeight: numericNumber('gross_weight'),
+  stock: integer('stock').notNull().default(0),
+  reorderLevel: integer('reorder_level'),
+  status: text('status'),
+  createdAt: timestamp('created_at', { mode: 'string' }),
+}, (table) => ({
+  skuIdx: uniqueIndex('product_variants_sku_idx').on(table.sku),
+  productIdIdx: index('product_variants_product_id_idx').on(table.productId),
 }))
 
 export const customers = pgTable('customers', {
@@ -769,6 +817,17 @@ export const settings = pgTable('settings', {
   dbDatabaseEncrypted: text('db_database_encrypted'),
   dbUserEncrypted: text('db_user_encrypted'),
   dbPasswordEncrypted: text('db_password_encrypted'),
+  /**
+   * Auto-generated product identifiers (Settings → Product codes, consumed by
+   * src/lib/productCodes.ts). NULL everywhere means the shipped defaults:
+   * prefix SLV, template {PREFIX}-{CATEGORY}-{SEQ}, 5-digit sequence, EAN-13
+   * barcode prefix 890 — the house style the app has always generated.
+   */
+  skuPrefix: text('sku_prefix'),
+  skuSuffix: text('sku_suffix'),
+  skuFormat: text('sku_format'),
+  skuSeqLength: integer('sku_seq_length'),
+  barcodePrefix: text('barcode_prefix'),
   updatedAt: ts('updated_at'),
 })
 

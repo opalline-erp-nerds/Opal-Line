@@ -6,7 +6,8 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { DataTable } from '@/components/ui/data-table'
 import type { ColumnDef } from '@/lib/table'
 import { dbApi } from '@/lib/api'
@@ -249,12 +250,22 @@ export default function Bookings() {
         </CardContent>
       </Card>
 
-      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent size="lg">
-          <DialogHeader>
-            <DialogTitle>New booking order</DialogTitle>
-            <DialogDescription>Record the order and any advance collected. Convert to an invoice later — the advance is credited automatically.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        size="lg"
+        isDirty={createOpen && (Boolean(customer) || Boolean(advance) || items.some((it) => it.product || it.sku))}
+        title="New booking order"
+        description="Record the order and any advance collected. Convert to an invoice later — the advance is credited automatically."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setCreateOpen(false)}>Cancel</Button>
+            <Button size="sm" onClick={createBooking} disabled={saving}>
+              {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />} Create booking
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-3">
             <div>
               <p className="mb-1 text-xs font-medium">Customer name *</p>
@@ -284,21 +295,34 @@ export default function Bookings() {
               <Input type="number" min={0} value={advance} onChange={(e) => setAdvance(e.target.value)} placeholder="0" />
             </div>
           </div>
+      </AppDialog>
+
+      <AppDialog
+        open={editTarget !== null}
+        onOpenChange={(open) => { if (!open) setEditTarget(null) }}
+        size="lg"
+        isDirty={
+          editTarget !== null &&
+          (editCustomer !== (editTarget.customer ?? '') ||
+            editAdvance !== String(editTarget.advancePaid ?? 0) ||
+            JSON.stringify(editItems) !==
+              JSON.stringify(
+                (editTarget.lineItems ?? []).length > 0
+                  ? editTarget.lineItems!.map((li) => ({ product: li.title ?? '', sku: li.sku ?? '', qty: li.quantity || 1, price: li.price || 0 }))
+                  : [{ ...EMPTY_ITEM }],
+              ))
+        }
+        title={`Edit booking ${editTarget?.internalId || ''}`}
+        description="Update the customer, items or advance. Only available before the booking is converted to an invoice."
+        footer={
           <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setCreateOpen(false)}>Cancel</Button>
-            <Button size="sm" onClick={createBooking} disabled={saving}>
-              {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />} Create booking
+            <Button variant="outline" size="sm" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
+            <Button size="sm" onClick={() => void submitEdit()} disabled={editSaving}>
+              {editSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />} Save changes
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null) }}>
-        <DialogContent size="lg">
-          <DialogHeader>
-            <DialogTitle>Edit booking {editTarget?.internalId || ''}</DialogTitle>
-            <DialogDescription>Update the customer, items or advance. Only available before the booking is converted to an invoice.</DialogDescription>
-          </DialogHeader>
+        }
+      >
           <div className="space-y-3">
             <div>
               <p className="mb-1 text-xs font-medium">Customer name *</p>
@@ -326,14 +350,7 @@ export default function Bookings() {
               <Input type="number" min={0} value={editAdvance} onChange={(e) => setEditAdvance(e.target.value)} placeholder="0" />
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
-            <Button size="sm" onClick={() => void submitEdit()} disabled={editSaving}>
-              {editSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />} Save changes
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

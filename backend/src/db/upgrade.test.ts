@@ -90,6 +90,9 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
       // the table rather than by the ALTER; the column assertion below still
       // guards that it exists afterwards.
       await sql.unsafe('alter table sales_orders drop column if exists location_id')
+      // Emulate an install whose products.created_at is still a DATE
+      // (predates the timestamp upgrade): the upgrade must widen it back.
+      await sql.unsafe('alter table products alter column created_at type date using created_at::date')
 
       assert.deepEqual(
         await purchaseTables(sql),
@@ -129,6 +132,19 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
         )
         assert.equal(rows.length, 1, `upgrade must produce ${col}`)
       }
+
+      // …and products.created_at must be widened back to a full timestamp:
+      // day granularity tied every same-day product, so "newest first" was
+      // meaningless within a day.
+      const [createdAtCol] = await sql.unsafe(
+        `select data_type from information_schema.columns
+         where table_schema = 'public' and table_name = 'products' and column_name = 'created_at'`,
+      )
+      assert.equal(
+        createdAtCol?.data_type,
+        'timestamp without time zone',
+        'upgrade must widen products.created_at from date to timestamp',
+      )
     } finally {
       await sql.end({ timeout: 5 })
     }

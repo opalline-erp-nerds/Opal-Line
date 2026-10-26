@@ -6,7 +6,8 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { RequireModule } from '@/components/RequirePermission'
 import { backupApi, dbApi, shopifyApi, type BackupDiffResult, type BackupFileInfo, type BackupResult, type BackupScopeInfo, type BackupValidation, type DryRunResult } from '@/lib/api'
 import { formatDateTime } from '@/lib/format'
@@ -639,12 +640,13 @@ function BackupRestoreContent() {
         </CardContent>
       </Card>
 
-      <Dialog open={pending !== null || pendingFile !== null} onOpenChange={(open) => { if (!open) { setPending(null); setPendingFile(null) } }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Restore silver rate too?</DialogTitle>
-            <DialogDescription>This product backup contains a silver rate snapshot. Restore it alongside the products?</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={pending !== null || pendingFile !== null}
+        onOpenChange={(open) => { if (!open) { setPending(null); setPendingFile(null) } }}
+        size="sm"
+        title="Restore silver rate too?"
+        description="This product backup contains a silver rate snapshot. Restore it alongside the products?"
+        footer={
           <DialogFooter className="mt-2">
             <Button variant="outline" onClick={() => { setPending(null); setPendingFile(null) }}>Cancel</Button>
             <Button variant="outline" onClick={() => {
@@ -658,15 +660,29 @@ function BackupRestoreContent() {
               setPending(null); setPendingFile(null)
             }}>Products + Silver Rate</Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        }
+      />
 
-      <Dialog open={restoreDialogOpen} onOpenChange={(open) => { if (!open) setRestoreTarget(null) }}>
-        <DialogContent size="lg">
-          <DialogHeader>
-            <DialogTitle>Restore Preview</DialogTitle>
-            <DialogDescription>Review what will happen before restoring {restoreTarget?.fileName}</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={restoreDialogOpen}
+        onOpenChange={(open) => { if (!open) setRestoreTarget(null) }}
+        size="xl"
+        isDirty={
+          restoreDialogOpen &&
+          !(restoreOpts.restoreSilverRate === false && restoreOpts.createSafetyBackup === true && restoreOpts.skipShopify === false)
+        }
+        title="Restore Preview"
+        description={`Review what will happen before restoring ${restoreTarget?.fileName ?? ''}`}
+        footer={
+          <DialogFooter className="mt-2">
+            <Button variant="outline" onClick={() => setRestoreTarget(null)}>Cancel</Button>
+            <Button onClick={confirmRestore} disabled={busy !== null}>
+              {busy?.startsWith('restore-') ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+              Confirm Restore
+            </Button>
+          </DialogFooter>
+        }
+      >
           {validation && (
             <div className="space-y-2 text-sm">
               <div className="flex items-center gap-2">
@@ -734,15 +750,7 @@ function BackupRestoreContent() {
               <Switch checked={restoreOpts.skipShopify} onCheckedChange={(v) => setRestoreOpts((o) => ({ ...o, skipShopify: v }))} />
             </div>
           </div>
-          <DialogFooter className="mt-2">
-            <Button variant="outline" onClick={() => setRestoreTarget(null)}>Cancel</Button>
-            <Button onClick={confirmRestore} disabled={busy !== null}>
-              {busy?.startsWith('restore-') ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
-              Confirm Restore
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

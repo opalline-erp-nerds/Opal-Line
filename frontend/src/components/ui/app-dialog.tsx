@@ -5,8 +5,8 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
-  type DialogSize,
 } from '@/components/ui/dialog'
+import { confirmDialog } from '@/components/ui/confirm'
 import { cn } from '@/lib/utils'
 
 /**
@@ -22,13 +22,25 @@ import { cn } from '@/lib/utils'
  * Title/description live in a fixed header, actions in a fixed footer; only
  * the body scrolls, so Save/Cancel are always reachable.
  *
+ * Size presets (width is always min(preset, 95vw); height auto up to 90vh):
+ *
+ *   sm  ~420px  quick forms (customer, expense, payment, bank account…)
+ *   md  ~640px  medium forms (user, quotation basics, detail cards)
+ *   lg  ~900px  forms with line items (orders, purchase orders, products)
+ *   xl  ~1100px documents (view invoice/order with items, print previews)
+ *
+ * Pass `isDirty` on forms: Esc, × and click-outside then ask "Discard
+ * changes?" before closing. Programmatic closes (Save, parent state resets)
+ * bypass the question.
+ *
  * ```tsx
  * <AppDialog
  *   open={open}
  *   onOpenChange={setOpen}
- *   size="2xl"
+ *   size="lg"
  *   title="Add Product"
  *   description="Create a product in the billing software."
+ *   isDirty={dirty}
  *   footer={<><Button …>Cancel</Button><Button …>Save</Button></>}
  * >
  *   …body…
@@ -42,7 +54,7 @@ export interface AppDialogProps {
   /** Optional sub-text under the title. */
   description?: ReactNode
   /** Width preset; defaults to `md`. `className` still overrides everything. */
-  size?: DialogSize
+  size?: AppDialogSize
   /** Fixed action bar at the bottom (buttons, validation messages…). Omit for pure display dialogs. */
   footer?: ReactNode
   /** Scrollable body content. */
@@ -51,10 +63,40 @@ export interface AppDialogProps {
   titleAdornment?: ReactNode
   /** Hide the built-in × (e.g. when a destructive close needs confirming). */
   hideClose?: boolean
+  /**
+   * The form has unsaved changes. Esc, × and click-outside then ask
+   * "Discard changes?" before closing; pressing Save (a programmatic close)
+   * never asks.
+   */
+  isDirty?: boolean
   className?: string
   bodyClassName?: string
   /** Extra classes for the fixed footer bar (e.g. `no-print` in print dialogs). */
   footerClassName?: string
+}
+
+/** Width presets: min(preset, 95vw). */
+export type AppDialogSize = 'sm' | 'md' | 'lg' | 'xl'
+
+const SIZE_CLASS: Record<AppDialogSize, string> = {
+  sm: 'max-w-[min(95vw,26.25rem)]',
+  md: 'max-w-[min(95vw,40rem)]',
+  lg: 'max-w-[min(95vw,56.25rem)]',
+  xl: 'max-w-[min(95vw,68.75rem)]',
+}
+
+/** Width class for a preset. Exported for tests. */
+export function appDialogSizeClass(size: AppDialogSize): string {
+  return SIZE_CLASS[size]
+}
+
+/**
+ * Whether a close request must be intercepted with a "Discard changes?" prompt.
+ * Opening (`next === true`) and clean forms (`isDirty` falsy) close straight away;
+ * only a dirty form being dismissed is guarded. Exported for tests.
+ */
+export function shouldConfirmDiscard(next: boolean, isDirty?: boolean): boolean {
+  return !next && Boolean(isDirty)
 }
 
 export function AppDialog({
@@ -67,20 +109,39 @@ export function AppDialog({
   children,
   titleAdornment,
   hideClose,
+  isDirty,
   className,
   bodyClassName,
   footerClassName,
 }: AppDialogProps) {
+  const handleOpenChange = (next: boolean) => {
+    if (!shouldConfirmDiscard(next, isDirty)) {
+      onOpenChange(next)
+      return
+    }
+    void confirmDialog({
+      title: 'Discard changes?',
+      description: 'Your unsaved changes will be lost.',
+      confirmLabel: 'Discard',
+      cancelLabel: 'Keep editing',
+      danger: true,
+    }).then((ok) => {
+      if (ok) onOpenChange(false)
+    })
+  }
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
         hideClose={hideClose}
-        size={size}
         className={cn(
           // flex column with a scrollable middle: header/footer never scroll
           // away, and the p-0/gap-0 overrides neutralise the primitive's
           // padding at both breakpoints (sections carry their own).
-          'flex flex-col gap-0 overflow-hidden p-0 sm:gap-0 sm:p-0',
+          // Height: auto up to 90vh, but never taller than the dvh-based
+          // viewport insets on small Electron/mobile windows.
+          'flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:gap-0 sm:p-0 sm:max-h-[min(90dvh,calc(100dvh-4rem))]',
+          SIZE_CLASS[size],
           className,
         )}
       >

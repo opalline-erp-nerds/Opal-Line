@@ -21,13 +21,10 @@ import { labelCode, LABEL_PRESETS, labelDesignFor, designFieldTexts, fitDesignFi
 export const ZPL_DOTS_PER_MM = 8
 export const ZPL_MAX_MM = 200
 
-export type ZplSymbology = 'qr' | 'code128'
-
 export interface ZplOptions {
   width: number        // mm
   height: number       // mm
   copies?: number
-  symbology?: ZplSymbology
   brand?: string
   showPrice?: boolean
   showWeight?: boolean
@@ -133,7 +130,6 @@ function zplFitLine(text: string, maxWidthDots: number, refHeightMm: number, ref
 
 function zplDesignLabel(product: ZplLabelInput, options: ZplOptions, design: LabelDesign): string | null {
   const copies = Math.min(Math.max(Math.floor(options.copies ?? 1) || 1, 1), 999)
-  const symbology: ZplSymbology = options.symbology === 'code128' ? 'code128' : 'qr'
   const showQR = options.showQR !== false
 
   const fieldTexts = designFieldTexts(
@@ -173,18 +169,12 @@ function zplDesignLabel(product: ZplLabelInput, options: ZplOptions, design: Lab
     // `^FT` + `^BQN` are emitted verbatim from the reference stream: the
     // printer applies its own quiet-zone anchoring, which is exactly what the
     // supplied samples show, so ZPL output lands where the reference does.
-    if (symbology === 'qr') {
-      lines.push(
-        `^FT${mmToDots(design.qr.x)},${mmToDots(design.qr.bottom)}^BQN,2,${design.qr.magnification}`,
-      )
-      lines.push(`^FH\\^FDLA,${code}^FS`)
-    } else {
-      // A linear symbol has no quiet-zone square to anchor on: `^FT` marks its
-      // top-left corner, so it is raised by its own height.
-      const barHeight = mmToDots(design.qr.size)
-      lines.push(`^FT${mmToDots(design.qr.x)},${mmToDots(design.qr.bottom) - barHeight}^BCN,${barHeight},Y,N,N`)
-      lines.push(`^FH\\^FD${code}^FS`)
-    }
+    // The symbol ALWAYS encodes the SKU — barcodes were removed from the
+    // product workflow.
+    lines.push(
+      `^FT${mmToDots(design.qr.x)},${mmToDots(design.qr.bottom)}^BQN,2,${design.qr.magnification}`,
+    )
+    lines.push(`^FH\\^FDLA,${code}^FS`)
   }
 
   lines.push(`^PQ${copies},0,1,Y`)
@@ -201,7 +191,6 @@ export function zplLabel(product: ZplLabelInput, options: ZplOptions): string | 
   if (design) return zplDesignLabel(product, options, design)
 
   const g = computeGeometry(options.width, options.height)
-  const symbology: ZplSymbology = options.symbology === 'code128' ? 'code128' : 'qr'
   const copies = Math.min(Math.max(Math.floor(options.copies ?? 1) || 1, 1), 999)
   const code = zplEscape(labelCode(product))
   const brand = options.showBrand === false ? '' : zplEscape((options.brand ?? 'Opal Line').trim())
@@ -229,17 +218,12 @@ export function zplLabel(product: ZplLabelInput, options: ZplOptions): string | 
     lines.push(`^FT${g.pad},${y}^A0N,${g.codeFont},${g.codeFont}^FH\\^FD${label}^FS`)
   }
 
-  // Scannable symbol, bottom-right (reference placement).
+  // Scannable symbol, bottom-right (reference placement). Always a QR code
+  // carrying the SKU.
   if (code) {
-    if (symbology === 'qr') {
-      const mag = Math.min(10, Math.max(2, Math.floor(g.qrSize / 30)))
-      lines.push(`^FT${g.qrX},${g.qrY + g.qrSize}^BQN,2,${mag}`)
-      lines.push(`^FH\\^FDLA,${code}^FS`)
-    } else {
-      const barH = Math.max(20, g.qrSize - 12)
-      lines.push(`^FT${g.qrX},${g.qrY + g.qrSize}^BCN,${barH},Y,N,N`)
-      lines.push(`^FH\\^FD${code}^FS`)
-    }
+    const mag = Math.min(10, Math.max(2, Math.floor(g.qrSize / 30)))
+    lines.push(`^FT${g.qrX},${g.qrY + g.qrSize}^BQN,2,${mag}`)
+    lines.push(`^FH\\^FDLA,${code}^FS`)
   }
 
   lines.push(`^PQ${copies},0,1,Y`)
@@ -268,7 +252,6 @@ export function zplOptionsForPreset(preset: string | undefined, overrides: Parti
     width: (overrides.width ?? (base as { width?: number }).width ?? 50),
     height: (overrides.height ?? (base as { height?: number }).height ?? 40),
     copies: overrides.copies ?? 1,
-    symbology: overrides.symbology ?? 'qr',
     brand: overrides.brand ?? base.brand ?? 'Opal Line',
     showPrice: overrides.showPrice ?? true,
     showWeight: overrides.showWeight ?? true,

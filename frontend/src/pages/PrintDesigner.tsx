@@ -63,14 +63,13 @@ export default function PrintDesignerPage() {
   const [saving, setSaving] = useState(false)
   const iframeRef = useRef<HTMLIFrameElement>(null)
 
-  // ── Barcode-label editing state ─────────────────────────────────────
+  // ── Product-label editing state ─────────────────────────────────────
   // The designer edits a working copy of the label's data (company, product,
-  // SKU, barcode, rate). "Fetch from ERP" fills it from a real product.
+  // SKU, rate). "Fetch from ERP" fills it from a real product.
   const [labelEdit, setLabelEdit] = useState({
     companyName: 'OPAL LINE JEWELS LLP',
     productName: '92.5 Sterling Silver Pendant',
     sku: 'SL-PD-001',
-    barcode: '8901234567890',
     rate: 3250,
     weight: 2.8,
   })
@@ -91,8 +90,8 @@ export default function PrintDesignerPage() {
     }).catch(() => {})
   }, [docType])
 
-  // Load the ERP catalogue once the barcode-label tab is opened so the
-  // product picker can fill real SKU/barcode/rate data. Live Shopify products
+  // Load the ERP catalogue once the product-label tab is opened so the
+  // product picker can fill real SKU/rate data. Live Shopify products
   // are merged in (and a Shopify failure is ignored) so the picker also shows
   // store products that have not been synced into the local DB yet.
   useEffect(() => {
@@ -118,7 +117,6 @@ export default function PrintDesignerPage() {
       companyName: labelEdit.companyName,
       productName: p.name,
       sku: p.sku,
-      barcode: p.barcode || p.sku,
       rate: Number(p.sellingPrice) || 0,
       weight: Number(p.netWeight) || 0,
     })
@@ -131,7 +129,7 @@ export default function PrintDesignerPage() {
     const q = productQuery.trim().toLowerCase()
     const list = q
       ? products.filter((p) =>
-          p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q) || (p.barcode || '').toLowerCase().includes(q),
+          p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q),
         )
       : products
     return list.slice(0, 40)
@@ -149,8 +147,8 @@ export default function PrintDesignerPage() {
 
   const html = useMemo(() => {
     if (isLabel) {
-      // Barcode labels build from the editable working copy — live as the
-      // user types SKU / barcode / rate / names.
+      // Product labels build from the editable working copy — live as the
+      // user types SKU / rate / names.
       const labelDoc: PrintDoc = {
         number: 'SO-2026-00789',
         customer: 'Retail Customer',
@@ -165,7 +163,6 @@ export default function PrintDesignerPage() {
           {
             product: labelEdit.productName,
             sku: labelEdit.sku,
-            barcode: labelEdit.barcode,
             sellingPrice: labelEdit.rate,
             rate: labelEdit.rate,
             weight: labelEdit.weight,
@@ -375,7 +372,7 @@ export default function PrintDesignerPage() {
               <TabsTrigger value="order" className="w-full justify-center px-2 text-xs">Order</TabsTrigger>
               <TabsTrigger value="packing-slip" className="w-full justify-center px-2 text-xs">Packing Slip</TabsTrigger>
               <TabsTrigger value="pick-list" className="w-full justify-center px-2 text-xs">Pick List</TabsTrigger>
-              <TabsTrigger value="barcode-label" className="w-full justify-center px-2 text-xs">Barcode Label</TabsTrigger>
+              <TabsTrigger value="barcode-label" className="w-full justify-center px-2 text-xs">Product Label</TabsTrigger>
             </TabsList>
 
           <TabsContent value="invoice" />
@@ -499,7 +496,7 @@ export default function PrintDesignerPage() {
                         <Input
                           value={productQuery}
                           onChange={(e) => setProductQuery(e.target.value)}
-                          placeholder="Search by product name, SKU or barcode…"
+                          placeholder="Search by product name or SKU…"
                           autoFocus
                         />
                         <div className="max-h-44 overflow-y-auto rounded-md border bg-card">
@@ -530,15 +527,9 @@ export default function PrintDesignerPage() {
                     <Label className="text-xs text-muted-foreground">Product name</Label>
                     <Input value={labelEdit.productName} onChange={(e) => setLabelEdit((s) => ({ ...s, productName: e.target.value }))} maxLength={160} />
                   </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <Label className="text-xs text-muted-foreground">SKU</Label>
-                      <Input value={labelEdit.sku} onChange={(e) => setLabelEdit((s) => ({ ...s, sku: e.target.value }))} maxLength={64} />
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label className="text-xs text-muted-foreground">Barcode</Label>
-                      <Input value={labelEdit.barcode} onChange={(e) => setLabelEdit((s) => ({ ...s, barcode: e.target.value }))} maxLength={64} placeholder="8901234567890" />
-                    </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground">SKU</Label>
+                    <Input value={labelEdit.sku} onChange={(e) => setLabelEdit((s) => ({ ...s, sku: e.target.value }))} maxLength={64} />
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1.5">

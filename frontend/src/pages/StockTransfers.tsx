@@ -23,15 +23,8 @@ import { Badge } from '@/components/ui/badge'
 import { StatCard } from '@/components/ui/stat-card'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import type { InventoryLocation, Product, StockTransfer, TransferStatus } from '@/types'
 import { formatDateTime, formatNumber, formatWeight } from '@/lib/format'
@@ -350,12 +343,21 @@ export default function StockTransfersPage() {
             }}>
               <ArrowDownToLine className="h-3.5 w-3.5" /> Receive
             </Button>
-            <Dialog open={receiveDialogOpen} onOpenChange={setReceiveDialogOpen}>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Receive Transfer</DialogTitle>
-                  <DialogDescription>Select an in-transit transfer to mark as received.</DialogDescription>
-                </DialogHeader>
+            <Button size="sm" onClick={() => setDialogOpen(true)}>
+              <Plus className="h-4 w-4" /> New Transfer
+            </Button>
+            <AppDialog
+              open={receiveDialogOpen}
+              onOpenChange={setReceiveDialogOpen}
+              size="md"
+              title="Receive Transfer"
+              description="Select an in-transit transfer to mark as received."
+              footer={
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => setReceiveDialogOpen(false)}>Close</Button>
+                </DialogFooter>
+              }
+            >
                 {transfers.filter((t) => t.status === 'in-transit').length === 0 ? (
                   <p className="py-4 text-sm text-muted-foreground">No transfers in transit.</p>
                 ) : (
@@ -399,21 +401,26 @@ export default function StockTransfersPage() {
                     })}
                   </div>
                 )}
-              </DialogContent>
-            </Dialog>
-            <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-              <DialogTrigger asChild>
-                <Button size="sm">
-                  <Plus className="h-4 w-4" /> New Transfer
-                </Button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>New Stock Transfer</DialogTitle>
-                  <DialogDescription>
-                    Select a product and the locations to move stock between.
-                  </DialogDescription>
-                </DialogHeader>
+            </AppDialog>
+            <AppDialog
+              open={dialogOpen}
+              onOpenChange={setDialogOpen}
+              size="sm"
+              isDirty={dialogOpen && Boolean(form.product || form.from || form.to || form.qty)}
+              title="New Stock Transfer"
+              description="Select a product and the locations to move stock between."
+              footer={
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+                  <Button
+                    onClick={handleCreate}
+                    disabled={!form.product || !form.from || !form.to || form.from === form.to || !form.qty || Number(form.qty) < 1 || saving || (availableAtSource != null && Number(form.qty) > availableAtSource)}
+                  >
+                    {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUpFromLine className="h-4 w-4" />} Create Transfer
+                  </Button>
+                </DialogFooter>
+              }
+            >
                 <div className="grid gap-4">
                   <div className="space-y-1.5">
                     <Label htmlFor="transfer-product">Product</Label>
@@ -470,18 +477,8 @@ export default function StockTransfersPage() {
                     </p>
                   ) : null}
                 </div>
-                <DialogFooter>
-                  <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-                  <Button
-                    onClick={handleCreate}
-                    disabled={!form.product || !form.from || !form.to || form.from === form.to || !form.qty || Number(form.qty) < 1 || saving || (availableAtSource != null && Number(form.qty) > availableAtSource)}
-                  >
-                    {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUpFromLine className="h-4 w-4" />} Create Transfer
-                  </Button>
-                </DialogFooter>
                 {error ? <p className="px-6 pb-4 text-sm text-red-600 dark:text-red-400">{error}</p> : null}
-              </DialogContent>
-            </Dialog>
+            </AppDialog>
           </>
         }
       />

@@ -52,12 +52,13 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
         dbApi.getRecentActivities(),
         dbApi.getNotificationFeed().catch(() => null),
       ])
-      setNotifications(activities)
+      setNotifications(Array.isArray(activities) ? (activities as any) : (activities as any).items ?? [])
       if (feedRes?.items) {
         setFeed(feedRes.items)
         setUnreadCount(feedRes.counts.alerts)
       } else if (lastSeenAt) {
-        const newUnread = activities.filter((a) => a.time && a.time > lastSeenAt).length
+        const act = Array.isArray(activities) ? (activities as any) : (activities as any).items ?? []
+        const newUnread = act.filter((a: any) => a.time && a.time > lastSeenAt).length
         setUnreadCount(newUnread)
       }
     } catch {

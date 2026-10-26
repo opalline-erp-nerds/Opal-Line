@@ -24,14 +24,8 @@ import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import type { Product, PurchaseReturn, Supplier } from '@/types'
 import { formatCurrency, formatDate, formatWeight } from '@/lib/format'
@@ -79,6 +73,8 @@ export default function PurchaseReturnsPage() {
   const [formError, setFormError] = useState('')
   const [header, setHeader] = useState({ number: '', supplier: '', receiveNow: false })
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()])
+  // Snapshot of the create form as it opened, for the close guard.
+  const [formBaseline, setFormBaseline] = useState('')
 
   const load = useCallback(() => {
     setLoading(true)
@@ -142,8 +138,11 @@ export default function PurchaseReturnsPage() {
   const knownSkus = useMemo(() => products.map((p) => p.sku), [products])
 
   const openDialog = () => {
-    setHeader({ number: `PR-${new Date().getFullYear()}-${String(returns.length + 1).padStart(4, '0')}`, supplier: '', receiveNow: false })
-    setLines([emptyLine()])
+    const nextHeader = { number: `PR-${new Date().getFullYear()}-${String(returns.length + 1).padStart(4, '0')}`, supplier: '', receiveNow: false }
+    const nextLines = [emptyLine()]
+    setHeader(nextHeader)
+    setLines(nextLines)
+    setFormBaseline(JSON.stringify({ header: nextHeader, lines: nextLines }))
     setFormError('')
     setFormOpen(true)
   }
@@ -225,16 +224,20 @@ export default function PurchaseReturnsPage() {
   const [editSaving, setEditSaving] = useState(false)
   const [editError, setEditError] = useState('')
   const [editForm, setEditForm] = useState({ number: '', supplier: '', date: '' })
+  // Snapshot of the edit form as it opened, for the close guard.
+  const [editBaseline, setEditBaseline] = useState('')
 
   const openEdit = useCallback((row: PurchaseReturn) => {
-    setEditTarget(row)
-    setEditError('')
     const d = row.date ? new Date(row.date) : null
-    setEditForm({
+    const next = {
       number: row.number ?? '',
       supplier: row.supplier ?? '',
       date: d && !Number.isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : '',
-    })
+    }
+    setEditTarget(row)
+    setEditError('')
+    setEditForm(next)
+    setEditBaseline(JSON.stringify(next))
     setViewReturn(null)
   }, [setEditTarget, setEditForm, setViewReturn])
 
@@ -441,12 +444,18 @@ export default function PurchaseReturnsPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={viewReturn !== null} onOpenChange={(open) => { if (!open) setViewReturn(null) }}>
-        <DialogContent size="2xl">
-          <DialogHeader>
-            <DialogTitle>Return {viewReturn?.number}</DialogTitle>
-            <DialogDescription>{viewReturn ? formatDate(viewReturn.date) : ''}</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={viewReturn !== null}
+        onOpenChange={(open) => { if (!open) setViewReturn(null) }}
+        size="xl"
+        title={`Return ${viewReturn?.number ?? ''}`}
+        description={viewReturn ? formatDate(viewReturn.date) : ''}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setViewReturn(null)}>Close</Button>
+          </DialogFooter>
+        }
+      >
           {viewReturn && (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
@@ -498,17 +507,25 @@ export default function PurchaseReturnsPage() {
               ) : null}
             </div>
           )}
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
-      <Dialog open={formOpen} onOpenChange={setFormOpen}>
-        <DialogContent size="3xl">
-          <DialogHeader>
-            <DialogTitle>Record Purchase Return</DialogTitle>
-            <DialogDescription>
-              Line items say what is going back to the supplier. Nothing leaves stock until the return is received.
-            </DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={formOpen}
+        onOpenChange={setFormOpen}
+        size="lg"
+        isDirty={formOpen && JSON.stringify({ header, lines }) !== formBaseline}
+        title="Record Purchase Return"
+        description="Line items say what is going back to the supplier. Nothing leaves stock until the return is received."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setFormOpen(false)}>Cancel</Button>
+            <Button onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Record return
+            </Button>
+          </DialogFooter>
+        }
+      >
 
           <div className="space-y-4">
             <div className="grid gap-3 sm:grid-cols-2">
@@ -612,25 +629,24 @@ export default function PurchaseReturnsPage() {
 
             {formError ? <p className="text-sm text-red-600 dark:text-red-400">{formError}</p> : null}
           </div>
+      </AppDialog>
 
+      <AppDialog
+        open={editTarget !== null}
+        onOpenChange={(open) => { if (!open) setEditTarget(null) }}
+        size="sm"
+        isDirty={editTarget !== null && JSON.stringify(editForm) !== editBaseline}
+        title={`Edit Return ${editTarget?.number ?? ''}`}
+        description="Correct the return number, supplier or date. Line items stay as recorded — receive/undo controls the stock."
+        footer={
           <DialogFooter>
-            <Button variant="outline" onClick={() => setFormOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Record return
+            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
+            <Button onClick={() => void submitEdit()} disabled={editSaving}>
+              {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Save changes
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null) }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Edit Return {editTarget?.number ?? ''}</DialogTitle>
-            <DialogDescription>
-              Correct the return number, supplier or date. Line items stay as recorded — receive/undo controls the stock.
-            </DialogDescription>
-          </DialogHeader>
+        }
+      >
           <div className="space-y-4">
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label="Return number">
@@ -655,14 +671,7 @@ export default function PurchaseReturnsPage() {
             </Field>
             {editError ? <p className="text-sm text-red-600 dark:text-red-400">{editError}</p> : null}
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
-            <Button onClick={() => void submitEdit()} disabled={editSaving}>
-              {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Save changes
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

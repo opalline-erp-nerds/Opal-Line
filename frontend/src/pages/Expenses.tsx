@@ -11,14 +11,8 @@ import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import type { Expense } from '@/types'
 import { formatCurrency, formatDateTime, todayIST } from '@/lib/format'
@@ -44,6 +38,8 @@ export default function ExpensesPage() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [form, setForm] = useState({ category: '', description: '', amount: '', paymentMethod: '' })
+  // Snapshot of the form as it opened, for the unsaved-changes close guard.
+  const [baseline, setBaseline] = useState('')
 
   const load = useCallback(() => {
     setLoading(true)
@@ -59,7 +55,9 @@ export default function ExpensesPage() {
   }, [load])
 
   const openDialog = () => {
-    setForm({ category: '', description: '', amount: '', paymentMethod: 'UPI' })
+    const next = { category: '', description: '', amount: '', paymentMethod: 'UPI' }
+    setForm(next)
+    setBaseline(JSON.stringify(next))
     setError('')
     setDialogOpen(true)
   }
@@ -286,12 +284,23 @@ export default function ExpensesPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Add Expense</DialogTitle>
-            <DialogDescription>Record a new operating expense.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        size="sm"
+        isDirty={dialogOpen && JSON.stringify(form) !== baseline}
+        title="Add Expense"
+        description="Record a new operating expense."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+            <Button onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+              Add Expense
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="grid gap-4">
             <div className="grid grid-cols-2 gap-3">
               <Field label="Category">
@@ -333,15 +342,7 @@ export default function ExpensesPage() {
             </Field>
             {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Add Expense
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

@@ -4,7 +4,6 @@ import {
   Printer,
   Tag,
   QrCode,
-  Barcode,
   Search,
   FileDown,
   Eye,
@@ -75,7 +74,6 @@ function toLabelProduct(p: Product): LabelProduct {
     id: p.id,
     name: p.name,
     sku: p.sku,
-    barcode: p.barcode || undefined,
     price: p.sellingPrice ?? 0,
     weight: p.netWeight || undefined,
     category: p.category,
@@ -251,7 +249,7 @@ export default function BarcodeLabelsPage() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     return products.filter((p) => {
-      if (q && !(`${p.name} ${p.sku} ${p.barcode ?? ''}`.toLowerCase().includes(q))) return false
+      if (q && !(`${p.name} ${p.sku}`.toLowerCase().includes(q))) return false
       if (category !== 'all' && p.category !== category) return false
       if (stockFilter === 'in' && !(p.stock > 0)) return false
       if (stockFilter === 'out' && p.stock !== 0) return false
@@ -355,7 +353,7 @@ export default function BarcodeLabelsPage() {
       return
     }
     if (grid.overflow) {
-      toast.error('Label size does not fit the page ΓÇö reduce size or margins')
+      toast.error('Label size does not fit the page — reduce size or margins')
       return
     }
     setGenerating(true)
@@ -401,7 +399,7 @@ export default function BarcodeLabelsPage() {
             <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300 ring-1 ring-primary-100">
               <Tag className="h-5 w-5" />
             </div>
-            <span>Barcode Labels</span>
+            <span>QR Labels</span>
           </span>
         }
         subtitle="Design, preview and print labels at true physical size from your product catalog"
@@ -417,7 +415,7 @@ export default function BarcodeLabelsPage() {
             </Button>
             <Button onClick={printLabels} disabled={generating || expandedCount === 0}>
               <Printer className="h-4 w-4" />
-              {generating ? 'PreparingΓÇª' : `Print ${expandedCount} Label${expandedCount === 1 ? '' : 's'}`}
+              {generating ? 'Preparing…' : `Print ${expandedCount} Label${expandedCount === 1 ? '' : 's'}`}
             </Button>
           </>
         }
@@ -510,7 +508,7 @@ export default function BarcodeLabelsPage() {
               {grid.overflow && (
                 <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  Label + margins exceed the page ΓÇö reduce size or margins.
+                  Label + margins exceed the page — reduce size or margins.
                 </div>
               )}
             </CardContent>
@@ -525,21 +523,15 @@ export default function BarcodeLabelsPage() {
             <CardContent className="space-y-3">
               <ToggleRow label="Product name" checked={cfg.showName} onCheckedChange={(v) => patch({ showName: v })} />
               <ToggleRow label="SKU" checked={cfg.showSku} onCheckedChange={(v) => patch({ showSku: v })} />
-              <ToggleRow label="Price (Γé╣)" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
+              <ToggleRow label="Price (₹)" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
               <ToggleRow label="Net weight" checked={cfg.showWeight} onCheckedChange={(v) => patch({ showWeight: v })} />
               <ToggleRow label="HUID" checked={cfg.showHuid} onCheckedChange={(v) => patch({ showHuid: v })} />
               <ToggleRow label="Category" checked={cfg.showCategory} onCheckedChange={(v) => patch({ showCategory: v })} />
               <ToggleRow
-                label="QR code"
+                label="QR code (encodes the SKU)"
                 icon={<QrCode className="h-3.5 w-3.5 text-muted-foreground" />}
                 checked={cfg.showQr}
                 onCheckedChange={(v) => patch({ showQr: v })}
-              />
-              <ToggleRow
-                label="Barcode (Code 128)"
-                icon={<Barcode className="h-3.5 w-3.5 text-muted-foreground" />}
-                checked={cfg.showBarcode}
-                onCheckedChange={(v) => patch({ showBarcode: v })}
               />
               <ToggleRow label="Border" checked={cfg.showBorder} onCheckedChange={(v) => patch({ showBorder: v })} />
               <ToggleRow label="Company name" checked={cfg.showCompany} onCheckedChange={(v) => patch({ showCompany: v })} />
@@ -674,7 +666,7 @@ export default function BarcodeLabelsPage() {
                 <Input
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search name, SKU or barcodeΓÇª"
+                  placeholder="Search name or SKU..."
                   className="h-8 pl-8 text-sm"
                 />
               </div>
@@ -732,7 +724,6 @@ export default function BarcodeLabelsPage() {
                           <p className="truncate text-sm font-medium text-foreground">{product.name}</p>
                           <p className="truncate text-xs text-muted-foreground">
                             {product.sku}
-                            {product.barcode && <span className="ml-2 font-mono">Γöé {product.barcode}</span>}
                             {product.sku && duplicates.has(product.sku.toLowerCase()) && (
                               <Badge variant="warning" className="ml-1.5 text-[10px]">
                                 Dup SKU
@@ -742,11 +733,11 @@ export default function BarcodeLabelsPage() {
                         </div>
                         <div className="shrink-0 text-right">
                           <p className="text-sm font-semibold text-primary-700">
-                            Γé╣{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
+                            ₹{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
                           </p>
                           <p className="text-[11px] text-muted-foreground">
                             {product.netWeight ? `${product.netWeight}g` : ''}
-                            {product.stock !== undefined ? ` ┬╖ ${product.stock} pcs` : ''}
+                            {product.stock !== undefined ? ` · ${product.stock} pcs` : ''}
                           </p>
                         </div>
                       </div>
@@ -760,4 +751,5 @@ export default function BarcodeLabelsPage() {
       </div>
     </div>
   )
+  
 }

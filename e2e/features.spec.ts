@@ -39,7 +39,7 @@ test.describe('recent feature coverage', () => {
     await expect(page.getByText('Import design')).toBeVisible()
 
     // The export/import controls must exist on all five doc tabs.
-    const tabs = ['Invoice', 'Quotation', 'Order', 'Packing Slip', 'Pick List', 'Barcode Label']
+    const tabs = ['Invoice', 'Quotation', 'Order', 'Packing Slip', 'Pick List', 'Product Label']
     for (const t of tabs) {
       await page.getByRole('tab', { name: new RegExp(`^${t}$`, 'i') }).click()
       await expect(page.getByRole('button', { name: /Export design/i })).toBeVisible({ timeout: 5000 })

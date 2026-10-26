@@ -1,13 +1,17 @@
 import 'dotenv/config'
 import { ImapFlow } from 'imapflow'
 import { simpleParser, type ParsedMail } from 'mailparser'
-import { eq, or } from 'drizzle-orm'
+import { and, eq, or, sql } from 'drizzle-orm'
 import { db } from './db/client'
 import * as schema from './db/schema'
+import { invoiceTotals } from './invoiceTotals'
+import { getLatestSilverRate } from './shopify'
 import { decryptSecret } from './lib/crypto'
 import { recountCustomerStatsBoth } from './customerStats'
 import { applyStockMovement, resolveMovementLocation } from './stock'
 import { logger } from './logger'
+
+const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
 
 /**
  * Shopify Order Email Ingestion
@@ -64,7 +68,19 @@ export interface OrderEmailData {
     phone?: string
   } | null
   total: number
-  items: Array<{ title: string; sku: string; quantity: number; price: number }>
+  items: Array<{
+    title: string
+    sku: string
+    quantity: number
+    price: number
+    // ERP pricing fields (for manual orders)
+    weight?: number
+    silverRate?: number
+    makingCharge?: number
+    silverValue?: number
+    makingValue?: number
+    amount?: number
+  }>
   paymentMethod: string
   date: string
 }
@@ -769,43 +785,150 @@ export async function createInvoiceForOrderRow(
   const lineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
   if (lineItems.length === 0) return null
 
+  // Detect manual orders (created via ERP, not imported from Shopify)
+  const isManualOrder = (order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#')
+
   // Settings: gst rate + invoice prefix
   const [settingsRow] = await db.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
   const gstRate = Number(settingsRow?.gstRate ?? 3)
   const prefix = settingsRow?.invoicePrefix?.trim() || 'INV-'
   const payment = order.payment === 'paid' ? 'Online' : order.payment === 'cod' ? 'COD' : 'Pending'
 
-  // Load product netWeights keyed by SKU for invoice-item weight snapshot
-  const productNetWeights = await db
-    .select({ sku: schema.products.sku, netWeight: schema.products.netWeight })
+  // Authoritative silver rate from Silver Rate Management (silver_rates table).
+  // This is the single source of truth for new pricing operations.
+  const latestRate = await getLatestSilverRate()
+  if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
+    throw new Error('Current silver rate is not available. Please update the rate in Silver Rate Management before creating invoices.')
+  }
+  const silverRate = latestRate.rate
+
+  // Load product data keyed by SKU for invoice-item snapshots (weight, making charge).
+  // Silver rate comes from Silver Rate Management, not the product catalogue.
+  const productData = await db
+    .select({
+      sku: schema.products.sku,
+      netWeight: schema.products.netWeight,
+      makingCharge: schema.products.makingCharge,
+    })
     .from(schema.products)
-  const netWeightMap = Object.fromEntries(
-    productNetWeights.map((p) => [p.sku, Number(p.netWeight ?? 0)])
+  const productMap = Object.fromEntries(
+    productData.map((p) => [
+      p.sku,
+      {
+        netWeight: Number(p.netWeight ?? 0),
+        makingCharge: Number(p.makingCharge ?? 0),
+      },
+    ])
   )
 
-  const items = lineItems.map((li) => {
-    const qty = Number(li.quantity ?? 0)
-    const price = Number(li.price ?? 0)
-    const amount = Math.round(price * qty * 100) / 100
-    // Weight snapshot: net weight × qty from the catalogue, keyed by SKU.
-    // Unknown SKUs keep 0 — the UI renders 0 as unknown ("—"), never 0.00 gm.
-    const netWeight = netWeightMap[String(li.sku ?? '')] ?? 0
-    const weight = netWeight > 0 ? Math.round(netWeight * qty * 1000) / 1000 : 0
-    return {
-      product: String(li.title ?? '').trim(),
-      sku: String(li.sku ?? ''),
-      qty,
-      weight,
-      silverRate: 0,
-      makingCharge: 0,
-      tax: Math.round(((amount * gstRate) / 100) * 100) / 100,
-      amount,
-    }
-  })
-  const subtotal = Math.round(items.reduce((a, it) => a + it.amount, 0) * 100) / 100
-  const gstAmount = Math.round(((subtotal * gstRate) / 100) * 100) / 100
+  let items: Array<{
+    product: string
+    sku: string
+    qty: number
+    weight: number
+    silverRate: number
+    makingCharge: number
+    tax: number
+    amount: number
+    silverValue?: number
+    makingValue?: number
+  }>
+  let shopifySubtotal: number
+  let erpSilverValue: number
+  let erpMakingCharge: number
+  let erpSubtotal: number
+  let silverValue: number
+  let makingCharge: number
+  let subtotal: number
+  let effectiveDiscount: number
+  let gstAmount: number
+  let grandTotal: number
   const discount = Number(order.discount ?? 0)
-  const grandTotal = Math.round((subtotal + gstAmount - discount) * 100) / 100
+
+  if (isManualOrder) {
+    // Manual orders: lineItems already contain ERP components (silverValue, makingValue, amount as subtotal, weight, silverRate, makingCharge)
+    // Use them directly to ensure invoice totals match order totals exactly.
+    items = lineItems.map((li) => {
+      const qty = Number(li.quantity ?? 0)
+      const weight = Number(li.weight ?? 0)
+      const itemSilverRate = Number(li.silverRate ?? 0)
+      const itemMakingCharge = Number(li.makingCharge ?? 0)
+      const silverValue = Number(li.silverValue ?? (weight > 0 ? round2(weight * itemSilverRate) : 0))
+      const makingValue = Number(li.makingValue ?? (weight > 0 ? round2(weight * itemMakingCharge) : 0))
+      const amount = Number(li.amount ?? round2(silverValue + makingValue))
+      return {
+        product: String(li.title ?? '').trim(),
+        sku: String(li.sku ?? ''),
+        qty,
+        weight,
+        silverRate: itemSilverRate,
+        makingCharge: itemMakingCharge,
+        tax: round2((amount * gstRate) / 100),
+        amount,      // Line subtotal (ex-GST)
+        silverValue,
+        makingValue,
+      }
+    })
+    shopifySubtotal = round2(items.reduce((a, it) => a + it.amount, 0))
+    // For manual orders, ERP components come directly from stored line items
+    erpSilverValue = round2(items.reduce((a, it) => a + (it.silverValue ?? 0), 0))
+    erpMakingCharge = round2(items.reduce((a, it) => a + (it.makingValue ?? 0), 0))
+    erpSubtotal = round2(erpSilverValue + erpMakingCharge)
+    // No adjustment needed for manual orders - they were priced using the same rate
+    effectiveDiscount = discount
+    subtotal = erpSubtotal
+    const totals = invoiceTotals(subtotal, gstRate, effectiveDiscount)
+    gstAmount = totals.gstAmount
+    grandTotal = totals.grandTotal
+    silverValue = erpSilverValue
+    makingCharge = erpMakingCharge
+  } else {
+    // Shopify orders: the customer has already paid a specific price (Shopify price).
+    // The invoice is a tax document for that transaction. The component breakdown MUST use
+    // the actual Silver Rate Management rate. If the ERP-calculated subtotal differs from
+    // the Shopify billed amount, the difference is reflected as a discount/adjustment.
+    // This ensures the displayed rate equals the actual Silver Rate Management rate.
+    items = lineItems.map((li) => {
+      const qty = Number(li.quantity ?? 0)
+      const price = Number(li.price ?? 0)
+      const amount = Math.round(price * qty * 100) / 100
+      // Product snapshot: net weight, making charge from catalogue.
+      // Silver rate comes from Silver Rate Management (authoritative source).
+      const product = productMap[String(li.sku ?? '')] ?? { netWeight: 0, makingCharge: 0 }
+      const weight = product.netWeight > 0 ? Math.round(product.netWeight * qty * 1000) / 1000 : 0
+      // Silver rate is the actual rate for items with weight > 0, 0 for zero-weight items
+      const itemSilverRate = weight > 0 ? silverRate : 0
+      return {
+        product: String(li.title ?? '').trim(),
+        sku: String(li.sku ?? ''),
+        qty,
+        weight,
+        silverRate: itemSilverRate,  // Actual Silver Rate Management rate (0 for zero-weight items)
+        makingCharge: product.makingCharge,
+        tax: Math.round(((amount * gstRate) / 100) * 100) / 100,
+        amount,      // Shopify billed amount per line
+      }
+    })
+    shopifySubtotal = Math.round(items.reduce((a, it) => a + it.amount, 0) * 100) / 100
+
+    // ERP-calculated components using ACTUAL Silver Rate Management rate
+    erpSilverValue = Math.round(items.reduce((a, it) => a + it.weight * it.silverRate, 0) * 100) / 100
+    erpMakingCharge = Math.round(items.reduce((a, it) => a + it.makingCharge * it.weight, 0) * 100) / 100
+    erpSubtotal = round2(erpSilverValue + erpMakingCharge)
+
+    // If ERP subtotal differs from Shopify billed amount, the difference is a discount/adjustment.
+    // The invoice subtotal for tax purposes is the ERP subtotal.
+    const adjustment = round2(erpSubtotal - shopifySubtotal)
+    effectiveDiscount = discount + (adjustment > 0 ? adjustment : 0)
+    subtotal = erpSubtotal
+    const totals = invoiceTotals(subtotal, gstRate, effectiveDiscount)
+    gstAmount = totals.gstAmount
+    grandTotal = totals.grandTotal
+
+    // Header totals use ERP-calculated components (no scaling)
+    silverValue = erpSilverValue
+    makingCharge = erpMakingCharge
+  }
 
   // Customer snapshot: customer record first, then the order's addresses
   const [customer] = order.customer
@@ -819,58 +942,92 @@ export async function createInvoiceForOrderRow(
 
   const number = await nextInvoiceNumber(prefix)
   const invoiceId = crypto.randomUUID()
-  await db.transaction(async (tx) => {
-    await tx.insert(schema.salesInvoices).values({
-      id: invoiceId,
-      number,
-      shopifyOrder: order.shopifyId ?? null,
-      customer: order.customer,
-      customerEmail: customer?.email ?? '',
-      customerPhone: customer?.phone ?? String(addr.phone ?? ''),
-      customerAddress: [address1, address2].filter(Boolean).join(', '),
-      customerCity: String(addr.city ?? customer?.city ?? ''),
-      customerState: String(addr.province ?? customer?.province ?? ''),
-      customerPincode: String(addr.zip ?? ''),
-      silverValue: 0,
-      makingCharge: 0,
-      subtotal,
-      gst: gstRate,
-      gstAmount,
-      discount,
-      grandTotal,
-      paymentMethod: payment,
-      paymentStatus: order.payment,
-      status: order.payment === 'paid' ? 'paid' : 'issued',
-      date: order.date ?? new Date().toISOString(),
-    })
-    const orderLocationId = (order as { locationId?: string | null }).locationId ?? null
-    for (const it of items) {
-      await tx.insert(schema.salesInvoiceItems).values({ ...it, id: crypto.randomUUID(), invoiceId })
-      // Deduct stock for the sold SKU, same rule as manual invoices. The
-      // order's own location is honoured so the deduction and any later
-      // reversal agree on which balance they touch. Skipped when the caller
-      // already moved stock (Shopify order import).
-      if (opts.deductStock !== false) {
-        await deductStock(tx, it.sku, it.qty, orderLocationId)
+  try {
+    await db.transaction(async (tx) => {
+      // Atomically claim the order for THIS invoice. The UPDATE locks the
+      // order row and only matches while it is still un-invoiced, so a
+      // concurrent or repeated create-invoice request loses the race here —
+      // it gets ORDER_ALREADY_INVOICED instead of silently raising a second
+      // invoice (and deducting stock twice). The claim lives in the same
+      // transaction as the inserts below, so a failure rolls it back too.
+      const claimed = await tx
+        .update(schema.salesOrders)
+        .set({ invoice: number })
+        .where(and(
+          eq(schema.salesOrders.id, order.id),
+          sql`(${schema.salesOrders.invoice} IS NULL OR ${schema.salesOrders.invoice} = '')`,
+        ))
+        .returning({ id: schema.salesOrders.id })
+      if (claimed.length === 0) {
+        const err = new Error(`Sales order ${order.id} is already linked to an invoice`)
+        ;(err as Error & { code?: string }).code = 'ORDER_ALREADY_INVOICED'
+        throw err
       }
-    }
-    await tx.update(schema.salesOrders).set({ invoice: number }).where(eq(schema.salesOrders.id, order.id))
-  })    // Loyalty: award points for this invoice (fire-and-forget, never blocks sync)
-    void import('./loyalty').then(({ earnForInvoice }) =>
-      earnForInvoice({ id: invoiceId, number, customer: order.customer ?? '', grandTotal, status: order.payment === 'paid' ? 'paid' : 'issued' }),
-    )
-    // E-invoicing: in `automatic` mode the IRN must be generated for invoices
-    // raised by THIS pipeline (fulfilment, email sync) too — not only for
-    // invoices created through POST /invoices. Fire-and-forget, same rule as
-    // the manual route: a gateway failure must never fail the invoice.
-    void import('./einvoice')
-      .then(async ({ resolveEInvoiceMode, generateEInvoiceForInvoice }) => {
-        if ((await resolveEInvoiceMode()) !== 'automatic') return
-        const result = await generateEInvoiceForInvoice(invoiceId)
-        if (!result.ok) logger.error({ err: result.error, invoice: number }, 'automatic IRN generation failed for auto-raised invoice')
+      // Store effectiveDiscount (includes adjustment) so that grandTotal = subtotal + gstAmount - discount holds
+      const storedDiscount = effectiveDiscount
+      await tx.insert(schema.salesInvoices).values({
+        id: invoiceId,
+        number,
+        shopifyOrder: order.shopifyId ?? null,
+        customer: order.customer,
+        customerEmail: customer?.email ?? '',
+        customerPhone: customer?.phone ?? String(addr.phone ?? ''),
+        customerAddress: [address1, address2].filter(Boolean).join(', '),
+        customerCity: String(addr.city ?? customer?.city ?? ''),
+        customerState: String(addr.province ?? customer?.province ?? ''),
+        customerPincode: String(addr.zip ?? ''),
+        silverValue,
+        makingCharge,
+        subtotal,
+        gst: gstRate,
+        gstAmount,
+        discount: storedDiscount,
+        grandTotal,
+        paymentMethod: payment,
+        paymentStatus: order.payment,
+        status: order.payment === 'paid' ? 'paid' : 'issued',
+        date: order.date ?? new Date().toISOString(),
       })
-      .catch(() => undefined)
-    return number
+      const orderLocationId = (order as { locationId?: string | null }).locationId ?? null
+      for (const it of items) {
+        await tx.insert(schema.salesInvoiceItems).values({ ...it, id: crypto.randomUUID(), invoiceId })
+        // Deduct stock for the sold SKU, same rule as manual invoices. The
+        // order's own location is honoured so the deduction and any later
+        // reversal agree on which balance they touch. Skipped when the caller
+        // already moved stock (Shopify order import).
+        if (opts.deductStock !== false) {
+          await deductStock(tx, it.sku, it.qty, orderLocationId)
+        }
+      }
+    })
+  } catch (err) {
+    if ((err as Error & { code?: string }).code !== 'ORDER_ALREADY_INVOICED') throw err
+    // Another request claimed the order first — return its invoice number
+    // instead of failing or, worse, inserting a duplicate.
+    const [fresh] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, order.id)).limit(1)
+    if (fresh?.invoice) {
+      logger.info({ orderId: order.id, invoice: fresh.invoice }, 'order already invoiced; reusing the linked invoice')
+      return fresh.invoice
+    }
+    throw err
+  }
+
+  // Loyalty: award points for this invoice (fire-and-forget, never blocks sync)
+  void import('./loyalty').then(({ earnForInvoice }) =>
+    earnForInvoice({ id: invoiceId, number, customer: order.customer ?? '', grandTotal, status: order.payment === 'paid' ? 'paid' : 'issued' }),
+  )
+  // E-invoicing: in `automatic` mode the IRN must be generated for invoices
+  // raised by THIS pipeline (fulfilment, email sync) too — not only for
+  // invoices created through POST /invoices. Fire-and-forget, same rule as
+  // the manual route: a gateway failure must never fail the invoice.
+  void import('./einvoice')
+    .then(async ({ resolveEInvoiceMode, generateEInvoiceForInvoice }) => {
+      if ((await resolveEInvoiceMode()) !== 'automatic') return
+      const result = await generateEInvoiceForInvoice(invoiceId)
+      if (!result.ok) logger.error({ err: result.error, invoice: number }, 'automatic IRN generation failed for auto-raised invoice')
+    })
+    .catch(() => undefined)
+  return number
 }
 
 /**

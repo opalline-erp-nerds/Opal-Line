@@ -10,15 +10,8 @@ import { Select } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import type { InventoryLocation, LocationStockSummary, Product } from '@/types'
 import { exportTable } from '@/lib/export'
@@ -85,15 +78,19 @@ export default function StockLocationsPage() {
   const [editTarget, setEditTarget] = useState<InventoryLocation | null>(null)
   const [editSaving, setEditSaving] = useState(false)
   const [editForm, setEditForm] = useState({ name: '', type: 'store', city: '', manager: '' })
+  // Snapshot of the edit form as it opened, for the unsaved-changes close guard.
+  const [editBaseline, setEditBaseline] = useState('')
 
   const openEdit = useCallback((loc: InventoryLocation) => {
-    setEditTarget(loc)
-    setEditForm({
+    const next = {
       name: loc.name ?? '',
       type: loc.type ?? 'store',
       city: loc.city ?? '',
       manager: loc.manager ?? '',
-    })
+    }
+    setEditTarget(loc)
+    setEditForm(next)
+    setEditBaseline(JSON.stringify(next))
   }, [])
 
   const submitEdit = async () => {
@@ -243,12 +240,22 @@ export default function StockLocationsPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null) }}>
-        <DialogContent className="max-w-[520px]">
-          <DialogHeader>
-            <DialogTitle>Edit Location</DialogTitle>
-            <DialogDescription>Update the location's details. Stock held here is unaffected.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={editTarget !== null}
+        onOpenChange={(open) => { if (!open) setEditTarget(null) }}
+        size="md"
+        isDirty={editTarget !== null && JSON.stringify(editForm) !== editBaseline}
+        title="Edit Location"
+        description="Update the location's details. Stock held here is unaffected."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
+            <Button onClick={() => void submitEdit()} disabled={editSaving || !editForm.name.trim()}>
+              {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Save changes
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="grid grid-cols-2 gap-3">
             <div className="col-span-2 space-y-1.5">
               <Label htmlFor="edit-loc-name">Name</Label>
@@ -278,14 +285,7 @@ export default function StockLocationsPage() {
               <Input id="edit-loc-manager" value={editForm.manager} onChange={(e) => setEditForm((f) => ({ ...f, manager: e.target.value }))} placeholder="Optional" />
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
-            <Button onClick={() => void submitEdit()} disabled={editSaving || !editForm.name.trim()}>
-              {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Save changes
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }
@@ -367,25 +367,33 @@ function NewLocationDialog({ onCreated }: { onCreated: () => void }) {
   }
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        setOpen(next)
-        if (!next) reset()
-      }}
-    >
-      <DialogTrigger asChild>
-        <Button size="sm">
-          <Plus className="h-4 w-4" /> New Location
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-[620px]">
-        <DialogHeader>
-          <DialogTitle>New Stock Location</DialogTitle>
-          <DialogDescription>
-            Add a store, warehouse or workshop. You can count stock into it as you open it.
-          </DialogDescription>
-        </DialogHeader>
+    <>
+      <Button size="sm" onClick={() => setOpen(true)}>
+        <Plus className="h-4 w-4" /> New Location
+      </Button>
+      <AppDialog
+        open={open}
+        onOpenChange={(next) => {
+          if (!next) {
+            reset()
+          }
+          setOpen(next)
+        }}
+        size="md"
+        isDirty={open && Boolean(form.name || form.city || form.manager || showCounts)}
+        title="New Stock Location"
+        description="Add a store, warehouse or workshop. You can count stock into it as you open it."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={submit} disabled={!form.name.trim() || saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <MapPin className="h-4 w-4" />} Create Location
+            </Button>
+          </DialogFooter>
+        }
+      >
 
         <div className="grid gap-4">
           <div className="grid grid-cols-2 gap-3">
@@ -467,16 +475,8 @@ function NewLocationDialog({ onCreated }: { onCreated: () => void }) {
           </div>
         </div>
 
-        <DialogFooter>
-          <Button variant="outline" onClick={() => setOpen(false)}>
-            Cancel
-          </Button>
-          <Button onClick={submit} disabled={!form.name.trim() || saving}>
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <MapPin className="h-4 w-4" />} Create Location
-          </Button>
-        </DialogFooter>
-        {error ? <p className="px-6 pb-4 text-sm text-red-600 dark:text-red-400">{error}</p> : null}
-      </DialogContent>
-    </Dialog>
+        {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
+      </AppDialog>
+    </>
   )
 }

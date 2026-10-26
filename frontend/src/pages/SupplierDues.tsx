@@ -6,14 +6,8 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { dbApi } from '@/lib/api'
@@ -298,15 +292,22 @@ export default function SupplierDuesPage() {
       )}
 
       {/* Record payment — pick which invoices this settles */}
-      <Dialog open={payFor !== null} onOpenChange={(open) => { if (!open) { setPayFor(null); setDetail(null) } }}>
-        <DialogContent size="2xl">
-          <DialogHeader>
-            <DialogTitle>Pay Supplier — {payFor?.supplier}</DialogTitle>
-            <DialogDescription>
-              Outstanding {formatCurrency(payFor?.balance ?? 0)} across {payFor?.invoiceCount ?? 0} purchase
-              invoice(s). Tick the invoices this payment settles.
-            </DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={payFor !== null}
+        onOpenChange={(open) => { if (!open) { setPayFor(null); setDetail(null) } }}
+        size="xl"
+        isDirty={payFor !== null && Boolean(payAmount || payNote || selected.length)}
+        title={`Pay Supplier — ${payFor?.supplier ?? ''}`}
+        description={`Outstanding ${formatCurrency(payFor?.balance ?? 0)} across ${payFor?.invoiceCount ?? 0} purchase invoice(s). Tick the invoices this payment settles.`}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setPayFor(null); setDetail(null) }}>Cancel</Button>
+            <Button onClick={submitPayment} disabled={paySaving || !payAmount || selected.length === 0}>
+              {paySaving ? 'Saving…' : 'Record Payment'}
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-4">
             <div className="max-h-56 overflow-y-auto rounded-md border border-border/60">
               <table className="w-full text-sm">
@@ -394,26 +395,23 @@ export default function SupplierDuesPage() {
               </div>
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => { setPayFor(null); setDetail(null) }}>Cancel</Button>
-            <Button onClick={submitPayment} disabled={paySaving || !payAmount || selected.length === 0}>
-              {paySaving ? 'Saving…' : 'Record Payment'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
       {/* Supplier ledger: open invoices + payment history */}
-      <Dialog open={viewFor !== null} onOpenChange={(open) => { if (!open) { setViewFor(null); setViewDetail(null) } }}>
-        <DialogContent size="2xl">
-          <DialogHeader>
-            <DialogTitle>Supplier Ledger — {viewFor?.supplier}</DialogTitle>
-            <DialogDescription>
-              {viewDetail
-                ? `Outstanding ${formatCurrency(viewDetail.outstanding)} · ${viewDetail.payments.length} payment(s) recorded`
-                : 'Loading payment history…'}
-            </DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={viewFor !== null}
+        onOpenChange={(open) => { if (!open) { setViewFor(null); setViewDetail(null) } }}
+        size="xl"
+        title={`Supplier Ledger — ${viewFor?.supplier ?? ''}`}
+        description={viewDetail
+          ? `Outstanding ${formatCurrency(viewDetail.outstanding)} · ${viewDetail.payments.length} payment(s) recorded`
+          : 'Loading payment history…'}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setViewFor(null); setViewDetail(null) }}>Close</Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-4">
             <div>
               <p className="mb-2 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -494,11 +492,7 @@ export default function SupplierDuesPage() {
               </div>
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => { setViewFor(null); setViewDetail(null) }}>Close</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

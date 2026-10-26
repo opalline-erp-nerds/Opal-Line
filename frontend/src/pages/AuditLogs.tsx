@@ -9,13 +9,8 @@ import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
 import type { AuditLogEntry } from '@/types'
@@ -204,12 +199,18 @@ export default function AuditLogsPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={viewLog !== null} onOpenChange={(open) => { if (!open) setViewLog(null) }}>
-        <DialogContent size="lg">
-          <DialogHeader>
-            <DialogTitle>{viewLog?.action}</DialogTitle>
-            <DialogDescription>{viewLog ? formatDateTime(viewLog.timestamp) : ''}</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={viewLog !== null}
+        onOpenChange={(open) => { if (!open) setViewLog(null) }}
+        size="lg"
+        title={viewLog?.action ?? ''}
+        description={viewLog ? formatDateTime(viewLog.timestamp) : ''}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setViewLog(null)}>Close</Button>
+          </DialogFooter>
+        }
+      >
           {viewLog && (
             <div className="space-y-2 text-sm">
               <div className="flex justify-between"><span className="text-muted-foreground">User</span><span className="font-medium">{viewLog.user}</span></div>
@@ -222,8 +223,7 @@ export default function AuditLogsPage() {
               </div>
             </div>
           )}
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

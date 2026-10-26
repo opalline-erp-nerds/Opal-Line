@@ -3,10 +3,10 @@ import PDFDocument from 'pdfkit'
 import { getRawClient } from './db/client'
 import { logger } from './logger'
 
+ 
 export interface ProductLabel {
   name: string
   sku: string
-  barcode?: string
   price: number
   weight?: number
   category?: string
@@ -27,7 +27,6 @@ interface LabelOptions {
   showPrice: boolean
   showWeight: boolean
   showQR: boolean
-  showBarcode: boolean
   showBrand: boolean
   brand: string
   copies: number
@@ -44,7 +43,6 @@ const DEFAULT_OPTIONS: LabelOptions = {
   showPrice: true,
   showWeight: true,
   showQR: true,
-  showBarcode: true,
   showBrand: true,
   brand: 'OPAL LINE',
   copies: 1,
@@ -71,7 +69,7 @@ const DEFAULT_OPTIONS: LabelOptions = {
 // at 14.75 mm. That content block (52.4 mm of artwork) is mapped into the real
 // 50 mm label — a uniform 0.897× horizontal compression with every height and
 // the reference's left-to-right ordering preserved. Its two right-hand lines
-// share one left edge because a production barcode (12 characters) is longer
+// share one left edge because a production SKU (10+ characters) needs more
 // than the 7-character sample and would otherwise collide with the QR symbol.
 
 /** Helvetica cap height, as a fraction of the em size (Adobe AFM metrics). */
@@ -325,6 +323,9 @@ export function designFieldTexts(
         if (opts.showPrice !== false) out.push({ kind: 'rate', text: formatLabelRate(product.price) })
         break
       case 'code': {
+        // The printed code IS the SKU (the same value the QR encodes). It is
+        // never truncated: `codeLength` only applies when a caller explicitly
+        // asks for a shortened rendering.
         const rawCode = labelCode(product)
         const code = opts.codeLength ? rawCode.slice(0, opts.codeLength) : rawCode
         // The slim 50×10 reference prints the bare identifier; every other size
@@ -385,7 +386,6 @@ export const LABEL_PRESETS: Record<string, LabelPresetOptions> = {
     rows: 28,
     label: '50 × 10 mm · Compact',
     brand: 'OPAL LINE',
-    codeLength: 3,
     reference: true,
   },
   // Existing sizes (kept for backwards compatibility)
@@ -454,7 +454,6 @@ function mapRow(p: any): ProductLabel {
   return {
     name: p.name || 'Product',
     sku: p.sku || '',
-    barcode: p.barcode || undefined,
     price: Number(p.selling_price || 0),
     weight: Number(p.net_weight || 0),
     category: p.category || undefined,
@@ -469,7 +468,7 @@ export async function fetchProductLabels(productIds: string[]): Promise<ProductL
   if (!client || productIds.length === 0) return []
   try {
     const products = await client.unsafe(
-      `SELECT name, sku, barcode, selling_price, net_weight, category, collection, hsn, huid FROM products WHERE id = ANY($1)`,
+      `SELECT name, sku, selling_price, net_weight, category, collection, hsn, huid FROM products WHERE id = ANY($1)`,
       [productIds]
     )
     // Preserve the caller's order — the printed sheet should match the order the
@@ -488,7 +487,7 @@ export async function fetchAllProductLabels(): Promise<ProductLabel[]> {
   if (!client) return []
   try {
     const products = await client.unsafe(
-      `SELECT name, sku, barcode, selling_price, net_weight, category, collection, hsn, huid FROM products ORDER BY name`
+      `SELECT name, sku, selling_price, net_weight, category, collection, hsn, huid FROM products ORDER BY name`
     )
     return products.map(mapRow)
   } catch (err) {
@@ -506,11 +505,13 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /**
- * The identifier a label encodes. Prefer the product's stable barcode; fall back
- * to the SKU so a label is never printed with an empty scannable code.
+ * The identifier a label encodes. QR labels ALWAYS encode the product's SKU
+ * (e.g. `OL-RNG-001`) — barcodes were removed from the product workflow, so
+ * the SKU is the single scannable identity and scanning one resolves the
+ * product through an exact SKU match.
  */
-export function labelCode(product: Pick<ProductLabel, 'barcode' | 'sku'>): string {
-  return (product.barcode && product.barcode.trim()) || (product.sku ?? '').trim()
+export function labelCode(product: Pick<ProductLabel, 'sku'>): string {
+  return (product.sku ?? '').trim()
 }
 
 /**
@@ -587,7 +588,6 @@ export interface LabelLine {
 export interface LabelLineInput {
   name: string
   sku: string
-  barcode?: string
   price: number
   weight?: number
   category?: string
@@ -749,7 +749,6 @@ function drawLabel(
     {
       name: product.name,
       sku: product.sku,
-      barcode: product.barcode,
       price: product.price,
       weight: product.weight,
       category: product.category,

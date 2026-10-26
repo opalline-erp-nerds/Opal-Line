@@ -1,5 +1,5 @@
 import { Router, type Response } from 'express'
-import { and, asc, desc, eq, gte, ne, sql, type AnyColumn, type SQL } from 'drizzle-orm'
+import { and, asc, desc, eq, gte, ilike, inArray, lt, ne, or, sql, type AnyColumn, type SQL } from 'drizzle-orm'
 import { db, schema } from '../db/client'
 import { CONSTANTS } from '../constants'
 import { logger } from '../logger'
@@ -36,12 +36,18 @@ function localDayStart(offsetDays = 0) {
 }
 
 const num = (v: unknown): number => Number(v ?? 0) || 0
+const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
 // SQL aggregation note: dates are stored as local-naive 'YYYY-MM-DD HH:MM:SS'
 // timestamps (drizzle timestamp mode:'string'). The dashboard page endpoints
 // aggregate in SQL against proper timestamp literals, so results are immune to
 // the string-format quirks ('T' vs ' ') that JS-side string compares had.
 const OUTSTANDING_WHERE = sql`(payment_status in ('pending','partial') or status = 'overdue')`
+
+// One receivable definition everywhere: the unpaid part of open invoices,
+// after successful payments. Shared by the Outstanding KPI, the summary strip
+// and the Receivable Summary so their totals and counts always agree.
+const UNPAID_INVOICE = sql`greatest(coalesce(${schema.salesInvoices.grandTotal}, 0) - coalesce((select sum(coalesce(${schema.payments.amount}, 0)) from ${schema.payments} where ${schema.payments.invoice} = ${schema.salesInvoices.number} and ${schema.payments.status} = 'success'), 0), 0)`
 
 // B2B vs B2C GST split heuristic. The JS pattern is the original matcher; the
 // string form runs the same alternation in Postgres via case-insensitive ~*.
@@ -66,6 +72,19 @@ function rangeFromQuery(req: { query: unknown }, res: Response, defaultPeriod?: 
     return null
   }
   return resolved.range
+}
+
+function bucketFormat(range: DashboardRange): string {
+  return range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD'
+}
+
+/** Fill every chart bucket from SQL sums, so flat/empty days still render. */
+function seriesPoints(range: DashboardRange, values: Map<string, number>) {
+  return enumerateBuckets(range).map((b) => ({
+    date: b.date,
+    label: b.label,
+    value: round2(values.get(b.key) ?? 0),
+  }))
 }
 
 /** Percentage delta and trend vs the equivalent previous window. A non-positive
@@ -140,7 +159,10 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
       returnsTotal(range.from, range.to),
       returnsTotal(range.prevFrom, range.prevTo),
       db!.select({ n: sql<number>`count(*)` }).from(schema.products).where(lowStockWhere()),
-      db!.select({ total: sql<number>`coalesce(sum(grand_total), 0)`, count: sql<number>`count(*)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      db!.select({
+        total: sql<number>`coalesce(sum(${UNPAID_INVOICE}), 0)`,
+        count: sql<number>`count(*) filter (where ${UNPAID_INVOICE} > 0)`,
+      }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
     ])
 
     // Returns (credit notes) reduce the period's sales, so a returned sale
@@ -167,8 +189,8 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
       { key: 'orders', label: 'Orders', value: String(curOrders), trend: orderCompare.trend, delta: orderCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'shopping-bag', accent: 'blue' },
       { key: 'invoices', label: 'Invoices', value: String(cur.count), trend: invoiceCompare.trend, delta: invoiceCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'file-text', accent: 'green' },
       { key: 'grossProfit', label: 'Gross Profit', value: hasCost ? inr(cur.profit) : 'N/A', trend: profitCompare.trend, delta: profitCompare.delta, deltaLabel: profitCaption, rangeLabel: range.label, icon: 'trending-up', accent: 'orange' },
-      { key: 'outstanding', label: 'Outstanding', value: inr(outstanding), trend: 'flat', delta: '—', deltaLabel: `${outstandingCount} invoices`, rangeLabel: range.label, icon: 'clock', accent: 'red' },
-      { key: 'lowStock', label: 'Low Stock Items', value: String(Number(lowStockRows[0]?.n ?? 0)), trend: 'flat', delta: '—', deltaLabel: 'Needs Reorder', rangeLabel: range.label, icon: 'package-x', accent: 'slate' },
+      { key: 'outstanding', label: 'Outstanding', value: inr(outstanding), trend: 'flat', delta: '—', deltaLabel: `${outstandingCount} invoices`, rangeLabel: 'As of now', icon: 'clock', accent: 'red' },
+      { key: 'lowStock', label: 'Low Stock Items', value: String(Number(lowStockRows[0]?.n ?? 0)), trend: 'flat', delta: '—', deltaLabel: 'Needs Reorder', rangeLabel: 'As of now', icon: 'package-x', accent: 'slate' },
     ])
   } catch {
     res.status(500).json({ error: 'Internal server error' })
@@ -184,7 +206,7 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
     const todayEnd = localDayStart(1)
     // Aggregated in SQL: full-table loads here scaled with every product,
     // customer, supplier, expense and invoice row for a handful of numbers.
-    const [productAgg, customerAgg, supplierAgg, expenseAgg, outstandingRows, orderAgg, invoiceAgg] = await Promise.all([
+    const [productAgg, customerAgg, supplierAgg, expenseAgg, outstandingRows, orderAgg, invoiceAgg, lastSyncRows] = await Promise.all([
       db!.select({
         total: sql<number>`count(*)`,
         active: sql<number>`count(*) filter (where status = 'active')`,
@@ -203,9 +225,10 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
         today: sql<number>`coalesce(sum(coalesce(amount, 0)) filter (where date >= ${todayStart} and date < ${todayEnd}), 0)`,
         ranged: sql<number>`coalesce(sum(coalesce(amount, 0)) filter (where date >= ${range.from} and date < ${range.to}), 0)`,
       }).from(schema.expenses),
-      db!.select({ total: sql<number>`coalesce(sum(grand_total), 0)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      db!.select({ total: sql<number>`coalesce(sum(${UNPAID_INVOICE}), 0)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
       db!.select({ total: sql<number>`count(*)` }).from(schema.salesOrders),
       db!.select({ total: sql<number>`count(*)` }).from(schema.salesInvoices),
+      db!.select({ at: sql<string | null>`max(${schema.syncLogs.time})` }).from(schema.syncLogs),
     ])
 
     res.json({
@@ -225,6 +248,7 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
       // orders but no invoices (e.g. all unpaid), so both are reported.
       totalOrders: Number(orderAgg[0]?.total ?? 0),
       totalInvoices: Number(invoiceAgg[0]?.total ?? 0),
+      lastSyncAt: lastSyncRows[0]?.at ?? null,
     })
   } catch {
     res.status(500).json({ error: 'Internal server error' })
@@ -327,6 +351,7 @@ dashboardRouter.get('/dashboard/top-products', async (req, res) => {
         qty: sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.qty}, 0)), 0)`,
         weight: sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.weight}, 0)), 0)`,
         revenue: sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0)), 0)`,
+        image: sql<string | null>`max(${schema.products.image})`,
       })
       .from(schema.salesInvoiceItems)
       .innerJoin(schema.salesInvoices, eq(schema.salesInvoices.id, schema.salesInvoiceItems.invoiceId))
@@ -339,7 +364,7 @@ dashboardRouter.get('/dashboard/top-products', async (req, res) => {
       ))
       .groupBy(sql`lower(${schema.salesInvoiceItems.sku})`)
       .orderBy(sql`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0)), 0) desc`)
-      .limit(5)
+      .limit(8)
 
     res.json(
       rows.map((r) => ({
@@ -349,6 +374,7 @@ dashboardRouter.get('/dashboard/top-products', async (req, res) => {
         qty: num(r.qty),
         weight: round2(num(r.weight)),
         revenue: round2(num(r.revenue)),
+        image: r.image ?? null,
         icon: iconFor(r.name, r.category),
       })),
     )
@@ -390,6 +416,435 @@ dashboardRouter.get('/dashboard/top-category', async (req, res) => {
         revenue: round2(num(r.revenue)),
       })),
     )
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── Dashboard summary widgets ──────────────────────────────────────────
+// Every list below is aggregated and limited in SQL (five rows, six for recent
+// invoices) and every daily series is grouped by the shared range buckets.
+
+const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+function parseMonthParam(value: unknown): { year: number; month: number } | null {
+  const m = /^(\d{4})-(\d{2})$/.exec(String(value ?? ''))
+  if (!m) return null
+  const year = Number(m[1])
+  const month = Number(m[2])
+  if (month < 1 || month > 12 || year < 2000 || year > 2100) return null
+  return { year, month }
+}
+
+function yearStart(year: number): string {
+  return `${year}-01-01T00:00:00`
+}
+
+/** Grouped Online vs In-store orders for the Order Summary card. */
+dashboardRouter.get('/dashboard/order-summary', async (req, res) => {
+  if (!requireDb(res)) return
+  const rawGrain = String(req.query.grain ?? 'week')
+  const grain = rawGrain === 'month' || rawGrain === 'year' ? rawGrain : 'week'
+  const requestedMonth = req.query.month ? parseMonthParam(req.query.month) : null
+  if (req.query.month && !requestedMonth) return res.status(400).json({ error: 'month must be YYYY-MM' })
+  const anchor = requestedMonth ?? parseMonthParam(new Date().toISOString().slice(0, 7))
+  if (!anchor) return res.status(400).json({ error: 'month must be YYYY-MM' })
+
+  let from: string
+  let to: string
+  let labels: string[]
+  let bucketSql: SQL<number>
+  let label: string
+
+  if (grain === 'week') {
+    const start = new Date(anchor.year, anchor.month - 1, 1)
+    const end = new Date(anchor.year, anchor.month, 1)
+    from = `${anchor.year}-${pad(anchor.month)}-01T00:00:00`
+    to = `${end.getFullYear()}-${pad(end.getMonth() + 1)}-01T00:00:00`
+    labels = ['01–07', '08–15', '16–23', '24–end']
+    bucketSql = sql<number>`least(3, floor((extract(day from ${schema.salesOrders.date}) - 1) / 7))::int`
+    label = `${MONTH_LABELS[anchor.month - 1]} ${start.getFullYear()}`
+  } else if (grain === 'month') {
+    from = yearStart(anchor.year)
+    to = yearStart(anchor.year + 1)
+    labels = MONTH_LABELS
+    bucketSql = sql<number>`extract(month from ${schema.salesOrders.date})::int`
+    label = String(anchor.year)
+  } else {
+    from = yearStart(anchor.year - 4)
+    to = yearStart(anchor.year + 1)
+    labels = Array.from({ length: 5 }, (_, i) => String(anchor.year - 4 + i))
+    bucketSql = sql<number>`extract(year from ${schema.salesOrders.date})::int`
+    label = `${anchor.year - 4}–${anchor.year}`
+  }
+
+  try {
+    const rows = await db!
+      .select({
+        bucket: bucketSql,
+        online: sql<number>`count(*) filter (where ${schema.salesOrders.shopifyId} is not null)`,
+        inStore: sql<number>`count(*) filter (where ${schema.salesOrders.shopifyId} is null)`,
+        revenue: sql<number>`coalesce(sum(coalesce(${schema.salesOrders.value}, 0)), 0)`,
+      })
+      .from(schema.salesOrders)
+      .where(and(gte(schema.salesOrders.date, from), lt(schema.salesOrders.date, to)))
+      .groupBy(sql`1`)
+      .orderBy(sql`1`)
+
+    const byBucket = new Map<number, { online: number; inStore: number; revenue: number }>()
+    for (const r of rows) byBucket.set(Number(r.bucket), { online: Number(r.online), inStore: Number(r.inStore), revenue: num(r.revenue) })
+
+    const points = labels.map((l, i) => {
+      const bucket = grain === 'year' ? anchor.year - 4 + i : i + 1
+      const row = byBucket.get(bucket)
+      return {
+        label: l,
+        online: row?.online ?? 0,
+        inStore: row?.inStore ?? 0,
+        revenue: round2(row?.revenue ?? 0),
+      }
+    })
+
+    res.json({ grain, label, points })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/** Latest supplier payments: daily spend series + payment/purchase status rows. */
+dashboardRouter.get('/dashboard/supplier-payments', async (req, res) => {
+  if (!requireDb(res)) return
+  const range = rangeFromQuery(req, res, 'last30')
+  if (!range) return
+  const q = String(req.query.q ?? '').trim()
+  const status = String(req.query.status ?? 'all')
+
+  try {
+    const [seriesRows, rows] = await Promise.all([
+      db!
+        .select({
+          bucket: sql<string>`to_char(${schema.supplierPayments.date}, ${bucketFormat(range)})`,
+          value: sql<number>`coalesce(sum(coalesce(${schema.supplierPayments.amount}, 0)), 0)`,
+        })
+        .from(schema.supplierPayments)
+        .where(and(gte(schema.supplierPayments.date, range.from), lt(schema.supplierPayments.date, range.to)))
+        .groupBy(sql`1`),
+      db!
+        .select({
+          id: schema.supplierPayments.id,
+          ref: schema.supplierPayments.ref,
+          supplier: schema.supplierPayments.supplier,
+          amount: schema.supplierPayments.amount,
+          method: schema.supplierPayments.method,
+          date: schema.supplierPayments.date,
+        })
+        .from(schema.supplierPayments)
+        .where(and(
+          gte(schema.supplierPayments.date, range.from),
+          lt(schema.supplierPayments.date, range.to),
+          q
+            ? or(
+                ilike(schema.supplierPayments.supplier, `%${q}%`),
+                ilike(schema.supplierPayments.ref, `%${q}%`),
+              )
+            : undefined,
+        ))
+        .orderBy(desc(schema.supplierPayments.date))
+        .limit(100),
+    ])
+
+    const allocated = new Map<string, number>()
+    const invoiceStatuses = new Map<string, string[]>()
+    const ids = rows.map((r) => r.id)
+    if (ids.length > 0) {
+      const allocations = await db!
+        .select({
+          paymentId: schema.supplierPaymentAllocations.paymentId,
+          amount: schema.supplierPaymentAllocations.amount,
+          invoiceStatus: schema.purchaseInvoices.status,
+        })
+        .from(schema.supplierPaymentAllocations)
+        .leftJoin(schema.purchaseInvoices, eq(schema.purchaseInvoices.id, schema.supplierPaymentAllocations.invoiceId))
+        .where(inArray(schema.supplierPaymentAllocations.paymentId, ids))
+      for (const a of allocations) {
+        allocated.set(a.paymentId, (allocated.get(a.paymentId) ?? 0) + num(a.amount))
+        if (a.invoiceStatus) {
+          const list = invoiceStatuses.get(a.paymentId) ?? []
+          list.push(a.invoiceStatus)
+          invoiceStatuses.set(a.paymentId, list)
+        }
+      }
+    }
+
+    const list = rows
+      .map((r) => {
+        const paid = allocated.get(r.id) ?? 0
+        const amount = num(r.amount)
+        const paymentStatus = paid >= amount - 0.01 ? 'settled' : paid > 0 ? 'partial' : 'unallocated'
+        const statuses = invoiceStatuses.get(r.id) ?? []
+        const purchaseStatus = statuses.includes('received')
+          ? 'received'
+          : statuses.includes('open')
+            ? 'open'
+            : statuses.includes('cancelled')
+              ? 'cancelled'
+              : 'unallocated'
+        return {
+          id: r.id,
+          ref: r.ref ?? r.id,
+          supplier: r.supplier ?? 'Unknown supplier',
+          purchaseStatus,
+          paymentStatus,
+          method: r.method ?? '—',
+          total: round2(amount),
+          date: r.date,
+        }
+      })
+      .filter((r) => status === 'all' || r.paymentStatus === status)
+      .slice(0, 5)
+
+    const values = new Map(seriesRows.map((r) => [String(r.bucket ?? ''), num(r.value)]))
+    res.json({ points: seriesPoints(range, values), rows: list })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/** Purchase order status donut + five latest incoming orders. */
+dashboardRouter.get('/dashboard/purchase-orders', async (req, res) => {
+  if (!requireDb(res)) return
+  const range = rangeFromQuery(req, res, 'last30')
+  if (!range) return
+  try {
+    const [segments, rows] = await Promise.all([
+      db!
+        .select({
+          status: sql<string>`coalesce(${schema.purchaseOrders.status}, 'open')`,
+          count: sql<number>`count(*)`,
+          value: sql<number>`coalesce(sum(coalesce(${schema.purchaseOrders.grandTotal}, 0)), 0)`,
+        })
+        .from(schema.purchaseOrders)
+        .where(and(gte(schema.purchaseOrders.date, range.from), lt(schema.purchaseOrders.date, range.to)))
+        .groupBy(sql`coalesce(${schema.purchaseOrders.status}, 'open')`)
+        .orderBy(sql`count(*) desc`),
+      db!
+        .select({
+          id: schema.purchaseOrders.id,
+          number: schema.purchaseOrders.number,
+          supplier: schema.purchaseOrders.supplier,
+          expectedDate: schema.purchaseOrders.expectedDate,
+          status: schema.purchaseOrders.status,
+          total: schema.purchaseOrders.grandTotal,
+          date: schema.purchaseOrders.date,
+        })
+        .from(schema.purchaseOrders)
+        .where(and(gte(schema.purchaseOrders.date, range.from), lt(schema.purchaseOrders.date, range.to)))
+        .orderBy(desc(schema.purchaseOrders.date))
+        .limit(5),
+    ])
+    res.json({
+      segments: segments.map((s) => ({ status: s.status, count: Number(s.count), value: round2(num(s.value)) })),
+      rows: rows.map((r) => ({
+        id: r.id,
+        number: r.number,
+        supplier: r.supplier ?? 'Unknown supplier',
+        expectedDate: r.expectedDate,
+        status: r.status ?? 'open',
+        total: round2(num(r.total)),
+        date: r.date,
+      })),
+    })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/** Latest customer collections: daily receipts + fulfilment/payment status rows. */
+dashboardRouter.get('/dashboard/customer-payments', async (req, res) => {
+  if (!requireDb(res)) return
+  const range = rangeFromQuery(req, res, 'last30')
+  if (!range) return
+  const q = String(req.query.q ?? '').trim()
+  const status = String(req.query.status ?? 'all')
+
+  try {
+    const [seriesRows, rows] = await Promise.all([
+      db!
+        .select({
+          bucket: sql<string>`to_char(${schema.payments.date}, ${bucketFormat(range)})`,
+          value: sql<number>`coalesce(sum(coalesce(${schema.payments.amount}, 0)), 0)`,
+        })
+        .from(schema.payments)
+        .where(and(gte(schema.payments.date, range.from), lt(schema.payments.date, range.to)))
+        .groupBy(sql`1`),
+      db!
+        .select({
+          id: schema.payments.id,
+          ref: schema.payments.ref,
+          customer: schema.payments.customer,
+          invoice: schema.payments.invoice,
+          invoiceCustomer: schema.salesInvoices.customer,
+          amount: schema.payments.amount,
+          method: schema.payments.method,
+          status: schema.payments.status,
+          date: schema.payments.date,
+          fulfillment: schema.salesOrders.fulfillment,
+        })
+        .from(schema.payments)
+        .leftJoin(schema.salesInvoices, eq(schema.salesInvoices.number, schema.payments.invoice))
+        .leftJoin(
+          schema.salesOrders,
+          or(
+            eq(schema.salesOrders.shopifyId, schema.salesInvoices.shopifyOrder),
+            eq(schema.salesOrders.internalId, schema.salesInvoices.shopifyOrder),
+          ),
+        )
+        .where(and(
+          gte(schema.payments.date, range.from),
+          lt(schema.payments.date, range.to),
+          q
+            ? or(
+                ilike(schema.payments.customer, `%${q}%`),
+                ilike(schema.payments.ref, `%${q}%`),
+                ilike(schema.payments.invoice, `%${q}%`),
+              )
+            : undefined,
+          status !== 'all' ? sql`lower(coalesce(${schema.payments.status}, '')) = ${status}` : undefined,
+        ))
+        .orderBy(desc(schema.payments.date))
+        .limit(5),
+    ])
+
+    const values = new Map(seriesRows.map((r) => [String(r.bucket ?? ''), num(r.value)]))
+    res.json({
+      points: seriesPoints(range, values),
+      rows: rows.map((r) => ({
+        id: r.id,
+        ref: r.ref ?? r.id,
+        customer: r.customer ?? r.invoiceCustomer ?? 'Unknown customer',
+        invoice: r.invoice ?? '—',
+        fulfillment: r.fulfillment ?? '—',
+        paymentStatus: r.status ?? 'pending',
+        method: r.method ?? '—',
+        total: round2(num(r.amount)),
+        date: r.date,
+      })),
+    })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/** Sales order status donut + latest orders. */
+dashboardRouter.get('/dashboard/sales-orders', async (req, res) => {
+  if (!requireDb(res)) return
+  const range = rangeFromQuery(req, res, 'last30')
+  if (!range) return
+  try {
+    const [segments, rows] = await Promise.all([
+      db!
+        .select({
+          status: sql<string>`coalesce(${schema.salesOrders.status}, 'imported')`,
+          count: sql<number>`count(*)`,
+          value: sql<number>`coalesce(sum(coalesce(${schema.salesOrders.value}, 0)), 0)`,
+        })
+        .from(schema.salesOrders)
+        .where(and(gte(schema.salesOrders.date, range.from), lt(schema.salesOrders.date, range.to)))
+        .groupBy(sql`coalesce(${schema.salesOrders.status}, 'imported')`)
+        .orderBy(sql`count(*) desc`),
+      db!
+        .select({
+          id: schema.salesOrders.id,
+          number: schema.salesOrders.internalId,
+          shopifyId: schema.salesOrders.shopifyId,
+          customer: schema.salesOrders.customer,
+          fulfillment: schema.salesOrders.fulfillment,
+          status: schema.salesOrders.status,
+          total: schema.salesOrders.value,
+          date: schema.salesOrders.date,
+        })
+        .from(schema.salesOrders)
+        .where(and(gte(schema.salesOrders.date, range.from), lt(schema.salesOrders.date, range.to)))
+        .orderBy(desc(schema.salesOrders.date))
+        .limit(5),
+    ])
+    res.json({
+      segments: segments.map((s) => ({ status: s.status, count: Number(s.count), value: round2(num(s.value)) })),
+      rows: rows.map((r) => ({
+        id: r.id,
+        number: r.number ?? r.shopifyId ?? r.id,
+        customer: r.customer ?? 'Unknown customer',
+        fulfillment: r.fulfillment ?? 'unfulfilled',
+        status: r.status ?? 'imported',
+        total: round2(num(r.total)),
+        date: r.date,
+      })),
+    })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/** Recent invoices: mini value series + six latest invoices (row opens detail). */
+dashboardRouter.get('/dashboard/recent-invoices', async (req, res) => {
+  if (!requireDb(res)) return
+  const range = rangeFromQuery(req, res, 'last30')
+  if (!range) return
+  try {
+    const [seriesRows, rows] = await Promise.all([
+      db!
+        .select({
+          bucket: sql<string>`to_char(${schema.salesInvoices.date}, ${bucketFormat(range)})`,
+          value: sql<number>`coalesce(sum(coalesce(${schema.salesInvoices.grandTotal}, 0)), 0)`,
+        })
+        .from(schema.salesInvoices)
+        .where(and(
+          gte(schema.salesInvoices.date, range.from),
+          lt(schema.salesInvoices.date, range.to),
+          NOT_VOIDED,
+        ))
+        .groupBy(sql`1`),
+      db!
+        .select({
+          id: schema.salesInvoices.id,
+          number: schema.salesInvoices.number,
+          customer: schema.salesInvoices.customer,
+          total: schema.salesInvoices.grandTotal,
+          paymentStatus: schema.salesInvoices.paymentStatus,
+          status: schema.salesInvoices.status,
+          date: schema.salesInvoices.date,
+        })
+        .from(schema.salesInvoices)
+        .where(and(
+          gte(schema.salesInvoices.date, range.from),
+          lt(schema.salesInvoices.date, range.to),
+          NOT_VOIDED,
+        ))
+        .orderBy(desc(schema.salesInvoices.date))
+        .limit(6),
+    ])
+
+    const values = new Map(seriesRows.map((r) => [String(r.bucket ?? ''), num(r.value)]))
+    const invoiceRows = rows.map((r) => ({
+      id: r.id,
+      number: r.number,
+      customer: r.customer ?? 'Walk-in customer',
+      total: round2(num(r.total)),
+      paymentStatus: r.paymentStatus ?? 'pending',
+      status: r.status ?? 'issued',
+      date: r.date,
+    }))
+    res.json({
+      points: seriesPoints(range, values),
+      // One bar per latest invoice so the chart can colour by payment state.
+      statusPoints: invoiceRows.map((r) => ({
+        date: r.date ?? '',
+        label: r.number ?? '',
+        value: r.total,
+        status: r.paymentStatus,
+      })),
+      rows: invoiceRows,
+    })
   } catch {
     res.status(500).json({ error: 'Internal server error' })
   }
@@ -443,12 +898,27 @@ dashboardRouter.get('/dashboard/payment-status', async (req, res) => {
 })
 
 // ── Silver Rate History ────────────────────────────────────────────────
-// One point per IST calendar day for the last `days` days (7 | 30 | 90).
-// silver_rates only records *changes*, so days without an update
-// forward-fill the last known rate (and rates from before the window carry
-// in); days before the first rate ever recorded are omitted — we never
-// invent history. No rates at all → `{ days, points: [] }`.
+// One point per IST calendar day for either a preset window (7 | 30 | 90
+// days ending today) or an explicit inclusive `from`/`to` custom range
+// (max 365 days, capped at today). silver_rates only records *changes*, so
+// days without an update forward-fill the last known rate (and rates from
+// before the window carry in); days before the first rate ever recorded are
+// omitted — we never invent history. No rates at all → `{ days, points: [] }`.
 const SILVER_HISTORY_WINDOWS = [7, 30, 90]
+const SILVER_HISTORY_MAX_DAYS = 365
+
+function parseISODay(value: unknown): string | null {
+  const raw = String(value ?? '')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null
+  const d = new Date(`${raw}T00:00:00Z`)
+  return Number.isNaN(d.getTime()) ? null : raw
+}
+
+function daysBetweenIso(from: string, to: string): number {
+  const a = new Date(`${from}T00:00:00Z`).getTime()
+  const b = new Date(`${to}T00:00:00Z`).getTime()
+  return Math.round((b - a) / 86400000) + 1
+}
 
 function shiftIsoDay(dayKey: string, deltaDays: number): string {
   const d = new Date(`${dayKey}T00:00:00Z`)
@@ -458,10 +928,38 @@ function shiftIsoDay(dayKey: string, deltaDays: number): string {
 
 dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
   if (!requireDb(res)) return
-  const days = Number(req.query.days ?? 7)
-  if (!SILVER_HISTORY_WINDOWS.includes(days)) {
-    return res.status(400).json({ error: 'days must be one of 7, 30, 90' })
+
+  const today = istDayKey(new Date())
+  const wantsCustom = req.query.from != null || req.query.to != null
+  let days: number
+  let start: string
+  let end: string
+
+  if (wantsCustom) {
+    const from = parseISODay(req.query.from)
+    const to = parseISODay(req.query.to)
+    if (!from || !to) {
+      return res.status(400).json({ error: 'from and to must be valid YYYY-MM-DD dates' })
+    }
+    if (to < from) {
+      return res.status(400).json({ error: 'to must be on or after from' })
+    }
+    days = daysBetweenIso(from, to)
+    if (days > SILVER_HISTORY_MAX_DAYS) {
+      return res.status(400).json({ error: `Custom range cannot exceed ${SILVER_HISTORY_MAX_DAYS} days` })
+    }
+    start = from
+    // Never invent future points: a range ending later still stops at today.
+    end = to > today ? today : to
+  } else {
+    days = Number(req.query.days ?? 7)
+    if (!SILVER_HISTORY_WINDOWS.includes(days)) {
+      return res.status(400).json({ error: 'days must be one of 7, 30, 90' })
+    }
+    start = shiftIsoDay(today, -(days - 1))
+    end = today
   }
+
   try {
     const rows = await db!
       .select({ rate: schema.silverRates.rate, updatedAt: schema.silverRates.updatedAt })
@@ -482,9 +980,6 @@ dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
     }
     const entries = [...byDay.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
 
-    const today = istDayKey(new Date())
-    const start = shiftIsoDay(today, -(days - 1))
-
     const points: Array<{ date: string; rate: number }> = []
     let carry: number | null = null
     let i = 0
@@ -492,7 +987,7 @@ dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
       carry = entries[i][1]
       i += 1
     }
-    for (let day = start; day <= today; day = shiftIsoDay(day, 1)) {
+    for (let day = start; day <= end; day = shiftIsoDay(day, 1)) {
       while (i < entries.length && entries[i][0] === day) {
         carry = entries[i][1]
         i += 1
@@ -599,48 +1094,114 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
   const range = rangeFromQuery(req, res)
   if (!range) return
   try {
-    // Every activity in the selected period, newest first (no fixed cap).
-    // Two sources feed the feed: activity_logs (recordActivity — auth, sales,
-    // system, backup and RBAC operations) and audit_logs (recordAudit — the
-    // Shopify sync events plus legacy seeded rows), merged newest-first.
-    const [activityRows, auditRows] = await Promise.all([
-      db!
-        .select({
-          id: schema.activityLogs.id,
-          timestamp: schema.activityLogs.timestamp,
-          user: schema.activityLogs.user,
-          action: schema.activityLogs.action,
-          module: schema.activityLogs.module,
-          entity: schema.activityLogs.entity,
-          detail: schema.activityLogs.details,
-        })
-        .from(schema.activityLogs)
-        .where(and(gte(schema.activityLogs.timestamp, range.from), sql`${schema.activityLogs.timestamp} < ${range.to}`)),
-      db!
-        .select({
-          id: schema.auditLogs.id,
-          timestamp: schema.auditLogs.timestamp,
-          user: schema.auditLogs.user,
-          action: schema.auditLogs.action,
-          module: schema.auditLogs.module,
-          entity: schema.auditLogs.entity,
-          detail: schema.auditLogs.changes,
-        })
-        .from(schema.auditLogs)
-        .where(and(gte(schema.auditLogs.timestamp, range.from), sql`${schema.auditLogs.timestamp} < ${range.to}`)),
-    ])
-    const logs = [...activityRows, ...auditRows].sort(newestFirst)
-    res.json(
-      logs.map((l) => ({
-        id: l.id,
-        type: activityType(l.module, l.action),
-        title: `${l.action ?? 'Activity'}${l.entity && !String(l.action ?? '').includes(l.entity) ? ` · ${l.entity}` : ''}`,
-        detail: l.detail ?? undefined,
-        actor: l.user ?? 'System',
-        time: friendlyTime(l.timestamp),
-      })),
+    const q = req.query as Record<string, unknown>
+    const limit = clamp(Number(q.limit ?? 8) || 8, 1, 100)
+    const latest = q.scope === 'latest'
+    const cursor = typeof q.cursor === 'string' ? q.cursor.trim() : ''
+    let cursorTs: string | null = null
+    let cursorId: string | null = null
+    if (cursor) {
+      try {
+        const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+          t: string
+          i: string
+        }
+        if (parsed?.t && parsed?.i) {
+          cursorTs = parsed.t
+          cursorId = parsed.i
+        }
+      } catch {
+        cursorTs = null
+        cursorId = null
+      }
+    }
+
+    // Merge activity_logs and audit_logs by (timestamp, id) desc using UNION ALL
+    // for stable cursor pagination.
+    const actWindow = latest
+      ? sql`true`
+      : and(gte(schema.activityLogs.timestamp, range.from), sql`${schema.activityLogs.timestamp} < ${range.to}`)
+    const audWindow = latest
+      ? sql`true`
+      : and(gte(schema.auditLogs.timestamp, range.from), sql`${schema.auditLogs.timestamp} < ${range.to}`)
+    const actWhere = and(
+      actWindow,
+      cursorTs && cursorId
+        ? sql`(${schema.activityLogs.timestamp} < ${cursorTs} OR (${schema.activityLogs.timestamp} = ${cursorTs} AND ${schema.activityLogs.id} < ${cursorId}))`
+        : sql`true`,
     )
-  } catch {
+    const audWhere = and(
+      audWindow,
+      cursorTs && cursorId
+        ? sql`(${schema.auditLogs.timestamp} < ${cursorTs} OR (${schema.auditLogs.timestamp} = ${cursorTs} AND ${schema.auditLogs.id} < ${cursorId}))`
+        : sql`true`,
+    )
+
+    // Count total in range (for "Showing X of total")
+    const [totalAct, totalAud] = await Promise.all([
+      db!.select({ n: sql<number>`count(*)` }).from(schema.activityLogs).where(actWindow),
+      db!.select({ n: sql<number>`count(*)` }).from(schema.auditLogs).where(audWindow),
+    ])
+    const total = Number(totalAct[0]?.n ?? 0) + Number(totalAud[0]?.n ?? 0)
+
+    const actSelect = db!
+      .select({
+        id: schema.activityLogs.id,
+        timestamp: schema.activityLogs.timestamp,
+        user: schema.activityLogs.user,
+        action: schema.activityLogs.action,
+        module: schema.activityLogs.module,
+        entity: schema.activityLogs.entity,
+        detail: schema.activityLogs.details,
+      })
+      .from(schema.activityLogs)
+      .where(actWhere)
+    const audSelect = db!
+      .select({
+        id: schema.auditLogs.id,
+        timestamp: schema.auditLogs.timestamp,
+        user: schema.auditLogs.user,
+        action: schema.auditLogs.action,
+        module: schema.auditLogs.module,
+        entity: schema.auditLogs.entity,
+        detail: schema.auditLogs.changes,
+      })
+      .from(schema.auditLogs)
+      .where(audWhere)
+
+    const rows = await db!.execute<{
+      id: string
+      timestamp: string | null
+      user: string | null
+      action: string | null
+      module: string | null
+      entity: string | null
+      detail: string | null
+    }>(
+      sql`(${actSelect}) UNION ALL (${audSelect}) ORDER BY timestamp DESC, id DESC LIMIT ${limit + 1}`,
+    )
+    const hasNext = rows.length > limit
+    const pageRows = hasNext ? rows.slice(0, limit) : rows
+    let nextCursor: string | null = null
+    if (hasNext && pageRows.length > 0) {
+      const last = pageRows[pageRows.length - 1]
+      if (last.timestamp && last.id) {
+        const payload = { t: last.timestamp, i: last.id }
+        nextCursor = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+      }
+    }
+    const items = pageRows.map((l) => ({
+      id: l.id,
+      type: activityType(l.module, l.action),
+      title: `${l.action ?? 'Activity'}${l.entity && !String(l.action ?? '').includes(l.entity) ? ` · ${l.entity}` : ''}`,
+      detail: l.detail ?? undefined,
+      actor: l.user ?? 'System',
+      time: friendlyTime(l.timestamp),
+      timestamp: l.timestamp,
+    }))
+    res.json({ items, total, nextCursor })
+  } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : 'Unknown error' }, 'dashboard activities failed')
     res.status(500).json({ error: 'Internal server error' })
   }
 })

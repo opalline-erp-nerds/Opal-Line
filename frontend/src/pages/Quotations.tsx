@@ -29,6 +29,7 @@ import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { AppDialog } from '@/components/ui/app-dialog'
+import { DialogFooter } from '@/components/ui/dialog'
 import { dbApi, backupApi, formatApiError } from '@/lib/api'
 import { SalesFollowUpsCard } from '@/components/sales-follow-ups-card'
 import type { AppSettings, Quotation } from '@/types'
@@ -96,6 +97,9 @@ export default function QuotationsPage() {
   const [error, setError] = useState('')
   const [form, setForm] = useState({ customer: '', phone: '', email: '', city: '', notes: '', gst: '3', discount: '0', validUntil: '' })
   const [items, setItems] = useState<ItemForm[]>([{ ...emptyItem }])
+  // Snapshot of the quotation form as it opened, for the unsaved-changes close guard.
+  const [baseline, setBaseline] = useState('')
+  const snapshotForm = () => JSON.stringify({ form, items })
   const [viewQuote, setViewQuote] = useState<Quotation | null>(null)
   const [convertingId, setConvertingId] = useState<string | null>(null)
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
@@ -193,9 +197,12 @@ export default function QuotationsPage() {
   const grandTotal = Math.round((itemsTotal + gstAmount - discount) * 100) / 100
 
   const openDialog = () => {
+    const nextForm = { customer: '', phone: '', email: '', city: '', notes: '', gst: '3', discount: '0', validUntil: '' }
+    const nextItems = [{ ...emptyItem }]
     setEditingId(null)
-    setForm({ customer: '', phone: '', email: '', city: '', notes: '', gst: '3', discount: '0', validUntil: '' })
-    setItems([{ ...emptyItem }])
+    setForm(nextForm)
+    setItems(nextItems)
+    setBaseline(JSON.stringify({ form: nextForm, items: nextItems }))
     setError('')
     setDialogOpen(true)
   }
@@ -203,8 +210,7 @@ export default function QuotationsPage() {
   // Reopen the same dialog prefilled to edit an existing quotation. Closed
   // quotes (converted/cancelled/expired) are read-only downstream.
   const openEdit = (q: Quotation) => {
-    setEditingId(q.id)
-    setForm({
+    const nextForm = {
       customer: q.customer ?? '',
       phone: q.customerPhone ?? '',
       email: q.customerEmail ?? '',
@@ -214,9 +220,9 @@ export default function QuotationsPage() {
       discount: String(q.discount ?? 0),
       // Date input wants yyyy-mm-dd; keep the date part of the stored instant.
       validUntil: q.validUntil ? q.validUntil.slice(0, 10) : '',
-    })
+    }
     const existingItems = q.items ?? []
-    setItems(
+    const nextItems =
       existingItems.length > 0
         ? existingItems.map((it) => ({
             product: it.product ?? '',
@@ -226,8 +232,11 @@ export default function QuotationsPage() {
             silverRate: it.silverRate ? String(it.silverRate) : '',
             makingCharge: it.makingCharge ? String(it.makingCharge) : '',
           }))
-        : [{ ...emptyItem }],
-    )
+        : [{ ...emptyItem }]
+    setEditingId(q.id)
+    setForm(nextForm)
+    setItems(nextItems)
+    setBaseline(JSON.stringify({ form: nextForm, items: nextItems }))
     setError('')
     setViewQuote(null)
     setDialogOpen(true)
@@ -733,17 +742,18 @@ export default function QuotationsPage() {
       <AppDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        size="2xl"
+        size="lg"
+        isDirty={dialogOpen && snapshotForm() !== baseline}
         title={editingId ? 'Edit Quotation' : 'New Quotation'}
         description={editingId ? 'Update the estimate. Totals recompute automatically.' : 'Create a pre-sale estimate. Nothing is billed until you convert it.'}
         footer={
-          <>
+          <DialogFooter>
             <Button variant="outline" size="sm" onClick={() => setDialogOpen(false)}>Cancel</Button>
             <Button size="sm" onClick={submit} disabled={saving}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
               {editingId ? 'Save Changes' : 'Create Quotation'}
             </Button>
-          </>
+          </DialogFooter>
         }
       >
           <div className="grid gap-3">
@@ -836,7 +846,7 @@ export default function QuotationsPage() {
       <AppDialog
         open={viewQuote !== null}
         onOpenChange={(open) => { if (!open) setViewQuote(null) }}
-        size="2xl"
+        size="xl"
         title={<>Quotation {viewQuote?.number}</>}
         description={viewQuote ? formatDate(viewQuote.date) : ''}
         footer={

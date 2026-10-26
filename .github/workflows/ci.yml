@@ -90,6 +90,16 @@ jobs:
         env:
           UPGRADE_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
 
+      # Shopify product sync integration test: the real sync code (push,
+      # pull, price push, inventory push) against an in-memory mock of the
+      # Shopify Admin REST API, in a throwaway database. Needs PostgreSQL, so
+      # it skips on the plain unit-test step and runs here for real.
+      - name: Shopify sync integration test (needs PostgreSQL)
+        run: node --import tsx --test --test-force-exit "src/shopify.sync.test.ts"
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+
       - name: Build frontend (tsc -b && vite build)
         run: npm run build
 

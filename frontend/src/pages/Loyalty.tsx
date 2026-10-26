@@ -22,14 +22,8 @@ import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import type { ColumnDef } from '@/lib/table'
 import { SearchableSelect } from '@/components/ui/searchable-select'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import type { Customer } from '@/types'
 import { formatDate } from '@/lib/format'
@@ -536,12 +530,23 @@ export default function LoyaltyPage() {
       </Card>
 
       {/* Add Points Dialog */}
-      <Dialog open={showAddPoints} onOpenChange={(open) => { setShowAddPoints(open); if (!open) setError('') }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Add Loyalty Points</DialogTitle>
-            <DialogDescription>Manually add points to a customer's loyalty balance.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={showAddPoints}
+        onOpenChange={(open) => { setShowAddPoints(open); if (!open) setError('') }}
+        size="sm"
+        isDirty={showAddPoints && Boolean(addFormCustomer || addFormPoints || addFormReason)}
+        title="Add Loyalty Points"
+        description="Manually add points to a customer's loyalty balance."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setShowAddPoints(false)}>Cancel</Button>
+            <Button size="sm" onClick={handleAddPoints} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+              Add Points
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-4">
             <div className="space-y-2">
               <Label>Customer</Label>
@@ -576,23 +581,26 @@ export default function LoyaltyPage() {
             </div>
             {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
           </div>
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setShowAddPoints(false)}>Cancel</Button>
-            <Button size="sm" onClick={handleAddPoints} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Add Points
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
       {/* Redeem Points Dialog */}
-      <Dialog open={showRedeemPoints} onOpenChange={(open) => { setShowRedeemPoints(open); if (!open) setError('') }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Redeem Loyalty Points</DialogTitle>
-            <DialogDescription>Deduct points from a customer's loyalty balance.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={showRedeemPoints}
+        onOpenChange={(open) => { setShowRedeemPoints(open); if (!open) setError('') }}
+        size="sm"
+        isDirty={showRedeemPoints && Boolean(redeemFormCustomer || redeemFormPoints || redeemFormReason)}
+        title="Redeem Loyalty Points"
+        description="Deduct points from a customer's loyalty balance."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setShowRedeemPoints(false)}>Cancel</Button>
+            <Button size="sm" onClick={handleRedeemPoints} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <TrendingDown className="h-4 w-4" />}
+              Redeem Points
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-4">
             <div className="space-y-2">
               <Label>Customer</Label>
@@ -627,23 +635,26 @@ export default function LoyaltyPage() {
             </div>
             {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
           </div>
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setShowRedeemPoints(false)}>Cancel</Button>
-            <Button size="sm" onClick={handleRedeemPoints} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <TrendingDown className="h-4 w-4" />}
-              Redeem Points
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
       {/* Edit Points Dialog */}
-      <Dialog open={editPointsFor !== null} onOpenChange={(open) => { if (!open) setEditPointsFor(null) }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Edit Points — {editPointsFor?.name}</DialogTitle>
-            <DialogDescription>Set this customer's balance to an absolute value.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={editPointsFor !== null}
+        onOpenChange={(open) => { if (!open) setEditPointsFor(null) }}
+        size="sm"
+        isDirty={editPointsFor !== null && (editPointsValue !== String(editPointsFor.balance) || Boolean(editPointsReason))}
+        title={`Edit Points — ${editPointsFor?.name ?? ''}`}
+        description="Set this customer's balance to an absolute value."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setEditPointsFor(null)}>Cancel</Button>
+            <Button size="sm" onClick={() => void handleEditPoints()} disabled={saving}>
+              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Pencil className="h-3.5 w-3.5" />}
+              Save Points
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-4">
             <div className="flex items-center justify-between rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-sm">
               <span className="text-muted-foreground">Current balance</span>
@@ -674,23 +685,21 @@ export default function LoyaltyPage() {
             </div>
             {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
           </div>
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setEditPointsFor(null)}>Cancel</Button>
-            <Button size="sm" onClick={() => void handleEditPoints()} disabled={saving}>
-              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Pencil className="h-3.5 w-3.5" />}
-              Save Points
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
       {/* Settings Dialog */}
-      <Dialog open={showSettings} onOpenChange={setShowSettings}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Loyalty Program Settings</DialogTitle>
-            <DialogDescription>Configure how loyalty points are earned and redeemed.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={showSettings}
+        onOpenChange={setShowSettings}
+        size="md"
+        title="Loyalty Program Settings"
+        description="Configure how loyalty points are earned and redeemed."
+        footer={
+          <DialogFooter>
+            <Button size="sm" onClick={() => setShowSettings(false)}>Done</Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-4">
             <div className="rounded-lg border border-border/60 bg-muted/30 p-3">
               <div className="flex items-center gap-2 mb-2">
@@ -742,11 +751,7 @@ export default function LoyaltyPage() {
               Configure advanced settings via the .env file: LOYALTY_ENABLED, LOYALTY_POINTS_PER.
             </p>
           </div>
-          <DialogFooter>
-            <Button size="sm" onClick={() => setShowSettings(false)}>Done</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

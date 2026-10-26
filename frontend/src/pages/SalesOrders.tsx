@@ -1,5 +1,6 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { ProductDialog } from '@/components/product-dialog'
+import { ManualInvoiceDialog } from '@/components/manual-invoice-dialog'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
@@ -20,7 +21,7 @@ import {
   Plus,
   Printer,
   RefreshCw,
-  ScanBarcode,
+  ScanQrCode,
   Search,
   UserRoundCheck,
   ShoppingBag,
@@ -37,14 +38,7 @@ import { Badge } from '@/components/ui/badge'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { DataTable } from '@/components/ui/data-table'
 import {
@@ -69,6 +63,7 @@ import { exportTable } from '@/lib/export'
 import type { Customer, Customer360, InventoryLocation, OrderEvent, OrderFullDetail, OrderStatus, Product, ProductVariant, SalesOrder } from '@/types'
 import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatDateTime, todayIST } from '@/lib/format'
+import { perUnitLinePrice, orderLinesTotal } from '@/lib/orderPricing'
 
 const statusMeta: Record<OrderStatus, { label: string; variant: 'success' | 'warning' | 'danger' | 'muted' | 'info' | 'purple' }> = {
   imported: { label: 'Imported', variant: 'info' },
@@ -120,6 +115,9 @@ interface OrderLineItem {
   sku: string
   qty: number
   price: number
+  // Product fields needed for price recalculation
+  netWeight?: number
+  makingCharge?: number
 }
 
 interface CreateResult {
@@ -230,6 +228,8 @@ export default function SalesOrdersPage() {
   const [formError, setFormError] = useState('')
   const [created, setCreated] = useState<CreateResult | null>(null)
   const [editing, setEditing] = useState<SalesOrder | null>(null)
+  // Order-form snapshot as of dialog open, for the unsaved-changes close guard.
+  const [formBaseline, setFormBaseline] = useState('')
 
   const [customerSel, setCustomerSel] = useState('')
   const [customerName, setCustomerName] = useState('')
@@ -268,8 +268,10 @@ export default function SalesOrdersPage() {
   // live per-line check below handles the common case; this holds the
   // server's authoritative per-location answer until the line is edited.
   const [serverStockErrors, setServerStockErrors] = useState<Record<string, string>>({})
-  const [barcodeInput, setBarcodeInput] = useState('')
+  const [scanInput, setScanInput] = useState('')
   const [scanFeedback, setScanFeedback] = useState<{ ok: boolean; text: string } | null>(null)
+  const [silverRate, setSilverRate] = useState<number | null>(null)
+  const [silverRateLoading, setSilverRateLoading] = useState(false)
 
   const [viewOrder, setViewOrder] = useState<SalesOrder | null>(null)
   const [printConfig, setPrintConfig] = useState<unknown>(null)
@@ -281,6 +283,17 @@ export default function SalesOrdersPage() {
   const [invoiceSavingId, setInvoiceSavingId] = useState<string | null>(null)
   const [syncingOrders, setSyncingOrders] = useState(false)
   const [syncMsg, setSyncMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  // Manual invoice creation — the same dialog the Sales Invoices page uses, so
+  // a walk-in / phone sale can be billed from either screen. The row action
+  // seeds the buyer from the order it was opened on.
+  const [manualInvoiceOpen, setManualInvoiceOpen] = useState(false)
+  const [manualInvoiceOrder, setManualInvoiceOrder] = useState<SalesOrder | null>(null)
+
+  const openManualInvoice = useCallback((order: SalesOrder | null) => {
+    setManualInvoiceOrder(order)
+    setManualInvoiceOpen(true)
+  }, [])
 
   const reload = useCallback(() => {
     dbApi.getSalesOrders().then(setOrders).catch(() => {})
@@ -567,7 +580,18 @@ export default function SalesOrdersPage() {
         ? o.lineItems.map((li) => ({ key: crypto.randomUUID(), productId: '', title: li.title, sku: li.sku ?? '', qty: li.quantity, price: li.price }))
         : [emptyLine()],
     )
+    setSilverRate(null)
     setDialogOpen(true)
+    // Fetch the current applied silver rate
+    setSilverRateLoading(true)
+    dbApi.getSilverRate()
+      .then((rate) => {
+        setSilverRate(rate.rate)
+        setSilverRateLoading(false)
+      })
+      .catch(() => {
+        setSilverRateLoading(false)
+      })
   }, [customers])
 
   /** Clone a past order into a fresh draft — same customer/items, today's date, nothing synced. */
@@ -595,7 +619,18 @@ export default function SalesOrdersPage() {
         ? o.lineItems.map((li) => ({ key: crypto.randomUUID(), productId: '', title: li.title, sku: li.sku ?? '', qty: li.quantity, price: li.price }))
         : [emptyLine()],
     )
+    setSilverRate(null)
     setDialogOpen(true)
+    // Fetch the current applied silver rate
+    setSilverRateLoading(true)
+    dbApi.getSilverRate()
+      .then((rate) => {
+        setSilverRate(rate.rate)
+        setSilverRateLoading(false)
+      })
+      .catch(() => {
+        setSilverRateLoading(false)
+      })
   }, [customers])
 
   const columns = useMemo<ColumnDef<SalesOrder>[]>(
@@ -625,6 +660,31 @@ export default function SalesOrdersPage() {
             <p className="text-[11px] text-muted-foreground">{row.original.items} items · {formatDate(row.original.date)}</p>
           </div>
         ),
+      },
+      {
+        // What was actually ordered — titles/SKUs from the order's line items,
+        // not just the money. Falls back to a dash for header-only rows.
+        id: 'products',
+        header: 'Products',
+        meta: { headerClassName: 'min-w-[180px]' },
+        cell: ({ row }) => {
+          const items = row.original.lineItems ?? []
+          if (items.length === 0) return <span className="text-xs text-muted-foreground">—</span>
+          const first = items[0]
+          return (
+            <div className="min-w-0 max-w-[280px]">
+              <p className="truncate text-[12.5px] text-foreground">
+                <span className="font-medium">{first.title || first.sku || 'Item'}</span> ×{first.quantity ?? 1}
+              </p>
+              {items.length > 1 ? (
+                <p className="truncate text-[11px] text-muted-foreground">
+                  {items.slice(1, 4).map((li) => `${li.title || li.sku || 'Item'} ×${li.quantity ?? 1}`).join(', ')}
+                  {items.length > 4 ? ` +${items.length - 4} more` : ''}
+                </p>
+              ) : null}
+            </div>
+          )
+        },
       },
       {
         accessorKey: 'value',
@@ -739,6 +799,9 @@ export default function SalesOrdersPage() {
                 </DropdownMenuItem>
               )}
               <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => openManualInvoice(row.original)}>
+                <FileText className="h-3.5 w-3.5" /> New invoice for this customer
+              </DropdownMenuItem>
               <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => cancelOrder(row.original)}>Cancel Order</DropdownMenuItem>
             </DropdownMenuContent>
             </DropdownMenu>
@@ -747,8 +810,33 @@ export default function SalesOrdersPage() {
         ),
       },
     ],
-    [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder],
+    [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder, openManualInvoice],
   )
+
+  const snapshotForm = () =>
+    JSON.stringify({
+      customerSel,
+      customerName,
+      customerEmail,
+      customerPhone,
+      billingAddr,
+      shippingAddr,
+      sameAsBilling,
+      orderDate,
+      payment,
+      fulfillment,
+      orderStatus,
+      note,
+      syncToShopify,
+      lineItems,
+    })
+
+  // Capture the freshly reset form each time the dialog opens (create, edit
+  // and duplicate all set the fields right before setDialogOpen(true)).
+  useEffect(() => {
+    if (dialogOpen) setFormBaseline(snapshotForm())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogOpen])
 
   const openDialog = () => {
     setEditing(null)
@@ -769,13 +857,21 @@ export default function SalesOrdersPage() {
     setNote('')
     setSyncToShopify(true)
     setLineItems([emptyLine()])
+    setSilverRate(null)
     setDialogOpen(true)
+    // Fetch the current applied silver rate from Silver Rate Management
+    setSilverRateLoading(true)
+    dbApi.getSilverRate()
+      .then((rate) => {
+        setSilverRate(rate.rate)
+        setSilverRateLoading(false)
+      })
+      .catch(() => {
+        setSilverRateLoading(false)
+      })
   }
 
-  const totalValue = useMemo(
-    () => lineItems.reduce((acc, li) => acc + (Number.isFinite(li.price) ? li.price : 0) * (Number.isFinite(li.qty) ? li.qty : 0), 0),
-    [lineItems],
-  )
+  const totalValue = useMemo(() => orderLinesTotal(lineItems), [lineItems])
 
   // Live stock check per line: mirrors the order endpoints' per-line
   // validation against the catalog already loaded, so an over-quantity shows
@@ -822,11 +918,18 @@ export default function SalesOrdersPage() {
 
   const selectProduct = (key: string, productId: string) => {
     const p = products.find((x) => x.id === productId)
+    if (!p) return
     clearServerStockError(key)
     // Multi-variant products open on their first variant so the line is
     // immediately billable; the Variant dropdown swaps it. Flat products keep
     // the plain product values, exactly as before.
-    const first = p ? (productVariants(p)[0] ?? null) : null
+    const first = productVariants(p)[0] ?? null
+    const price = perUnitLinePrice({
+      silverRate,
+      netWeight: p.netWeight,
+      makingCharge: p.makingCharge,
+      fallback: first?.sellingPrice ?? p.sellingPrice,
+    })
     setLineItems((prev) =>
       prev.map((li) => {
         if (li.key !== key) return li
@@ -836,7 +939,9 @@ export default function SalesOrdersPage() {
           variantId: first?.id ?? null,
           title: first && p ? `${p.name} — ${variantLabel(first)}` : (p?.name ?? li.title),
           sku: first ? first.sku : (p?.sku ?? li.sku),
-          price: first?.sellingPrice ?? p?.sellingPrice ?? li.price,
+          price: price ?? li.price,
+          netWeight: p.netWeight,
+          makingCharge: p.makingCharge,
         }
       }),
     )
@@ -858,21 +963,28 @@ export default function SalesOrdersPage() {
               variantId: v.id,
               title: `${p.name} — ${variantLabel(v)}`,
               sku: v.sku,
-              price: v.sellingPrice ?? row.price,
+              price: perUnitLinePrice({
+                silverRate,
+                netWeight: p.netWeight,
+                makingCharge: p.makingCharge,
+                fallback: v.sellingPrice ?? row.price,
+              }) ?? row.price,
+              netWeight: p.netWeight,
+              makingCharge: p.makingCharge,
             }
           : row,
       ),
     )
   }
 
-  // Barcode scan: scanners type the code and press Enter instantly, so a plain
-  // input with an Enter handler works. Matches product barcode, then variant
-  // barcode, then product SKU, then variant SKU. Re-scanning the same
-  // product/variant pair bumps its quantity.
-  const handleBarcodeScan = () => {
-    const code = barcodeInput.trim()
+  // Label scan: scanners type the code and press Enter instantly, so a plain
+  // input with an Enter handler works. A label's QR encodes ONLY the SKU, so
+  // resolution is product SKU → variant SKU (exact, case-insensitive).
+  // Re-scanning the same product/variant pair bumps its quantity.
+  const handleScan = () => {
+    const code = scanInput.trim()
     const match = matchProductByCode(products, code)
-    setBarcodeInput('')
+    setScanInput('')
     if (!match) {
       setScanFeedback({ ok: false, text: `No product matches "${code}"` })
       return
@@ -880,14 +992,39 @@ export default function SalesOrdersPage() {
     const { product: p, variant } = match
     const title = variant ? `${p.name} — ${variantLabel(variant)}` : p.name
     const sku = variant ? variant.sku : p.sku
-    const price = variant?.sellingPrice ?? p.sellingPrice ?? 0
+    const price = perUnitLinePrice({
+      silverRate,
+      netWeight: p.netWeight,
+      makingCharge: p.makingCharge,
+      fallback: variant?.sellingPrice ?? p.sellingPrice,
+    }) ?? 0
     setScanFeedback({ ok: true, text: `Added ${title}${price ? ` · ₹${price.toFixed(2)}` : ''}` })
     setLineItems((prev) => {
       const existing = prev.find((li) => li.productId === p.id && (li.variantId ?? null) === (variant?.id ?? null))
       if (existing) {
-        return prev.map((li) => (li.key === existing.key ? { ...li, qty: li.qty + 1 } : li))
+        // Re-scanning bumps the quantity; the price stays PER-UNIT (refreshed
+        // at the current rate). Pricing the full new quantity here and then
+        // multiplying by quantity in the subtotal double-counted every rescan.
+        const newQty = existing.qty + 1
+        const newPrice =
+          perUnitLinePrice({
+            silverRate,
+            netWeight: existing.netWeight,
+            makingCharge: existing.makingCharge,
+            fallback: existing.price,
+          }) ?? existing.price
+        return prev.map((li) => (li.key === existing.key ? { ...li, qty: newQty, price: newPrice } : li))
       }
-      const fresh = { productId: p.id, variantId: variant?.id ?? null, title, sku, price, qty: 1 }
+      const fresh = {
+        productId: p.id,
+        variantId: variant?.id ?? null,
+        title,
+        sku,
+        price,
+        qty: 1,
+        netWeight: p.netWeight,
+        makingCharge: p.makingCharge,
+      }
       // Fill the empty first line if it's untouched, otherwise append
       const firstEmpty = prev.length === 1 && !prev[0].productId && !prev[0].title
       if (firstEmpty) {
@@ -898,7 +1035,24 @@ export default function SalesOrdersPage() {
   }
 
   const updateLineItem = (key: string, patch: Partial<OrderLineItem>) => {
-    setLineItems((prev) => prev.map((li) => (li.key === key ? { ...li, ...patch } : li)))
+    setLineItems((prev) =>
+      prev.map((li) => {
+        if (li.key !== key) return li
+        const updated = { ...li, ...patch }
+        if (patch.qty !== undefined && patch.qty !== li.qty) {
+          // Refresh the PER-UNIT price at the current rate; the quantity must
+          // never scale it — the subtotal multiplies price × qty once.
+          const unit = perUnitLinePrice({
+            silverRate,
+            netWeight: li.netWeight,
+            makingCharge: li.makingCharge,
+            fallback: null,
+          })
+          if (unit !== undefined) updated.price = unit
+        }
+        return updated
+      }),
+    )
     // A changed quantity re-runs the live check; drop any stale server report.
     if ('qty' in patch) clearServerStockError(key)
   }
@@ -918,7 +1072,12 @@ export default function SalesOrdersPage() {
         price: Number(li.price) || 0,
         // Shopify sync targets the exact variant; the local invoice keeps
         // billing the variant's SKU, which the line already carries.
-        ...(li.variantId ? { variantId: li.variantId } : {}),
+        ...(li.variantId
+          ? {
+              variantId: li.variantId,
+              productSku: products.find((product) => product.id === li.productId)?.sku,
+            }
+          : {}),
       }))
     if (!editing && items.length === 0) {
       setFormError('Add at least one line item.')
@@ -1008,6 +1167,9 @@ export default function SalesOrdersPage() {
             </Button>
             <Button size="sm" className="gap-1.5" onClick={openDialog}>
               <Plus className="h-4 w-4" /> Manual Order
+            </Button>
+            <Button size="sm" className="gap-1.5" onClick={() => openManualInvoice(null)}>
+              <FileText className="h-4 w-4" /> New Invoice
             </Button>
           </>
         }
@@ -1126,7 +1288,8 @@ export default function SalesOrdersPage() {
       <AppDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        size="3xl"
+        size="lg"
+        isDirty={dialogOpen && snapshotForm() !== formBaseline}
         title={editing ? `Edit Order ${editing.shopifyId}` : 'Create Manual Order'}
         description={
           editing
@@ -1137,7 +1300,7 @@ export default function SalesOrdersPage() {
           created ? (
             <Button onClick={() => setDialogOpen(false)}>Done</Button>
           ) : (
-            <>
+            <DialogFooter>
               <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={saving}>Cancel</Button>
               <Button onClick={createOrder} disabled={saving}>
                 {saving ? (
@@ -1156,7 +1319,7 @@ export default function SalesOrdersPage() {
                   'Create Order'
                 )}
               </Button>
-            </>
+            </DialogFooter>
           )
         }
       >
@@ -1270,21 +1433,48 @@ export default function SalesOrdersPage() {
                     <Plus className="h-3.5 w-3.5" /> Add Item
                   </Button>
                 </div>
+                {/* Silver rate indicator */}
+                {silverRateLoading ? (
+                  <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+                    <span className="animate-pulse">Loading current silver rate…</span>
+                  </div>
+                ) : silverRate ? (
+                  <div className="mb-2 flex items-center justify-between text-xs">
+                    <span className="text-success-700">Current Silver Rate: ₹{silverRate.toFixed(2)}/g (from Silver Rate Management)</span>
+                    <Button variant="ghost" size="icon-sm" onClick={() => {
+                      setSilverRateLoading(true)
+                      dbApi.getSilverRate()
+                        .then((rate) => {
+                          setSilverRate(rate.rate)
+                          setSilverRateLoading(false)
+                        })
+                        .catch(() => {
+                          setSilverRateLoading(false)
+                        })
+                    }} disabled={silverRateLoading} title="Refresh silver rate">
+                      <RefreshCw className={`h-3.5 w-3.5 ${silverRateLoading ? 'animate-spin' : ''}`} />
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="mb-2 flex items-center gap-2 text-xs text-destructive">
+                    <span>Silver rate unavailable — prices will be calculated after fetching rate</span>
+                  </div>
+                )}
                 {!editing ? (
                   <div className="mb-3">
                     <div className="flex items-end gap-2">
                       <div className="min-w-0 flex-1">
-                        <Label className="text-xs text-muted-foreground">Scan barcode / SKU</Label>
+                        <Label className="text-xs text-muted-foreground">Scan QR / SKU</Label>
                         <Input
-                          value={barcodeInput}
-                          onChange={(e) => setBarcodeInput(e.target.value)}
-                          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleBarcodeScan() } }}
-                          placeholder="Scan or type a barcode / SKU, then press Enter"
+                          value={scanInput}
+                          onChange={(e) => setScanInput(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleScan() } }}
+                          placeholder="Scan a label QR or type a SKU, then press Enter"
                           autoComplete="off"
                         />
                       </div>
-                      <Button variant="outline" size="sm" className="h-9" onClick={handleBarcodeScan} disabled={!barcodeInput.trim()}>
-                        <ScanBarcode className="h-3.5 w-3.5" /> Add
+                      <Button variant="outline" size="sm" className="h-9" onClick={handleScan} disabled={!scanInput.trim()}>
+                        <ScanQrCode className="h-3.5 w-3.5" /> Add
                       </Button>
                     </div>
                     {scanFeedback ? (
@@ -1372,6 +1562,16 @@ export default function SalesOrdersPage() {
                             value={li.price}
                             onChange={(e) => updateLineItem(li.key, { price: Number(e.target.value) })}
                           />
+                          {/* Show price breakdown when calculated from silver rate */}
+                          {li.netWeight && li.netWeight > 0 && li.makingCharge && li.makingCharge > 0 && silverRate && (
+                            <div className="mt-1 text-[10px] text-muted-foreground space-y-0.5">
+                              <div>Silver: {silverRate.toFixed(2)} × {li.netWeight} × {li.qty} = ₹{(silverRate * li.netWeight * li.qty).toFixed(2)}</div>
+                              <div>Making: {li.makingCharge.toFixed(2)} × {li.netWeight} × {li.qty} = ₹{(li.makingCharge * li.netWeight * li.qty).toFixed(2)}</div>
+                              <div>Subtotal: ₹{(silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty).toFixed(2)}</div>
+                              <div>GST (3%): ₹{((silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty) * 0.03).toFixed(2)}</div>
+                              <div className="font-medium">Total: ₹{(silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty + (silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty) * 0.03).toFixed(2)}</div>
+                            </div>
+                          )}
                         </div>
                         <div className="w-28 pb-0.5 text-right text-sm font-semibold tabular-nums text-foreground">
                           {formatCurrency((Number.isFinite(li.price) ? li.price : 0) * (Number.isFinite(li.qty) ? li.qty : 0))}
@@ -1485,7 +1685,7 @@ export default function SalesOrdersPage() {
       <AppDialog
         open={viewOrder !== null}
         onOpenChange={(open) => { if (!open) setViewOrder(null) }}
-        size="2xl"
+        size="xl"
         className="print-dialog"
         footerClassName="no-print"
         title={<>Order {viewOrder?.shopifyId ?? ''}</>}
@@ -1564,6 +1764,27 @@ export default function SalesOrdersPage() {
                   value={formatCurrency(viewOrder.lineItems.reduce((sum, li) => sum + (li.price ?? 0) * (li.quantity ?? 0), 0))}
                 />
               ) : null}
+              {/* The actual products on the order — title/SKU/qty/line total. */}
+              {viewOrder.lineItems && viewOrder.lineItems.length > 0 ? (
+                <div className="border-b border-border/60 py-2">
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-muted-foreground">Line Items</span>
+                    <span className="text-[11px] text-muted-foreground">{viewOrder.lineItems.length} product(s)</span>
+                  </div>
+                  <div className="space-y-1">
+                    {viewOrder.lineItems.map((li, i) => (
+                      <div key={i} className="flex items-center justify-between gap-3 text-xs">
+                        <span className="min-w-0 flex-1 truncate">
+                          <span className="font-medium text-foreground">{li.title || 'Item'}</span>
+                          {li.sku ? <span className="ml-1.5 font-mono text-muted-foreground">{li.sku}</span> : null}
+                        </span>
+                        <span className="shrink-0 tabular-nums text-muted-foreground">{li.quantity ?? 1} × {formatCurrency(li.price ?? 0)}</span>
+                        <span className="shrink-0 tabular-nums font-medium text-foreground">{formatCurrency((li.price ?? 0) * (li.quantity ?? 0))}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
               <DetailRow label="Payment" value={getPaymentMeta(viewOrder.payment).label} />
               <DetailRow label="Fulfillment" value={getFulfillmentMeta(viewOrder.fulfillment).label} />
               <DetailRow label="Invoice" value={viewOrder.invoice ?? 'Not raised'} />
@@ -1598,30 +1819,6 @@ export default function SalesOrdersPage() {
                   </div>
                 </div>
               ) : null}
-              {viewOrder.lineItems && viewOrder.lineItems.length > 0 ? (
-                <div className="border-b border-border/60 py-2">
-                  <div className="mb-1.5 flex items-center justify-between">
-                    <span className="text-muted-foreground">Line Items</span>
-                    <span className="text-[11px] text-muted-foreground">{viewOrder.lineItems.length} product(s)</span>
-                  </div>
-                  <div className="space-y-1">
-                    {viewOrder.lineItems.map((li, i) => (
-                      <div key={i} className="flex items-center justify-between gap-3 text-xs">
-                        <span className="min-w-0 flex-1 truncate">
-                          <span className="font-medium text-foreground">{li.title}</span>
-                          {li.sku ? <span className="ml-1.5 font-mono text-muted-foreground">{li.sku}</span> : null}
-                        </span>
-                        <span className="shrink-0 tabular-nums text-muted-foreground">
-                          {li.quantity} × {formatCurrency(li.price)}
-                        </span>
-                        <span className="shrink-0 tabular-nums font-medium text-foreground">
-                          {formatCurrency((li.price ?? 0) * li.quantity)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
               <Customer360Card customer={viewOrder.customer} />
               <Order360Section orderId={viewOrder.id} />
               <OrderTimeline orderId={viewOrder.id} />
@@ -1629,26 +1826,34 @@ export default function SalesOrdersPage() {
           ) : null}
       </AppDialog>
 
-      <Dialog open={viewDialogOpen} onOpenChange={setViewDialogOpen}>
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Save current view</DialogTitle>
-            <DialogDescription>
-              Stores the current search and status filter as a one-click chip above the table.
-            </DialogDescription>
-          </DialogHeader>
-          <Input
-            placeholder="View name (e.g. Today's Shopify orders)"
-            value={viewName}
-            onChange={(e) => setViewName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') saveView() }}
-          />
+      <ManualInvoiceDialog
+        open={manualInvoiceOpen}
+        onOpenChange={setManualInvoiceOpen}
+        initialCustomer={manualInvoiceOrder?.customer ?? ''}
+        initialCustomerPhone={manualInvoiceOrder?.customerPhone ?? ''}
+      />
+
+      <AppDialog
+        open={viewDialogOpen}
+        onOpenChange={setViewDialogOpen}
+        size="sm"
+        isDirty={viewDialogOpen && viewName.trim() !== ''}
+        title="Save current view"
+        description="Stores the current search and status filter as a one-click chip above the table."
+        footer={
           <DialogFooter>
             <Button variant="outline" size="sm" onClick={() => setViewDialogOpen(false)}>Cancel</Button>
             <Button size="sm" onClick={saveView}>Save view</Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        }
+      >
+        <Input
+          placeholder="View name (e.g. Today's Shopify orders)"
+          value={viewName}
+          onChange={(e) => setViewName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') saveView() }}
+        />
+      </AppDialog>
 
       <ProductDialog
         open={newProductLineKey !== null}

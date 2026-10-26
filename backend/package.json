@@ -24,15 +24,15 @@
     "express": "^5.3.0",
     "express-rate-limit": "^8.7.1",
     "helmet": "^8.3.0",
-    "imapflow": "^2.4.3",
-    "mailparser": "^3.9.39",
+    "imapflow": "^2.5.5",
+    "mailparser": "^3.9.46",
     "nodemailer": "^10.0.1",
     "pdfkit": "^0.20.2",
     "pino": "^10.4.0",
     "postgres": "^3.4.9",
     "qrcode": "^1.5.4",
     "qs": "^6.16.1",
-    "resend": "^6.33.0",
+    "resend": "^6.34.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {

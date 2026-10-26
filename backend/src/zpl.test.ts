@@ -11,8 +11,7 @@ import {
 
 const product = {
   name: 'Diamond Ring',
-  sku: 'SKU-1',
-  barcode: 'OLABC12345',
+  sku: 'OL-RNG-001',
   price: 1234.5,
   weight: 3.2,
   category: 'Rings',
@@ -27,7 +26,7 @@ test('zplEscape neutralises the ZPL command introducers', () => {
 })
 
 test('zplEscape replaces non-ASCII and control characters so the byte stream stays safe', () => {
-  assert.equal(zplEscape('Ring\u00b7'), 'Ring?')
+  assert.equal(zplEscape('Ring·'), 'Ring?')
   assert.equal(zplEscape('a\nb\tc'), 'a?b?c')
   assert.equal(zplEscape(null), '')
 })
@@ -43,25 +42,38 @@ test('a malicious product name cannot inject a ZPL command', () => {
 
 // 17. Valid, scannable payloads ----------------------------------------------
 
-test('the QR symbol uses the reference ^BQN command and carries the identifier', () => {
-  const zpl = zplLabel(product, { width: 50, height: 40, symbology: 'qr' })
+test('the QR symbol uses the reference ^BQN command and carries the SKU', () => {
+  const zpl = zplLabel(product, { width: 50, height: 40 })
   assert.ok(zpl)
   assert.match(zpl!, /\^BQN,2,\d+/)
-  assert.ok(zpl!.includes('^FDLA,OLABC12345^FS'))
+  assert.ok(zpl!.includes('^FDLA,OL-RNG-001^FS'))
 })
 
-test('the linear option uses Code 128 with the exact same identifier', () => {
-  const zpl = zplLabel(product, { width: 50, height: 40, symbology: 'code128' })
+test('the QR payload is ONLY the SKU — never the name, price or weight', () => {
+  const zpl = zplLabel(product, { width: 50, height: 40 })
   assert.ok(zpl)
-  assert.match(zpl!, /\^BCN,\d+,Y,N,N/)
-  assert.ok(zpl!.includes('^FDOLABC12345^FS'))
+  const lines = zpl!.split('\n')
+  const bqn = lines.findIndex((line) => line.includes('^BQN'))
+  assert.ok(bqn >= 0, 'a QR symbol is emitted')
+  // The line right after ^BQN is the data field: ^FH\ ^FDLA,<SKU>^FS
+  // ("level L, auto data type" + the payload) — nothing else may appear there.
+  const payloadLine = lines[bqn + 1]
+  assert.equal(payloadLine, '^FH\\^FDLA,OL-RNG-001^FS')
+  assert.ok(!payloadLine.includes('DIAMOND RING'))
+  assert.ok(!payloadLine.includes('1234.50'))
+  assert.ok(!payloadLine.includes('3.2'))
+})
+
+test('no linear barcode (Code 128) is ever emitted — labels are QR-only', () => {
+  const zpl = zplLabel(product, { width: 50, height: 40 })
+  assert.ok(zpl)
+  assert.ok(!zpl!.includes('^BC'), 'Code 128 command must never appear')
+})
+
+test('a product without a SKU prints no QR symbol instead of a broken one', () => {
+  const zpl = zplLabel({ ...product, sku: '' }, { width: 50, height: 25 })
+  assert.ok(zpl)
   assert.ok(!zpl!.includes('^BQN'))
-})
-
-test('a product without a barcode falls back to its SKU in the symbol', () => {
-  const zpl = zplLabel({ ...product, barcode: undefined }, { width: 50, height: 25 })
-  assert.ok(zpl)
-  assert.ok(zpl!.includes('^FDLA,SKU-1^FS'))
 })
 
 // 13/15. Dimensions + printer integration ------------------------------------
@@ -101,7 +113,7 @@ test('copies are delegated to the printer with ^PQ', () => {
 // 9/10. Individual + bulk printing -------------------------------------------
 
 test('renderZpl emits exactly one label block per product', () => {
-  const many = Array.from({ length: 4 }, (_, i) => ({ ...product, barcode: `OL${i}00000000` }))
+  const many = Array.from({ length: 4 }, (_, i) => ({ ...product, sku: `OL-RNG-00${i + 1}` }))
   const zpl = renderZpl(many, { width: 50, height: 25 })
   assert.equal((zpl.match(/\^XA/g) ?? []).length, 4)
   assert.equal((zpl.match(/\^XZ/g) ?? []).length, 4)
@@ -135,17 +147,20 @@ test('all six reference template keys keep their brand and code layout in ZPL', 
   for (const ref of references) {
     const options = zplOptionsForPreset(ref.key, { showPrice: true })
     const zpl = zplLabel(
-      { name: 'Fusion of Kempu & NA', sku: '0012535', barcode: '0012535', price: 39999 },
+      { name: 'Fusion of Kempu & NA', sku: '0012535', price: 39999 },
       options,
     )
     assert.ok(zpl, ref.key)
     assert.ok(zpl!.includes(`^PW${ref.width * ZPL_DOTS_PER_MM}`), `${ref.key} width`)
-    assert.ok(zpl!.includes(`^LL${ref.height * ZPL_DOTS_PER_MM}`), `${ref.key} height`)
+    assert.ok(zpl!.includes(`^LL${ref.height * ZPL_DOTS_PER_MM}`), `${ref.key} length`)
     assert.ok(zpl!.includes(`^FD${ref.brand}^FS`), `${ref.key} brand`)
     assert.ok(zpl!.includes('^FDFUSION OF KEMPU & NA^FS'), `${ref.key} product description`)
     assert.ok(zpl!.includes('^FDRate: 39999.00/-^FS'), `${ref.key} rate`)
-    assert.ok(zpl!.includes('^FDLA,0012535^FS'), `${ref.key} QR payload`)
-    if (ref.key === 'label-50x10-compact') assert.ok(zpl!.includes('^FD001^FS'), 'compact short code')
+    assert.ok(zpl!.includes('^FDLA,0012535^FS'), `${ref.key} QR payload is the SKU`)
+    if (ref.key === 'label-50x10-compact') {
+      // The slim reference prints the bare, FULL identifier — never a fragment.
+      assert.ok(zpl!.includes('^FD0012535^FS'), 'compact full code')
+    }
   }
 })
 

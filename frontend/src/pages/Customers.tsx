@@ -12,15 +12,9 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -133,17 +127,21 @@ export default function CustomersPage() {
   const [editTarget, setEditTarget] = useState<Customer | null>(null)
   const [editSaving, setEditSaving] = useState(false)
   const [editForm, setEditForm] = useState({ name: '', email: '', phone: '', city: '', province: '', status: 'active' as 'active' | 'inactive' })
+  // Snapshot of the edit form as it opened, for the unsaved-changes close guard.
+  const [editBaseline, setEditBaseline] = useState('')
 
   const openEdit = (c: Customer) => {
-    setEditTarget(c)
-    setEditForm({
+    const next = {
       name: c.name ?? '',
       email: c.email ?? '',
       phone: c.phone ?? '',
       city: c.city ?? '',
       province: c.province ?? '',
-      status: c.status === 'inactive' ? 'inactive' : 'active',
-    })
+      status: (c.status === 'inactive' ? 'inactive' : 'active') as 'active' | 'inactive',
+    }
+    setEditTarget(c)
+    setEditForm(next)
+    setEditBaseline(JSON.stringify(next))
   }
 
   const submitEdit = async () => {
@@ -466,7 +464,7 @@ export default function CustomersPage() {
             <Button variant="outline" size="sm" onClick={importFromShopify} disabled={importing}>
               <UserPlus className="h-3.5 w-3.5" /> {importing ? 'Importing...' : 'Import from Shopify'}
             </Button>
-            <Button size="sm" onClick={() => setShowAdd(true)}>
+            <Button size="sm" onClick={() => { setAddName(''); setAddEmail(''); setAddPhone(''); setAddCity(''); setShowAdd(true) }}>
               <Plus className="h-4 w-4" /> Add Customer
             </Button>
           </>
@@ -542,17 +540,35 @@ export default function CustomersPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={viewCustomer !== null} onOpenChange={(open) => { if (!open) setViewCustomer(null) }}>
-        <DialogContent size="md">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Avatar className="h-8 w-8">
-                <AvatarFallback className="bg-primary-100 text-primary-700">{initials(viewCustomer?.name ?? '')}</AvatarFallback>
-              </Avatar>
-              {viewCustomer?.name}
-            </DialogTitle>
-            <DialogDescription>Customer details and activity</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={viewCustomer !== null}
+        onOpenChange={(open) => { if (!open) setViewCustomer(null) }}
+        size="md"
+        titleAdornment={
+          <Avatar className="h-8 w-8">
+            <AvatarFallback className="bg-primary-100 text-primary-700">{initials(viewCustomer?.name ?? '')}</AvatarFallback>
+          </Avatar>
+        }
+        title={viewCustomer?.name ?? 'Customer'}
+        description="Customer details and activity"
+        footer={
+          <DialogFooter>
+            {viewCustomer?.phone ? (
+              <Button variant="outline" onClick={() => (window.location.href = `tel:${encodeURI(viewCustomer.phone)}`)}>
+                <Phone className="h-4 w-4" /> Call
+              </Button>
+            ) : null}
+            {viewCustomer?.email ? (
+              <Button variant="outline" onClick={() => (window.location.href = `mailto:${encodeURI(viewCustomer.email)}`)}>
+                <Mail className="h-4 w-4" /> Email
+              </Button>
+            ) : null}
+            <Button onClick={() => { setViewCustomer(null); navigate('/sales/invoices') }}>
+              <ShoppingBag className="h-4 w-4" /> Order History
+            </Button>
+          </DialogFooter>
+        }
+      >
           {viewCustomer ? (
             <>
             <div className="space-y-0.5 text-sm">
@@ -688,108 +704,98 @@ export default function CustomersPage() {
             </div>
             </>
           ) : null}
+      </AppDialog>
+
+      <AppDialog
+        open={showAdd}
+        onOpenChange={setShowAdd}
+        size="sm"
+        isDirty={showAdd && Boolean(addName || addEmail || addPhone || addCity)}
+        title="Add Customer"
+        description="Create a new customer record."
+        footer={
           <DialogFooter>
-            {viewCustomer?.phone ? (
-              <Button variant="outline" onClick={() => (window.location.href = `tel:${encodeURI(viewCustomer.phone)}`)}>
-                <Phone className="h-4 w-4" /> Call
-              </Button>
-            ) : null}
-            {viewCustomer?.email ? (
-              <Button variant="outline" onClick={() => (window.location.href = `mailto:${encodeURI(viewCustomer.email)}`)}>
-                <Mail className="h-4 w-4" /> Email
-              </Button>
-            ) : null}
-            <Button onClick={() => { setViewCustomer(null); navigate('/sales/invoices') }}>
-              <ShoppingBag className="h-4 w-4" /> Order History
-            </Button>
+            <Button type="button" variant="outline" onClick={() => setShowAdd(false)}>Cancel</Button>
+            <Button type="submit" form="add-customer-form" disabled={saving || !addName.trim()}>{saving ? 'Saving...' : 'Save Customer'}</Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={showAdd} onOpenChange={setShowAdd}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Add Customer</DialogTitle>
-            <DialogDescription>Create a new customer record.</DialogDescription>
-          </DialogHeader>
-          <form onSubmit={saveCustomer} className="space-y-4">
+        }
+      >
+        <form id="add-customer-form" onSubmit={saveCustomer} className="space-y-4">
+          <div className="space-y-2">
+            <Label htmlFor="cust-name">Name</Label>
+            <Input id="cust-name" value={addName} onChange={(e) => setAddName(e.target.value)} placeholder="Full name" required />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="cust-name">Name</Label>
-              <Input id="cust-name" value={addName} onChange={(e) => setAddName(e.target.value)} placeholder="Full name" required />
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="cust-email">Email</Label>
-                <Input id="cust-email" type="email" value={addEmail} onChange={(e) => setAddEmail(e.target.value)} placeholder="name@example.com" />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="cust-phone">Phone</Label>
-                <Input id="cust-phone" value={addPhone} onChange={(e) => setAddPhone(e.target.value)} placeholder="+91..." />
-              </div>
+              <Label htmlFor="cust-email">Email</Label>
+              <Input id="cust-email" type="email" value={addEmail} onChange={(e) => setAddEmail(e.target.value)} placeholder="name@example.com" />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="cust-city">City</Label>
-              <Input id="cust-city" value={addCity} onChange={(e) => setAddCity(e.target.value)} placeholder="City" />
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setShowAdd(false)}>Cancel</Button>
-              <Button type="submit" disabled={saving || !addName.trim()}>{saving ? 'Saving...' : 'Save Customer'}</Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null) }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Edit Customer</DialogTitle>
-            <DialogDescription>Update contact details and status.</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="edit-cust-name">Name</Label>
-              <Input id="edit-cust-name" value={editForm.name} onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))} placeholder="Full name" required />
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="edit-cust-email">Email</Label>
-                <Input id="edit-cust-email" type="email" value={editForm.email} onChange={(e) => setEditForm((f) => ({ ...f, email: e.target.value }))} placeholder="name@example.com" />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="edit-cust-phone">Phone</Label>
-                <Input id="edit-cust-phone" value={editForm.phone} onChange={(e) => setEditForm((f) => ({ ...f, phone: e.target.value }))} placeholder="+91..." />
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="edit-cust-city">City</Label>
-                <Input id="edit-cust-city" value={editForm.city} onChange={(e) => setEditForm((f) => ({ ...f, city: e.target.value }))} placeholder="City" />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="edit-cust-province">State / Province</Label>
-                <Input id="edit-cust-province" value={editForm.province} onChange={(e) => setEditForm((f) => ({ ...f, province: e.target.value }))} placeholder="State" />
-              </div>
-            </div>
-            <div className="space-y-2">
-              <Label>Status</Label>
-              <Select
-                options={[
-                  { value: 'active', label: 'Active' },
-                  { value: 'inactive', label: 'Inactive' },
-                ]}
-                value={editForm.status}
-                onValueChange={(v) => setEditForm((f) => ({ ...f, status: v === 'inactive' ? 'inactive' : 'active' }))}
-              />
+              <Label htmlFor="cust-phone">Phone</Label>
+              <Input id="cust-phone" value={addPhone} onChange={(e) => setAddPhone(e.target.value)} placeholder="+91..." />
             </div>
           </div>
+          <div className="space-y-2">
+            <Label htmlFor="cust-city">City</Label>
+            <Input id="cust-city" value={addCity} onChange={(e) => setAddCity(e.target.value)} placeholder="City" />
+          </div>
+        </form>
+      </AppDialog>
+
+      <AppDialog
+        open={editTarget !== null}
+        onOpenChange={(open) => { if (!open) setEditTarget(null) }}
+        size="sm"
+        isDirty={editTarget !== null && JSON.stringify(editForm) !== editBaseline}
+        title="Edit Customer"
+        description="Update contact details and status."
+        footer={
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
             <Button onClick={() => void submitEdit()} disabled={editSaving || !editForm.name.trim()}>
               {editSaving ? 'Saving...' : 'Save Changes'}
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        }
+      >
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <Label htmlFor="edit-cust-name">Name</Label>
+            <Input id="edit-cust-name" value={editForm.name} onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))} placeholder="Full name" required />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-cust-email">Email</Label>
+              <Input id="edit-cust-email" type="email" value={editForm.email} onChange={(e) => setEditForm((f) => ({ ...f, email: e.target.value }))} placeholder="name@example.com" />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-cust-phone">Phone</Label>
+              <Input id="edit-cust-phone" value={editForm.phone} onChange={(e) => setEditForm((f) => ({ ...f, phone: e.target.value }))} placeholder="+91..." />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-cust-city">City</Label>
+              <Input id="edit-cust-city" value={editForm.city} onChange={(e) => setEditForm((f) => ({ ...f, city: e.target.value }))} placeholder="City" />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-cust-province">State / Province</Label>
+              <Input id="edit-cust-province" value={editForm.province} onChange={(e) => setEditForm((f) => ({ ...f, province: e.target.value }))} placeholder="State" />
+            </div>
+          </div>
+          <div className="space-y-2">
+            <Label>Status</Label>
+            <Select
+              options={[
+                { value: 'active', label: 'Active' },
+                { value: 'inactive', label: 'Inactive' },
+              ]}
+              value={editForm.status}
+              onValueChange={(v) => setEditForm((f) => ({ ...f, status: v === 'inactive' ? 'inactive' : 'active' }))}
+            />
+          </div>
+        </div>
+      </AppDialog>
     </div>
   )
 }

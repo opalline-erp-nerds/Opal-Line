@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { Building2, Check, CheckCircle2, Copy, Download, Eye, Loader2, PackageCheck, Pencil, Plus, Save, Search, ShoppingCart, Trash2, Wallet, Weight, XCircle, X } from 'lucide-react'
+import { Building2, Check, CheckCircle2, Copy, Download, Eye, Loader2, PackageCheck, Pencil, Plus, Save, Search, ShoppingCart, Trash2, Wallet, Weight, XCircle } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -10,14 +10,8 @@ import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import { toast } from '@/components/ui/confirm'
 import { exportTable } from '@/lib/export'
@@ -77,6 +71,8 @@ export default function PurchaseOrdersPage() {
   const [form, setForm] = useState({ supplier: '', supplierId: '', date: '', expectedDate: '', gst: '3' })
   const [editingId, setEditingId] = useState<string | null>(null)
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()])
+  // Snapshot of the PO form as it opened, for the unsaved-changes close guard.
+  const [formBaseline, setFormBaseline] = useState('')
   const [fieldErrors, setFieldErrors] = useState<{ supplier?: string; date?: string; lines?: string }>({})
   const [lineErrors, setLineErrors] = useState<Record<number, string>>({})
   const [viewPo, setViewPo] = useState<PurchaseOrder | null>(null)
@@ -115,15 +111,18 @@ export default function PurchaseOrdersPage() {
   }, [])
 
   const openDialog = () => {
-    setEditingId(null)
-    setForm({
+    const nextForm = {
       supplier: '',
       supplierId: '',
       date: new Date().toISOString().slice(0, 10),
       expectedDate: '',
       gst: '3',
-    })
-    setLines([emptyLine()])
+    }
+    const nextLines = [emptyLine()]
+    setEditingId(null)
+    setForm(nextForm)
+    setLines(nextLines)
+    setFormBaseline(JSON.stringify({ form: nextForm, lines: nextLines }))
     setError('')
     setFieldErrors({})
     setLineErrors({})
@@ -133,16 +132,15 @@ export default function PurchaseOrdersPage() {
   // Edit an existing PO — every field is prefilled and saved through the
   // full-edit endpoint (header fields + lines in one call).
   const openEdit = useCallback((po: PurchaseOrder) => {
-    setEditingId(po.id)
-    setForm({
+    const nextForm = {
       supplier: po.supplier ?? '',
       supplierId: po.supplierId ?? '',
       date: po.date ? po.date.slice(0, 10) : '',
       expectedDate: po.expectedDate ? po.expectedDate.slice(0, 10) : '',
       gst: String(po.gst ?? 3),
-    })
+    }
     // Saved lines arrive already "added" — they open confirmed.
-    setLines(
+    const nextLines =
       (po.lines ?? []).length > 0
         ? po.lines!.map((l) => ({
             sku: l.sku ?? '',
@@ -153,8 +151,11 @@ export default function PurchaseOrdersPage() {
             rate: l.rate != null ? String(l.rate) : '0',
             confirmed: true,
           }))
-        : [emptyLine()],
-    )
+        : [emptyLine()]
+    setEditingId(po.id)
+    setForm(nextForm)
+    setLines(nextLines)
+    setFormBaseline(JSON.stringify({ form: nextForm, lines: nextLines }))
     setError('')
     setFieldErrors({})
     setLineErrors({})
@@ -523,12 +524,21 @@ export default function PurchaseOrdersPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={viewPo !== null} onOpenChange={(open) => { if (!open) setViewPo(null) }}>
-        <DialogContent size="md">
-          <DialogHeader>
-            <DialogTitle>Purchase Order {viewPo?.number}</DialogTitle>
-            <DialogDescription>{viewPo ? formatDate(viewPo.date) : ''}</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={viewPo !== null}
+        onOpenChange={(open) => { if (!open) setViewPo(null) }}
+        size="xl"
+        title={`Purchase Order ${viewPo?.number ?? ''}`}
+        description={viewPo ? formatDate(viewPo.date) : ''}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setViewPo(null)}>Close</Button>
+            <Button onClick={() => viewPo && openEdit(viewPo)}>
+              <Pencil className="h-4 w-4" /> Edit Purchase Order
+            </Button>
+          </DialogFooter>
+        }
+      >
           {viewPo && (
             <div className="space-y-3 text-sm">
               <div className="space-y-2">
@@ -652,38 +662,26 @@ export default function PurchaseOrdersPage() {
               </>
             )}
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setViewPo(null)}>Close</Button>
-            <Button onClick={() => viewPo && openEdit(viewPo)}>
-              <Pencil className="h-4 w-4" /> Edit Purchase Order
+      </AppDialog>
+
+      <AppDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        size="lg"
+        isDirty={dialogOpen && JSON.stringify({ form, lines }) !== formBaseline}
+        title={editingId ? `Edit Purchase Order ${orders.find((o) => o.id === editingId)?.number ?? ''}` : 'New Purchase Order'}
+        description={editingId ? 'Update supplier, dates, line items and GST.' : 'Raise a purchase order with a supplier.'}
+        footer={
+          <DialogFooter className="items-center gap-3">
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+            <Button onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              {editingId ? 'Save Changes' : 'Save as Draft'}
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent hideClose size="lg" className="gap-0 p-0 sm:max-w-[500px]">
-          {/* Header — light divider underneath */}
-          <div className="flex items-center justify-between gap-3 border-b border-gray-200 px-5 py-4">
-            <div className="min-w-0">
-              <DialogTitle className="truncate text-[15px] font-bold text-[#2e1065]">
-                {editingId ? `Edit Purchase Order ${orders.find((o) => o.id === editingId)?.number ?? ''}` : 'New Purchase Order'}
-              </DialogTitle>
-              <DialogDescription className="sr-only">
-                {editingId ? 'Update supplier, dates, line items and GST.' : 'Raise a purchase order with a supplier.'}
-              </DialogDescription>
-            </div>
-            <button
-              type="button"
-              aria-label="Close"
-              onClick={() => setDialogOpen(false)}
-              className="rounded-md p-1 text-[#2e1065]/70 transition-colors hover:bg-[#f5f3ff] hover:text-[#2e1065]"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-
-          <div className="space-y-4 px-5 py-4">
+        }
+      >
+          <div className="space-y-4">
             <div className="space-y-1.5">
               <FormLabel required>Supplier</FormLabel>
               <Select
@@ -890,28 +888,7 @@ export default function PurchaseOrdersPage() {
 
             {error ? <p className="text-[12.5px] text-red-600">{error}</p> : null}
           </div>
-
-          {/* Footer — dark indigo divider, right-aligned actions */}
-          <div className="flex items-center justify-end gap-3 border-t border-[#2e1065] px-5 py-3.5">
-            <button
-              type="button"
-              onClick={() => setDialogOpen(false)}
-              className="px-2 py-1.5 text-[13px] font-medium text-[#7c3aed] hover:underline"
-            >
-              × Cancel
-            </button>
-            <Button
-              type="button"
-              onClick={submit}
-              disabled={saving}
-              className="rounded-lg bg-[#7c3aed] px-4 text-[13px] font-medium text-white shadow-sm hover:bg-[#6d28d9]"
-            >
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-              {editingId ? 'Save Changes' : 'Save as Draft'}
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

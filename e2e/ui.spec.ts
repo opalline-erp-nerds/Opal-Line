@@ -101,6 +101,7 @@ test('customers page shows the PII-recovery tools', async ({ page }) => {
 
 test('dashboard shows error state when API fails', async ({ page }) => {
   // Mock the dashboard KPIs API to return an error
+  // Trailing * so the pattern matches the ?period=... query string too.
   await page.route('**/api/v1/db/dashboard/kpis*', async (route) => {
     await route.fulfill({
       status: 500,

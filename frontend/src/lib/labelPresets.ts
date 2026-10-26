@@ -138,7 +138,6 @@ export const FALLBACK_LABEL_PRESETS: LabelPreset[] = [
     rows: 28,
     reference: true,
     brand: 'OPAL LINE',
-    codeLength: 3,
     design: SLIM_DESIGN,
   },
 ]

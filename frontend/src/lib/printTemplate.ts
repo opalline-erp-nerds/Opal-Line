@@ -1,4 +1,5 @@
 import { escapeHtml, numberToIndianWords } from '@/lib/utils'
+import type { Invoice } from '@/types'
 
 /**
  * Shared print-template builder — one source of truth for printable documents.
@@ -63,7 +64,6 @@ export interface PrintDesignerConfig {
   labelFrontRate: boolean
   /** Back-side field toggles. */
   labelBackSku: boolean
-  labelBackBarcode: boolean
   labelBackName: boolean
   labelFrontSku?: boolean
   labelBackCompany?: boolean
@@ -143,7 +143,6 @@ export const DEFAULT_PRINT_CONFIG: PrintDesignerConfig = {
   labelFrontName: true,
   labelFrontRate: true,
   labelBackSku: true,
-  labelBackBarcode: true,
   labelBackName: false,
   labelFrontSku: true,
   labelBackCompany: true,
@@ -225,7 +224,6 @@ export function mergePrintConfig(saved: unknown): PrintDesignerConfig {
     labelFrontName: s.labelFrontName !== false,
     labelFrontRate: s.labelFrontRate !== false,
     labelBackSku: s.labelBackSku !== false,
-    labelBackBarcode: s.labelBackBarcode !== false,
     labelBackName: s.labelBackName === true,
     labelFrontSku: s.labelFrontSku !== false,
     labelBackCompany: s.labelBackCompany !== false,
@@ -253,6 +251,8 @@ export interface PrintDoc {
   customerCity?: string | null
   customerState?: string | null
   customerPincode?: string | null
+  /** Buyer GSTIN (sales_invoices.buyer_gstin) — drives intra vs inter-state. */
+  customerGstin?: string | null
   businessName?: string
   businessGstin?: string | null
   businessAddress?: string | null
@@ -267,6 +267,61 @@ export interface PrintDoc {
   paymentStatus?: string
   date: string
   items?: Array<Record<string, unknown>>
+}
+
+/**
+ * Map a PERSISTED invoice onto the print document — the only path from an
+ * invoice to paper. The invoice screen and the printed page render the same
+ * saved values (subtotal, gst rate, gst amount, discount, grand total and the
+ * per-item snapshots); printing never recalculates business amounts.
+ *
+ * `business` lets the caller override with live Settings values (business
+ * name/GSTIN/address/phone/email), mirroring what the invoice detail screen
+ * does; `imagesBySku` supplies optional product thumbnails.
+ */
+export function invoicePrintDoc(
+  invoice: Invoice,
+  opts: { imagesBySku?: ReadonlyMap<string, string>; business?: Partial<PrintDoc> } = {},
+): PrintDoc {
+  const doc: PrintDoc = {
+    number: invoice.number,
+    shopifyOrder: invoice.shopifyOrder,
+    customer: invoice.customer,
+    customerEmail: invoice.customerEmail,
+    customerPhone: invoice.customerPhone ?? null,
+    customerAddress: invoice.customerAddress ?? null,
+    customerCity: invoice.customerCity ?? null,
+    customerState: invoice.customerState ?? null,
+    customerPincode: invoice.customerPincode ?? null,
+    customerGstin: invoice.buyerGstin ?? invoice.customerGstin ?? null,
+    businessName: invoice.businessName,
+    businessGstin: invoice.businessGstin ?? null,
+    businessAddress: invoice.businessAddress ?? null,
+    businessPhone: invoice.businessPhone ?? null,
+    businessEmail: invoice.businessEmail ?? null,
+    gst: invoice.gst,
+    gstAmount: invoice.gstAmount,
+    discount: invoice.discount,
+    subtotal: invoice.subtotal,
+    grandTotal: invoice.grandTotal,
+    paymentMethod: invoice.paymentMethod,
+    paymentStatus: invoice.paymentStatus,
+    date: invoice.date,
+    items: invoice.items.map((i) => ({
+      product: i.product,
+      sku: i.sku,
+      hsn: i.hsn,
+      qty: i.qty,
+      weight: i.weight,
+      silverRate: i.silverRate,
+      makingCharge: i.makingCharge,
+      tax: i.tax,
+      amount: i.amount,
+      image: opts.imagesBySku?.get(i.sku),
+    })),
+  }
+  if (opts.business) Object.assign(doc, opts.business)
+  return doc
 }
 
 /** Open one or more built documents in print windows (batch = one window per
@@ -326,7 +381,6 @@ const lighten = (hex: string, amount: number): string => {
 interface LabelItem {
   product: string
   sku: string
-  barcode: string
   rate: number
   weight: number
 }
@@ -337,7 +391,6 @@ function labelItemsFromDoc(doc: PrintDoc): LabelItem[] {
   const items = raw.map((i: any) => ({
     product: String(i.product ?? i.name ?? i.description ?? d.productName ?? ''),
     sku: String(i.sku ?? i.code ?? d.sku ?? ''),
-    barcode: String(i.barcode ?? d.barcode ?? ''),
     rate: Number(i.sellingPrice ?? i.rate ?? i.amount ?? i.price ?? d.rate ?? 0),
     weight: Number(i.weight ?? i.netWeight ?? 0),
   }))
@@ -346,14 +399,13 @@ function labelItemsFromDoc(doc: PrintDoc): LabelItem[] {
     : [{
         product: String(d.productName ?? '92.5 Sterling Silver Pendant'),
         sku: String(d.sku ?? 'SL-PD-001'),
-        barcode: String(d.barcode ?? '8901234567890'),
         rate: Number(d.rate ?? 3250),
         weight: 2.8,
       }]
 }
 
 /**
- * Build an A4 sheet of barcode labels at true physical size.
+ * Build an A4 sheet of product labels at true physical size.
  *
  * Every label is laid out in `mm` inside a CSS grid whose column/row count is
  * derived from the real label dimensions, so 50×25, 50×22, 35×22, 50×10 and
@@ -398,7 +450,7 @@ export function buildBarcodeLabelHtml(doc: PrintDoc, config: PrintDesignerConfig
     (c.labelShowFront ? sideSheet(frontLabel) : '') +
     (c.labelShowBack ? sideSheet(backLabel) : '')
 
-  return `<!doctype html><html><head><title>Barcode Labels</title><style>
+  return `<!doctype html><html><head><title>Product Labels</title><style>
       @page{margin:0;}
       *{margin:0;padding:0;box-sizing:border-box;}
       body{font-family:${fontStack};color:#232733;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact;margin:0;padding:0;}
@@ -422,13 +474,66 @@ export function buildBarcodeLabelHtml(doc: PrintDoc, config: PrintDesignerConfig
  * Build the complete printable HTML document (A4/Letter, print-CSS ready).
  * The returned string is opened in a print window or embedded in an iframe.
  */
+/**
+ * Reconcile per-line GST with the document's stored GST money for invoices
+ * whose rows never got a line-level tax snapshot (legacy rows store tax: 0
+ * while gstAmount is real — this is why the printed GST column used to dash
+ * every line even though the summary showed CGST/SGST).
+ *
+ * The stored document GST is apportioned across lines by their amount share
+ * with largest-remainder rounding, so the printed column sums EXACTLY to the
+ * printed Total GST. It only splits what is already stored — it never derives
+ * a second GST base, so nothing is added twice. Lines that already carry tax
+ * are returned untouched. Only invoices reconcile: orders legitimately dash.
+ */
+function applyLineTax(items: Array<Record<string, unknown>>, docGst: number): Array<Record<string, unknown>> {
+  if (!(docGst > 0) || items.length === 0) return items
+  if (items.some((it) => Number(it.tax) > 0)) return items
+  const amounts = items.map((it) => Math.max(0, Number(it.amount) || 0))
+  const base = amounts.reduce((a, b) => a + b, 0)
+  if (!(base > 0)) return items
+  // Largest-remainder: floor every line to paise, then hand leftover cents to
+  // the largest fractional parts so the column adds up to the stored total.
+  const shares = amounts.map((amount) => {
+    const exact = (docGst * amount * 100) / base
+    return { cents: Math.floor(exact), frac: exact - Math.floor(exact) }
+  })
+  let leftover = Math.round(docGst * 100) - shares.reduce((s, sh) => s + sh.cents, 0)
+  shares
+    .map((sh, i) => ({ i, frac: sh.frac }))
+    .sort((a, b) => b.frac - a.frac)
+    .forEach(({ i }) => {
+      if (leftover > 0) {
+        shares[i].cents += 1
+        leftover -= 1
+      }
+    })
+  return items.map((it, i) => ({ ...it, tax: shares[i].cents / 100 }))
+}
+
 export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extras: PrintDocExtras): string {
   if (extras.docType === 'barcode-label') return buildBarcodeLabelHtml(doc, config, extras)
   const c = config
-  const items = doc.items ?? []
+  const docItems = doc.items ?? []
   const gstRate = Number(doc.gst) || 0
-  const taxable = Math.max(0, Number(doc.subtotal) - Number(doc.discount))
+  // GST is charged on the subtotal (the sum of the printed line amounts), so
+  // the printed "Taxable Value" IS the subtotal — the discount gets its own
+  // row further down and must not be subtracted twice. With this base the
+  // printed rows add up to the persisted grand total (subtotal + GST − discount).
+  const taxable = Math.max(0, Number(doc.subtotal) || 0)
   const totalTax = Number(doc.gstAmount) || 0
+  // Invoice lines historically stored no per-line GST snapshot (tax: 0) while
+  // the invoice-level gstAmount was real — the printed GST column dashed every
+  // row because of it. Reconcile at render time so each line carries its share
+  // of the STORED document GST (never a freshly derived base → no double count).
+  const items = extras.docType === 'invoice' ? applyLineTax(docItems, totalTax) : docItems
+  // Supply type: a buyer GSTIN in another state than the business GSTIN means
+  // an inter-state supply, taxed as IGST instead of CGST + SGST — the same
+  // GSTIN-prefix rule backend/src/purchases.ts uses for the input-tax split.
+  const stateCode = (g: unknown) => (/^\d{2}/.test(String(g ?? '')) ? String(g).slice(0, 2) : null)
+  const bizStateCode = stateCode(doc.businessGstin)
+  const buyStateCode = stateCode(doc.customerGstin)
+  const interState = bizStateCode !== null && buyStateCode !== null && bizStateCode !== buyStateCode
   const halfTax = Math.round((totalTax / 2) * 100) / 100
   const hsnCodes = [...new Set(items.map((i) => String(i.hsn ?? '')).filter(Boolean))]
   const hsnDisplay = hsnCodes.length > 0 ? hsnCodes.join(', ') : '7113'
@@ -466,18 +571,22 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
   const fulfilmentRows = items
     .map((i, idx) => {
       const tick = extras.docType === 'pick-list'
-        ? `<td style="padding:9px 10px;${cellBorder}width:34px;"><span style="display:inline-block;width:16px;height:16px;border:2px solid ${c.accent2};border-radius:3px;"></span></td>`
+        ? `<td style="padding:7px 10px;${cellBorder}width:34px;"><span style="display:inline-block;width:16px;height:16px;border:2px solid ${c.accent2};border-radius:3px;"></span></td>`
         : ''
       const imgSrc = typeof i.image === 'string' && i.image ? i.image : ''
-      const imgCell = extras.showImages && imgSrc
-        ? `<td style="padding:6px 8px;${cellBorder}width:56px;"><img src="${escapeHtml(imgSrc)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e5e7eb;" onerror="this.style.display='none'"/></td>`
+      // The header reserves the image column whenever showImages is on, so
+      // EVERY row must emit the cell too — otherwise a product without an
+      // image shifts its whole row one column left in the PDF (Making Value
+      // under Rate, GST under MAKING VALUE, Amount under GST AMOUNT).
+      const imgCell = extras.showImages
+        ? `<td style="padding:6px 8px;${cellBorder}width:56px;">${imgSrc ? `<img src="${escapeHtml(imgSrc)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e5e7eb;" onerror="this.style.display='none'"/>` : ''}</td>`
         : ''
       return `<tr style="${zebra(idx)}">
           ${tick}
           ${imgCell}
-          <td style="padding:9px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
-          <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
-          ${c.showWeight ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
+          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
         </tr>`
     })
     .join('')
@@ -487,21 +596,36 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     `<th>Product</th><th style="text-align:right;">Qty</th>` +
     (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '')
 
+  // 0 in the rate/making/tax snapshot columns means "unknown" (order-raised
+  // items carry no rate or making snapshot) — dash it exactly like the
+  // invoice screen does, instead of printing a misleading ₹0.00 / 0%.
+  // `tax` holds a MONEY amount (the per-line GST), never a percentage.
+  const money = (v: unknown) => (Number(v) > 0 ? `₹${fmt(Number(v))}` : '—')
+
   const itemRows = items
     .map((i, idx) => {
       const imgSrc = typeof i.image === 'string' && i.image ? i.image : ''
-      const imgCell = extras.showImages && imgSrc
-        ? `<td style="padding:6px 8px;${cellBorder}width:56px;"><img src="${escapeHtml(imgSrc)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e5e7eb;" onerror="this.style.display='none'"/></td>`
+      // The header reserves the image column whenever showImages is on, so
+      // EVERY row must emit the cell too — otherwise a product without an
+      // image shifts its whole row one column left in the PDF (Making Value
+      // under Rate, GST under MAKING VALUE, Amount under GST AMOUNT).
+      const imgCell = extras.showImages
+        ? `<td style="padding:6px 8px;${cellBorder}width:56px;">${imgSrc ? `<img src="${escapeHtml(imgSrc)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e5e7eb;" onerror="this.style.display='none'"/>` : ''}</td>`
         : ''
+      const lineMakingValue = (Number(i.weight) || 0) * (Number(i.makingCharge) || 0)
+      // AMOUNT column = taxable line amount + that line's GST — the gross the
+      // customer pays for the line (confirmed replacement for the old ex-GST
+      // figure); the GST portion stays separately visible in GST AMOUNT.
+      const lineAmount = (Number(i.amount) || 0) + (Number(i.tax) || 0)
       return `<tr style="${zebra(idx)}">
           ${imgCell}
-          <td style="padding:9px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
-          ${c.showHsn ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:center;">${escapeHtml(String(i.hsn ?? hsnDisplay))}</td>` : ''}
-          <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
-          ${c.showWeight ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
-          ${c.showRate ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">₹${fmt(Number(i.silverRate) || 0)}</td><td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">₹${fmt(Number(i.makingCharge) || 0)}</td>` : ''}
-          ${c.showTax ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.tax) || 0}%</td>` : ''}
-          <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(Number(i.amount) || 0)}</td>
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
+          ${c.showHsn ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:center;">${escapeHtml(String(i.hsn ?? hsnDisplay))}</td>` : ''}
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
+          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
+          ${c.showRate ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.silverRate)}</td><td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(lineMakingValue)}</td>` : ''}
+          ${c.showTax ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.tax)}</td>` : ''}
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(lineAmount)}</td>
         </tr>`
     })
     .join('')
@@ -512,16 +636,16 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     (c.showHsn ? `<th style="text-align:center;">HSN</th>` : '') +
     `<th style="text-align:right;">Qty</th>` +
     (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '') +
-    (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making (₹)</th>` : '') +
-    (c.showTax ? `<th style="text-align:right;">GST</th>` : '') +
+    (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making Value (₹)</th>` : '') +
+    (c.showTax ? `<th style="text-align:right;">GST AMOUNT (₹)</th>` : '') +
     `<th style="text-align:right;">Amount (₹)</th>`
   const footSpans =
-    `<td colspan="${(extras.showImages ? 1 : 0) + (c.showHsn ? 2 : 1)}" style="padding:9px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item(s)</td>` +
-    `<td style="padding:9px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalQty}</td>` +
-    (c.showWeight ? `<td style="padding:9px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalWeight.toFixed(2)} g</td>` : '') +
+    `<td colspan="${(extras.showImages ? 1 : 0) + (c.showHsn ? 2 : 1)}" style="padding:7px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item(s)</td>` +
+    `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalQty}</td>` +
+    (c.showWeight ? `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalWeight.toFixed(2)} g</td>` : '') +
     (c.showRate ? `<td colspan="2"></td>` : '') +
     (c.showTax ? `<td></td>` : '') +
-    `<td style="padding:9px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:11px;">₹${fmt(doc.subtotal)}</td>`
+    `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:11px;">₹${fmt(doc.grandTotal)}</td>`
 
   const logoImg = c.showLogo && c.logoDataUrl ? `<img class="logo" src="${c.logoDataUrl}" alt="logo"/>` : ''
   const logoLeft = c.logoAlign === 'left'
@@ -581,10 +705,11 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
       </div>`
     : ''
 
+  const supplyLine = interState ? `Inter-state supply · IGST @ ${gstRate}%` : `Intra-state supply · GST @ ${gstRate}%`
   const gstinLine =
     extras.docType !== 'order'
-      ? `<div class="meta-line">${c.showGSTIN && doc.businessGstin ? `GSTIN: ${escapeHtml(doc.businessGstin)} · ` : ''}Intra-state supply · GST @ ${gstRate}%</div>`
-      : `<div class="meta-line">Intra-state supply · GST @ ${gstRate}%</div>`
+      ? `<div class="meta-line">${c.showGSTIN && doc.businessGstin ? `GSTIN: ${escapeHtml(doc.businessGstin)} · ` : ''}${supplyLine}</div>`
+      : `<div class="meta-line">${supplyLine}</div>`
 
   const watermark = c.watermark
     ? `<div class="watermark" style="color:${c.accent};">${escapeHtml(c.watermark)}</div>`
@@ -605,7 +730,7 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
   return `<!doctype html><html><head><title>${escapeHtml(doc.number)}</title><style>
       *{margin:0;padding:0;box-sizing:border-box;}
       body{font-family:${FONTS[c.font]};color:#232733;margin:0;padding:${c.margins.top}mm ${c.margins.right}mm ${c.margins.bottom}mm ${c.margins.left}mm;background:${c.paperTint === 'cream' ? '#fdfbf5' : '#fff'};font-size:${(11 * c.fontScale).toFixed(1)}px;max-width:${pageWidth};}
-      .header-banner{background:linear-gradient(135deg, ${c.accent2} 0%, #2a2a45 100%);color:#fff;padding:18px 22px;border-radius:${radius};margin-bottom:18px;display:flex;justify-content:space-between;align-items:center;gap:12px;box-shadow:0 1px 3px rgba(15,23,42,.18);}
+      .header-banner{background:linear-gradient(135deg, ${c.accent2} 0%, #2a2a45 100%);color:#fff;padding:14px 20px;border-radius:${radius};margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;gap:12px;box-shadow:0 1px 3px rgba(15,23,42,.18);}
       .header-banner h1{font-size:${(20 * c.fontScale).toFixed(0)}px;font-weight:800;letter-spacing:.4px;}
       .header-banner .sub{color:#aab3c5;font-size:${(9 * c.fontScale).toFixed(0)}px;margin-top:2px;}
       .header-banner .logo{max-height:46px;max-width:120px;object-fit:contain;background:#fff;border-radius:4px;padding:3px;}
@@ -631,42 +756,43 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
       .boxed-badge{color:#1a1a2e;font-size:${(10 * c.fontScale).toFixed(0)}px;font-weight:800;letter-spacing:1.5px;border-radius:${radius};padding:6px 16px;white-space:nowrap;}
       .header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
       .info-row{display:flex;gap:8px;flex:1;}
-      .info-box{background:${accentSoft2};border:1px solid ${accentSoft};border-radius:${radius};padding:11px 14px;flex:1;}
+      .info-box{background:${accentSoft2};border:1px solid ${accentSoft};border-radius:${radius};padding:9px 12px;flex:1;}
       .info-box .label{font-size:7.5px;font-weight:700;color:#8a8fa3;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px;}
       .info-box .value{font-size:12px;font-weight:700;color:#1f2937;}
       .info-box .detail{font-size:10px;color:#6b7280;margin-top:2px;text-transform:capitalize;}
-      .billto-row{display:flex;gap:12px;margin-bottom:14px;}
-      .billto-box{background:${accentSoft2};border:1px solid ${accentSoft};border-radius:${radius};padding:12px 14px;flex:1;}
+      .billto-row{display:flex;gap:12px;margin-bottom:10px;}
+      .billto-box{background:${accentSoft2};border:1px solid ${accentSoft};border-radius:${radius};padding:10px 12px;flex:1;}
       .billto-box .label{font-size:7.5px;font-weight:700;color:#8a8fa3;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:6px;}
       .billto-box .name{font-size:13px;font-weight:700;color:#1f2937;margin-bottom:3px;}
       .billto-box .detail{font-size:10px;color:#6b7280;line-height:1.55;}
-      .meta-line{font-size:10px;color:#8a8fa3;margin-bottom:14px;}
-      table.items{width:100%;border-collapse:collapse;margin-bottom:16px;border-radius:${radius};overflow:hidden;}
+      .meta-line{font-size:10px;color:#8a8fa3;margin-bottom:10px;}
+      table.items{width:100%;border-collapse:collapse;margin-bottom:12px;border-radius:${radius};overflow:hidden;}
       ${c.borderStyle === 'full' ? `table.items{border:1px solid #e5e7eb;}` : ''}
-      table.items thead th{${headBg}padding:9px 10px;font-size:8.5px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;text-align:left;}
+      table.items thead th{${headBg}padding:8px 10px;font-size:8.5px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;text-align:left;}
       table.items thead th:last-child{text-align:right;}
-      table.items tbody td{padding:9px 10px;font-size:11px;}
+      table.items tbody td{padding:7px 10px;font-size:11px;}
       table.items tfoot td{background:#f6f7f9;font-weight:600;}
-      .totals-wrap{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:16px;}
-      .totals-box{margin-left:auto;width:280px;background:${accentSoft2};border:1px solid ${accentSoft};border-radius:${radius};padding:15px 16px;}
-      .totals-box .row{display:flex;justify-content:space-between;padding:3.5px 0;font-size:11px;color:#374151;}
-      .totals-box .grand{display:flex;justify-content:space-between;padding-top:9px;font-size:14px;font-weight:800;color:#1a1a2e;border-top:2px solid ${c.accent};margin-top:7px;}
-      .amount-words{background:#fef7e0;border:1px solid #f3e3b3;border-radius:${radius};padding:10px 14px;font-size:10px;color:#92400e;margin:0 0 16px;}
+      .totals-wrap{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:12px;}
+      .totals-box{margin-left:auto;width:280px;background:${accentSoft2};border:1px solid ${accentSoft};border-radius:${radius};padding:12px 14px;}
+      .totals-box .row{display:flex;justify-content:space-between;padding:3px 0;font-size:11px;color:#374151;}
+      .totals-box .grand{display:flex;justify-content:space-between;padding-top:8px;font-size:14px;font-weight:800;color:#1a1a2e;border-top:2px solid ${c.accent};margin-top:6px;}
+      .amount-words{background:#fef7e0;border:1px solid #f3e3b3;border-radius:${radius};padding:8px 12px;font-size:10px;color:#92400e;margin:0 0 12px;}
       .amount-words b{color:#78350f;}
-      .footer{border-top:1px solid #e5e7eb;padding-top:12px;margin-top:4px;clear:both;}
-      .declaration{font-size:9px;color:#6b7280;line-height:1.65;margin-bottom:${c.showSignature ? '14px' : '4px'};max-width:65%;}
-      .signatures{display:flex;justify-content:space-between;margin-top:18px;}
+      .footer{border-top:1px solid #e5e7eb;padding-top:8px;margin-top:2px;clear:both;}
+      .declaration{font-size:9px;color:#6b7280;line-height:1.65;margin-bottom:${c.showSignature ? '10px' : '4px'};max-width:65%;}
+      .signatures{display:flex;justify-content:space-between;margin-top:12px;}
       .sig-block{text-align:center;width:150px;}
-      .sig-line{border-top:1px solid #d1d5db;margin-top:40px;padding-top:4px;font-size:9px;color:#6b7280;}
-      .gen-footer{text-align:center;font-size:8px;color:#9ca3af;margin-top:16px;padding-top:8px;border-top:1px solid #f3f4f6;}
+      .sig-line{border-top:1px solid #d1d5db;margin-top:28px;padding-top:4px;font-size:9px;color:#6b7280;}
+      .gen-footer{text-align:center;font-size:8px;color:#9ca3af;margin-top:10px;padding-top:6px;border-top:1px solid #f3f4f6;}
       .footnote{font-size:9px;color:#6b7280;margin-top:10px;}
       .bank{font-size:9.5px;color:#374151;background:${accentSoft2};border:1px solid ${accentSoft};border-radius:${radius};padding:9px 12px;margin-top:10px;white-space:pre-line;}
-      .thanks{font-size:11px;font-weight:700;color:${c.accent2};margin-top:8px;}
+      .thanks{font-size:11px;font-weight:700;color:${c.accent2};margin-top:6px;}
       .qr-block{float:left;text-align:center;margin:4px 0 10px;}
       .qr-caption{font-size:8.5px;color:#6b7280;margin-top:3px;}
       .watermark{position:fixed;top:45%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:72px;font-weight:800;opacity:.08;letter-spacing:10px;pointer-events:none;white-space:nowrap;}
       .terms{border-top:1px solid #e5e7eb;padding-top:12px;margin-top:14px;font-size:9px;color:#6b7280;line-height:1.6;max-width:65%;clear:both;}
       .fulfil-note{background:${accentSoft2};border:1px solid ${accentSoft};border-radius:${radius};padding:10px 14px;font-size:10px;color:#374151;margin-bottom:16px;}
+      @page{size:${c.pageSize === 'letter' ? 'letter' : 'A4'};margin:0;}
       @media print{
         body{font-size:10px;}
         .header-banner{background:linear-gradient(135deg, ${c.accent2} 0%, #2a2a45 100%) !important;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
@@ -706,7 +832,9 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
         ${qrBlock}
         <div class="totals-box">
           <div class="row"><span>Taxable Value</span><span>₹${fmt(taxable)}</span></div>
-          ${gstRate > 0 ? `<div class="row"><span>CGST @ ${gstRate / 2}%</span><span>₹${fmt(halfTax)}</span></div><div class="row"><span>SGST @ ${gstRate / 2}%</span><span>₹${fmt(halfTax)}</span></div><div class="row"><span>Total GST</span><span>₹${fmt(totalTax)}</span></div>` : ''}
+          ${gstRate > 0 ? (interState
+            ? `<div class="row"><span>IGST @ ${gstRate}%</span><span>₹${fmt(totalTax)}</span></div>`
+            : `<div class="row"><span>CGST @ ${gstRate / 2}%</span><span>₹${fmt(halfTax)}</span></div><div class="row"><span>SGST @ ${gstRate / 2}%</span><span>₹${fmt(halfTax)}</span></div><div class="row"><span>Total GST</span><span>₹${fmt(totalTax)}</span></div>`) : ''}
           ${Number(doc.discount) > 0 ? `<div class="row" style="color:#dc2626;"><span>Discount</span><span>- ₹${fmt(doc.discount)}</span></div>` : ''}
           <div class="grand"><span>${escapeHtml(extras.totalLabel ?? 'GRAND TOTAL')}</span><span>₹${fmt(doc.grandTotal)}</span></div>
         </div>

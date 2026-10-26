@@ -15,14 +15,8 @@ import type { Payment } from '@/types'
 import { formatCurrency, formatDateTime } from '@/lib/format'
 import { Search } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 
 const statusBadge: Record<Payment['status'], { label: string; variant: 'success' | 'warning' | 'danger' | 'muted' }> = {
   settled: { label: 'Settled', variant: 'success' },
@@ -75,6 +69,8 @@ export default function PaymentsPage() {
     gateway: 'Manual',
     status: 'settled',
   })
+  // Snapshot of the form as it opened, for the unsaved-changes close guard.
+  const [baseline, setBaseline] = useState('')
 
   const load = useCallback(() => {
     setLoading(true)
@@ -142,7 +138,9 @@ export default function PaymentsPage() {
   }, [payments, load])
 
   const openDialog = () => {
-    setForm({ ref: `PAY-${Date.now()}`, invoice: '', customer: '', amount: '', method: 'UPI', gateway: 'Manual', status: 'settled' })
+    const next = { ref: `PAY-${Date.now()}`, invoice: '', customer: '', amount: '', method: 'UPI', gateway: 'Manual', status: 'settled' }
+    setForm(next)
+    setBaseline(JSON.stringify(next))
     setError('')
     setDialogOpen(true)
   }
@@ -366,12 +364,22 @@ export default function PaymentsPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent size="md">
-          <DialogHeader>
-            <DialogTitle>Add Payment</DialogTitle>
-            <DialogDescription>Record a manual payment or adjustment.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        size="sm"
+        isDirty={dialogOpen && JSON.stringify(form) !== baseline}
+        title="Add Payment"
+        description="Record a manual payment or adjustment."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+            <Button onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Create Payment'}
+            </Button>
+          </DialogFooter>
+        }
+      >
           {error && <div className="mb-4 p-3 text-sm text-red-600 dark:text-red-400 bg-red-50 rounded-lg">{error}</div>}
           <div className="grid gap-4 py-4">
             <div>
@@ -407,14 +415,7 @@ export default function PaymentsPage() {
               </div>
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Create Payment'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

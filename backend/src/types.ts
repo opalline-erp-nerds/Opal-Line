@@ -18,6 +18,26 @@ export interface SyncProduct {
   inventoryQuantity: number
   inventoryItemId: number
   variantId: number
+  /**
+   * Shopify-style options on the live product:
+   * `[{ name: 'Size', values: ['Small', 'Large'] }]`. Empty for a simple
+   * single-variant listing.
+   */
+  options?: Array<{ name: string; values: string[] }>
+  /** Every variant on the live product (not just the first). */
+  variants?: Array<{
+    id: number
+    title: string
+    option1: string | null
+    option2: string | null
+    option3: string | null
+    sku: string
+    barcode: string | null
+    price: string
+    compareAtPrice: string | null
+    inventoryQuantity: number
+    inventoryItemId: number
+  }>
   createdAt: string
   updatedAt: string
 }

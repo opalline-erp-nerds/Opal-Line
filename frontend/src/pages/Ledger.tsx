@@ -10,18 +10,12 @@ import { Label } from '@/components/ui/label'
 import { DataTable } from '@/components/ui/data-table'
 import { dbApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import type { LedgerEntry } from '@/types'
 import { formatCurrency, formatDate, todayIST } from '@/lib/format'
 import { Search } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 
 export default function LedgerPage() {
   const [entries, setEntries] = useState<LedgerEntry[]>([])
@@ -266,12 +260,22 @@ export default function LedgerPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent size="md">
-          <DialogHeader>
-            <DialogTitle>{editing ? 'Edit Ledger Entry' : 'Add Ledger Entry'}</DialogTitle>
-            <DialogDescription>{editing ? 'Update the ledger entry details.' : 'Record a new debit or credit entry.'}</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        size="md"
+        isDirty={dialogOpen && Boolean(form.date || form.description || form.ref || form.debit || form.credit)}
+        title={editing ? 'Edit Ledger Entry' : 'Add Ledger Entry'}
+        description={editing ? 'Update the ledger entry details.' : 'Record a new debit or credit entry.'}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+            <Button onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : editing ? 'Update' : 'Create'}
+            </Button>
+          </DialogFooter>
+        }
+      >
           {error && <div className="mb-4 p-3 text-sm text-red-600 dark:text-red-400 bg-red-50 rounded-lg">{error}</div>}
           <div className="grid gap-4 py-4">
             <div>
@@ -297,14 +301,7 @@ export default function LedgerPage() {
               </div>
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : editing ? 'Update' : 'Create'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

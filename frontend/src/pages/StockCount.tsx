@@ -23,7 +23,6 @@ interface ScannedItem {
   id: string
   name: string
   sku: string
-  barcode: string | null
   systemStock: number | null
   counted: number
 }
@@ -109,7 +108,6 @@ export default function StockCountPage() {
             id: p.id,
             name: p.name,
             sku: p.sku,
-            barcode: p.barcode,
             systemStock: levelsRef.current[p.id] ?? p.stock,
             counted: 1,
           },
@@ -163,7 +161,7 @@ export default function StockCountPage() {
     <div className="mx-auto w-full max-w-[1100px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
       <PageHeader
         title="Scan Stock Count"
-        subtitle="Scan barcodes with a scanner gun (or type SKU) to count stock quickly, then apply."
+        subtitle="Scan a product's QR label (or type its SKU) to count stock quickly, then apply."
         actions={
           <Button onClick={() => void submit()} disabled={saving || items.length === 0}>
             <Save className="h-4 w-4" />
@@ -176,7 +174,7 @@ export default function StockCountPage() {
         <CardContent className="space-y-4 p-5">
           <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
             <div>
-              <Label htmlFor="scan-input">Barcode / SKU</Label>
+              <Label htmlFor="scan-input">QR / SKU</Label>
               <div className="relative mt-1">
                 <ScanLine className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input

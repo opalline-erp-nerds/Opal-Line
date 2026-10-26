@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Bell, Building2, Check, KeyRound, Landmark, Loader2, LogOut, Monitor, Moon, Save, Settings as SettingsIcon, ShieldCheck, SlidersHorizontal, Sun, Tag, Users } from 'lucide-react'
+import { Bell, Building2, Check, KeyRound, Landmark, Loader2, LogOut, Monitor, Moon, Package, Save, Settings as SettingsIcon, ShieldCheck, SlidersHorizontal, Sun, Tag, Users } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -14,6 +14,7 @@ import { dbApi, authApi } from '@/lib/api'
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useAuth } from '@/auth/auth-context'
 import { setTheme, type Theme } from '@/lib/theme'
+import { renderSku } from '@/lib/productCodes'
 import type { AppSettings } from '@/types'
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -41,6 +42,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   loginLockoutEnabled: false,
   lockoutThreshold: 5,
   lockoutDurationMinutes: 15,
+  skuPrefix: 'OL',
+  skuSuffix: '',
+  skuFormat: '{PREFIX}-{CATEGORY}-{SEQ}',
+  skuSeqLength: 3,
   updatedAt: null,
 }
 
@@ -194,6 +199,7 @@ function SettingsContent() {
       <Tabs defaultValue="business">
         <TabsList>
           <TabsTrigger value="business"><Building2 /> Business</TabsTrigger>
+          <TabsTrigger value="products"><Package /> Product Codes</TabsTrigger>
           <TabsTrigger value="appearance"><Sun /> Appearance</TabsTrigger>
           <TabsTrigger value="silver"><Tag /> Silver Rate</TabsTrigger>
           <TabsTrigger value="banking"><Landmark /> Banking</TabsTrigger>
@@ -295,6 +301,87 @@ function SettingsContent() {
                 <Field label="Invoice Prefix">
                   <Input value={settings.invoicePrefix} onChange={(e) => set('invoicePrefix', e.target.value)} />
                 </Field>
+              </CardContent>
+            </Card>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="products">
+          <div className="grid gap-4 md:grid-cols-2">
+            <Card>
+              <CardContent className="space-y-4 p-5">
+                <div className="flex items-center gap-2">
+                  <Package className="h-4 w-4 text-muted-foreground" />
+                  <h3 className="font-semibold text-foreground">SKU auto-generation</h3>
+                </div>
+                <p className="text-[13px] text-muted-foreground">
+                  New products get a free SKU on this format. The tokens are replaced when the code is generated:
+                  {' '}<span className="font-mono text-foreground">{'{PREFIX}'}</span>,{' '}
+                  <span className="font-mono text-foreground">{'{CATEGORY}'}</span> (3-letter category code),{' '}
+                  <span className="font-mono text-foreground">{'{SEQ}'}</span> (running number) and{' '}
+                  <span className="font-mono text-foreground">{'{SUFFIX}'}</span>.
+                </p>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="Prefix">
+                    <Input
+                      aria-label="SKU prefix"
+                      value={settings.skuPrefix ?? 'OL'}
+                      onChange={(e) => set('skuPrefix', e.target.value.toUpperCase())}
+                      maxLength={12}
+                      placeholder="OL"
+                    />
+                  </Field>
+                  <Field label="Suffix">
+                    <Input
+                      aria-label="SKU suffix"
+                      value={settings.skuSuffix ?? ''}
+                      onChange={(e) => set('skuSuffix', e.target.value.toUpperCase())}
+                      maxLength={12}
+                      placeholder="None"
+                    />
+                  </Field>
+                  <Field label="ID format">
+                    {/* Fixed template enum plus free typing of any token
+                        arrangement — a format without {SEQ} would mint
+                        identical SKUs forever, so it is rejected. */}
+                    <CreatableSelect
+                      options={[
+                        { value: '{PREFIX}-{CATEGORY}-{SEQ}', label: 'PREFIX-CATEGORY-SEQ — OL-RNG-001' },
+                        { value: '{PREFIX}-{SEQ}{SUFFIX}', label: 'PREFIX-SEQ SUFFIX — OL-001' },
+                        { value: '{CATEGORY}-{SEQ}', label: 'CATEGORY-SEQ — RNG-001' },
+                        { value: '{PREFIX}{CATEGORY}{SEQ}', label: 'PREFIXCATEGORYSEQ — OLRNG001' },
+                      ]}
+                      value={settings.skuFormat ?? '{PREFIX}-{CATEGORY}-{SEQ}'}
+                      onValueChange={(v) => {
+                        if (!v.includes('{SEQ}')) {
+                          toast.error('The ID format must contain {SEQ} so every SKU is unique')
+                          return
+                        }
+                        set('skuFormat', v)
+                      }}
+                      placeholder="Pick a format or type your own"
+                      createLabel="Use this format"
+                      className="w-full"
+                    />
+                  </Field>
+                  <Field label="Sequence digits">
+                    <Input
+                      type="number"
+                      min={3}
+                      max={8}
+                      aria-label="SKU sequence digits"
+                      value={settings.skuSeqLength ?? 3}
+                      onChange={(e) => set('skuSeqLength', Math.max(3, Number(e.target.value) || 3))}
+                    />
+                    <p className="text-[11px] text-muted-foreground">Minimum 3 — sequences are three digits, e.g. 001.</p>
+                  </Field>
+                </div>
+                <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5">
+                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Preview</p>
+                  <p className="mt-0.5 font-mono text-sm text-foreground" data-testid="sku-preview">
+                    {renderSku(settings, 'Rings', 42)}
+                  </p>
+                </div>
               </CardContent>
             </Card>
           </div>

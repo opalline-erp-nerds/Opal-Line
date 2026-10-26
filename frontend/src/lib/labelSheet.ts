@@ -4,7 +4,6 @@ export interface LabelProduct {
   id: string
   name: string
   sku: string
-  barcode?: string
   price: number
   weight?: number
   category?: string
@@ -29,7 +28,6 @@ export interface LabelConfig {
   showCategory: boolean
   showCompany: boolean
   showQr: boolean
-  showBarcode: boolean
   showBorder: boolean
   fontScale: number
   companyName: string
@@ -78,7 +76,6 @@ export const DEFAULT_LABEL_CONFIG: LabelConfig = {
   showCategory: false,
   showCompany: false,
   showQr: true,
-  showBarcode: false,
   showBorder: true,
   fontScale: 1,
   companyName: 'OPAL LINE JEWELS LLP',
@@ -130,18 +127,13 @@ export function computeGrid(cfg: LabelConfig): LabelGrid {
 export function gridDescription(cfg: LabelConfig): string {
   const g = computeGrid(cfg)
   return `${g.columns} × ${g.rows} per ${cfg.page === 'letter' ? 'Letter' : 'A4'} page`
-}
-
-function sanitizeBarcodeText(text: string): string {
-  return text.replace(/[^\x20-\x7E]/g, '').trim()
-}
-
-export function barcodeValue(p: LabelProduct): string {
-  return sanitizeBarcodeText(p.barcode || p.sku || '')
-}
-
+}/**
+ * What the QR symbol encodes: ONLY the product SKU (e.g. `OL-RNG-001`).
+ * Product names, prices and weights are never part of the payload — scanning
+ * a printed label must resolve the product through an exact SKU match.
+ */
 export function qrPayload(p: LabelProduct): string {
-  return JSON.stringify({ sku: p.sku, name: p.name, price: p.price })
+  return (p.sku ?? '').trim()
 }
 
 function withFillViewport(svg: string, preserveAspectRatio: string): string {
@@ -153,31 +145,6 @@ function withFillViewport(svg: string, preserveAspectRatio: string): string {
 type BwipSvgOptions = Parameters<typeof bwipJs.toSVG>[0]
 function encoderOptions(options: Record<string, unknown>): BwipSvgOptions {
   return options as unknown as BwipSvgOptions
-}
-
-export function barcodeSvg(text: string): string | null {
-  const value = sanitizeBarcodeText(text)
-  if (!value) return null
-  try {
-    const svg = bwipJs.toSVG(
-      encoderOptions({
-        bcid: 'code128',
-        text: value,
-        height: 10,
-        // ~10 module quiet zone on each side (required for reliable scans).
-        paddingleft: 25,
-        paddingright: 25,
-        includetext: false,
-        barcolor: '000000',
-        backgroundcolor: 'FFFFFF',
-      }),
-    )
-    // Uniform horizontal stretch keeps relative bar widths intact, so the
-    // code stays scannable while filling the full label width.
-    return withFillViewport(svg, 'none')
-  } catch {
-    return null
-  }
 }
 
 export function qrSvg(text: string): string | null {
@@ -214,18 +181,14 @@ function formatPrice(value: number): string {
   return `₹${Math.round(value || 0).toLocaleString('en-IN')}`
 }
 
-function buildLabelHtml(p: LabelProduct, cfg: LabelConfig, qrCode: string | null, barCode: string | null): string {
+function buildLabelHtml(p: LabelProduct, cfg: LabelConfig, qrCode: string | null): string {
   const w = cfg.widthMm
   const h = cfg.heightMm
   const pad = clamp(Math.min(h * 0.07, w * 0.035), 0.4, 1.6)
   const innerW = w - pad * 2
   const innerH = h - pad * 2
 
-  const hasBarcode = !!barCode
-  const barH = hasBarcode ? clamp(h * 0.17, 2.6, 5.5) : 0
-  const barGap = hasBarcode ? clamp(h * 0.03, 0.3, 1) : 0
-
-  const bodyH = Math.max(1.5, innerH - barH - barGap)
+  const bodyH = Math.max(1.5, innerH)
   const qrSize = qrCode ? clamp(Math.min(bodyH, innerW * 0.38), 0, 16) : 0
   const showQr = !!qrCode && qrSize >= 3
   const qrGap = showQr ? clamp(w * 0.03, 0.4, 1.4) : 0
@@ -250,7 +213,6 @@ function buildLabelHtml(p: LabelProduct, cfg: LabelConfig, qrCode: string | null
           ${bottom.length ? `<div class="bottom">${bottom.join('')}</div>` : ''}
         </div>
       </div>
-      ${hasBarcode ? `<div class="barcode" style="height:${barH}mm;margin-top:${barGap}mm">${barCode}</div>` : ''}
     </div>`
 }
 
@@ -287,7 +249,6 @@ export function buildLabelSheet(products: LabelProduct[], cfg: LabelConfig, opts
   const renderedPages = Math.max(1, Math.ceil(rendered.length / grid.labelsPerPage))
 
   const qrCache = new Map<string, string | null>()
-  const barCache = new Map<string, string | null>()
 
   const pages: string[] = []
   for (let pageIdx = 0; pageIdx < renderedPages; pageIdx++) {
@@ -297,16 +258,10 @@ export function buildLabelSheet(products: LabelProduct[], cfg: LabelConfig, opts
       let qr: string | null = null
       if (cfg.showQr) {
         const key = qrPayload(p)
-        if (!qrCache.has(key)) qrCache.set(key, qrSvg(key))
-        qr = qrCache.get(key) ?? null
+        if (key && !qrCache.has(key)) qrCache.set(key, qrSvg(key))
+        qr = (key && qrCache.get(key)) || null
       }
-      let bar: string | null = null
-      if (cfg.showBarcode) {
-        const value = barcodeValue(p)
-        if (!barCache.has(value)) barCache.set(value, barcodeSvg(value))
-        bar = barCache.get(value) ?? null
-      }
-      cells.push(buildLabelHtml(p, cfg, qr, bar))
+      cells.push(buildLabelHtml(p, cfg, qr))
     }
     pages.push(`<div class="page">${cells.join('')}</div>`)
   }
@@ -318,7 +273,7 @@ export function buildLabelSheet(products: LabelProduct[], cfg: LabelConfig, opts
       .page{margin:0 auto 6mm;box-shadow:0 1px 6px rgba(15,23,42,.18);background:#fff;}
     }`
 
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Barcode Labels</title><style>
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Product Labels</title><style>
     @page{size:${cfg.page === 'letter' ? 'letter' : 'A4'};margin:0;}
     *{margin:0;padding:0;box-sizing:border-box;}
     html,body{background:#fff;color:#111827;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
@@ -366,8 +321,6 @@ export function buildLabelSheet(products: LabelProduct[], cfg: LabelConfig, opts
       font-size:${clamp(cfg.heightMm * 0.085 * cfg.fontScale, 1.2, 3)}mm;
       color:#6b7280;line-height:1.1;
     }
-    .lbl .barcode{display:flex;align-items:center;justify-content:center;}
-    .lbl .barcode svg{display:block;width:100%;height:100%;}
     @media print{
       body{background:#fff;}
       .page{margin:0;box-shadow:none;}

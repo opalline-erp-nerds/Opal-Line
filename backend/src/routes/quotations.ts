@@ -118,11 +118,11 @@ export function normalizeQuotationItems(raw: unknown): Array<Record<string, unkn
       const item = it && typeof it === 'object' ? (it as Record<string, unknown>) : {}
       const weight = num(item.weight, 0)
       const silverRate = num(item.silverRate, 0)
-      const makingCharge = num(item.makingCharge, 0)
+      const makingChargePerGram = num(item.makingCharge, 0)
       const qty = Math.max(1, Math.floor(num(item.qty, 1)))
       const amount =
         weight > 0 && silverRate > 0
-          ? round2(weight * silverRate + makingCharge)
+          ? round2(weight * silverRate + weight * makingChargePerGram)
           : num(item.amount, 0)
       return {
         product: String(item.product ?? item.title ?? '').trim(),
@@ -130,7 +130,7 @@ export function normalizeQuotationItems(raw: unknown): Array<Record<string, unkn
         qty,
         weight,
         silverRate,
-        makingCharge,
+        makingCharge: makingChargePerGram,
         amount,
       }
     })

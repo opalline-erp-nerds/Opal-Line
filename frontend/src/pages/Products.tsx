@@ -1,9 +1,8 @@
-import { toast, confirmDialog } from '@/components/ui/confirm'
+import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
 import {
-  Barcode,
   Copy,
   Download,
   ExternalLink,
@@ -18,8 +17,8 @@ import {
   RefreshCw,
   Search,
   Tags,
+  Trash2,
   Upload,
-  Wand2,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
@@ -30,14 +29,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -48,6 +40,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ProductDialog } from '@/components/product-dialog'
 import { BulkImportDialog } from '@/components/bulk-import-dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi, shopifyApi, backupApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
 import type { Product } from '@/types'
@@ -84,6 +77,7 @@ const productTints: Record<string, { bg: string; text: string }> = {
 export default function ProductsPage() {
   const navigate = useNavigate()
   const [products, setProducts] = useState<Product[]>([])
+  const [lastDayById, setLastDayById] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
   const [pushing, setPushing] = useState(false)
@@ -111,6 +105,7 @@ export default function ProductsPage() {
   const [stockStatus, setStockStatus] = useState('')
   const [addOpen, setAddOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<Product | null>(null)
+  const [duplicateOf, setDuplicateOf] = useState<Product | null>(null)
   const [bulkMode, setBulkMode] = useState<'csv' | 'images' | null>(null)
   const [selectedProducts, setSelectedProducts] = useState<Product[]>([])
   const [viewProduct, setViewProduct] = useState<Product | null>(null)
@@ -118,16 +113,35 @@ export default function ProductsPage() {
   const [reorderQty, setReorderQty] = useState('')
   const [reorderSaving, setReorderSaving] = useState(false)
   const [duplicates, setDuplicates] = useState<Array<{ sku: string; cnt: number; products: string }>>([])
-  const [barcodeBusy, setBarcodeBusy] = useState<string | null>(null)
-  const [missingBarcodes, setMissingBarcodes] = useState(0)
 
   const load = useCallback(() => {
     setLoading(true)
     setError('')
-    dbApi
-      .getProducts()
-      .then((p) => {
-        setProducts(p)
+    Promise.all([
+      dbApi.getProducts(),
+      dbApi.getProductLastDayPrices().catch(() => ({ data: [] as Array<{ productId: string; sellingPrice: number }> })),
+    ])
+      .then(([p, hist]) => {
+        // Show newest-added first by default. created_at is a full
+        // timestamp, so this sort is deterministic down to the second (ties
+        // fall back to the API's stable sequence, so the list never reorders
+        // on re-render); the API itself orders newest-first too.
+        const withTime = p.map((product, index) => ({
+          product,
+          index,
+          t: Date.parse(product.createdAt ?? ''),
+        }))
+        withTime.sort((a, b) => {
+          const at = Number.isFinite(a.t) ? a.t : Number.NEGATIVE_INFINITY
+          const bt = Number.isFinite(b.t) ? b.t : Number.NEGATIVE_INFINITY
+          return bt !== at ? bt - at : a.index - b.index
+        })
+        setProducts(withTime.map((x) => x.product))
+        const map: Record<string, number> = {}
+        for (const row of hist.data ?? []) {
+          if (Number.isFinite(row.sellingPrice)) map[row.productId] = row.sellingPrice
+        }
+        setLastDayById(map)
         setLoading(false)
       })
       .catch((e) => {
@@ -138,10 +152,6 @@ export default function ProductsPage() {
       .getProductDuplicates()
       .then((r) => setDuplicates(r.data))
       .catch(() => setDuplicates([]))
-    dbApi
-      .getBarcodeSummary()
-      .then((s) => setMissingBarcodes(s.missing))
-      .catch(() => setMissingBarcodes(0))
   }, [])
 
   useEffect(() => {
@@ -196,8 +206,7 @@ export default function ProductsPage() {
       const matchQuery =
         !q ||
         p.name.toLowerCase().includes(q) ||
-        p.sku.toLowerCase().includes(q) ||
-        (p.barcode ?? '').toLowerCase().includes(q)
+        p.sku.toLowerCase().includes(q)
       const matchCategory = !category || p.category === category
       const matchPurity = !purity || String(p.purity) === purity
       const matchStock =
@@ -219,78 +228,13 @@ export default function ProductsPage() {
     }
   }, [])
 
-  const duplicateProduct = useCallback(async (p: Product) => {
-    try {
-      await dbApi.create('products', {
-        name: `${p.name} (Copy)`,
-        sku: `${p.sku}-COPY`,
-        // Deliberately do NOT copy the barcode — one barcode identifies exactly
-        // one product, so the copy gets its own generated code.
-        barcode: '',
-        category: p.category,
-        collection: p.collection ?? '',
-        purity: p.purity ?? '92.5',
-        supplier: p.supplier ?? '',
-        grossWeight: p.grossWeight ?? null,
-        stoneWeight: p.stoneWeight ?? null,
-        netWeight: p.netWeight ?? null,
-        makingCharge: p.makingCharge ?? null,
-        gst: p.gst ?? null,
-        silverRate: p.silverRate ?? null,
-        sellingPrice: p.sellingPrice ?? null,
-        compareAtPrice: p.compareAtPrice ?? null,
-        stock: p.stock ?? null,
-        reorderLevel: p.reorderLevel ?? null,
-        vendor: p.vendor ?? '',
-        productType: p.productType ?? '',
-        tags: p.tags ?? '',
-        image: p.image ?? '',
-        trackInventory: p.trackInventory ?? false,
-        chargeOnTax: p.chargeOnTax ?? true,
-        status: 'draft',
-        shopifyStatus: 'not-listed',
-      })
-      setPushMessage({ ok: true, text: `Duplicated "${p.name}" as a new draft product.` })
-      load()
-    } catch (e) {
-      setPushMessage({ ok: false, text: e instanceof Error ? e.message : 'Could not duplicate product' })
-    }
-  }, [load])
-
-  const generateBarcode = useCallback(async (p: Product) => {
-    setBarcodeBusy(p.id)
-    try {
-      const res = await dbApi.generateProductBarcode(p.id)
-      setProducts((prev) => prev.map((x) => (x.id === p.id ? { ...x, barcode: res.barcode } : x)))
-      setMissingBarcodes((n) => Math.max(0, n - 1))
-      toast.success(res.created ? `Generated barcode ${res.barcode}` : `Barcode: ${res.barcode}`)
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Could not generate a barcode')
-    } finally {
-      setBarcodeBusy(null)
-    }
+  // Duplicate reuses the Add Product form, prefilled from the source product.
+  // The unique field (SKU) is regenerated by the dialog; the user
+  // reviews and saves like any new product.
+  const duplicateProduct = useCallback((p: Product) => {
+    setDuplicateOf(p)
+    setAddOpen(true)
   }, [])
-
-  const generateAllMissing = useCallback(async () => {
-    try {
-      const preview = await dbApi.generateMissingBarcodes({ dryRun: true })
-      if (preview.candidates === 0) {
-        toast.info('Every product already has a barcode')
-        return
-      }
-      const ok = await confirmDialog({
-        title: `Generate ${preview.candidates} barcode${preview.candidates === 1 ? '' : 's'}?`,
-        description: 'Only products without a barcode are updated. Existing barcodes are never changed.',
-        confirmLabel: 'Generate',
-      })
-      if (!ok) return
-      const result = await dbApi.generateMissingBarcodes({})
-      toast.success(`Assigned ${result.assigned} barcode${result.assigned === 1 ? '' : 's'}`)
-      load()
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Could not generate barcodes')
-    }
-  }, [load])
 
   const printLabelsFor = useCallback(
     (list: Product[]) => {
@@ -300,6 +244,34 @@ export default function ProductsPage() {
     },
     [navigate],
   )
+
+  const deleteProduct = useCallback(async (p: Product) => {
+    const confirmed = await confirmDialog({
+      title: `Delete "${p.name}"?`,
+      description: `${p.sku} is removed from the catalog and will not appear in new invoices. Past invoices, stock movements and batches keep their records.`,
+      danger: true,
+      confirmLabel: 'Delete product',
+    })
+    if (!confirmed) return
+    try {
+      await dbApi.remove('products', p.id)
+      load()
+      // Undo re-creates with the SAME id: the generic create route honours a
+      // client-supplied id, so stock levels, movements and variants reattach
+      // to the restored product instead of pointing at a ghost row.
+      toast.undoable('Product deleted', async () => {
+        try {
+          await dbApi.create('products', { ...p })
+          load()
+          toast.success('Delete undone — product restored')
+        } catch {
+          toast.error('Could not restore product')
+        }
+      })
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to delete product')
+    }
+  }, [load])
 
   const columns = useMemo<ColumnDef<Product>[]>(
     () => [
@@ -327,53 +299,55 @@ export default function ProductsPage() {
               )}
               <div className="min-w-0">
                 <p className="truncate font-medium text-foreground group-hover:text-primary-700">{row.original.name}</p>
-                <p className="text-[11px] text-muted-foreground">{row.original.sku}{row.original.huid ? ` · HUID ${row.original.huid}` : ''}</p>
+                <p className="text-[11px] text-muted-foreground">
+                  {row.original.sku}
+                  {(() => {
+                    // Shopify-style options: show the combination count (what
+                    // the stock actually splits into), not the option count.
+                    const opts = Array.isArray(row.original.options) ? row.original.options : []
+                    if (opts.length === 0) return ''
+                    const combos = opts.reduce((a, o) => a * Math.max(1, o.values?.length ?? 0), 1)
+                    return combos > 0 ? ` · ${combos} variant${combos === 1 ? '' : 's'}` : ''
+                  })()}
+                  {row.original.huid ? ` · HUID ${row.original.huid}` : ''}
+                </p>
               </div>
             </Link>
           )
         },
       },
       {
-        id: 'barcode',
-        header: 'Barcode',
-        meta: { headerClassName: 'min-w-[150px]' },
-        cell: ({ row }) => {
-          const code = (row.original.barcode ?? '').trim()
-          if (!code) {
-            return (
-              <span className="flex items-center gap-1.5">
-                <Badge variant="warning" dot>
-                  Missing
-                </Badge>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  disabled={barcodeBusy === row.original.id}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    generateBarcode(row.original)
-                  }}
-                  title="Generate barcode"
-                >
-                  <Wand2 className={cn('h-3.5 w-3.5', barcodeBusy === row.original.id && 'animate-pulse')} />
-                </Button>
-              </span>
-            )
-          }
-          return (
-            <span className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
-              <Barcode className="h-3.5 w-3.5 shrink-0" />
-              {code}
-            </span>
-          )
-        },
-      },
-      { accessorKey: 'purity', header: 'Purity', cell: ({ row }) => <span className="tabular-nums">{row.original.purity != null ? `${row.original.purity}%` : '—'}</span>, meta: { align: 'right' as const } },
+        accessorKey: 'purity', header: 'Purity', cell: ({ row }) => <span className="tabular-nums">{row.original.purity != null ? `${row.original.purity}%` : '—'}</span>, meta: { align: 'right' as const } },
       { accessorKey: 'collection', header: 'Collection', cell: ({ row }) => <Badge variant="outline">{row.original.collection ?? '—'}</Badge> },
       { accessorKey: 'netWeight', header: 'Net Wt', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">{formatWeight(row.original.netWeight)}</span>, meta: { align: 'right' as const } },
       { accessorKey: 'makingCharge', header: 'Making', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">{row.original.makingCharge != null ? `${row.original.makingCharge} ₹/g` : '—'}</span>, meta: { align: 'right' as const } },
       { accessorKey: 'silverRate', header: 'Silver Rate', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">₹{row.original.silverRate?.toFixed(2) ?? '—'}/g</span>, meta: { align: 'right' as const } },
       { accessorKey: 'sellingPrice', header: 'Selling Price', cell: ({ row }) => <span className="font-semibold tabular-nums text-foreground">{formatCurrency(row.original.sellingPrice)}</span>, meta: { align: 'right' as const } },
+      {
+        id: 'lastDayPrice',
+        header: 'Last Day Price',
+        meta: { align: 'right' as const },
+        cell: ({ row }) => {
+          const last = lastDayById[row.original.id]
+          const today = row.original.sellingPrice
+          if (last == null || !Number.isFinite(last)) {
+            return <span className="text-muted-foreground">—</span>
+          }
+          const lastLabel = formatCurrency(last, { decimals: true })
+          if (today == null || !Number.isFinite(today) || Math.round(today * 100) === Math.round(last * 100)) {
+            return <span className="tabular-nums text-muted-foreground">{lastLabel} —</span>
+          }
+          const down = today < last
+          return (
+            <span className="inline-flex items-baseline justify-end gap-1.5 tabular-nums">
+              <span className="font-medium text-foreground">{lastLabel}</span>
+              <span className={down ? 'text-red-600 dark:text-red-400' : 'text-success-700 dark:text-emerald-400'}>
+                {down ? '▼' : '▲'} {formatCurrency(Math.abs(today - last), { decimals: true })}
+              </span>
+            </span>
+          )
+        },
+      },
       {
         id: 'cost',
         header: 'Cost',
@@ -384,24 +358,6 @@ export default function ProductsPage() {
             return <span className="text-[11px] text-muted-foreground">not set</span>
           }
           return <span className="tabular-nums text-muted-foreground">{formatCurrency(cost)}</span>
-        },
-      },
-      {
-        id: 'margin',
-        header: 'Margin',
-        meta: { align: 'right' as const },
-        cell: ({ row }) => {
-          const cost = row.original.costPrice
-          const sell = row.original.sellingPrice
-          if (cost == null || !Number.isFinite(cost) || cost <= 0 || !sell) {
-            return <span className="text-[11px] text-muted-foreground">—</span>
-          }
-          const pct = ((sell - cost) / sell) * 100
-          return (
-            <span className={cn('tabular-nums', pct < 10 ? 'text-warning-600' : 'text-success-600')}>
-              {pct.toFixed(1)}%
-            </span>
-          )
         },
       },
       { accessorKey: 'stock', header: 'Stock', cell: ({ row }) => {
@@ -438,13 +394,11 @@ export default function ProductsPage() {
             <TooltipProvider delayDuration={200}>
             <Tooltip>
               <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-sm" asChild>
-                <Link to={`/inventory/products/${row.original.id}`}>
-                  <Pencil className="h-3.5 w-3.5" />
-                </Link>
+              <Button variant="ghost" size="icon-sm" onClick={() => setEditTarget(row.original)}>
+                <Pencil className="h-3.5 w-3.5" />
               </Button>
               </TooltipTrigger>
-              <TooltipContent>View / Edit</TooltipContent>
+              <TooltipContent>Edit</TooltipContent>
             </Tooltip>
             {row.original.shopifyStatus === 'synced' && row.original.shopifyId ? (
               <Tooltip>
@@ -500,8 +454,8 @@ export default function ProductsPage() {
                   {row.original.status === 'inactive' ? 'Activate' : 'Deactivate'}
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => toggleStatus(row.original)}>
-                  {row.original.status === 'inactive' ? 'Activate product' : 'Deactivate product'}
+                <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => void deleteProduct(row.original)}>
+                  <Trash2 className="h-3.5 w-3.5" /> Delete product
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -510,11 +464,12 @@ export default function ProductsPage() {
         ),
       },
     ],
-    [pushProducts, pushing, toggleStatus, duplicateProduct, barcodeBusy, generateBarcode, printLabelsFor],
+    [pushProducts, pushing, toggleStatus, duplicateProduct, deleteProduct, printLabelsFor, lastDayById],
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-4 px-4 py-4 sm:space-y-5 sm:py-6 lg:px-6">
+    <div className="w-full space-y-4 py-4 sm:space-y-5 sm:py-6">
+      <div className="px-4 lg:px-6">
       <PageHeader
         title="Products"
         subtitle="Manage jewellery products, pricing, inventory and Shopify synchronization."
@@ -537,11 +492,6 @@ export default function ProductsPage() {
                 <Tags className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Print Labels ({selectedProducts.length})</span>
               </Button>
             )}
-            {missingBarcodes > 0 && (
-              <Button variant="outline" size="sm" onClick={generateAllMissing}>
-                <Wand2 className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Generate Barcodes ({missingBarcodes})</span>
-              </Button>
-            )}
             <Button variant="outline" size="sm" onClick={() => exportTable('products.csv', columns, filtered)}>
               <Download className="h-3.5 w-3.5" /> Export
             </Button>
@@ -554,9 +504,10 @@ export default function ProductsPage() {
           </div>
         }
       />
+      </div>
 
       {duplicates.length > 0 && (
-        <Card>
+        <Card className="mx-4 lg:mx-6">
           <CardContent className="flex flex-col gap-2 border border-amber-300 bg-amber-50 p-4 dark:border-amber-500/40 dark:bg-amber-950/30">
             <div className="flex items-center gap-2">
               <Search className="h-4 w-4 text-amber-600 dark:text-amber-400 dark:text-amber-400" />
@@ -570,21 +521,27 @@ export default function ProductsPage() {
               ))}
               {duplicates.length > 5 && <li>…and {duplicates.length - 5} more</li>}
             </ul>
-            <p className="text-xs text-muted-foreground">Duplicate SKUs cause inventory sync and barcode conflicts. Rename all but one.</p>
+            <p className="text-xs text-muted-foreground">Duplicate SKUs cause inventory and sync conflicts. Rename all but one.</p>
           </CardContent>
         </Card>
       )}
 
       <ProductDialog
         open={addOpen}
-        onOpenChange={setAddOpen}
+        onOpenChange={(o) => {
+          if (!o) setDuplicateOf(null)
+          setAddOpen(o)
+        }}
         mode="add"
+        duplicateOf={duplicateOf}
         products={products}
         onEditProduct={(p) => {
           setAddOpen(false)
+          setDuplicateOf(null)
           setEditTarget(p)
         }}
         onSaved={(product, pushed) => {
+          setDuplicateOf(null)
           setPushMessage(pushed
             ? { ok: true, text: `Created "${product.name}" and pushed to Shopify.` }
             : { ok: true, text: `Created "${product.name}".` })
@@ -614,40 +571,18 @@ export default function ProductsPage() {
         onDone={load}
       />
 
-      <Dialog open={viewProduct !== null} onOpenChange={(open) => { if (!open) setViewProduct(null) }}>
-        <DialogContent size="lg">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              {productImageSrc(viewProduct ?? {}) ? (
-                <img src={productImageSrc(viewProduct ?? {})} alt="" className="h-8 w-8 rounded-md object-cover" />
-              ) : null}
-              {viewProduct?.name}
-            </DialogTitle>
-            <DialogDescription>{viewProduct ? `${viewProduct.sku} · ${viewProduct.category}` : ''}</DialogDescription>
-          </DialogHeader>
-          {viewProduct ? (
-            <div className="space-y-0.5 text-sm">
-              <DetailRow label="Purity" value={viewProduct.purity != null ? `${viewProduct.purity}%` : '—'} />
-              <DetailRow label="Gross Weight" value={viewProduct.grossWeight != null ? formatWeight(viewProduct.grossWeight) : '—'} />
-              <DetailRow label="Stone Weight" value={viewProduct.stoneWeight != null ? formatWeight(viewProduct.stoneWeight) : '—'} />
-              <DetailRow label="Net Weight" value={viewProduct.netWeight != null ? formatWeight(viewProduct.netWeight) : '—'} />
-              <DetailRow label="Making Charge" value={viewProduct.makingCharge != null ? `${viewProduct.makingCharge} ₹/g` : '—'} />
-              <DetailRow label="Silver Rate" value={viewProduct.silverRate != null ? `₹${viewProduct.silverRate}/g` : '—'} />
-              <DetailRow label="Selling Price" value={formatCurrency(viewProduct.sellingPrice)} />
-              {viewProduct.compareAtPrice ? <DetailRow label="Compare At" value={formatCurrency(viewProduct.compareAtPrice)} /> : null}
-              <DetailRow label="GST" value={viewProduct.gst != null ? `${viewProduct.gst}%` : '—'} />
-              {viewProduct.hsn ? <DetailRow label="HSN" value={viewProduct.hsn} /> : null}
-              <DetailRow label="Barcode" value={(viewProduct.barcode ?? '').trim() || 'Not assigned'} />
-              <DetailRow label="Stock" value={`${viewProduct.stock ?? 0} pcs${(viewProduct.stock ?? 0) <= (viewProduct.reorderLevel ?? 0) ? ' · LOW' : ''}`} />
-              <DetailRow label="Reorder Level" value={viewProduct.reorderLevel != null ? `${viewProduct.reorderLevel} pcs` : 'Not set'} />
-              {viewProduct.supplier ? <DetailRow label="Supplier" value={viewProduct.supplier} /> : null}
-              {viewProduct.collection ? <DetailRow label="Collection" value={viewProduct.collection} /> : null}
-              {viewProduct.vendor ? <DetailRow label="Vendor" value={viewProduct.vendor} /> : null}
-              {viewProduct.tags ? <DetailRow label="Tags" value={viewProduct.tags.split(',').join(', ')} /> : null}
-              <DetailRow label="Shopify" value={viewProduct.shopifyStatus === 'synced' ? 'Synced' : viewProduct.shopifyStatus === 'pending' ? 'Pending' : viewProduct.shopifyStatus === 'error' ? 'Error' : 'Not Listed'} />
-              <DetailRow label="Status" value={viewProduct.status ?? '—'} />
-            </div>
-          ) : null}
+      <AppDialog
+        open={viewProduct !== null}
+        onOpenChange={(open) => { if (!open) setViewProduct(null) }}
+        size="md"
+        titleAdornment={
+          productImageSrc(viewProduct ?? {}) ? (
+            <img src={productImageSrc(viewProduct ?? {})} alt="" className="h-8 w-8 rounded-md object-cover" />
+          ) : null
+        }
+        title={viewProduct?.name ?? 'Product'}
+        description={viewProduct ? `${viewProduct.sku} · ${viewProduct.category}` : ''}
+        footer={
           <DialogFooter>
             <Button variant="outline" onClick={() => setViewProduct(null)}>Close</Button>
             <Button onClick={() => { setReorderFor(viewProduct); setReorderQty(String(Math.max(10, (viewProduct?.reorderLevel ?? 5) - (viewProduct?.stock ?? 0)))); setViewProduct(null) }}>
@@ -659,20 +594,40 @@ export default function ProductsPage() {
               </Link>
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={reorderFor !== null} onOpenChange={(open) => { if (!open) setReorderFor(null) }}>
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Quick Reorder — {reorderFor?.name}</DialogTitle>
-            <DialogDescription>Add stock for {reorderFor?.sku}</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label htmlFor="reorder-qty">Quantity to add</Label>
-            <Input id="reorder-qty" type="number" min="1" value={reorderQty} onChange={(e) => setReorderQty(e.target.value)} />
-            <p className="text-xs text-muted-foreground">Current stock: {reorderFor?.stock ?? 0} pcs · Reorder level: {reorderFor?.reorderLevel ?? '—'}</p>
+        }
+      >
+        {viewProduct ? (
+          <div className="space-y-0.5 text-sm">
+            <DetailRow label="Purity" value={viewProduct.purity != null ? `${viewProduct.purity}%` : '—'} />
+            <DetailRow label="Gross Weight" value={viewProduct.grossWeight != null ? formatWeight(viewProduct.grossWeight) : '—'} />
+            <DetailRow label="Stone Weight" value={viewProduct.stoneWeight != null ? formatWeight(viewProduct.stoneWeight) : '—'} />
+            <DetailRow label="Net Weight" value={viewProduct.netWeight != null ? formatWeight(viewProduct.netWeight) : '—'} />
+            <DetailRow label="Making Charge" value={viewProduct.makingCharge != null ? `${viewProduct.makingCharge} ₹/g` : '—'} />
+            <DetailRow label="Silver Rate" value={viewProduct.silverRate != null ? `₹${viewProduct.silverRate}/g` : '—'} />
+            <DetailRow label="Selling Price" value={formatCurrency(viewProduct.sellingPrice)} />
+            {viewProduct.compareAtPrice ? <DetailRow label="Compare At" value={formatCurrency(viewProduct.compareAtPrice)} /> : null}
+            <DetailRow label="GST" value={viewProduct.gst != null ? `${viewProduct.gst}%` : '—'} />
+            {viewProduct.hsn ? <DetailRow label="HSN" value={viewProduct.hsn} /> : null}
+            <DetailRow label="Stock" value={`${viewProduct.stock ?? 0} pcs${(viewProduct.stock ?? 0) <= (viewProduct.reorderLevel ?? 0) ? ' · LOW' : ''}`} />
+            <DetailRow label="Reorder Level" value={viewProduct.reorderLevel != null ? `${viewProduct.reorderLevel} pcs` : 'Not set'} />
+            {viewProduct.supplier ? <DetailRow label="Supplier" value={viewProduct.supplier} /> : null}
+            {viewProduct.collection ? <DetailRow label="Collection" value={viewProduct.collection} /> : null}
+            {viewProduct.vendor ? <DetailRow label="Vendor" value={viewProduct.vendor} /> : null}
+            {viewProduct.tags ? <DetailRow label="Tags" value={viewProduct.tags.split(',').join(', ')} /> : null}
+            <DetailRow label="Shopify" value={viewProduct.shopifyStatus === 'synced' ? 'Synced' : viewProduct.shopifyStatus === 'pending' ? 'Pending' : viewProduct.shopifyStatus === 'error' ? 'Error' : 'Not Listed'} />
+            <DetailRow label="Status" value={viewProduct.status ?? '—'} />
           </div>
+        ) : null}
+      </AppDialog>
+
+      <AppDialog
+        open={reorderFor !== null}
+        onOpenChange={(open) => { if (!open) setReorderFor(null) }}
+        size="sm"
+        isDirty={reorderFor !== null && Number(reorderQty) !== Math.max(10, (reorderFor.reorderLevel ?? 5) - (reorderFor.stock ?? 0))}
+        title={`Quick Reorder — ${reorderFor?.name ?? ''}`}
+        description={reorderFor ? `Add stock for ${reorderFor.sku}` : ''}
+        footer={
           <DialogFooter>
             <Button variant="outline" onClick={() => setReorderFor(null)}>Cancel</Button>
             <Button
@@ -696,30 +651,36 @@ export default function ProductsPage() {
               {reorderSaving ? <RefreshCw className="h-4 w-4 animate-spin" /> : <PackagePlus className="h-4 w-4" />} Add Stock
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        }
+      >
+        <div className="space-y-2">
+          <Label htmlFor="reorder-qty">Quantity to add</Label>
+          <Input id="reorder-qty" type="number" min="1" value={reorderQty} onChange={(e) => setReorderQty(e.target.value)} />
+          <p className="text-xs text-muted-foreground">Current stock: {reorderFor?.stock ?? 0} pcs · Reorder level: {reorderFor?.reorderLevel ?? '—'}</p>
+        </div>
+      </AppDialog>
 
       {error ? (
-        <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-4 py-3 text-sm text-red-700">
+        <div className="mx-4 flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-4 py-3 text-sm text-red-700 lg:mx-6">
           <span className="mt-0.5 block h-2 w-2 shrink-0 rounded-full bg-red-600" />
           <p>{error}. Start the backend with <code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs">npm run dev --prefix backend</code>.</p>
         </div>
       ) : null}
 
       {pushMessage ? (
-        <div className={cn('flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm', pushMessage.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 bg-red-50/60 text-red-700')}>
+        <div className={cn('mx-4 flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm lg:mx-6', pushMessage.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 bg-red-50/60 text-red-700')}>
           <span className={cn('mt-0.5 block h-2 w-2 shrink-0 rounded-full', pushMessage.ok ? 'bg-success-600' : 'bg-red-600')} />
           <p>{pushMessage.text}</p>
         </div>
       ) : null}
 
-      <Card>
-        <CardContent className="space-y-4 p-3 sm:p-4">
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2.5">
+      <Card className="rounded-none border-x-0 shadow-none">
+        <CardContent className="space-y-4 p-0">
+          <div className="flex flex-col gap-2 px-4 pt-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2.5">
             <div className="relative min-w-0 flex-1 sm:min-w-[240px]">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
               <Input
-                placeholder="Search product name, SKU, barcode..."
+                placeholder="Search product name or SKU..."
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 className="pl-9"
@@ -771,6 +732,7 @@ export default function ProductsPage() {
           </div>
 
           <DataTable
+            className="min-w-0"
             onRowDoubleClick={openProduct}
             onRowClick={setViewProduct}
             onSelectionChange={setSelectedProducts}
@@ -784,7 +746,7 @@ export default function ProductsPage() {
         </CardContent>
       </Card>
 
-      <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground sm:gap-4">
+      <div className="mx-4 flex flex-wrap items-center gap-3 rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground sm:gap-4 lg:mx-6">
         <LegendSwatch color={GREEN} label="Shopify synced" />
         <LegendSwatch color={ORANGE} label="Pending approval" />
         <LegendSwatch color={RED} label="Sync error" />

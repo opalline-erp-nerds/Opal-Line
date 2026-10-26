@@ -57,3 +57,32 @@ export function safeImageUrl(url: string | null | undefined): string | undefined
   if (!url) return undefined
   return /^https?:\/\//i.test(url) ? url : undefined
 }
+
+/** Round to 2 decimal places, matching backend round2 (uses Number.EPSILON). */
+export function round2(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100
+}
+
+/** Calculate the jewellery price for a line item using the current silver rate.
+ * Formula (matching backend computeSellingPrice):
+ *   silverValue = silverRatePerGram × totalBillableGrams
+ *   makingValue = makingChargePerGram × totalBillableGrams
+ *   subtotal = silverValue + makingValue
+ *   gst = round2(subtotal × 0.03)
+ *   finalPrice = subtotal + gst
+ */
+export function calculateJewelleryPrice(params: {
+  silverRatePerGram: number
+  netWeightPerUnit: number
+  makingChargePerGram: number
+  quantity: number
+}): { silverValue: number; makingValue: number; subtotal: number; gst: number; finalPrice: number } {
+  const { silverRatePerGram, netWeightPerUnit, makingChargePerGram, quantity } = params
+  const totalBillableGrams = netWeightPerUnit * quantity
+  const silverValue = round2(silverRatePerGram * totalBillableGrams)
+  const makingValue = round2(makingChargePerGram * totalBillableGrams)
+  const subtotal = round2(silverValue + makingValue)
+  const gst = round2(subtotal * 0.03)
+  const finalPrice = round2(subtotal + gst)
+  return { silverValue, makingValue, subtotal, gst, finalPrice }
+}

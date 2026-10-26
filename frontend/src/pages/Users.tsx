@@ -14,14 +14,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { DataTable } from '@/components/ui/data-table'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi, rbacApi } from '@/lib/api'
 import { ACTIONS, MODULES, emptyPermissions } from '@/lib/permissions'
 import { useAuth } from '@/auth/auth-context'
@@ -76,6 +70,11 @@ export default function UsersPage() {
     description: '',
     permissions: emptyPermissions(),
   })
+  // Form snapshots as-of-open, for the unsaved-changes close guards.
+  const [inviteBaseline, setInviteBaseline] = useState('')
+  const [editBaseline, setEditBaseline] = useState('')
+  const [permsBaseline, setPermsBaseline] = useState('')
+  const [roleBaseline, setRoleBaseline] = useState('')
 
   const load = useCallback(() => {
     setLoading(true)
@@ -96,7 +95,9 @@ export default function UsersPage() {
   const roleNames = useMemo(() => roles.map((r) => r.name), [roles])
 
   const openInvite = () => {
-    setInviteForm({ name: '', email: '', username: '', role: roleNames[0] ?? 'Manager', password: '', showPassword: false })
+    const next = { name: '', email: '', username: '', role: roleNames[0] ?? 'Manager', password: '', showPassword: false }
+    setInviteForm(next)
+    setInviteBaseline(JSON.stringify({ ...next, showPassword: undefined }))
     setError('')
     setInviteOpen(true)
   }
@@ -138,6 +139,7 @@ export default function UsersPage() {
 
   const openEdit = (user: User) => {
     setEditUser(user)
+    setEditBaseline(JSON.stringify(user))
     setNewPassword('')
     setShowNewPassword(false)
     setError('')
@@ -217,10 +219,12 @@ export default function UsersPage() {
   const openPerms = async (user: User) => {
     setPermsUser(user)
     setPermsData(null)
+    setPermsBaseline('')
     setPermsOpen(true)
     try {
       const meta = await rbacApi.getUserPermissions(user.id)
       setPermsData(meta)
+      setPermsBaseline(JSON.stringify(meta.overrides))
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load permissions')
     }
@@ -243,12 +247,14 @@ export default function UsersPage() {
   }
 
   const openRoleDialog = (role?: Role) => {
-    setEditingRole(role ?? null)
-    setRoleDraft({
+    const next = {
       name: role?.name ?? '',
       description: role?.description ?? '',
       permissions: role?.permissions ? { ...role.permissions } : emptyPermissions(),
-    })
+    }
+    setEditingRole(role ?? null)
+    setRoleDraft(next)
+    setRoleBaseline(JSON.stringify(next))
     setError('')
     setRoleDialogOpen(true)
   }
@@ -550,12 +556,23 @@ export default function UsersPage() {
         </TabsContent>
       </Tabs>
 
-      <Dialog open={inviteOpen} onOpenChange={setInviteOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Invite User</DialogTitle>
-            <DialogDescription>Invite a team member to access Opal Line.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={inviteOpen}
+        onOpenChange={setInviteOpen}
+        size="sm"
+        isDirty={inviteOpen && JSON.stringify({ ...inviteForm, showPassword: undefined }) !== inviteBaseline}
+        title="Invite User"
+        description="Invite a team member to access Opal Line."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setInviteOpen(false)}>Cancel</Button>
+            <Button onClick={submitInvite} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+              Send Invite
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="grid gap-4">
             <Field label="Full Name">
               <Input
@@ -610,22 +627,25 @@ export default function UsersPage() {
             </div>
             {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
           </div>
+      </AppDialog>
+
+      <AppDialog
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        size="md"
+        isDirty={editOpen && (newPassword !== '' || (editUser !== null && JSON.stringify(editUser) !== editBaseline))}
+        title="Edit User"
+        description={`Update profile and role for ${editUser?.name ?? ''}.`}
+        footer={
           <DialogFooter>
-            <Button variant="outline" onClick={() => setInviteOpen(false)}>Cancel</Button>
-            <Button onClick={submitInvite} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Send Invite
+            <Button variant="outline" onClick={() => setEditOpen(false)}>Cancel</Button>
+            <Button onClick={submitEdit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Save Changes
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={editOpen} onOpenChange={setEditOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Edit User</DialogTitle>
-            <DialogDescription>Update profile and role for {editUser?.name}.</DialogDescription>
-          </DialogHeader>
+        }
+      >
           {editUser ? (
             <div className="grid gap-4">
               <Field label="Full Name">
@@ -686,22 +706,25 @@ export default function UsersPage() {
               {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
             </div>
           ) : null}
+      </AppDialog>
+
+      <AppDialog
+        open={Boolean(resetUser)}
+        onOpenChange={(open) => { if (!open) setResetUser(null) }}
+        size="sm"
+        isDirty={resetPassword !== ''}
+        title="Set Password"
+        description={`Set a new login password for ${resetUser?.name ?? ''}.`}
+        footer={
           <DialogFooter>
-            <Button variant="outline" onClick={() => setEditOpen(false)}>Cancel</Button>
-            <Button onClick={submitEdit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Save Changes
+            <Button variant="outline" onClick={() => setResetUser(null)}>Cancel</Button>
+            <Button onClick={submitResetPassword} disabled={saving || !resetPassword}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+              Save Password
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={Boolean(resetUser)} onOpenChange={(open) => !open && setResetUser(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Set Password</DialogTitle>
-            <DialogDescription>Set a new login password for {resetUser?.name}.</DialogDescription>
-          </DialogHeader>
+        }
+      >
           <div className="grid gap-4">
             <Field label="New password">
               <div className="relative">
@@ -724,24 +747,30 @@ export default function UsersPage() {
             </Field>
             {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
           </div>
+      </AppDialog>
+
+      <AppDialog
+        open={permsOpen}
+        onOpenChange={setPermsOpen}
+        size="xl"
+        isDirty={permsOpen && permsData !== null && JSON.stringify(permsData.overrides) !== permsBaseline}
+        title="Manage Permissions"
+        description={
+          <>
+            {permsUser?.name} inherits the <span className="font-medium text-foreground">{permsUser?.role}</span> role.
+            Toggle a cell to create a personal override; un-checking role defaults reverts to the role.
+          </>
+        }
+        footer={
           <DialogFooter>
-            <Button variant="outline" onClick={() => setResetUser(null)}>Cancel</Button>
-            <Button onClick={submitResetPassword} disabled={saving || !resetPassword}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
-              Save Password
+            <Button variant="outline" onClick={() => setPermsOpen(false)}>Cancel</Button>
+            <Button onClick={savePerms} disabled={saving || !permsData}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Save Permissions
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={permsOpen} onOpenChange={setPermsOpen}>        <DialogContent size="3xl">
-          <DialogHeader>
-            <DialogTitle>Manage Permissions</DialogTitle>
-            <DialogDescription>
-              {permsUser?.name} inherits the <span className="font-medium text-foreground">{permsUser?.role}</span> role.
-              Toggle a cell to create a personal override; un-checking role defaults reverts to the role.
-            </DialogDescription>
-          </DialogHeader>
+        }
+      >
           {permsData ? (
             <div className="space-y-4">
               <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
@@ -781,24 +810,25 @@ export default function UsersPage() {
             </div>
           )}
           {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
+      </AppDialog>
+
+      <AppDialog
+        open={roleDialogOpen}
+        onOpenChange={setRoleDialogOpen}
+        size="lg"
+        isDirty={roleDialogOpen && JSON.stringify(roleDraft) !== roleBaseline}
+        title={editingRole ? `Edit Role — ${editingRole.name}` : 'New Role'}
+        description="Configure module access for this role. Users assigned to the role inherit these permissions."
+        footer={
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPermsOpen(false)}>Cancel</Button>
-            <Button onClick={savePerms} disabled={saving || !permsData}>
+            <Button variant="outline" onClick={() => setRoleDialogOpen(false)}>Cancel</Button>
+            <Button onClick={submitRole} disabled={saving}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Save Permissions
+              {editingRole ? 'Save Role' : 'Create Role'}
             </Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={roleDialogOpen} onOpenChange={setRoleDialogOpen}>
-        <DialogContent size="3xl">
-          <DialogHeader>
-            <DialogTitle>{editingRole ? `Edit Role — ${editingRole.name}` : 'New Role'}</DialogTitle>
-            <DialogDescription>
-              Configure module access for this role. Users assigned to the role inherit these permissions.
-            </DialogDescription>
-          </DialogHeader>
+        }
+      >
           <div className="grid gap-4">
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Role Name">
@@ -823,15 +853,7 @@ export default function UsersPage() {
             />
             {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setRoleDialogOpen(false)}>Cancel</Button>
-            <Button onClick={submitRole} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              {editingRole ? 'Save Role' : 'Create Role'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

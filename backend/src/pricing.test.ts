@@ -36,14 +36,21 @@ describe('round2 / num helpers', () => {
 })
 
 describe('normalizeInvoiceItems (invoice line pricing)', () => {
-  test('recomputes amount from weight x rate + making charge', () => {
+  test('recomputes amount from weight x (rate + makingChargePerGram)', () => {
+    // Correct formula: amount = weight × (silverRate + makingChargePerGram)
+    // weight=10.5g, silverRate=92.5/g, makingCharge=150/g
+    // amount = 10.5 × (92.5 + 150) = 10.5 × 242.5 = 2546.25
     const rows = dbRoutes.normalizeInvoiceItems([
       { product: ' Silver Chain ', sku: ' C1 ', qty: 1, weight: 10.5, silverRate: 92.5, makingCharge: 150 },
     ])
     assert.equal(rows.length, 1)
     assert.equal(rows[0].product, 'Silver Chain')
     assert.equal(rows[0].sku, 'C1')
-    assert.equal(rows[0].amount, 1121.25)
+    assert.equal(rows[0].amount, 2546.25)
+    // Verify component values
+    assert.equal(rows[0].silverRate, 92.5)
+    assert.equal(rows[0].makingCharge, 150)
+    assert.equal(rows[0].weight, 10.5)
   })
 
   test('keeps the provided amount when weight or rate is missing', () => {
@@ -76,20 +83,48 @@ describe('normalizeInvoiceItems (invoice line pricing)', () => {
     assert.equal(rows.length, 1)
     assert.equal(rows[0].amount, 100) // 2.5 x 40
   })
+
+  test('the managed silver rate overrides any client-supplied rate', () => {
+    // The whole point of Silver Rate Management: a stale/tampered payload
+    // carrying rate=290 must be repriced at the managed rate (300).
+    const rows = dbRoutes.normalizeInvoiceItems(
+      [{ product: 'Chain', sku: 'C9', weight: 2, silverRate: 290, makingCharge: 0 }],
+      300,
+    )
+    assert.equal(rows[0].silverRate, 300)
+    assert.equal(rows[0].amount, 600) // 2g x (300 + 0)
+  })
+
+  test('falls back to the provided rate only when no managed rate exists', () => {
+    const rows = dbRoutes.normalizeInvoiceItems([
+      { product: 'Ring', sku: 'R2', weight: 1, silverRate: 92.5, makingCharge: 0 },
+    ])
+    assert.equal(rows[0].silverRate, 92.5)
+    // A managed rate of 0 (unset) must not zero out pricing.
+    const zeroManaged = dbRoutes.normalizeInvoiceItems(
+      [{ product: 'Ring', sku: 'R3', weight: 1, silverRate: 92.5, makingCharge: 0 }],
+      0,
+    )
+    assert.equal(zeroManaged[0].silverRate, 92.5)
+  })
 })
 
 describe('quotation normalization and totals', () => {
-  test('computes line amount as round2(weight x rate + making charge)', () => {
+  test('computes line amount as round2(weight x (rate + makingChargePerGram))', () => {
+    // Correct formula: amount = weight × (silverRate + makingChargePerGram)
+    // weight=10.5g, silverRate=92.5/g, makingCharge=150/g
+    // amount = 10.5 × (92.5 + 150) = 10.5 × 242.5 = 2546.25
     const rows = quotations.normalizeQuotationItems([
       { product: 'Chain', sku: 'C1', qty: 1, weight: 10.5, silverRate: 92.5, makingCharge: 150 },
     ])
-    assert.equal(rows[0].amount, 1121.25)
+    assert.equal(rows[0].amount, 2546.25)
+    assert.equal(rows[0].makingCharge, 150)
   })
 
-  test('rounds once at the end, unlike the invoice path which rounds silver first', () => {
-    // Documenting the differing rounding order between the two paths: the
-    // invoice rounds the silver value before adding the making charge, the
-    // quotation rounds a single time. These inputs expose the difference.
+  test('rounds once at the end for both paths with the new formula', () => {
+    // Both paths now use the same formula: weight × (silverRate + makingChargePerGram)
+    // weight=1.005, silverRate=1, makingCharge=0.004
+    // amount = 1.005 × (1 + 0.004) = 1.00902 -> rounded to 1.01
     const [quoteRow] = quotations.normalizeQuotationItems([
       { product: 'X', sku: 'X1', weight: 1.005, silverRate: 1, makingCharge: 0.004 },
     ])
@@ -97,7 +132,7 @@ describe('quotation normalization and totals', () => {
       { product: 'X', sku: 'X1', weight: 1.005, silverRate: 1, makingCharge: 0.004 },
     ])
     assert.equal(quoteRow.amount, 1.01)
-    assert.equal(invoiceRow.amount, 1)
+    assert.equal(invoiceRow.amount, 1.01)
   })
 
   test('computeTotals applies GST then discount', () => {

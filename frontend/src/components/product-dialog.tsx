@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { ImagePlus, Loader2, Plus, Trash2, Wand2 } from 'lucide-react'
+import { ImagePlus, Loader2, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -8,10 +8,16 @@ import { Switch } from '@/components/ui/switch'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { toast } from '@/components/ui/confirm'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
-import { findDuplicateProduct, generateBarcode, generateSku, type DuplicateMatch } from '@/lib/productCodes'
-import type { Product, Supplier } from '@/types'
+import {
+  combineOptions,
+  findDuplicateProduct,
+  generateSku,
+  generateVariantSku,
+  type DuplicateMatch,
+  type ProductCodeSettings,
+} from '@/lib/productCodes'
+import type { Product, ProductOption, Supplier } from '@/types'
 import { cn, safeImageUrl } from '@/lib/utils'
-import { todayIST } from '@/lib/format'
 import { SupplierPicker } from '@/components/ui/supplier-picker'
 
 const API_ORIGIN = (import.meta.env.VITE_API_BASE ?? '').replace(/\/api\/v1$/, '') || ''
@@ -26,13 +32,14 @@ export interface ProductDialogProps {
   products?: Product[]
   /** Opens the duplicate panel's "Edit existing product" target. */
   onEditProduct?: (product: Product) => void
+  /** Add-mode seed: pre-fills the form from this product (Duplicate action). */
+  duplicateOf?: Product | null
 }
 
 interface ProductForm {
   name: string
   description: string
   sku: string
-  barcode: string
   huid: string
   category: string
   collection: string
@@ -96,7 +103,6 @@ const EMPTY_FORM: ProductForm = {
   name: '',
   description: '',
   sku: '',
-  barcode: '',
   huid: '',
   category: DEFAULT_CATEGORY,
   collection: '',
@@ -126,7 +132,6 @@ function fromProduct(p: Product): ProductForm {
     name: p.name ?? '',
     description: p.description ?? '',
     sku: p.sku ?? '',
-    barcode: p.barcode ?? '',
     huid: p.huid ?? '',
     category: p.category ?? DEFAULT_CATEGORY,
     collection: p.collection ?? '',
@@ -166,7 +171,6 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, 
     name: form.name.trim(),
     description: form.description.trim() || null,
     sku: form.sku.trim(),
-    barcode: form.barcode.trim() || null,
     huid: form.huid.trim() || null,
     category: form.category,
     collection: form.collection.trim() || null,
@@ -190,6 +194,19 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, 
     trackInventory: form.trackInventory,
     chargeOnTax: form.chargeOnTax,
   }
+}
+
+/** One editable variant combination in the dialog (Shopify's variant table). */
+interface VariantDraft {
+  /** Stable identity across option edits — the joined title ("Small / Red"). */
+  title: string
+  optionValues: string[]
+  /** Set only for rows loaded from the database (edit mode). */
+  id?: string
+  sku: string
+  price: string
+  compareAtPrice: string
+  stock: string
 }
 
 /** One editable stock count in the edit dialog — a row per location. */
@@ -219,21 +236,78 @@ function SectionTitle({ title, hint }: { title: string; hint?: string }) {
   )
 }
 
-export function ProductDialog({ open, onOpenChange, mode, product, onSaved, products, onEditProduct }: ProductDialogProps) {
+/** Shopify-style tag editor for one option's values (Size → S, M, L). */
+function ChipsInput({
+  values,
+  onChange,
+  placeholder,
+  ariaLabel,
+}: {
+  values: string[]
+  onChange: (values: string[]) => void
+  placeholder?: string
+  ariaLabel?: string
+}) {
+  const [draft, setDraft] = useState('')
+  const add = (raw: string) => {
+    const parts = raw.split(',').map((p) => p.trim()).filter(Boolean)
+    if (parts.length === 0) return
+    const next = [...values]
+    for (const p of parts) if (!next.some((x) => x.toLowerCase() === p.toLowerCase())) next.push(p)
+    onChange(next)
+    setDraft('')
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 rounded-md border p-2">
+      {values.map((v) => (
+        <span key={v} className="flex items-center gap-1 rounded-full border bg-muted px-2 py-0.5 text-xs text-foreground">
+          {v}
+          <button
+            type="button"
+            onClick={() => onChange(values.filter((x) => x !== v))}
+            aria-label={`Remove ${v}`}
+            className="text-muted-foreground hover:text-foreground"
+          >
+            ×
+          </button>
+        </span>
+      ))}
+      <input
+        className="min-w-[7rem] flex-1 bg-transparent text-sm outline-none"
+        value={draft}
+        placeholder={placeholder}
+        aria-label={ariaLabel}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ',') {
+            e.preventDefault()
+            add(draft)
+          }
+        }}
+        onBlur={() => {
+          if (draft.trim()) add(draft)
+        }}
+      />
+    </div>
+  )
+}
+
+export function ProductDialog({ open, onOpenChange, mode, product, onSaved, products, onEditProduct, duplicateOf }: ProductDialogProps) {
   const [form, setForm] = useState<ProductForm>(EMPTY_FORM)
+  // Snapshot of the form as it opened, for the unsaved-changes close guard.
+  const [baseline, setBaseline] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [uploading, setUploading] = useState(false)
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [supplierId, setSupplierId] = useState<string>('')
-  // Active duplicate (same SKU or barcode) — resolved inline before saving.
+  // Active duplicate (same SKU) — resolved inline before saving.
   const [duplicate, setDuplicate] = useState<DuplicateMatch | null>(null)
   // Categories added inline by this user (persisted per browser).
   const [customCategories, setCustomCategories] = useState<string[]>(loadCustomCategories)
   // Collection names already used by products (loaded once per mount) so the
   // collection picker can offer them alongside the built-in categories.
   const [collectionChoices, setCollectionChoices] = useState<string[]>([])
-  const [barcodeBusy, setBarcodeBusy] = useState(false)
   const collectionsLoaded = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // Latest catalogue for code generation + duplicate checks without turning
@@ -243,6 +317,15 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   // only the cross-location rollup, so the per-location truth comes from the
   // ledger when the dialog opens.
   const [levelDraft, setLevelDraft] = useState<StockRow[]>([])
+  // Settings → Product codes (SKU format) — loaded once per mount and
+  // applied when minting codes; null until loaded (the shipped defaults).
+  const [codeSettings, setCodeSettings] = useState<ProductCodeSettings | null>(null)
+  const codeSettingsRef = useRef<ProductCodeSettings | null>(null)
+  // Shopify-style options + the editable variant table derived from them.
+  const [options, setOptions] = useState<ProductOption[]>([])
+  const [variants, setVariants] = useState<VariantDraft[]>([])
+  /** SKU last auto-minted for an untouched add-mode form (see the effect). */
+  const lastGenerated = useRef<{ sku: string } | null>(null)
 
   const set = <K extends keyof ProductForm>(key: K, value: ProductForm[K]) => setForm((f) => ({ ...f, [key]: value }))
 
@@ -250,11 +333,14 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     if (products) productsRef.current = products
   }, [products])
 
-  // Suppliers load once per mount — never on the open path — so opening the
-  // dialog is a pure render with zero network waits (was: a fetch on every
-  // open that re-rendered the whole form mid-animation).
+  // Suppliers + code settings load once per mount — never on the open path —
+  // so opening the dialog is a pure render with zero network waits.
   useEffect(() => {
     dbApi.getSuppliers().then(setSuppliers).catch(() => setSuppliers([]))
+    dbApi.getSettings().then((s) => {
+      codeSettingsRef.current = s
+      setCodeSettings(s)
+    }).catch(() => setCodeSettings(null))
     // Collection fallback (pages that don't pass `products`): fetch lazily
     // after first paint so it never competes with the dialog opening.
     const t = window.setTimeout(() => {
@@ -272,43 +358,103 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     if (!open) return
     const initial = mode === 'edit' && product
       ? fromProduct(product)
-      : {
-          ...EMPTY_FORM,
-          // New products get unique identifiers up front (house style
-          // SLV-RNG-00001, scan-ready EAN-13); saving re-checks and the
-          // duplicate panel offers fresh codes if anything still collides.
-          sku: generateSku(productsRef.current, EMPTY_FORM.category),
-          barcode: generateBarcode(productsRef.current),
-        }
+      : mode === 'add' && duplicateOf
+        ? {
+            ...fromProduct(duplicateOf),
+            // Duplicate keeps the descriptive fields but clears the unique
+            // one: a fresh SKU is generated like any new product, and the
+            // copy is not pushed to Shopify until asked.
+            name: `${duplicateOf.name} (Copy)`,
+            sku: generateSku(productsRef.current, duplicateOf.category ?? EMPTY_FORM.category, codeSettingsRef.current),
+            pushToShopify: false,
+          }
+        : {
+            ...EMPTY_FORM,
+            // New products get a category-based SKU up front (settings format,
+            // e.g. OL-RNG-001); saving re-checks and the duplicate panel offers
+            // a fresh code if anything still collides.
+            sku: generateSku(productsRef.current, EMPTY_FORM.category, codeSettingsRef.current),
+          }
     const p = computePrice(initial)
     if (Number.isFinite(p)) initial.sellingPrice = String(Math.round(p * 100) / 100)
+    lastGenerated.current = mode === 'add' ? { sku: initial.sku } : null
     // Defer the reset out of the effect body (react/set-state-in-effect).
     queueMicrotask(() => {
       setForm(initial)
+      setBaseline(JSON.stringify(initial))
       setSupplierId(product?.supplierId ?? '')
       setError('')
       setDuplicate(null)
+      setOptions([])
+      setVariants([])
     })
+  }, [open, mode, product, duplicateOf])
+
+  // Edit mode: pull this product's option definitions + variant rows.
+  useEffect(() => {
+    if (!open || mode !== 'edit' || !product?.id) return
+    let cancelled = false
+    dbApi.getProductVariants(product.id)
+      .then(({ options: opts, variants: rows }) => {
+        if (cancelled) return
+        setOptions(Array.isArray(opts) ? opts : [])
+        setVariants(
+          (rows ?? []).map((v) => ({
+            id: v.id,
+            title: v.title ?? '',
+            optionValues: Array.isArray(v.optionValues) ? v.optionValues : [],
+            sku: v.sku ?? '',
+            price: v.sellingPrice != null ? String(v.sellingPrice) : '',
+            compareAtPrice: v.compareAtPrice != null ? String(v.compareAtPrice) : '',
+            stock: String(Math.floor(Number(v.stock) || 0)),
+          })),
+        )
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setOptions([])
+          setVariants([])
+        }
+      })
+    return () => {
+      cancelled = true
+    }
   }, [open, mode, product])
 
-  // Edit mode: the product already exists, so the server can assign a real,
-  // globally-unique barcode immediately. Add mode pre-fills a locally generated
-  // EAN-13 (see the effect above) and the backend still assigns one on save if
-  // the field is left blank (see the create route).
-  const generateServerBarcode = async () => {
-    if (!product?.id) return
-    setBarcodeBusy(true)
-    try {
-      const res = await dbApi.generateProductBarcode(product.id)
-      set('barcode', res.barcode)
-      setError('')
-      toast.success(res.created ? `Generated barcode ${res.barcode}` : `Barcode: ${res.barcode}`)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not generate a barcode')
-    } finally {
-      setBarcodeBusy(false)
-    }
-  }
+  // Code settings arrive after mount; if the form is still exactly what we
+  // auto-minted (the user has not touched the SKU), re-mint under the
+  // saved format so an Add dialog opened instantly still honours Settings.
+  useEffect(() => {
+    if (!open || mode !== 'add' || !codeSettings) return
+    const gen = lastGenerated.current
+    if (!gen) return
+    queueMicrotask(() => {
+      setForm((f) => {
+        if (f.sku !== gen.sku) return f
+        const sku = generateSku(productsRef.current, f.category, codeSettings)
+        lastGenerated.current = { sku }
+        return { ...f, sku }
+      })
+    })
+  }, [codeSettings, open, mode])
+
+  // The SKU's middle segment IS the category (OL-RNG-001): re-mint an
+  // untouched add-mode SKU whenever the category changes, so a product never
+  // keeps the generic code minted for the previous category. Edit mode is
+  // guarded — an existing SKU is never regenerated.
+  useEffect(() => {
+    if (!open || mode !== 'add') return
+    const gen = lastGenerated.current
+    if (!gen) return
+    queueMicrotask(() => {
+      setForm((f) => {
+        if (f.sku !== gen.sku) return f
+        const sku = generateSku(productsRef.current, f.category, codeSettingsRef.current)
+        lastGenerated.current = { sku }
+        return { ...f, sku }
+      })
+    })
+  }, [form.category, open, mode])
 
   // Stock levels behind the edit dialog: clear first (deferred — sync setState
   // in an effect is linted), then load this product's per-location balances.
@@ -353,12 +499,18 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   }, [open, mode, product])
 
   const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
-    setForm((f) => {
-      const next = { ...f, [key]: value }
-      const p = computePrice(next)
-      if (Number.isFinite(p)) next.sellingPrice = String(Math.round(p * 100) / 100)
-      return next
-    })
+    const next = { ...form, [key]: value }
+    const p = computePrice(next)
+    if (Number.isFinite(p)) {
+      const rounded = String(Math.round(p * 100) / 100)
+      next.sellingPrice = rounded
+      // The auto-calculated price flows through to every variant that still
+      // carries it; variant prices the user edited individually stay put.
+      if (variants.length > 0 && form.sellingPrice !== rounded) {
+        setVariants((vs) => vs.map((v) => (v.price === form.sellingPrice ? { ...v, price: rounded } : v)))
+      }
+    }
+    setForm(next)
   }
 
   const categorySelectOptions = useMemo(() => {
@@ -398,6 +550,86 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   const computed = computePrice(form)
   const hasAutoPrice = Number.isFinite(computed)
   const sellingLocked = hasAutoPrice
+
+  // ── Shopify-style options → variants ────────────────────────────────────
+  // The variant table is derived from the option definitions (cartesian
+  // product, last option varying fastest — same as Shopify). Rows are keyed
+  // by their joined title, so editing one option's values keeps every
+  // unchanged combination's SKU/price/stock intact.
+  const hasVariants = options.length > 0
+
+  const syncVariants = (nextOptions: ProductOption[], prev: VariantDraft[]) => {
+    const combos = combineOptions(nextOptions)
+    const byTitle = new Map(prev.map((v) => [v.title, v]))
+    const takenSku = new Set<string>([
+      ...productsRef.current.map((p) => (p.sku ?? '').trim().toUpperCase()),
+      ...prev.map((v) => v.sku.trim().toUpperCase()),
+    ])
+    const parentSku = form.sku.trim() || generateSku(productsRef.current, form.category, codeSettingsRef.current)
+    const defaultPrice = form.sellingPrice.trim()
+    const next: VariantDraft[] = combos.map((combo) => {
+      const kept = byTitle.get(combo.title)
+      if (kept) return { ...kept, optionValues: combo.optionValues }
+      const sku = generateVariantSku(parentSku, combo.optionValues, takenSku)
+      takenSku.add(sku.toUpperCase())
+      return {
+        title: combo.title,
+        optionValues: combo.optionValues,
+        sku,
+        price: defaultPrice,
+        compareAtPrice: '',
+        stock: '0',
+      }
+    })
+    setVariants(next)
+  }
+
+  const addOption = () => {
+    if (options.length >= 3) return
+    setOptions((prev) => [...prev, { name: `Option ${prev.length + 1}`, values: [] }])
+  }
+
+  const setOptionName = (index: number, name: string) => {
+    setOptions((prev) => prev.map((o, i) => (i === index ? { ...o, name } : o)))
+  }
+
+  const setOptionValues = (index: number, values: string[]) => {
+    const next = options.map((o, i) => (i === index ? { ...o, values } : o))
+    setOptions(next)
+    syncVariants(next, variants)
+  }
+
+  const removeOption = (index: number) => {
+    const next = options.filter((_, i) => i !== index)
+    setOptions(next)
+    syncVariants(next, variants)
+  }
+
+  const setVariantField = (index: number, key: 'sku' | 'price' | 'compareAtPrice' | 'stock', value: string) => {
+    setVariants((prev) => prev.map((v, i) => (i === index ? { ...v, [key]: value } : v)))
+  }
+
+  /** Every option named with at least one value, and no duplicate variant SKU. */
+  const validateVariants = (): string | null => {
+    for (const o of options) {
+      if (!o.name.trim()) return 'Every option needs a name (e.g. Size)'
+      if (o.values.filter((v) => v.trim() !== '').length === 0) {
+        return `Option “${o.name}” needs at least one value`
+      }
+    }
+    const seen = new Set<string>()
+    for (const v of variants) {
+      const sku = v.sku.trim().toUpperCase()
+      if (!sku) return `Variant “${v.title}” needs a SKU`
+      if (seen.has(sku)) return `Duplicate variant SKU: ${v.sku}`
+      seen.add(sku)
+      const clash = productsRef.current.find(
+        (p) => p.id !== (mode === 'edit' ? product?.id : undefined) && (p.sku ?? '').trim().toUpperCase() === sku,
+      )
+      if (clash) return `Variant SKU ${v.sku} is already used by “${clash.name}”`
+    }
+    return null
+  }
 
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return
@@ -482,12 +714,22 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     setError('')
     try {
       const body = buildBody(form, silverRate, sellingPrice, supplierId)
+      if (hasVariants) {
+        const variantError = validateVariants()
+        if (variantError) {
+          setError(variantError)
+          setSaving(false)
+          return
+        }
+        // Stock lives on the variants; the parent rollup is rolled up
+        // server-side from their sum (never a second opening-stock count).
+        body.stock = 0
+      }
       // Duplicate guard: never silently create a second product on the same
-      // identifier — offer to open the existing one or mint fresh codes.
+      // identifier — offer to open the existing one or mint a fresh code.
       const dup = findDuplicateProduct(
         productsRef.current,
         body.sku ?? '',
-        body.barcode ?? '',
         mode === 'edit' ? product?.id : undefined,
       )
       if (dup) {
@@ -505,20 +747,46 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
         const changedRows = levelDraft.filter((r) => Math.floor(Number(r.value) || 0) !== r.original)
         for (const r of changedRows) {
           await dbApi.setProductStock(product.id, Math.floor(Number(r.value) || 0), r.locationId)
-        }
-        if (changedRows.length > 0) {
-          // Keep the list in sync without a refetch: the rollup is the sum of
-          // the per-location counts just written.
-          saved = { ...saved, stock: levelDraft.reduce((a, r) => a + Math.floor(Number(r.value) || 0), 0) }
-        }
-      } else {
+        }          if (changedRows.length > 0) {
+            // Keep the list in sync without a refetch: the rollup is the sum of
+            // the per-location counts just written.
+            saved = { ...saved, stock: levelDraft.reduce((a, r) => a + Math.floor(Number(r.value) || 0), 0) }
+          }
+        } else {
         saved = await dbApi.create<Product>('products', {
           ...body,
           hsn: '71131130',
           shopifyStatus: 'not-listed',
           status: 'active',
-          createdAt: todayIST(),
+          // Full timestamp, not just the date: the products list is ordered
+          // newest-first and same-day creations must not tie.
+          createdAt: new Date().toISOString(),
         })
+      }
+      // Shopify-style variants: replace-all save of the option definitions +
+      // one row per combination. The backend rolls the stock difference into
+      // the parent's ledger as a count correction and returns the new rollup.
+      if (hasVariants) {
+        const res = await dbApi.saveProductVariants(saved.id, {
+          options: options.map((o) => ({ name: o.name.trim(), values: o.values.map((v) => v.trim()).filter(Boolean) })),
+          variants: variants.map((v) => ({
+            id: v.id,
+            title: v.title,
+            optionValues: v.optionValues,
+            sku: v.sku.trim(),
+            sellingPrice: parseFloat(v.price) || undefined,
+            compareAtPrice: parseFloat(v.compareAtPrice) || undefined,
+            stock: Math.max(0, Math.floor(parseInt(v.stock, 10) || 0)),
+          })),
+        })
+        saved = { ...saved, stock: res.stock, options: res.options }
+      } else if (mode === 'edit' && product) {
+        // Options were removed — clear the parent's definitions so the
+        // product goes back to being a simple (single-variant) product.
+        const hadOptions = Array.isArray(product.options) && product.options.length > 0
+        if (hadOptions) {
+          saved = await dbApi.update<Product>('products', product.id, { options: null })
+        }
       }
       let pushed = false
       const linked = saved.shopifyId != null && String(saved.shopifyId).trim() !== '' && !String(saved.shopifyId).trim().startsWith('#')
@@ -568,7 +836,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
         const dup = findDuplicateProduct(
           productsRef.current,
           form.sku,
-          form.barcode,
           mode === 'edit' ? product?.id : undefined,
         )
         if (dup) {
@@ -585,8 +852,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   const regenerateCodes = () => {
     setForm((f) => ({
       ...f,
-      sku: generateSku(productsRef.current, f.category),
-      barcode: generateBarcode(productsRef.current),
+      sku: generateSku(productsRef.current, f.category, codeSettingsRef.current),
     }))
     setDuplicate(null)
     setError('')
@@ -597,8 +863,8 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   const duplicatePanel = duplicate ? (
     <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50/60 px-3 py-2 text-sm text-amber-900">
       <p>
-        <span className="font-medium">{duplicate.field === 'sku' ? 'SKU' : 'Barcode'}</span>{' '}
-        <span className="font-mono">{duplicate.field === 'sku' ? form.sku : form.barcode}</span> is already used
+        <span className="font-medium">SKU</span>{' '}
+        <span className="font-mono">{form.sku}</span> is already used
         by <span className="font-medium">“{duplicate.product.name}”</span>
         {duplicate.product.sku ? (
           <> (SKU <span className="font-mono">{duplicate.product.sku}</span>)</>
@@ -632,8 +898,9 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     <AppDialog
       open={open}
       onOpenChange={onOpenChange}
-      size="2xl"
-      title={mode === 'edit' ? 'Edit Product' : 'Add Product'}
+      size="lg"
+      isDirty={JSON.stringify(form) !== baseline}
+      title={mode === 'edit' ? 'Edit Product' : duplicateOf ? 'Duplicate Product' : 'Add Product'}
       description={
         mode === 'edit'
           ? 'Update the product in the billing software. Shopify options are only used when "Push to Shopify" is on.'
@@ -667,7 +934,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
             <SectionTitle title="Basic details" />
             <div className="grid grid-cols-2 gap-3">
               <Field label="Title *" className="col-span-2">
-                <Input value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="e.g. Silver Classic Ring" />
+                <Input aria-label="Product title" value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="e.g. Silver Classic Ring" />
               </Field>
               <Field label="Description" className="col-span-2">
                 <textarea
@@ -680,34 +947,8 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                 <p className="text-[11px] text-muted-foreground">Synced to Shopify body_html when the product is pushed.</p>
               </Field>
               <Field label="SKU *">
-                <Input value={form.sku} onChange={(e) => set('sku', e.target.value)} placeholder="e.g. SLV-RNG-00001" />
-              </Field>
-              <Field label="Barcode">
-                <div className="flex gap-1.5">
-                  <Input
-                    value={form.barcode}
-                    onChange={(e) => set('barcode', e.target.value)}
-                    placeholder={mode === 'edit' ? 'Code encoded in the label' : 'Auto-generated if left blank'}
-                    className="font-mono"
-                  />
-                  {mode === 'edit' && product?.id ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="icon"
-                      disabled={barcodeBusy}
-                      onClick={generateServerBarcode}
-                      title="Generate a unique barcode"
-                    >
-                      <Wand2 className={cn('h-4 w-4', barcodeBusy && 'animate-pulse')} />
-                    </Button>
-                  ) : null}
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  {mode === 'edit'
-                    ? 'This exact value is encoded in the printed QR/barcode.'
-                    : 'Leave blank to generate a unique barcode automatically on save.'}
-                </p>
+                <Input aria-label="Product SKU" value={form.sku} onChange={(e) => set('sku', e.target.value)} placeholder="e.g. OL-RNG-001" />
+                <p className="text-[11px] text-muted-foreground">Auto-generated per category. The printed label's QR code encodes this SKU.</p>
               </Field>
               <Field label="HUID (Hallmark)">
                 <Input value={form.huid} onChange={(e) => set('huid', e.target.value)} placeholder="e.g. HUIA07" />
@@ -749,25 +990,131 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           </div>
 
           <div className="space-y-3">
+            <SectionTitle
+              title="Options & variants"
+              hint="Add options like Size or Colour — every combination becomes its own variant with its own SKU, price and stock (Shopify-style)."
+            />
+            {options.map((opt, i) => (
+              <div key={i} className="space-y-2 rounded-lg border p-3">
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={opt.name}
+                    onChange={(e) => setOptionName(i, e.target.value)}
+                    placeholder={`Option ${i + 1} name (e.g. ${['Size', 'Colour', 'Material'][i] ?? 'Style'})`}
+                    aria-label={`Option ${i + 1} name`}
+                    className="max-w-[16rem]"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={() => removeOption(i)}
+                    aria-label={`Remove option ${opt.name}`}
+                    title="Remove option"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+                <ChipsInput
+                  values={opt.values}
+                  onChange={(vals) => setOptionValues(i, vals)}
+                  placeholder="Type a value, press Enter (e.g. Small)"
+                  ariaLabel={`Values for ${opt.name}`}
+                />
+              </div>
+            ))}
+            {options.length < 3 ? (
+              <Button type="button" variant="outline" size="sm" onClick={addOption} aria-label="Add option">
+                <Plus className="h-4 w-4" /> Add option
+              </Button>
+            ) : (
+              <p className="text-[11px] text-muted-foreground">Shopify allows up to 3 options per product.</p>
+            )}
+
+            {hasVariants ? (
+              <div className="space-y-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {variants.length} variant{variants.length === 1 ? '' : 's'}
+                </p>
+                <div className="overflow-x-auto rounded-lg border">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/40 text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+                        <th className="px-3 py-2 font-medium">Variant</th>
+                        <th className="px-3 py-2 font-medium">Price (₹)</th>
+                        <th className="px-3 py-2 font-medium">Stock (pcs)</th>
+                        <th className="px-3 py-2 font-medium">SKU</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {variants.map((v, i) => (
+                        <tr key={v.title} className="border-b last:border-b-0">
+                          <td className="px-3 py-1.5 text-xs font-medium text-foreground">{v.title}</td>
+                          <td className="px-3 py-1.5">
+                            <Input
+                              type="number"
+                              step="0.01"
+                              min={0}
+                              value={v.price}
+                              onChange={(e) => setVariantField(i, 'price', e.target.value)}
+                              aria-label={`Price for ${v.title}`}
+                              className="h-8 w-24"
+                            />
+                          </td>
+                          <td className="px-3 py-1.5">
+                            <Input
+                              type="number"
+                              step="1"
+                              min={0}
+                              value={v.stock}
+                              onChange={(e) => setVariantField(i, 'stock', e.target.value)}
+                              aria-label={`Stock for ${v.title}`}
+                              className="h-8 w-20"
+                            />
+                          </td>
+                          <td className="px-3 py-1.5">
+                            <Input
+                              value={v.sku}
+                              onChange={(e) => setVariantField(i, 'sku', e.target.value)}
+                              aria-label={`SKU for ${v.title}`}
+                              className="h-8 w-44 font-mono text-xs"
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  SKUs are minted per variant using the Product codes settings. Price follows the
+                  product's auto-calculated price until you override it per row. The product's stock is the sum of
+                  its variants.
+                </p>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="space-y-3">
             <SectionTitle title="Weight & pricing" />
             <div className="grid grid-cols-3 gap-3">
               <Field label="Stone weight (g)">
                 <Input type="number" step="0.01" value={form.stoneWeight} onChange={(e) => set('stoneWeight', e.target.value)} />
               </Field>
               <Field label="Net weight (g)">
-                <Input type="number" step="0.01" value={form.netWeight} onChange={(e) => setPricing('netWeight', e.target.value)} />
+                <Input aria-label="Net weight" type="number" step="0.01" value={form.netWeight} onChange={(e) => setPricing('netWeight', e.target.value)} />
               </Field>
               <Field label="Silver rate (₹/g) *">
-                <Input type="number" step="0.01" value={form.silverRate} onChange={(e) => setPricing('silverRate', e.target.value)} />
+                <Input aria-label="Silver rate" type="number" step="0.01" value={form.silverRate} onChange={(e) => setPricing('silverRate', e.target.value)} />
               </Field>
               <Field label="Making charge (₹/g)">
-                <Input type="number" step="0.01" value={form.makingCharge} onChange={(e) => setPricing('makingCharge', e.target.value)} />
+                <Input aria-label="Making charge" type="number" step="0.01" value={form.makingCharge} onChange={(e) => setPricing('makingCharge', e.target.value)} />
               </Field>
               <Field label="GST %">
                 <Input type="number" step="0.1" value={form.gst} onChange={(e) => setPricing('gst', e.target.value)} />
               </Field>
               <Field label="Selling price (₹)">
                 <Input
+                  aria-label="Selling price"
                   type="number"
                   step="0.01"
                   value={form.sellingPrice}
@@ -779,7 +1126,19 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
               <Field label="Compare-at price (₹)">
                 <Input type="number" step="0.01" value={form.compareAtPrice} onChange={(e) => set('compareAtPrice', e.target.value)} placeholder="Optional strikethrough" />
               </Field>
-              {mode === 'edit' ? (
+              {hasVariants ? (
+                <Field label="Stock (from variants)">
+                  <Input
+                    type="number"
+                    step="1"
+                    value={variants.reduce((a, v) => a + Math.max(0, Math.floor(parseInt(v.stock, 10) || 0)), 0)}
+                    disabled
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Set per variant in the table above — the product total is their sum.
+                  </p>
+                </Field>
+              ) : mode === 'edit' ? (
                 <Field label="Stock (pcs)">
                   {levelDraft.length > 0 ? (
                     <div className="space-y-1.5">
@@ -816,7 +1175,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                   <Input type="number" step="1" value={form.stock} onChange={(e) => set('stock', e.target.value)} />
                 </Field>
               )}
-              {mode === 'edit' ? (
+              {mode === 'edit' && !hasVariants ? (
                 <p className="text-[11px] text-muted-foreground">
                   Saved as a <span className="font-medium text-foreground">count correction</span> in that location's stock
                   ledger. Use <span className="font-medium text-foreground">Stock Transfer</span> to move stock between

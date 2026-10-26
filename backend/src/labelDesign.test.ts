@@ -355,7 +355,7 @@ test('a line the sample already condenses past the limit is not shrunk further',
 
 test('the sample placeholder values are never printed as production data', () => {
   const design = labelDesignFor(50, 40)!
-  const real = { name: 'Diamond Ring', sku: 'SKU-1', barcode: 'OLABC12345', price: 1234.5, weight: 3.2, category: 'Rings' }
+  const real = { name: 'Diamond Ring', sku: 'SKU-1', price: 1234.5, weight: 3.2, category: 'Rings' }
   const texts = designFieldTexts(
     real,
     { showPrice: true, showWeight: true, showBrand: true, brand: 'OPAL LINE' },
@@ -366,7 +366,7 @@ test('the sample placeholder values are never printed as production data', () =>
     assert.ok(!joined.includes(sample), `placeholder ${sample} leaked into ${joined}`)
   }
   assert.ok(joined.includes('DIAMOND RING'))
-  assert.ok(joined.includes('OLABC12345'))
+  assert.ok(joined.includes('SKU-1'))
   assert.ok(joined.includes('Rings'))
   assert.ok(joined.includes('Rate: 1234.50/-'))
 })
@@ -457,7 +457,6 @@ test('the ZPL stream reproduces the sample ^FT/^A0N/^BQ grid', () => {
       width: w,
       height: h,
       copies: 1,
-      symbology: 'qr',
       brand: 'OPAL LINE',
       showPrice: true,
       showWeight: true,
@@ -517,13 +516,14 @@ test('the ZPL stream reproduces the sample ^FT/^A0N/^BQ grid', () => {
 
 test('the ZPL stream never contains the sample placeholders for real products', () => {
   const zpl = renderZpl(
-    [{ name: 'Diamond Ring', sku: 'SKU-1', barcode: 'OLABC12345', price: 1234.5, weight: 3.2, category: 'Rings' } as never],
-    { width: 50, height: 40, copies: 1, symbology: 'qr', brand: 'OPAL LINE', showPrice: true, showWeight: true, showQR: true },
+    [{ name: 'Diamond Ring', sku: 'SKU-1', price: 1234.5, weight: 3.2, category: 'Rings' } as never],
+    { width: 50, height: 40, copies: 1, brand: 'OPAL LINE', showPrice: true, showWeight: true, showQR: true },
   )
   for (const sample of ['W12345', '0012535', '99999.00', '39999.00']) {
     assert.ok(!zpl.includes(sample), `placeholder ${sample} leaked into the ZPL`)
   }
-  assert.ok(zpl.includes('^FDCode: OLABC12345^FS'))
+  assert.ok(zpl.includes('^FDCode: SKU-1^FS'))
   assert.ok(zpl.includes('^FDRate: 1234.50/-^FS'))
-  assert.ok(zpl.includes('^FDLA,OLABC12345^FS'))
+  // The QR encodes exactly the SKU — the product's single identity.
+  assert.ok(zpl.includes('^FDLA,SKU-1^FS'))
 })

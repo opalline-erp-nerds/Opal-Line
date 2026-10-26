@@ -42,6 +42,7 @@ function makeInvoice(overrides: Partial<InvoiceData> = {}): InvoiceData {
     cgst: 16.4,
     sgst: 16.4,
     totalGst: 32.8,
+    gstRate: 3,
     grandTotal: 1126.3,
     amountInWords: 'One Thousand One Hundred and Twenty Six Rupees and Thirty Paise Only',
     businessName: 'Opal Line Jewels LLP',
@@ -186,6 +187,57 @@ describe('invoice PDF rendering', () => {
     assert.ok(withQr.toString('latin1').includes('/Subtype /Image'))
     const withoutQr = await invoicePdf.createPDFBuffer(makeInvoice({ upiId: undefined }))
     assert.ok(!withoutQr.toString('latin1').includes('/Subtype /Image'))
+  })
+
+  test('a discounted invoice prints the GST base, rate labels and totals the screen shows', async () => {
+    // Regression: the totals box used to print "Taxable Value" as
+    // subtotal − discount — subtracting the discount once there and once more
+    // on the Discount row, so the printed rows no longer added up to the
+    // printed grand total — and it derived a made-up "effective" CGST rate
+    // from that discounted base. The stored GST base IS the subtotal and
+    // CGST/SGST are half the stored GST rate, exactly like the invoice screen.
+    const buf = await invoicePdf.createPDFBuffer(
+      makeInvoice({
+        gstRate: 3,
+        subtotal: 2350.5,
+        discount: 100,
+        cgst: 35.26,
+        sgst: 35.26,
+        totalGst: 70.52,
+        grandTotal: 2321.02,
+        items: [
+          { name: 'Silver Ring', hsn: '7113', quantity: 2, grossWeight: 25, netWeight: 25, silverRate: 0, makingCharge: 0, amount: 1000 },
+          { name: 'Gold Pendant', hsn: '7114', quantity: 1, grossWeight: 10, netWeight: 10, silverRate: 0, makingCharge: 0, amount: 1350.5 },
+        ],
+      }),
+    )
+    const text = extractPdfText(buf)
+    // pdfkit renders inter-word spacing (e.g. the gap in "Rs. 2,350.50") as a
+    // spacing operator rather than a literal space character, so compare the
+    // whitespace-stripped text for money values.
+    const flat = text.replace(/\s+/g, '')
+
+    // Taxable Value = the GST base (the items-table total), NOT subtotal − discount.
+    assert.ok(flat.includes('TaxableValue'), 'missing taxable value row')
+    assert.ok(flat.includes('Rs.2,350.50'), 'taxable value must be the GST base (subtotal)')
+    assert.ok(!flat.includes('Rs.2,250.50'), 'taxable value must not subtract the discount')
+    // Rate labels come from the stored GST rate; amounts come from the stored GST money.
+    assert.ok(flat.includes('CGST@1.5%'), 'CGST label must be half the stored GST rate')
+    assert.ok(flat.includes('SGST@1.5%'), 'SGST label must be half the stored GST rate')
+    assert.ok(flat.includes('Rs.35.26'), 'CGST/SGST amount must be the stored gst amount split in half')
+    assert.ok(flat.includes('Discount'), 'missing discount row')
+    // Grand total is the persisted value; together the rows add up again.
+    assert.ok(flat.includes('Rs.2,321.02'), 'grand total must be the persisted value')
+
+    // Each line keeps its own product ↔ amount association.
+    const ringAt = flat.indexOf('SilverRing')
+    const pendantAt = flat.indexOf('GoldPendant')
+    assert.ok(ringAt !== -1, 'missing Silver Ring')
+    assert.ok(pendantAt !== -1 && pendantAt > ringAt, 'missing Gold Pendant')
+    const ringAmountAt = flat.indexOf('Rs.1,000.00', ringAt)
+    const pendantAmountAt = flat.indexOf('Rs.1,350.50', pendantAt)
+    assert.ok(ringAmountAt > ringAt && ringAmountAt < pendantAt, 'ring amount must print inside the ring row')
+    assert.ok(pendantAmountAt > pendantAt, 'pendant amount must print inside the pendant row')
   })
 })
 

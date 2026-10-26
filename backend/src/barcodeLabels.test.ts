@@ -64,7 +64,6 @@ test('same-size 50x10 templates retain distinct identities and compact code rule
   assert.equal(byKey.get('label-50x10-compact')?.brand, 'OPAL LINE')
   assert.equal(byKey.get('label-50x10')?.label, '50 × 10 mm · Standard')
   assert.equal(byKey.get('label-50x10-loni')?.label, '50 × 10 mm · Alternate')
-  assert.equal(byKey.get('label-50x10-compact')?.codeLength, 3)
   assert.notEqual(byKey.get('label-50x10')?.key, byKey.get('label-50x10-loni')?.key)
   assert.notEqual(byKey.get('label-50x10-loni')?.key, byKey.get('label-50x10-compact')?.key)
 })
@@ -87,13 +86,14 @@ test('compact label fields use live product data and the short product identifie
   const design = LABEL_PRESET_LIST.find((item) => item.key === 'label-50x10-compact')?.design
   assert.ok(design)
   const fields = designFieldTexts(
-    { name: 'Fusion of Kempu & NA', sku: '0012535', barcode: '0012535', price: 39999 },
+    { name: 'Fusion of Kempu & NA', sku: '0012535', price: 39999 },
     preset,
     design!,
   )
   assert.equal(fields.find((field) => field.kind === 'brand')?.text, 'OPAL LINE')
   assert.equal(fields.find((field) => field.kind === 'name')?.text, 'FUSION OF KEMPU & NA')
-  assert.equal(fields.find((field) => field.kind === 'code')?.text, '001')
+  // The printed code is the full SKU — never a truncated fragment.
+  assert.equal(fields.find((field) => field.kind === 'code')?.text, '0012535')
   assert.equal(fields.find((field) => field.kind === 'rate')?.text, 'Rate: 39999.00/-')
 })
 
@@ -128,11 +128,13 @@ test('resolveLabelPreset honours a legacy businessName override', () => {
 
 // 11/12. Content, long names, missing optional fields -------------------------
 
-test('labelCode prefers the product barcode and falls back to SKU', () => {
-  assert.equal(labelCode({ barcode: 'OL123', sku: 'SKU-1' }), 'OL123')
-  assert.equal(labelCode({ barcode: '', sku: 'SKU-1' }), 'SKU-1')
-  assert.equal(labelCode({ barcode: undefined, sku: 'SKU-1' }), 'SKU-1')
-  assert.equal(labelCode({ barcode: '  ', sku: 'SKU-1' }), 'SKU-1')
+test('labelCode always returns the SKU — the single scannable identity', () => {
+  assert.equal(labelCode({ sku: 'OL-RNG-001' }), 'OL-RNG-001')
+  assert.equal(labelCode({ sku: '  OL-CHN-042  ' }), 'OL-CHN-042')
+  // A blank SKU yields an empty code (the label then prints no symbol) rather
+  // than falling back to any other identifier.
+  assert.equal(labelCode({ sku: '' }), '')
+  assert.equal(labelCode({ sku: '   ' }), '')
 })
 
 test('formatLabelRate matches the reference "Rate: x/-" shape', () => {
@@ -147,7 +149,6 @@ test('formatLabelRate matches the reference "Rate: x/-" shape', () => {
 const product = {
   name: 'Diamond Ring',
   sku: 'SKU-1',
-  barcode: 'OLABC12345',
   price: 1234.5,
   weight: 3.2,
   category: 'Rings',
@@ -163,7 +164,7 @@ test('a full label shows brand, name, code and price', () => {
   assert.ok(kinds.includes('price'))
   assert.ok(kinds.includes('code'))
   assert.equal(lines.find((l) => l.kind === 'name')?.text, 'Diamond Ring')
-  assert.equal(lines.find((l) => l.kind === 'code')?.text, 'Code: OLABC12345')
+  assert.equal(lines.find((l) => l.kind === 'code')?.text, 'Code: SKU-1')
 })
 
 test('a tiny label drops optional lines but keeps the name and price', () => {
@@ -178,7 +179,7 @@ test('the compact (50x10) label omits the "Code:" prefix to save space', () => {
   const geo = computeLabelGeometry((50 / 25.4) * 72, (10 / 25.4) * 72, true)
   const lines = computeLabelLines(geo, product, { showPrice: true, showWeight: true, showBrand: true, brand: 'B', compact: true })
   const code = lines.find((l) => l.kind === 'code')
-  if (code) assert.equal(code.text, 'OLABC12345')
+  if (code) assert.equal(code.text, 'SKU-1')
 })
 
 test('missing optional fields never produce empty text entries', () => {
@@ -214,7 +215,7 @@ test('label geometry leaves no code space when QR is disabled', () => {
 // Scannable payload + smoke test of the real PDF pipeline ---------------------
 
 test('generateLabelsPDF produces a PDF and encodes the identifier', async () => {
-  const pdf = await generateLabelsPDF([product], { width: 50, height: 25, columns: 4, rows: 11, showPrice: true, showWeight: true, showQR: true, showBarcode: true, showBrand: true, brand: 'OPAL LINE', copies: 1 })
+  const pdf = await generateLabelsPDF([product], { width: 50, height: 25, columns: 4, rows: 11, showPrice: true, showWeight: true, showQR: true, showBrand: true, brand: 'OPAL LINE', copies: 1 })
   assert.ok(pdf, 'expected a PDF buffer')
   assert.ok(pdf!.length > 500)
   assert.equal(pdf!.subarray(0, 5).toString('latin1'), '%PDF-')
@@ -246,7 +247,7 @@ test('the label preview/export QR encoder returns a real PNG symbol', async () =
   assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a')
 })
 
-test('labels survive a long name and a missing barcode', async () => {
+test('labels survive a long name and a missing SKU', async () => {
   const longName = 'Antique Finish Hand Crafted Temple Design Silver Necklace With Gemstones'
   const pdf = await generateLabelsPDF(
     [{ name: longName, sku: 'SKU-LONG', price: 99999, weight: 42.5 }],

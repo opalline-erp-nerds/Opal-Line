@@ -10,10 +10,10 @@
    * because gold at large areas reads cheap rather than premium.
    */
   :root {
-    --background: 220 33% 98%;
-    --foreground: 222 47% 11%;
+    --background: 218 50% 97%;
+    --foreground: 224 42% 20%;
     --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
+    --card-foreground: 224 42% 20%;
     --popover: 0 0% 100%;
     --popover-foreground: 222 47% 11%;
     --primary: 222 64% 28%;
@@ -31,7 +31,7 @@
     --secondary: 220 22% 94%;
     --secondary-foreground: 222 47% 14%;
     --muted: 220 24% 95%;
-    --muted-foreground: 220 12% 42%;
+    --muted-foreground: 233 12% 42%;
     --accent: 43 78% 94%;
     --accent-foreground: 35 62% 24%;
     --destructive: 0 72% 45%;
@@ -39,6 +39,9 @@
     --border: 220 18% 87%;
     --input: 220 12% 60%;
     --ring: 222 64% 34%;
+    /* Dashboard accents: links and chart grid lines. */
+    --link: 221 83% 53%;
+    --grid: 240 21% 93%;
 
     /* Gold — the single premium accent. Deliberately not a full ramp; only
      * these four are ever referenced. */
@@ -110,6 +113,8 @@
     --border: 220 18% 22%;
     --input: 218 12% 50%;
     --ring: 43 74% 52%;
+    --link: 217 91% 65%;
+    --grid: 240 15% 20%;
 
     /* Lifted for dark backgrounds so gold keeps its metallic read instead of
      * going muddy against near-black. */
@@ -195,18 +200,21 @@
   }
 }
 
+@layer components {
+}
+
 /* Print support: print only the open dialog (used by detail dialogs) */
 @media print {
   /* Printing always happens on white paper — force light palette even in dark mode */
   html.dark {
-    --background: 220 33% 98%;
-    --foreground: 222 47% 11%;
+    --background: 218 50% 97%;
+    --foreground: 224 42% 20%;
     --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
+    --card-foreground: 224 42% 20%;
     --popover: 0 0% 100%;
     --popover-foreground: 222 47% 11%;
     --muted: 220 24% 95%;
-    --muted-foreground: 220 12% 42%;
+    --muted-foreground: 233 12% 42%;
     --secondary: 220 22% 94%;
     --secondary-foreground: 222 47% 14%;
     --border: 220 18% 87%;

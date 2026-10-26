@@ -73,6 +73,7 @@ export const createOrderSchema = z.object({
   items: z.array(z.object({
     title: z.string().min(1).max(255),
     sku: z.string().max(100).optional(),
+    productSku: z.string().max(100).optional(),
     quantity: z.number().int().min(1),
     price: z.number().min(0),
     // Shopify ProductVariant id (numeric or gid:// form) when the line was
@@ -155,7 +156,6 @@ export const updateInvoiceSchema = createInvoiceSchema.partial()
 export const createProductSchema = z.object({
   name: z.string().min(1, 'Product name is required').max(255),
   sku: z.string().min(1, 'SKU is required').max(100),
-  barcode: z.string().max(100).optional().or(z.literal('')),
   category: z.string().min(1, 'Category is required').max(100),
   collection: z.string().max(100).optional().or(z.literal('')),
   purity: z.number().min(0).max(100).optional(),
@@ -181,6 +181,33 @@ export const createProductSchema = z.object({
 })
 
 export const updateProductSchema = createProductSchema.partial()
+
+// ─── Shopify-style product variants ────────────────────────────────────────
+// Option definitions on the parent product (max 3, matching Shopify's limit),
+// and one validated row per option-value combination.
+export const productOptionSchema = z.object({
+  name: z.string().min(1, 'Option name is required').max(100),
+  values: z.array(z.string().min(1).max(100)).min(1, 'At least one value is required').max(50),
+})
+
+export const productVariantSchema = z.object({
+  id: z.string().max(64).optional(),
+  title: z.string().min(1, 'Variant title is required').max(255),
+  optionValues: z.array(z.string().min(1).max(100)).min(1).max(3),
+  sku: z.string().min(1, 'Variant SKU is required').max(100),
+  sellingPrice: z.number().min(0).optional(),
+  compareAtPrice: z.number().min(0).optional(),
+  costPrice: z.number().min(0).optional(),
+  grossWeight: z.number().min(0).optional(),
+  stock: z.number().int().min(0),
+  reorderLevel: z.number().int().min(0).optional(),
+  status: z.string().max(50).optional(),
+})
+
+export const saveProductVariantsSchema = z.object({
+  options: z.array(productOptionSchema).min(1, 'At least one option is required').max(3),
+  variants: z.array(productVariantSchema).min(1, 'At least one variant is required').max(200),
+})
 
 export const createCustomerSchema = z.object({
   name: z.string().min(1, 'Customer name is required').max(255),

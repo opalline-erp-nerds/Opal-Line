@@ -3,7 +3,6 @@ import assert from 'node:assert/strict'
 import type { Product } from '@/types'
 import {
   findVariantById,
-  findVariantByBarcode,
   findVariantBySku,
   matchProductByCode,
   normalizeVariant,
@@ -101,12 +100,11 @@ test('variant labels fall back to the SKU', () => {
   assert.equal(variantLabel(v), 'X-9')
 })
 
-test('findVariantById / BySku / ByBarcode are exact and case-insensitive', () => {
+test('findVariantById / BySku are exact and case-insensitive', () => {
   const p = variantProduct()
   assert.equal(findVariantById(p, 'v-2')?.sku, 'RING-42-18')
   assert.equal(findVariantById(p, 'nope'), null)
   assert.equal(findVariantBySku(p, 'ring-42-16')?.id, 'v-1')
-  assert.equal(findVariantByBarcode(p, ' 8900000000117 ')?.id, 'v-2')
   assert.equal(findVariantBySku(p, ''), null)
 })
 
@@ -117,24 +115,22 @@ test('variant options feed the modal dropdown', () => {
   ])
 })
 
-test('scan resolution prefers product barcode, then variant barcode, then SKUs', () => {
-  const plain = flatProduct({ id: 'p-2', sku: 'BANGLE-1', barcode: '8900000000200' })
+test('scan resolution matches product SKU then variant SKU — never a barcode', () => {
+  const plain = flatProduct({ id: 'p-2', sku: 'BANGLE-1' })
   const withVars = variantProduct()
 
-  const byProductBarcode = matchProductByCode([withVars, plain], '8900000000017')
-  assert.equal(byProductBarcode?.product.id, 'p-1')
-  assert.equal(byProductBarcode?.variant, null)
-
-  const byVariantBarcode = matchProductByCode([plain, withVars], '8900000000117')
-  assert.equal(byVariantBarcode?.product.id, 'p-1')
-  assert.equal(byVariantBarcode?.variant?.id, 'v-2')
-
-  const byProductSku = matchProductByCode([withVars], 'RING-42')
+  const byProductSku = matchProductByCode([withVars, plain], 'ring-42')
+  assert.equal(byProductSku?.product.id, 'p-1')
   assert.equal(byProductSku?.variant, null)
 
-  const byVariantSku = matchProductByCode([plain, withVars], 'ring-42-16')
+  const byVariantSku = matchProductByCode([plain, withVars], 'RING-42-16')
   assert.equal(byVariantSku?.product.id, 'p-1')
   assert.equal(byVariantSku?.variant?.id, 'v-1')
 
+  // Labels carry a QR encoding ONLY the SKU: legacy barcode values (on the
+  // product or its variants) must never resolve to a product.
+  assert.equal(matchProductByCode([plain, withVars], '8900000000017'), null)
+  assert.equal(matchProductByCode([plain, withVars], '8900000000117'), null)
   assert.equal(matchProductByCode([plain], 'nope'), null)
+  assert.equal(matchProductByCode([plain], ''), null)
 })

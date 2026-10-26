@@ -1,4 +1,6 @@
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
+import { Button } from '@/components/ui/button'
 import { ACTION_SHORTCUTS, NAV_SHORTCUTS } from '@/lib/shortcuts'
 
 function Key({ children }: { children: string }) {
@@ -24,12 +26,18 @@ function Row({ keys, label }: { keys: string; label: string }) {
 
 export function ShortcutsHelp({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent size="md">
-        <DialogHeader>
-          <DialogTitle>Keyboard Shortcuts</DialogTitle>
-          <DialogDescription>Work faster — press `?` anywhere to see this list.</DialogDescription>
-        </DialogHeader>
+    <AppDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      size="md"
+      title="Keyboard Shortcuts"
+      description="Work faster — press `?` anywhere to see this list."
+      footer={
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Close</Button>
+        </DialogFooter>
+      }
+    >
         <div className="space-y-4">
           <div>
             <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Navigation — press g, then</p>
@@ -44,7 +52,6 @@ export function ShortcutsHelp({ open, onOpenChange }: { open: boolean; onOpenCha
             ))}
           </div>
         </div>
-      </DialogContent>
-    </Dialog>
+    </AppDialog>
   )
 }

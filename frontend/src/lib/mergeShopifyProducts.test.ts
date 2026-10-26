@@ -5,11 +5,12 @@ import type { SyncProduct } from '@/types/shopify'
 import { mergeShopifyProducts, shopifyProductToProduct } from './mergeShopifyProducts'
 
 /**
- * The Barcode Labels and Print Designer pages show a merged catalog of local
+ * The QR Labels and Print Designer pages show a merged catalog of local
  * ERP products plus the connected Shopify store's products. These tests pin
  * the contract those pages rely on: Shopify rows appear, duplicates are not
- * added twice, and the fields both pages search on (name / SKU / barcode) are
- * populated.
+ * added twice, and the fields both pages search on (name / SKU) are
+ * populated. The Shopify barcode value is carried through as legacy data
+ * only — no screen searches or displays it.
  */
 
 const localProduct = (over: Partial<Product> = {}): Product => ({
@@ -68,7 +69,7 @@ test('appends Shopify-only products to the local catalog', () => {
   assert.equal(merged[1].name, 'Shopify Chain')
 })
 
-test('mapped Shopify product carries the fields both pages search on', () => {
+test('mapped Shopify product carries its name, SKU and legacy barcode value', () => {
   const p = shopifyProductToProduct(syncProduct())
   assert.equal(p.name, 'Shopify Chain')
   assert.equal(p.sku, 'SH-CH-1')
@@ -80,15 +81,14 @@ test('mapped Shopify product carries the fields both pages search on', () => {
   assert.equal(p.id, 'shopify:222')
 })
 
-test('search by name / SKU / barcode finds the merged Shopify product', () => {
+test('search by name / SKU finds the merged Shopify product', () => {
   const merged = mergeShopifyProducts([localProduct()], [syncProduct()])
   const matches = (q: string) => {
     const needle = q.toLowerCase()
-    return merged.filter((p) => `${p.name} ${p.sku} ${p.barcode ?? ''}`.toLowerCase().includes(needle))
+    return merged.filter((p) => `${p.name} ${p.sku}`.toLowerCase().includes(needle))
   }
   assert.equal(matches('shopify chain').length, 1, 'by name')
   assert.equal(matches('sh-ch-1').length, 1, 'by SKU')
-  assert.equal(matches('8901234567890').length, 1, 'by barcode')
 })
 
 test('does not duplicate a product already present locally by SKU', () => {

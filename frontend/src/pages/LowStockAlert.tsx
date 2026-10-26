@@ -13,15 +13,8 @@ import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import { StatCard } from '@/components/ui/stat-card'
 import { DataTable } from '@/components/ui/data-table'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import type { LowStockItem, Product } from '@/types'
 import { formatCurrency, formatNumber } from '@/lib/format'
@@ -180,48 +173,20 @@ export default function LowStockAlertPage() {
         header: '',
         meta: { align: 'right' as const, headerClassName: 'w-28' },
         cell: ({ row }) => (
-          <Dialog>
-            <DialogTrigger asChild>
-              <Button
-                variant="soft-primary"
-                size="sm"
-                onClick={() => {
-                  setOrderTarget(row.original)
-                  setOrderQty(String(Math.max(0, row.original.reorderLevel * 2 - row.original.stock)))
-                }}
-              >
-                <Plus className="h-3.5 w-3.5" /> Reorder
-              </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Reorder {orderTarget?.product}</DialogTitle>
-                <DialogDescription>
-                  Current stock: {orderTarget ? formatNumber(orderTarget.stock) : '—'} pcs · reorder level {orderTarget?.reorderLevel}
-                </DialogDescription>
-              </DialogHeader>
-              <div className="space-y-1.5">
-                <Label htmlFor="order-qty">Order quantity (pcs)</Label>
-                <Input
-                  id="order-qty"
-                  type="number"
-                  min={1}
-                  value={orderQty}
-                  onChange={(e) => setOrderQty(e.target.value)}
-                />
-              </div>
-              <DialogFooter>
-                <Button variant="outline" onClick={() => setOrderTarget(null)}>Cancel</Button>
-                <Button onClick={handleOrder} disabled={!orderQty || Number(orderQty) < 1}>
-                  <ShoppingBag className="h-4 w-4" /> Create Purchase Order
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
+          <Button
+            variant="soft-primary"
+            size="sm"
+            onClick={() => {
+              setOrderTarget(row.original)
+              setOrderQty(String(Math.max(0, row.original.reorderLevel * 2 - row.original.stock)))
+            }}
+          >
+            <Plus className="h-3.5 w-3.5" /> Reorder
+          </Button>
         ),
       },
     ],
-    [orderTarget, orderQty, handleOrder],
+    [],
   )
 
   return (
@@ -317,6 +282,34 @@ export default function LowStockAlertPage() {
           &nbsp;· Reorder levels are set per product and can be edited from the product detail page.
         </p>
       </div>
+
+      <AppDialog
+        open={orderTarget !== null}
+        onOpenChange={(open) => { if (!open) setOrderTarget(null) }}
+        size="sm"
+        isDirty={orderTarget !== null && Number(orderQty) !== Math.max(0, (orderTarget.reorderLevel * 2) - orderTarget.stock)}
+        title={`Reorder ${orderTarget?.product ?? ''}`}
+        description={orderTarget ? `Current stock: ${formatNumber(orderTarget.stock)} pcs · reorder level ${orderTarget.reorderLevel}` : ''}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOrderTarget(null)}>Cancel</Button>
+            <Button onClick={handleOrder} disabled={!orderQty || Number(orderQty) < 1}>
+              <ShoppingBag className="h-4 w-4" /> Create Purchase Order
+            </Button>
+          </DialogFooter>
+        }
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="order-qty">Order quantity (pcs)</Label>
+          <Input
+            id="order-qty"
+            type="number"
+            min={1}
+            value={orderQty}
+            onChange={(e) => setOrderQty(e.target.value)}
+          />
+        </div>
+      </AppDialog>
     </div>
   )
 }

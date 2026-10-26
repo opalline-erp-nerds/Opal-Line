@@ -7,7 +7,8 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Select } from '@/components/ui/select'
 import { dbApi } from '@/lib/api'
 import { formatCurrency } from '@/lib/format'
@@ -255,14 +256,21 @@ export default function DuesPage() {
       )}
 
       {/* Record Payment dialog */}
-      <Dialog open={payFor !== null} onOpenChange={(open) => { if (!open) setPayFor(null) }}>
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Record Payment — {payFor?.customer}</DialogTitle>
-            <DialogDescription>
-              Outstanding {formatCurrency(payFor?.total ?? 0)} across {payFor?.invoiceCount ?? 0} invoice(s). Amount is applied oldest-first.
-            </DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={payFor !== null}
+        onOpenChange={(open) => { if (!open) setPayFor(null) }}
+        size="sm"
+        title={`Record Payment — ${payFor?.customer ?? ''}`}
+        description={`Outstanding ${formatCurrency(payFor?.total ?? 0)} across ${payFor?.invoiceCount ?? 0} invoice(s). Amount is applied oldest-first.`}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPayFor(null)}>Cancel</Button>
+            <Button onClick={submitPayment} disabled={paySaving || !payAmount}>
+              {paySaving ? 'Saving…' : 'Record Payment'}
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-4">
             <div className="space-y-2">
               <Label htmlFor="pay-amount">Amount (₹)</Label>
@@ -282,14 +290,7 @@ export default function DuesPage() {
               />
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setPayFor(null)}>Cancel</Button>
-            <Button onClick={submitPayment} disabled={paySaving || !payAmount}>
-              {paySaving ? 'Saving…' : 'Record Payment'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

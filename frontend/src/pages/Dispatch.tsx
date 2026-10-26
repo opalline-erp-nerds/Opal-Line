@@ -6,7 +6,8 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { DataTable } from '@/components/ui/data-table'
 import type { ColumnDef } from '@/lib/table'
 import { dbApi } from '@/lib/api'
@@ -174,14 +175,22 @@ export default function DispatchPage() {
         </Card>
       )}
 
-      <Dialog open={dispatchFor !== null} onOpenChange={(open) => { if (!open) setDispatchFor(null) }}>
-        <DialogContent size="md">
-          <DialogHeader>
-            <DialogTitle>Dispatch order {dispatchFor?.internalId || dispatchFor?.shopifyId}</DialogTitle>
-            <DialogDescription>
-              The customer is notified automatically with tracking details once dispatched.
-            </DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={dispatchFor !== null}
+        onOpenChange={(open) => { if (!open) setDispatchFor(null) }}
+        size="md"
+        isDirty={dispatchFor !== null && Boolean(courier || customCourier || tracking || expected)}
+        title={`Dispatch order ${dispatchFor?.internalId || dispatchFor?.shopifyId || ''}`}
+        description="The customer is notified automatically with tracking details once dispatched."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setDispatchFor(null)}>Cancel</Button>
+            <Button size="sm" onClick={saveDispatch} disabled={saving}>
+              <Truck className="h-4 w-4" /> {saving ? 'Saving…' : 'Dispatch & notify'}
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-3">
             <div className="space-y-1.5">
               <Label>Courier</Label>
@@ -205,15 +214,8 @@ export default function DispatchPage() {
               <Label htmlFor="expected">Expected delivery</Label>
               <Input id="expected" type="date" value={expected} onChange={(e) => setExpected(e.target.value)} />
             </div>
-            <div className="flex justify-end gap-2 pt-1">
-              <Button variant="outline" size="sm" onClick={() => setDispatchFor(null)}>Cancel</Button>
-              <Button size="sm" onClick={saveDispatch} disabled={saving}>
-                <Truck className="h-4 w-4" /> {saving ? 'Saving…' : 'Dispatch & notify'}
-              </Button>
-            </div>
           </div>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

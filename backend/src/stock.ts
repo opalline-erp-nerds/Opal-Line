@@ -476,6 +476,167 @@ export async function applyStockMovement(input: StockMovementInput): Promise<num
   return Math.floor(num(total?.qty))
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Order lines vs the catalogue
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * A line SKU resolved to the rows whose stock it draws from.
+ *
+ * `productId` is always the PARENT product: stock_levels, stock_movements and
+ * the products.stock rollup are keyed by it. `ledgerSku` is that product's SKU
+ * — movements must be written under it because applyStockMovement resolves by
+ * products.sku. `variantId` is set when the line billed a product_variants
+ * SKU: variant stock is its own counter (product_variants.stock) that the
+ * parent rollup mirrors, so a sale must move BOTH or the rollup invariant
+ * (products.stock = Σ variant stock) silently drifts.
+ */
+export interface StockSkuResolution {
+  productId: string
+  ledgerSku: string
+  variantId?: string
+}
+
+/**
+ * Resolves a line SKU against BOTH catalogues — product_variants first
+ * (variant SKUs are unique and need not match the parent's SKU), then
+ * products. Rows are locked FOR UPDATE so two concurrent orders on the same
+ * SKU serialise here rather than racing on the balance arithmetic.
+ *
+ * Returns null for an empty or unknown SKU; callers decide whether that is a
+ * skip (restoring an old line whose product was deleted) or an error.
+ */
+export async function resolveStockSku(client: Client, sku: string): Promise<StockSkuResolution | null> {
+  const value = String(sku ?? '').trim()
+  if (!value || !client) return null
+  const [variant] = await client
+    .select({ id: schema.productVariants.id, productId: schema.productVariants.productId })
+    .from(schema.productVariants)
+    .where(eq(schema.productVariants.sku, value))
+    .limit(1)
+    .for('update')
+  if (variant) {
+    const [parent] = await client
+      .select({ sku: schema.products.sku })
+      .from(schema.products)
+      .where(eq(schema.products.id, variant.productId))
+      .limit(1)
+      .for('update')
+    // Orphan variant (parent deleted): nothing trustworthy to deduct.
+    if (!parent?.sku) return null
+    return { productId: variant.productId, ledgerSku: parent.sku, variantId: variant.id }
+  }
+  const [product] = await client
+    .select({ id: schema.products.id })
+    .from(schema.products)
+    .where(eq(schema.products.sku, value))
+    .limit(1)
+    .for('update')
+  if (!product) return null
+  return { productId: product.id, ledgerSku: value }
+}
+
+/**
+ * Deducts ONE order line's stock inside the caller's transaction: resolves
+ * the SKU to its product/variant, checks availability at the order's location
+ * (and at the variant's own counter for variant lines), records the ledger
+ * movement against the parent product and decrements the variant counter.
+ *
+ * Throws — rather than silently skipping — when a non-empty SKU matches
+ * nothing in either catalogue: a manual order billing an unknown SKU must not
+ * be saved pretending it moved stock it never moved. Returns the parent
+ * product id (for the post-save Shopify inventory push), or null for an empty
+ * line.
+ */
+export async function deductOrderLineStock(input: {
+  tx: Tx
+  locationId: string
+  sku: string
+  qty: number
+  refType?: string
+}): Promise<{ productId: string } | null> {
+  const sku = String(input.sku ?? '').trim()
+  const qty = Math.max(0, Math.floor(num(input.qty)))
+  if (!sku || qty <= 0) return null
+
+  const resolved = await resolveStockSku(input.tx, sku)
+  if (!resolved) throw new Error(`Unknown SKU: ${sku}`)
+
+  // Availability is checked AT the order's location: a chain can hold 12
+  // units while the shop actually taking the sale has 2.
+  const level = await levelAt(input.tx, resolved.productId, input.locationId)
+  if (level < qty) {
+    throw new Error(`Insufficient stock for SKU ${sku} at this location: available ${level}, requested ${qty}`)
+  }
+  if (resolved.variantId) {
+    // The variant's own counter is global (no per-location split); it must
+    // not go negative either, or the rollup invariant breaks.
+    const [variant] = await input.tx
+      .select({ stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.id, resolved.variantId))
+      .limit(1)
+    const variantStock = Math.floor(num(variant?.stock))
+    if (variantStock < qty) {
+      throw new Error(`Insufficient stock for SKU ${sku} at this location: available ${variantStock}, requested ${qty}`)
+    }
+  }
+
+  await applyStockMovement({
+    sku: resolved.ledgerSku,
+    qty: -qty,
+    type: 'sale_out',
+    refType: input.refType ?? 'sales_order',
+    locationId: input.locationId,
+    tx: input.tx,
+  })
+  if (resolved.variantId) {
+    await input.tx
+      .update(schema.productVariants)
+      .set({ stock: sql`${schema.productVariants.stock} - ${qty}` })
+      .where(eq(schema.productVariants.id, resolved.variantId))
+  }
+  return { productId: resolved.productId }
+}
+
+/**
+ * Puts ONE order line's stock back — the mirror of deductOrderLineStock,
+ * used when an edit replaces the old items and when an order is cancelled.
+ * Unresolvable SKUs return null instead of throwing: a reversal must never
+ * trap an edit or cancellation of an old order whose product has since been
+ * deleted (such a line's original deduction is already void).
+ */
+export async function restoreOrderLineStock(input: {
+  tx: Tx
+  locationId: string
+  sku: string
+  qty: number
+  refType?: string
+}): Promise<{ productId: string } | null> {
+  const sku = String(input.sku ?? '').trim()
+  const qty = Math.max(0, Math.floor(num(input.qty)))
+  if (!sku || qty <= 0) return null
+
+  const resolved = await resolveStockSku(input.tx, sku)
+  if (!resolved) return null
+
+  await applyStockMovement({
+    sku: resolved.ledgerSku,
+    qty,
+    type: 'sale_return_in',
+    refType: input.refType ?? 'sales_order',
+    locationId: input.locationId,
+    tx: input.tx,
+  })
+  if (resolved.variantId) {
+    await input.tx
+      .update(schema.productVariants)
+      .set({ stock: sql`${schema.productVariants.stock} + ${qty}` })
+      .where(eq(schema.productVariants.id, resolved.variantId))
+  }
+  return { productId: resolved.productId }
+}
+
 /**
  * Moves stock between two locations as a matched pair of movements, so each
  * location's ledger shows its own side and neither total changes.

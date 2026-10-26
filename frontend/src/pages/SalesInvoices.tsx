@@ -1,8 +1,8 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { Copy, Download, Eye, FileText, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, Printer, Search, Undo2, X } from 'lucide-react'
+import { Copy, Download, Eye, FileText, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, Printer, RefreshCw, Search, Trash2, Undo2, X } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { dbApi } from '@/lib/api'
+import { ManualInvoiceDialog } from '@/components/manual-invoice-dialog'
 import { exportTable } from '@/lib/export'
 import type { Invoice, InvoiceItem } from '@/types'
 import { formatCurrency, formatDate } from '@/lib/format'
@@ -46,7 +47,9 @@ const statusBadge: Record<Invoice['status'], { label: string; variant: 'success'
 
 export default function SalesInvoicesPage() {
   const navigate = useNavigate()
+  const location = useLocation()
   const [duplicatingId, setDuplicatingId] = useState<string | null>(null)
+  const [reinvoiceId, setReinvoiceId] = useState<string | null>(null)
   const [invoices, setInvoices] = useState<Invoice[]>([])
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
@@ -68,12 +71,41 @@ export default function SalesInvoicesPage() {
     date: '', dueDate: '', paymentMethod: '', paymentStatus: 'pending', status: 'issued',
     discount: '0', gst: '3',
   })
+  // Snapshot of the edit form as it opened, for the unsaved-changes close guard.
+  const [editBaseline, setEditBaseline] = useState('')
 
-  const openEdit = (inv: Invoice) => {
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+
+  // Manual invoice creation — a walk-in / phone sale billed straight to an
+  // invoice, no sales order involved. The dialog owns its own draft state; this
+  // page only tracks whether it is open and what it produced.
+  const [createOpen, setCreateOpen] = useState(false)
+
+  // Permanent delete: the backend reverses the invoice's stock in the same
+  // transaction, and the loyalty points it earned are reversed right after.
+  const deleteInvoice = async (inv: Invoice) => {
+    if (!(await confirmDialog({
+      title: `Delete invoice ${inv.number}?`,
+      description: 'This permanently removes the invoice. The stock it sold comes back into inventory and the loyalty points it earned are reversed.',
+      confirmLabel: 'Delete',
+      danger: true,
+    }))) return
+    setDeletingId(inv.id)
+    try {
+      await dbApi.remove('invoices', inv.id)
+      setInvoices((prev) => prev.filter((x) => x.id !== inv.id))
+      setViewInvoice((v) => (v?.id === inv.id ? null : v))
+      toast.success(`Invoice ${inv.number} deleted — stock and loyalty points reversed`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Delete failed')
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  const openEdit = useCallback((inv: Invoice) => {
     const toDateInput = (v?: string | null) => (v ? new Date(v).toISOString().slice(0, 10) : '')
-    setEditTarget(inv)
-    setEditError('')
-    setEditForm({
+    const next = {
       customer: inv.customer ?? '',
       customerEmail: inv.customerEmail ?? '',
       customerPhone: inv.customerPhone ?? '',
@@ -89,9 +121,31 @@ export default function SalesInvoicesPage() {
       status: inv.status,
       discount: String(inv.discount ?? 0),
       gst: String(inv.gst ?? 3),
-    })
+    }
+    setEditTarget(inv)
+    setEditError('')
+    setEditForm(next)
+    setEditBaseline(JSON.stringify(next))
     setViewInvoice(null)
-  }
+  }, [])
+
+  // The invoice detail page links here with { state: { editInvoiceId } } so
+  // its Edit button can reuse this page's edit dialog.
+  useEffect(() => {
+    // Defer the setState out of the effect body (react/set-state-in-effect)
+    // — same queueMicrotask pattern the other pages use. The router state is
+    // cleared after it is consumed so a later invoices reload (e.g. right
+    // after saving) cannot pop the edit dialog back open.
+    const editId = (location.state as { editInvoiceId?: string } | null)?.editInvoiceId
+    if (!editId) return
+    queueMicrotask(() => {
+      const inv = invoices.find((x) => x.id === editId)
+      if (inv) {
+        openEdit(inv)
+        navigate(location.pathname, { replace: true, state: null })
+      }
+    })
+  }, [location.state, location.pathname, invoices, openEdit, navigate])
 
   const submitEdit = async () => {
     if (!editTarget) return
@@ -139,6 +193,29 @@ export default function SalesInvoicesPage() {
     }
   }
 
+  // Cancel the invoice and immediately raise a fresh one from the same order.
+  // Cancel restores the sold stock and reverses the loyalty points, so the
+  // reissued invoice deducts stock again — no double-count either way.
+  const reinvoice = useCallback(async (inv: Invoice) => {
+    if (!(await confirmDialog({
+      title: `Cancel and reissue ${inv.number}?`,
+      description: 'The current invoice is cancelled, its stock and loyalty points are reversed, and a fresh invoice is raised from the same order line items.',
+      confirmLabel: 'Cancel & reissue',
+    }))) return
+    setReinvoiceId(inv.id)
+    try {
+      const r = await dbApi.reinvoiceOrder(inv.number)
+      setInvoices((prev) => prev.filter((x) => x.id !== inv.id))
+      toast.success(`Invoice ${r.cancelled} cancelled and reissued as ${r.invoiceNumber}`)
+      // Pull the fresh invoice in so it shows immediately.
+      dbApi.getInvoices().then(setInvoices).catch(() => undefined)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Reissue failed')
+    } finally {
+      setReinvoiceId(null)
+    }
+  }, [])
+
   useEffect(() => {
     dbApi.getInvoices().then((d) => {
       setInvoices(d)
@@ -178,12 +255,16 @@ export default function SalesInvoicesPage() {
   // Stable DataTable row handlers: inline lambdas would change identity every
   // render and defeat the table memo, re-rendering all rows on each keystroke
   // in the view dialog (felt as input lag).
+  // The ref remembers which invoice the dialog is showing so a slower item
+  // fetch for a previously opened invoice can never overwrite it.
+  const openInvoiceIdRef = useRef<string | null>(null)
   const openInvoice = useCallback((inv: Invoice) => {
+    openInvoiceIdRef.current = inv.id
     setViewInvoice(inv)
     setInvoiceItems(inv.items ?? [])
     if (!inv.items?.length) {
       dbApi.getInvoiceById(inv.id).then((full) => {
-        if (full) setInvoiceItems(full.items ?? [])
+        if (openInvoiceIdRef.current === inv.id) setInvoiceItems(full?.items ?? [])
       }).catch(() => {})
     }
   }, [])
@@ -264,13 +345,11 @@ export default function SalesInvoicesPage() {
             <TooltipProvider delayDuration={200}>
             <Tooltip>
               <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-sm" asChild>
-                <Link to={`/sales/invoices/${row.original.id}`}>
+              <Button variant="ghost" size="icon-sm" onClick={() => setViewInvoice(row.original)}>
                   <Eye className="h-3.5 w-3.5" />
-                </Link>
-              </Button>
+                </Button>
               </TooltipTrigger>
-              <TooltipContent>View / Print / PDF</TooltipContent>
+              <TooltipContent>View</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -279,6 +358,14 @@ export default function SalesInvoicesPage() {
               </Button>
               </TooltipTrigger>
               <TooltipContent>Print</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon-sm" aria-label={`Edit invoice ${row.original.number}`} onClick={() => openEdit(row.original)}>
+                <Pencil className="h-3.5 w-3.5" />
+              </Button>
+              </TooltipTrigger>
+              <TooltipContent>Edit invoice</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -295,7 +382,7 @@ export default function SalesInvoicesPage() {
             </Tooltip>
             <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon-sm">
+              <Button variant="ghost" size="icon-sm" aria-label={`More actions for ${row.original.number}`}>
                 <MoreHorizontal className="h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>              <DropdownMenuContent align="end">
@@ -304,7 +391,20 @@ export default function SalesInvoicesPage() {
               <DropdownMenuItem onClick={() => navigate(`/sales/invoices/${row.original.id}`)}><Download className="h-3.5 w-3.5" /> Download PDF</DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={() => setInvoiceStatus(row.original, 'refunded')}><Undo2 className="h-3.5 w-3.5" /> Refund</DropdownMenuItem>
-              <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => setInvoiceStatus(row.original, 'cancelled')}><X className="h-3.5 w-3.5" /> Cancel</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => setInvoiceStatus(row.original, 'cancelled')}><X className="h-3.5 w-3.5" /> Cancel</DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={reinvoiceId === row.original.id}
+                onClick={() => void reinvoice(row.original)}
+              >
+                {reinvoiceId === row.original.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />} Cancel & reissue
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400"
+                disabled={deletingId === row.original.id}
+                onClick={() => void deleteInvoice(row.original)}
+              >
+                {deletingId === row.original.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} Delete invoice
+              </DropdownMenuItem>
             </DropdownMenuContent>
             </DropdownMenu>
             </TooltipProvider>
@@ -312,7 +412,7 @@ export default function SalesInvoicesPage() {
         ),
       },
     ],
-    [navigate, duplicatingId],
+    [navigate, duplicatingId, openEdit, deletingId, reinvoiceId, reinvoice],
   )
 
   return (
@@ -325,7 +425,7 @@ export default function SalesInvoicesPage() {
             <Button variant="outline" size="sm" onClick={() => exportTable('sales-invoices.csv', columns, filtered)}>
               <Download className="h-3.5 w-3.5" /> Export
             </Button>
-            <Button size="sm" onClick={() => navigate('/sales/orders')}>
+            <Button size="sm" onClick={() => setCreateOpen(true)}>
               <Plus className="h-4 w-4" /> <span className="hidden sm:inline">New Invoice</span><span className="sm:hidden">New</span>
             </Button>
           </div>
@@ -390,7 +490,7 @@ export default function SalesInvoicesPage() {
       <AppDialog
         open={viewInvoice !== null}
         onOpenChange={(open) => { if (!open) setViewInvoice(null) }}
-        size="2xl"
+        size="xl"
         className="print-dialog"
         footerClassName="no-print"
         title={viewInvoice?.number}
@@ -475,6 +575,7 @@ export default function SalesInvoicesPage() {
         open={editTarget !== null}
         onOpenChange={(open) => { if (!open) setEditTarget(null) }}
         size="lg"
+        isDirty={editTarget !== null && JSON.stringify(editForm) !== editBaseline}
         title={`Edit ${editTarget?.number ?? ''}`}
         description="Update invoice header details. Totals recalculate when discount or GST changes."
         footer={
@@ -540,6 +641,15 @@ export default function SalesInvoicesPage() {
           </div>
         </div>
       </AppDialog>
+
+      <ManualInvoiceDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreated={(inv) => {
+          setInvoices((prev) => [inv, ...prev])
+          setViewInvoice(inv)
+        }}
+      />
     </div>
   )
 }

@@ -270,7 +270,6 @@ export const backupApi = {
     opts?: {
       preset?: string
       copies?: number
-      format?: 'qr' | 'code128'
       showPrice?: boolean
       showWeight?: boolean
       showQR?: boolean

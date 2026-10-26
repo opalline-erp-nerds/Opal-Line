@@ -1,5 +1,26 @@
 # Progress Log
 
+## CURRENT TASK (2026-10-23) — Docs push + pending-work log
+
+- Added the eight reference docs to `docs/` — `AGENTS.md`, `ARCHITECTURE.md`, `CODE_STYLE.md`, `DESIGN_SYSTEM.md`, `PRD.md`, `README.md` (docs index), `SECURITY.md`, `TESTING.md` — and pushed them to `origin/chandru2` together with this log.
+- **Add/Edit Product rebuild (colour variants / SKU + barcode sequences / Shopify variants, Parts 1–8) — REVOKED 2026-10-23.** The user's team is taking that work over; the local commits `69063e5`, `fc988ec`, `73ad5cb` were discarded with `git reset --hard origin/chandru2` (HEAD `b04edf8`) and nothing from the feature was pushed. No product-form code remains in the tree.
+- **Leftover dev-DB state from the revoked work (not in git):** dev DB `opal_line` still has `product_variants`, `sku_counters`, `product_barcode_seq`, `products.has_colours` and 89 default variant rows; a throwaway `opal_line_test` database also exists. The desktop `opal_line` DB (47193) was never touched.
+- **PENDING #5's "push only to `chandru1`" is superseded** by the explicit 2026-10-23 request to push the docs to `chandru2`.
+
+### Pending work (carried forward, priority order)
+
+1. **Catalogue damage (PENDING #1)** — read-only report first, then wait for approval: which Shopify store the 15:17 sync pulled from, before/after counts from the pre-copy backup + `sync_logs`, restore plan for real products/stock/49 orphaned `stock_levels` rows, then make the sync non-destructive. No DB writes until approved.
+2. **Approved fixes A–E (PENDING #3, after #1)** — voided-order count consistency, "Last sync" from `sync_logs`, GST basis subtitle, orphan `stock_levels` cleanup (show → back up → delete), commit `backend/src/shopify.ts`.
+3. **Item 1b — Total Stock (Weight) sanity** — NOT STARTED.
+4. **Item 1c — Outstanding point-in-time "As of now"** — NOT STARTED.
+5. **Item 1f — Fair comparisons (same elapsed prior period)** — NOT STARTED.
+6. **Add/Edit Product rebuild** — handed to the user's team; the revoked dev-DB objects above still need a keep/drop decision.
+7. **Docs upkeep** — follow `docs/README.md` ("Keeping Documentation Updated") when the matching code changes.
+
+Known follow-ups recorded but not fixed: UTC-vs-local day-boundary skew in `recordActivity`/`recordAudit`; header activity feed is today-only; app-bootstrap fetches (`silver-rate-provider`, `auth-provider` user preload) ignore role and 403 for dashboard-only users.
+
+---
+
 ## CURRENT TASK (2026-10-19, in progress)
 
 **Dashboard: add Financial Analytics sections + fix empty short ranges.**

@@ -9,7 +9,7 @@ export const MODULES: RbacModule[] = [
   { key: 'silver-rate', label: 'Silver Rate', description: 'View and update silver rate' },
   { key: 'sales', label: 'Sales', description: 'Invoices, orders, customers and returns' },
   { key: 'purchase', label: 'Purchase', description: 'Purchase orders, invoices, suppliers and returns' },
-  { key: 'inventory', label: 'Inventory', description: 'Products, stock, transfers, barcodes and low stock' },
+  { key: 'inventory', label: 'Inventory', description: 'Products, stock, transfers, QR labels and low stock' },
   { key: 'accounts', label: 'Accounts', description: 'Expenses, payments, bank accounts and ledger' },
   { key: 'reports', label: 'Reports', description: 'Business, GST, sales and inventory reports' },
   { key: 'shopify', label: 'Shopify', description: 'Shopify sync, price and inventory push' },

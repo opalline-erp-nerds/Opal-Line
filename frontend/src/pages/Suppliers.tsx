@@ -11,14 +11,8 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { dbApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
@@ -277,26 +271,18 @@ export default function SuppliersPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={viewSupplier !== null} onOpenChange={(open) => { if (!open) setViewSupplier(null) }}>
-        <DialogContent size="md">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Avatar className="h-8 w-8">
-                <AvatarFallback className="bg-primary-100 text-primary-700">{initials(viewSupplier?.name ?? '')}</AvatarFallback>
-              </Avatar>
-              {viewSupplier?.name}
-            </DialogTitle>
-            <DialogDescription>Supplier details</DialogDescription>
-          </DialogHeader>
-          {viewSupplier ? (
-            <div className="space-y-0.5 text-sm">
-              <DetailRow label="Contact" value={viewSupplier.contact || '—'} />
-              <DetailRow label="Phone" value={viewSupplier.phone || '—'} />
-              <DetailRow label="City" value={viewSupplier.city || '—'} />
-              <DetailRow label="Outstanding" value={formatCurrency(viewSupplier.outstanding)} />
-              <DetailRow label="Status" value={viewSupplier.status === 'active' ? 'Active' : 'Inactive'} />
-            </div>
-          ) : null}
+      <AppDialog
+        open={viewSupplier !== null}
+        onOpenChange={(open) => { if (!open) setViewSupplier(null) }}
+        size="md"
+        titleAdornment={
+          <Avatar className="h-8 w-8">
+            <AvatarFallback className="bg-primary-100 text-primary-700">{initials(viewSupplier?.name ?? '')}</AvatarFallback>
+          </Avatar>
+        }
+        title={viewSupplier?.name ?? 'Supplier'}
+        description="Supplier details"
+        footer={
           <DialogFooter>
             {viewSupplier?.phone ? (
               <Button variant="outline" onClick={() => (window.location.href = `tel:${encodeURI(viewSupplier.phone)}`)}>
@@ -305,8 +291,18 @@ export default function SuppliersPage() {
             ) : null}
             <Button onClick={() => setViewSupplier(null)}>Close</Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        }
+      >
+        {viewSupplier ? (
+          <div className="space-y-0.5 text-sm">
+            <DetailRow label="Contact" value={viewSupplier.contact || '—'} />
+            <DetailRow label="Phone" value={viewSupplier.phone || '—'} />
+            <DetailRow label="City" value={viewSupplier.city || '—'} />
+            <DetailRow label="Outstanding" value={formatCurrency(viewSupplier.outstanding)} />
+            <DetailRow label="Status" value={viewSupplier.status === 'active' ? 'Active' : 'Inactive'} />
+          </div>
+        ) : null}
+      </AppDialog>
 
       <SupplierDialog
         open={dialogOpen}

@@ -52,29 +52,32 @@ export function SupplierDialog({
   error,
 }: SupplierDialogProps) {
   const [form, setForm] = React.useState<SupplierFormPayload>(EMPTY_FORM)
+  // Snapshot of the form as it opened, for the unsaved-changes close guard.
+  const [baseline, setBaseline] = React.useState('')
 
   React.useEffect(() => {
     if (!open) {
       queueMicrotask(() => setForm(EMPTY_FORM))
       return
     }
-    if (supplier && mode === 'edit') {
-      queueMicrotask(() =>
-        setForm({
-          name: supplier.name ?? '',
-          contact: supplier.contact ?? '',
-          phone: supplier.phone ?? '',
-          alternatePhone: supplier.alternatePhone ?? '',
-          email: supplier.email ?? '',
-          gstin: supplier.gstin ?? '',
-          city: supplier.city ?? '',
-          address: supplier.address ?? '',
-          status: supplier.status ?? 'active',
-        }),
-      )
-    } else {
-      queueMicrotask(() => setForm(EMPTY_FORM))
-    }
+    const next: SupplierFormPayload =
+      supplier && mode === 'edit'
+        ? {
+            name: supplier.name ?? '',
+            contact: supplier.contact ?? '',
+            phone: supplier.phone ?? '',
+            alternatePhone: supplier.alternatePhone ?? '',
+            email: supplier.email ?? '',
+            gstin: supplier.gstin ?? '',
+            city: supplier.city ?? '',
+            address: supplier.address ?? '',
+            status: supplier.status ?? 'active',
+          }
+        : EMPTY_FORM
+    queueMicrotask(() => {
+      setForm(next)
+      setBaseline(JSON.stringify(next))
+    })
   }, [open, supplier, mode])
 
   const setField = (key: keyof SupplierFormPayload, value: string) =>
@@ -94,7 +97,8 @@ export function SupplierDialog({
     <AppDialog
       open={open}
       onOpenChange={onOpenChange}
-      size="2xl"
+      size="sm"
+      isDirty={open && JSON.stringify(form) !== baseline}
       title={title}
       description={description}
       footer={
