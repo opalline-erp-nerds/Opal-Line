@@ -48,13 +48,10 @@ import { dbApi } from '@/lib/api'
 import { shopifyApi } from '@/lib/api'
 import type {
   Activity,
-  AgingBucket,
-  AgingInvoice,
   AnalyticsStat,
   KpiCardData,
   LowStockItem,
   PaymentStatusSegment,
-  ReceivablesAging,
   SalesOverviewPoint,
   SilverRate,
   TopCategory,
@@ -64,7 +61,7 @@ import type {
   RangeQuery,
 } from '@/types'
 import type { ShopifyStatus } from '@/types/shopify'
-import { compactCurrency, formatCurrency, formatDate, formatDateTime, formatPieces, formatWeight } from '@/lib/format'
+import { compactCurrency, formatCurrency, formatDateTime, formatPieces, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 const kpiIcons: Record<string, LucideIcon> = {
@@ -112,11 +109,7 @@ const quickActions: { label: string; icon: LucideIcon; path: string; module: str
 
 export default function DashboardPage() {
   const navigate = useNavigate()
-  const { currentUser } = useAuth()
-  // Security snapshot is Admin / Super Admin only — the endpoint 403s for
-  // everyone else, so don't even fetch it (and never render the card).
-  const securityAdmin = currentUser?.role === 'Admin' || currentUser?.role === 'Super Admin'
-const [kpis, setKpis] = useState<KpiCardData[]>([])
+  const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [summary, setSummary] = useState<Record<string, string | number> | null>(null)
   const [salesData, setSalesData] = useState<SalesOverviewPoint[]>([])
   const [topProducts, setTopProducts] = useState<TopProduct[]>([])
@@ -129,10 +122,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [lowStock, setLowStock] = useState<LowStockItem[]>([])
   const [activities, setActivities] = useState<Activity[]>([])
   const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
-  const [security, setSecurity] = useState<{ failedLogins: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> } | null>(null)
-  const [aging, setAging] = useState<ReceivablesAging | null>(null)
-  const [expandedBucket, setExpandedBucket] = useState<AgingBucket['key'] | null>(null)
-  const [bucketInvoices, setBucketInvoices] = useState<Partial<Record<AgingBucket['key'], AgingInvoice[] | 'loading'>>>({})
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [period, setPeriod] = useState<PeriodKey>(() => loadStoredRange()?.period ?? 'today')
@@ -167,8 +156,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       dbApi.getLowStock(),
       dbApi.getRecentActivities(range),
       dbApi.getAnalyticsStats(range),
-      securityAdmin ? dbApi.getDashboardSecurity(range) : Promise.resolve(null),
-      dbApi.getReceivablesAging(),
       shopifyApi.getStatus(),
     ]).then((results) => {
       if (cancelled) return
@@ -182,9 +169,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       const lowStockResult = results[7]
       const activitiesResult = results[8]
       const analyticsResult = results[9]
-      const securityResult = results[10]
-      const agingResult = results[11]
-      const shopifyStatusResult = results[12]
+      const shopifyStatusResult = results[10]
 
       // Helper: if fulfilled, return value; if rejected, log error and return default
       const safe = (result: PromiseSettledResult<any>): any => {
@@ -243,12 +228,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       // Analytics
       const analytics = analyticsResult.status === 'fulfilled' ? analyticsResult.value : []
 
-      // Security
-      const security = securityResult.status === 'fulfilled' ? securityResult.value : null
-
-      // Aging
-      const aging = agingResult.status === 'fulfilled' ? agingResult.value : null
-
       // Shopify Status
       const shopifyStatus = shopifyStatusResult.status === 'fulfilled' ? shopifyStatusResult.value : null
 
@@ -266,8 +245,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       setLowStock(lowStock)
       setActivities(Array.isArray(activities) ? activities : [])
       setAnalytics(analytics)
-      setSecurity(security)
-      setAging(aging)
       setShopifyStatus(shopifyStatus)
       // If critical widgets (KPIs or summary) had errors, mark DB as unreachable
       if (kpisResult.status === 'rejected' || summaryResult.status === 'rejected') {
@@ -283,23 +260,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
     return () => {
       cancelled = true
     }
-  }, [period, customRange, securityAdmin])
-
-  // Receivables aging drill-down: lazily fetch (and cache) the invoices behind
-  // a bucket the first time it is expanded.
-  const toggleBucket = (key: AgingBucket['key']) => {
-    if (expandedBucket === key) {
-      setExpandedBucket(null)
-      return
-    }
-    setExpandedBucket(key)
-    if (bucketInvoices[key]) return
-    setBucketInvoices((prev) => ({ ...prev, [key]: 'loading' }))
-    dbApi
-      .getAgingInvoices(key)
-      .then((r) => setBucketInvoices((prev) => ({ ...prev, [key]: r.invoices })))
-      .catch(() => setBucketInvoices((prev) => ({ ...prev, [key]: [] })))
-  }
+  }, [period, customRange])
 
   return (
     <div className="print-area mx-auto w-full max-w-[1600px] space-y-6 px-4 py-4 sm:py-6 lg:px-6">
@@ -701,154 +662,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
 
-            <Card className="xl:col-span-1">
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="text-sm">Receivables Aging</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Outstanding by due date</p>
-                </div>
-                {aging && aging.overdueCount > 0 ? (
-                  <Badge variant="warning" className="text-[10px]">{compactCurrency(aging.overdueTotal)} overdue</Badge>
-                ) : aging && aging.invoiceCount > 0 ? (
-                  <Badge variant="success" className="text-[10px]">Nothing overdue</Badge>
-                ) : null}
-              </CardHeader>
-              <CardContent>
-                {aging ? (
-                  aging.invoiceCount > 0 ? (
-                    <>
-                      <div className="space-y-3">
-                        {aging.buckets.map((b) => {
-                          const list = bucketInvoices[b.key]
-                          const expanded = expandedBucket === b.key
-                          return (
-                            <div key={b.key}>
-                              <button
-                                type="button"
-                                onClick={() => toggleBucket(b.key)}
-                                aria-expanded={expanded}
-                                className="flex w-full items-center gap-2 rounded-sm text-left text-[12px] hover:bg-muted/50"
-                              >
-                                <span
-                                  className={cn(
-                                    'h-2 w-2 rounded-full',
-                                    b.key === 'current' && 'bg-success',
-                                    b.key === 'd1_30' && 'bg-amber-500',
-                                    b.key === 'd31_60' && 'bg-orange-500',
-                                    b.key === 'd60plus' && 'bg-destructive',
-                                  )}
-                                />
-                                <span className="text-muted-foreground">{b.label}</span>
-                                <span className="ml-auto font-semibold tabular-nums text-foreground">{compactCurrency(b.value)}</span>
-                                <span className="w-14 text-right tabular-nums text-muted-foreground">{b.count} inv</span>
-                                <ChevronDown className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform', expanded ? '' : '-rotate-90')} />
-                              </button>
-                              <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
-                                <div
-                                  className={cn(
-                                    'h-full rounded-full',
-                                    b.key === 'current' && 'bg-success',
-                                    b.key === 'd1_30' && 'bg-amber-500',
-                                    b.key === 'd31_60' && 'bg-orange-500',
-                                    b.key === 'd60plus' && 'bg-destructive',
-                                  )}
-                                  style={{ width: `${aging.total > 0 ? Math.max(2, Math.round((b.value / aging.total) * 100)) : 0}%` }}
-                                />
-                              </div>
-                              {expanded ? (
-                                <div className="mt-2 space-y-1.5 rounded-md border bg-muted/30 p-2">
-                                  {list === 'loading' ? (
-                                    <p className="py-1 text-center text-[11.5px] text-muted-foreground">Loading invoices…</p>
-                                  ) : list && list.length > 0 ? (
-                                    list.map((inv) => (
-                                      <div key={inv.id} className="flex items-center justify-between gap-2 text-[11.5px]">
-                                        <div className="min-w-0">
-                                          <p className="truncate font-medium text-foreground">{inv.customer || inv.number}</p>
-                                          <p className="truncate text-muted-foreground">
-                                            {inv.number}
-                                            {inv.dueDate ? ` · due ${formatDate(inv.dueDate)}` : ' · no due date'}
-                                          </p>
-                                        </div>
-                                        <div className="shrink-0 text-right">
-                                          <p className="font-semibold tabular-nums text-foreground">{compactCurrency(inv.outstanding ?? inv.grandTotal)}</p>
-                                          {inv.outstanding != null && inv.outstanding < inv.grandTotal ? (
-                                            <p className="text-[10.5px] text-muted-foreground">of {compactCurrency(inv.grandTotal)}</p>
-                                          ) : null}
-                                          {inv.daysOverdue > 0 ? (
-                                            <p className="text-[10.5px] font-medium text-red-600 dark:text-red-400">{inv.daysOverdue}d overdue</p>
-                                          ) : (
-                                            <p className="text-[10.5px] text-muted-foreground">not due</p>
-                                          )}
-                                        </div>
-                                      </div>
-                                    ))
-                                  ) : (
-                                    <p className="py-1 text-center text-[11.5px] text-muted-foreground">No invoices in this bucket.</p>
-                                  )}
-                                </div>
-                              ) : null}
-                            </div>
-                          )
-                        })}
-                      </div>
-                      <Button variant="soft-primary" className="mt-4 w-full" size="sm" onClick={() => navigate('/reports/dues')}>
-                        View Dues
-                      </Button>
-                    </>
-                  ) : (
-                    <EmptyState
-                      icon={Clock}
-                      title="No outstanding receivables"
-                      description="Invoices awaiting payment will be grouped here by how overdue they are."
-                    />
-                  )
-                ) : (
-                  <p className="py-6 text-center text-sm text-muted-foreground">Aging snapshot unavailable.</p>
-                )}
-              </CardContent>
-            </Card>
-
-            {securityAdmin ? (
-            <Card className="xl:col-span-1">
-              <CardHeader>
-                <CardTitle className="text-sm flex items-center gap-2">
-                  <ShieldAlert className="h-4 w-4 text-muted-foreground" /> Security
-                </CardTitle>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">Failed logins and account lockouts</p>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                {security ? (
-                  <>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="rounded-lg border p-3">
-                        <p className="text-2xl font-bold text-foreground">{security.failedLogins}</p>
-                        <p className="text-[11px] text-muted-foreground">Failed logins · {resolveClientRange(period, customRange).rangeText}</p>
-                      </div>
-                      <div className="rounded-lg border p-3">
-                        <p className={`text-2xl font-bold ${security.lockedAccounts > 0 ? 'text-destructive' : 'text-foreground'}`}>{security.lockedAccounts}</p>
-                        <p className="text-[11px] text-muted-foreground">Locked accounts</p>
-                      </div>
-                    </div>
-                    {security.recent.length > 0 ? (
-                      <div className="space-y-1.5">
-                        <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Recent failures</p>
-                        {security.recent.map((r, i) => (
-                          <div key={i} className="flex items-center justify-between gap-2 text-[12px]">
-                            <span className="truncate font-medium text-foreground">{r.entity || 'Unknown user'}</span>
-                            <span className="shrink-0 text-muted-foreground">{r.timestamp ? new Date(r.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : ''}</span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-[12px] text-muted-foreground">No failed logins recorded.</p>
-                    )}
-                  </>
-                ) : (
-                  <p className="text-sm text-muted-foreground">Security snapshot unavailable.</p>
-                )}
-              </CardContent>
-            </Card>
-            ) : null}
           </div>
 
           <Card>
