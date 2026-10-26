@@ -48,6 +48,7 @@ import type {
   SalesReturn,
   SilverRate,
   SilverHistoryDays,
+  SilverHistoryRange,
   SilverRatePoint,
   ProfitAnalytics,
   StockCategory,
@@ -189,11 +190,17 @@ export const dbApi = {
   getAgingInvoices: (bucket: AgingBucket['key']): Promise<{ bucket: string; invoices: AgingInvoice[] }> =>
     request(`/db/dashboard/aging/invoices?bucket=${encodeURIComponent(bucket)}`),
   // One point per IST calendar day, backfilled server-side, for the given
-  // window (the chart owns this range — the page-wide filter does not drive it).
-  getSilverRateHistory: (days: SilverHistoryDays = 7): Promise<SilverRatePoint[]> =>
-    request<{ days: number; points: SilverRatePoint[] }>(`/db/dashboard/silver-history?days=${days}`).then(
+  // preset window or inclusive custom range (the chart owns this range — the
+  // page-wide filter does not drive it).
+  getSilverRateHistory: (window: SilverHistoryDays | SilverHistoryRange = 7): Promise<SilverRatePoint[]> => {
+    const query =
+      typeof window === 'number'
+        ? `days=${window}`
+        : `from=${encodeURIComponent(window.from)}&to=${encodeURIComponent(window.to)}`
+    return request<{ days: number; points: SilverRatePoint[] }>(`/db/dashboard/silver-history?${query}`).then(
       (res) => res.points,
-    ),
+    )
+  },
   getLowStock: (): Promise<LowStockItem[]> => request('/db/dashboard/low-stock'),
   getRecentActivities: (
     range?: DashboardRangeInput | string,

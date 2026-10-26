@@ -444,12 +444,27 @@ dashboardRouter.get('/dashboard/payment-status', async (req, res) => {
 })
 
 // ── Silver Rate History ────────────────────────────────────────────────
-// One point per IST calendar day for the last `days` days (7 | 30 | 90).
-// silver_rates only records *changes*, so days without an update
-// forward-fill the last known rate (and rates from before the window carry
-// in); days before the first rate ever recorded are omitted — we never
-// invent history. No rates at all → `{ days, points: [] }`.
+// One point per IST calendar day for either a preset window (7 | 30 | 90
+// days ending today) or an explicit inclusive `from`/`to` custom range
+// (max 365 days, capped at today). silver_rates only records *changes*, so
+// days without an update forward-fill the last known rate (and rates from
+// before the window carry in); days before the first rate ever recorded are
+// omitted — we never invent history. No rates at all → `{ days, points: [] }`.
 const SILVER_HISTORY_WINDOWS = [7, 30, 90]
+const SILVER_HISTORY_MAX_DAYS = 365
+
+function parseISODay(value: unknown): string | null {
+  const raw = String(value ?? '')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null
+  const d = new Date(`${raw}T00:00:00Z`)
+  return Number.isNaN(d.getTime()) ? null : raw
+}
+
+function daysBetweenIso(from: string, to: string): number {
+  const a = new Date(`${from}T00:00:00Z`).getTime()
+  const b = new Date(`${to}T00:00:00Z`).getTime()
+  return Math.round((b - a) / 86400000) + 1
+}
 
 function shiftIsoDay(dayKey: string, deltaDays: number): string {
   const d = new Date(`${dayKey}T00:00:00Z`)
@@ -459,10 +474,38 @@ function shiftIsoDay(dayKey: string, deltaDays: number): string {
 
 dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
   if (!requireDb(res)) return
-  const days = Number(req.query.days ?? 7)
-  if (!SILVER_HISTORY_WINDOWS.includes(days)) {
-    return res.status(400).json({ error: 'days must be one of 7, 30, 90' })
+
+  const today = istDayKey(new Date())
+  const wantsCustom = req.query.from != null || req.query.to != null
+  let days: number
+  let start: string
+  let end: string
+
+  if (wantsCustom) {
+    const from = parseISODay(req.query.from)
+    const to = parseISODay(req.query.to)
+    if (!from || !to) {
+      return res.status(400).json({ error: 'from and to must be valid YYYY-MM-DD dates' })
+    }
+    if (to < from) {
+      return res.status(400).json({ error: 'to must be on or after from' })
+    }
+    days = daysBetweenIso(from, to)
+    if (days > SILVER_HISTORY_MAX_DAYS) {
+      return res.status(400).json({ error: `Custom range cannot exceed ${SILVER_HISTORY_MAX_DAYS} days` })
+    }
+    start = from
+    // Never invent future points: a range ending later still stops at today.
+    end = to > today ? today : to
+  } else {
+    days = Number(req.query.days ?? 7)
+    if (!SILVER_HISTORY_WINDOWS.includes(days)) {
+      return res.status(400).json({ error: 'days must be one of 7, 30, 90' })
+    }
+    start = shiftIsoDay(today, -(days - 1))
+    end = today
   }
+
   try {
     const rows = await db!
       .select({ rate: schema.silverRates.rate, updatedAt: schema.silverRates.updatedAt })
@@ -483,9 +526,6 @@ dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
     }
     const entries = [...byDay.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
 
-    const today = istDayKey(new Date())
-    const start = shiftIsoDay(today, -(days - 1))
-
     const points: Array<{ date: string; rate: number }> = []
     let carry: number | null = null
     let i = 0
@@ -493,7 +533,7 @@ dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
       carry = entries[i][1]
       i += 1
     }
-    for (let day = start; day <= today; day = shiftIsoDay(day, 1)) {
+    for (let day = start; day <= end; day = shiftIsoDay(day, 1)) {
       while (i < entries.length && entries[i][0] === day) {
         carry = entries[i][1]
         i += 1

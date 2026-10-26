@@ -306,6 +306,15 @@ export interface AgingInvoice {
 /** Preset windows of the dashboard Silver Rate History chart. */
 export type SilverHistoryDays = 7 | 30 | 90
 
+/** Selected tab: one of the presets or the custom date range. */
+export type SilverHistoryWindow = SilverHistoryDays | 'custom'
+
+/** Inclusive custom window for the Silver Rate History chart. */
+export interface SilverHistoryRange {
+  from: string
+  to: string
+}
+
 /** One backfilled silver-rate point: `date` is an IST calendar day (YYYY-MM-DD). */
 export interface SilverRatePoint {
   date: string
