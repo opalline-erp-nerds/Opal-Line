@@ -701,6 +701,53 @@ export interface ReorderSuggestion {
   priority: 'urgent' | 'soon' | 'ok'
 }
 
+/** Age bands for stock that is still on hand. 180+ is the unbounded last band. */
+export type StockAgingBucketKey = 'd0_30' | 'd31_60' | 'd61_90' | 'd91_180' | 'd180_plus'
+
+export interface StockAgingRow {
+  id: string
+  name: string
+  sku: string
+  category: string
+  quantity: number
+  /** Alias of `quantity`, matching the product field used elsewhere. */
+  stock: number
+  /** FIFO date the oldest remaining unit entered stock (ISO), or null. */
+  stockEntryDate: string | null
+  /** Newest non-cancelled sale across invoices and order line items (ISO). */
+  lastSoldDate: string | null
+  daysInStock: number
+  agingBucket: StockAgingBucketKey
+  agingStatus: string
+  stockValue: number
+}
+
+export interface StockAgingBucket {
+  key: StockAgingBucketKey
+  label: string
+  tone: 'success' | 'info' | 'warning' | 'danger' | 'muted'
+  count: number
+  quantity: number
+  value: number
+}
+
+export interface StockAgingResponse {
+  generatedAt: string
+  data: StockAgingRow[]
+  buckets: StockAgingBucket[]
+  totals: {
+    products: number
+    quantity: number
+    value: number
+    neverSold: number
+  }
+  filters: {
+    q: string
+    category: string
+    bucket: StockAgingBucketKey | ''
+  }
+}
+
 export interface SyncLog {
   id: string
   entity: 'Order' | 'Product' | 'Inventory' | 'Customer' | 'Price' | 'Payment'

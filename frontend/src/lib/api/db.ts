@@ -59,6 +59,7 @@ import type {
   Customer360,
   OrderFullDetail,
   ReorderSuggestion,
+  StockAgingResponse,
   Shipment,
   NotificationLogEntry,
 } from '@/types'
@@ -352,6 +353,8 @@ export const dbApi = {
     }),
   reorderSuggestions: () =>
     request<{ data: ReorderSuggestion[]; generatedAt: string }>('/db/inventory/reorder-suggestions'),
+  /** Stock on hand with FIFO age, last-sold date and 30/60/90/180+ bands. */
+  getStockAging: () => request<StockAgingResponse>('/db/inventory/aging'),
   getCustomers: () => list<Customer>('/db/customers', PAGED),
   getSuppliers: () => list<Supplier>('/db/suppliers', PAGED),
   getInvoices: async (): Promise<Invoice[]> => {
