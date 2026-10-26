@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import {
   AlertTriangle,
@@ -11,9 +11,9 @@ import {
   Clock,
   Gem,
   History,
-  IndianRupee,
   Maximize2,
   Minimize2,
+  MoreHorizontal,
   Pencil,
   RefreshCw,
   ShieldCheck,
@@ -32,6 +32,13 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { DialogFooter } from '@/components/ui/dialog'
 import { AppDialog } from '@/components/ui/app-dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { useSilverRate } from '@/lib/silver-rate-context'
@@ -52,22 +59,20 @@ interface SilverUpdateResult {
   steps?: Array<{ key: string; label: string; status: 'done' | 'failed' | 'skipped'; detail?: string }>
 }
 
-interface Step {
-  key: string
-  label: string
-  icon: LucideIcon
-  desc: string
+/** One row of the price preview inside the drawer (old → new retail price). */
+interface PreviewRow {
+  product: Product
+  oldPrice: number
+  newPrice: number
 }
-
-const steps: Step[] = [
-  { key: 'request', label: 'Enter New Rate', icon: Tag, desc: 'Admin sets the new silver rate' },
-  { key: 'preview', label: 'Preview Impact', icon: TrendingUp, desc: 'Review product price changes' },
-  { key: 'approve', label: 'Approve & Sync', icon: ShieldCheck, desc: 'Push approved prices to Shopify' },
-]
 
 export default function SilverRatePage() {
   const { refresh: refreshSilverRate } = useSilverRate()
+  const approvalsRef = useRef<HTMLDivElement>(null)
+  // 0 = closed, 1 = edit (rate / when), 2 = review, 3 = result
   const [step, setStep] = useState(0)
+  // One drawer, two flows: apply the rate now, or queue it for later.
+  const [mode, setMode] = useState<'now' | 'schedule'>('now')
   const [newRate, setNewRate] = useState('')
   const [dialogOpen, setDialogOpen] = useState(false)
   const [processing, setProcessing] = useState(false)
@@ -89,12 +94,13 @@ export default function SilverRatePage() {
   const [togglingAuto, setTogglingAuto] = useState(false)
   const [fetchingNow, setFetchingNow] = useState(false)
   const [fetchNowResult, setFetchNowResult] = useState<{ ok: boolean; message: string } | null>(null)
+  // Products repriced by the most recent apply/fetch in this session; falls
+  // back to the catalog size (that is what the last apply covered).
+  const [lastRepriced, setLastRepriced] = useState<number | null>(null)
   // One-off scheduled rate changes: a rate + a specific date/time applied
   // automatically then (queue lives in settings.scheduled_rate_changes).
   // Guided dialog state — rate → when → preview, plus edit-in-place.
   const [scheduled, setScheduled] = useState<PendingRateChange[]>([])
-  const [schOpen, setSchOpen] = useState(false)
-  const [schStep, setSchStep] = useState(0)
   const [schRate, setSchRate] = useState('')
   const [schDate, setSchDate] = useState('')
   const [schTime, setSchTime] = useState('')
@@ -164,6 +170,8 @@ export default function SilverRatePage() {
   }, [affected, rateValid])
 
   const openUpdate = () => {
+    setMode('now')
+    setError('')
     setNewRate(String(currentRate.rate))
     setStep(1)
     setRateProgress(null)
@@ -194,6 +202,7 @@ export default function SilverRatePage() {
       const res = await dbApi.submitSilverRateRequest(rateValue, syncFirst)
       if (res.direct) {
         setResult(res)
+        setLastRepriced(res.updated)
       } else {
         setPendingResult({ message: res.message, rate: rateValue })
       }
@@ -248,7 +257,7 @@ export default function SilverRatePage() {
     return Number.isNaN(at.getTime()) ? null : at
   }, [schDate, schTime])
 
-  /** Old → new prices for every product at the dialog's rate (preview step). */
+  /** Old → new prices for every product at the dialog's rate (review step). */
   const scheduleImpact = useMemo(() => {
     if (!scheduleRateValid || !scheduleInstant) return null
     return products.map((p) => {
@@ -266,18 +275,11 @@ export default function SilverRatePage() {
   )
 
   const openScheduleDialog = (edit?: PendingRateChange) => {
+    setMode('schedule')
     setSchError('')
     setSchSuccess('')
     setSchEditId(edit?.id ?? null)
-    // One-click "when" presets — computed here (an event, not render) so the
-    // clock is read exactly when the dialog opens and never goes stale.
-    const tomorrow = (new Date().getDay() + 1) % 7
-    setWhenPresets([
-      { key: 'tmr-9', label: presetLabel(upcomingWeekdayAt(tomorrow, 9), 'Tomorrow'), date: upcomingWeekdayAt(tomorrow, 9) },
-      { key: 'tmr-18', label: presetLabel(upcomingWeekdayAt(tomorrow, 18), 'Tomorrow'), date: upcomingWeekdayAt(tomorrow, 18) },
-      { key: 'sat-10', label: presetLabel(upcomingWeekdayAt(6, 10), 'Saturday'), date: upcomingWeekdayAt(6, 10) },
-      { key: 'mon-9', label: presetLabel(upcomingWeekdayAt(1, 9), 'Monday'), date: upcomingWeekdayAt(1, 9) },
-    ])
+    seedWhenPresets()
     if (edit) {
       const at = new Date(edit.applyAt)
       setSchRate(String(edit.rate))
@@ -287,25 +289,47 @@ export default function SilverRatePage() {
     } else {
       setSchRate(String(currentRate.rate))
       // Sensible default: an hour from now, easy to nudge with the presets.
-      const soon = new Date(Date.now() + 60 * 60_000)
+      const soon = hourFromNow()
       setSchDate(toDateInputValue(soon))
       setSchTime(toTimeInputValue(soon))
       setSchNote('')
     }
-    setSchStep(0)
-    setSchOpen(true)
+    setError('')
+    setStep(1)
+    setDialogOpen(true)
   }
 
-  const goNextFromRate = () => {
+  /**
+   * One-click "when" presets — computed as an event (not during render) so
+   * the clock is read exactly when the drawer opens and never goes stale.
+   */
+  const seedWhenPresets = () => {
+    const tomorrow = (new Date().getDay() + 1) % 7
+    setWhenPresets([
+      { key: 'tmr-9', label: presetLabel(upcomingWeekdayAt(tomorrow, 9), 'Tomorrow'), date: upcomingWeekdayAt(tomorrow, 9) },
+      { key: 'tmr-18', label: presetLabel(upcomingWeekdayAt(tomorrow, 18), 'Tomorrow'), date: upcomingWeekdayAt(tomorrow, 18) },
+      { key: 'sat-10', label: presetLabel(upcomingWeekdayAt(6, 10), 'Saturday'), date: upcomingWeekdayAt(6, 10) },
+      { key: 'mon-9', label: presetLabel(upcomingWeekdayAt(1, 9), 'Monday'), date: upcomingWeekdayAt(1, 9) },
+    ])
+  }
+
+  /** Seed the schedule draft (rate + an hour from now) when it is still empty. */
+  const seedScheduleDraft = () => {
+    seedWhenPresets()
+    if (!schDate) {
+      const soon = hourFromNow()
+      setSchDate(toDateInputValue(soon))
+      setSchTime(toTimeInputValue(soon))
+    }
+    if (!Number.isFinite(parseFloat(schRate))) setSchRate(String(currentRate.rate))
+  }
+
+  /** Edit step → review step (rate + when must both be valid). */
+  const reviewSchedule = () => {
     if (!scheduleRateValid) {
       setSchError('Enter a valid rate — ₹/gm greater than 0')
       return
     }
-    setSchError('')
-    setSchStep(1)
-  }
-
-  const goNextFromWhen = () => {
     if (!scheduleInstant) {
       setSchError('Pick the date and time to apply the rate')
       return
@@ -315,7 +339,7 @@ export default function SilverRatePage() {
       return
     }
     setSchError('')
-    setSchStep(2)
+    setStep(2)
   }
 
   const submitSchedule = async () => {
@@ -342,7 +366,7 @@ export default function SilverRatePage() {
         ? await dbApi.updateScheduledRateChange(schEditId, { rate, applyAt: at.toISOString(), note })
         : await dbApi.scheduleSilverRateChange({ rate, applyAt: at.toISOString(), note })
       setScheduled(res.changes)
-      setSchOpen(false)
+      setDialogOpen(false)
       setSchSuccess(
         schEditId
           ? `Updated — ₹${rate.toFixed(2)}/gm now applies ${formatDateTime(at.toISOString())}.`
@@ -406,6 +430,7 @@ export default function SilverRatePage() {
         ok: res.ok,
         message: res.ok ? `Fetched ₹${(res.rate ?? 0).toFixed(2)}/gm — ${(res.repriced ?? 0).toLocaleString('en-IN')} products repriced` : res.error ?? 'Fetch failed',
       })
+      if (res.ok) setLastRepriced(res.repriced ?? null)
       loadAll()
     } catch (e) {
       setFetchNowResult({ ok: false, message: e instanceof Error ? e.message : 'Fetch failed' })
@@ -415,8 +440,12 @@ export default function SilverRatePage() {
   }
 
   const rollbackTo = (rate: number) => {
+    setMode('now')
+    setError('')
     setNewRate(String(rate))
     setStep(1)
+    setRateProgress(null)
+    setRateMinimized(false)
     setDialogOpen(true)
   }
 
@@ -424,6 +453,69 @@ export default function SilverRatePage() {
   // Admin / Super Admin can apply a rate change (and fetch the spot rate)
   // directly; every other role always goes through approval.
   const canApprove = isApprover || autoStatus?.isApprover === true
+
+  /** Pending rows first so the decision list leads the expanded card. */
+  const sortedRequests = useMemo(
+    () => [...requests].sort((a, b) => Number(a.status !== 'pending') - Number(b.status !== 'pending')),
+    [requests],
+  )
+
+  const nextScheduled = useMemo(
+    () => [...scheduled].sort((a, b) => Date.parse(a.applyAt) - Date.parse(b.applyAt))[0] ?? null,
+    [scheduled],
+  )
+
+  /** Newest 5 recorded rates, oldest → newest, for the hero sparkline. */
+  const sparkRates = useMemo(() => {
+    const rows = [...history]
+      .filter((h) => h.updatedAt && !Number.isNaN(Date.parse(h.updatedAt)))
+      .sort((a, b) => Date.parse(b.updatedAt as string) - Date.parse(a.updatedAt as string))
+      .slice(0, 5)
+      .map((h) => h.rate)
+    const list = rows.length >= 2 ? rows : [currentRate.previousRate, currentRate.rate]
+    return list.filter((r) => Number.isFinite(r) && r > 0).reverse()
+  }, [history, currentRate])
+
+  // Rate field in view: apply mode edits `newRate`, schedule mode edits `schRate`.
+  const activeRate = mode === 'now' ? rateValue : scheduleDialogRate
+  const activeRateValid = mode === 'now' ? rateValid : scheduleRateValid
+  const activeDelta = activeRateValid ? Math.round((activeRate - currentRate.rate) * 100) / 100 : 0
+
+  const setActiveRate = (value: string) => (mode === 'now' ? setNewRate(value) : setSchRate(value))
+
+  const adjustRate = (delta: number) => {
+    const base = Number.isFinite(parseFloat(mode === 'now' ? newRate : schRate)) ? parseFloat(mode === 'now' ? newRate : schRate) : currentRate.rate
+    setActiveRate((Math.round((base + delta) * 100) / 100).toFixed(2))
+  }
+
+  const resetRate = () => setActiveRate(String(currentRate.rate))
+
+  const focusApprovals = () => {
+    approvalsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    approvalsRef.current?.focus({ preventScroll: true })
+  }
+
+  const footerError = mode === 'now' ? error : schError
+
+  const syncBadge = processing
+    ? { variant: 'info' as const, label: 'Applying…' }
+    : history[0]?.syncStatus === 'synced'
+      ? { variant: 'success' as const, label: 'Synced' }
+      : history[0]?.syncStatus === 'failed'
+        ? { variant: 'danger' as const, label: 'Failed' }
+        : history[0]?.syncStatus === 'skipped'
+          ? { variant: 'muted' as const, label: 'Skipped' }
+          : { variant: 'muted' as const, label: '—' }
+
+  const repriced = lastRepriced ?? products.length
+
+  const autoLine = !autoStatus
+    ? 'Auto-rate status unavailable.'
+    : autoStatus.lastError
+      ? autoStatus.lastError
+      : `Next run ${formatDateTime(autoStatus.nextRunAt)} · last fetch ${
+          autoStatus.lastRate != null ? `₹${autoStatus.lastRate.toFixed(2)} / gm` : autoStatus.lastResult ?? 'never'
+        }`
 
   return (
     <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
@@ -435,12 +527,12 @@ export default function SilverRatePage() {
 
       <PageHeader
         title="Silver Rate Management"
-        subtitle="Silver rates drive all product pricing. Changes are previewed and approved before syncing to Shopify."
+        subtitle="Silver rates drive all product pricing."
         actions={
           <>
             <Button variant="outline" onClick={syncProducts} disabled={syncingProducts} className="gap-2">
               <RefreshCw className={cn('h-4 w-4', syncingProducts && 'animate-spin')} />
-              {syncingProducts ? 'Syncing products...' : 'Sync Products from Shopify'}
+              {syncingProducts ? 'Syncing…' : 'Sync products'}
             </Button>
             <Button onClick={openUpdate} className="gap-2">
               <TrendingUp className="h-4 w-4" /> {canApprove ? 'Update Silver Rate' : 'Request Rate Change'}
@@ -448,6 +540,27 @@ export default function SilverRatePage() {
           </>
         }
       />
+
+      {autoStatus && !autoStatus.apiUrlConfigured ? (
+        <div
+          role="alert"
+          className="flex flex-col items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 sm:flex-row sm:items-center sm:gap-x-3"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
+          <div className="min-w-0 sm:flex-1">
+            <p className="font-semibold">Rate source not configured</p>
+            <p className="text-[13px] text-amber-800">
+              Automatic spot-rate fetching stays off until SILVER_RATE_API_URL is set on the server.
+            </p>
+          </div>
+          <Link
+            to="/system/settings"
+            className="rounded-md border border-amber-400 bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition-colors hover:bg-amber-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-700 focus-visible:ring-offset-1"
+          >
+            Open settings
+          </Link>
+        </div>
+      ) : null}
 
       {!canApprove ? (
         <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50/60 px-4 py-3 text-sm text-amber-800">
@@ -495,471 +608,748 @@ export default function SilverRatePage() {
         </div>
       ) : null}
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader className="flex-row items-center justify-between space-y-0">
-            <div className="flex items-center gap-2">
-              <ShieldCheck className="h-4 w-4 text-muted-foreground" />
-              <CardTitle className="text-sm">Rate Change Approvals</CardTitle>
-            </div>
-            {pendingCount > 0 ? <Badge variant="warning" className="text-[10px]">{pendingCount} pending</Badge> : <Badge variant="muted" className="text-[10px]">None pending</Badge>}
-          </CardHeader>
-          <CardContent>
-            {requests.length === 0 ? (
-              <p className="py-4 text-center text-[13px] text-muted-foreground">
-                {canApprove
-                  ? 'No rate change requests. Staff submissions will appear here for approval.'
-                  : 'No rate change requests yet. Any rate change you submit is sent to an Admin or Super Admin for approval.'}
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {requests.map((r) => (
-                  <div key={r.id} className="rounded-lg border p-3">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-sm font-bold tabular-nums text-foreground">₹{(r.rate ?? 0).toFixed(2)} / gm</span>
-                      <Badge variant={r.status === 'pending' ? 'warning' : r.status === 'approved' ? 'success' : 'danger'} dot>
-                        {r.status}
-                      </Badge>
-                      {r.previousRate != null ? (
-                        <span className="text-[11px] text-muted-foreground">from ₹{r.previousRate.toFixed(2)}</span>
-                      ) : null}
-                      <span className="ml-auto text-[11px] text-muted-foreground">
-                        {r.requestedBy ?? 'Unknown'}
-                        {r.requestedByRole ? ` · ${r.requestedByRole}` : ''} · {formatDateTime(r.requestedAt)}
-                      </span>
-                    </div>
-                    {r.decidedBy ? (
-                      <p className="mt-1 text-[11px] text-muted-foreground">
-                        {r.status === 'approved' ? 'Approved' : 'Rejected'} by {r.decidedBy} · {formatDateTime(r.decidedAt)}
-                        {r.decisionNote ? ` — "${r.decisionNote}"` : ''}
-                      </p>
-                    ) : null}
-                    {r.resultNote ? <p className="mt-1 text-[11px] text-muted-foreground">{r.resultNote}</p> : null}
-                    {isApprover && r.status === 'pending' ? (
-                      <div className="mt-2 flex gap-2">
-                        <Button size="sm" variant="success" className="gap-1" onClick={() => decide(r.id, 'approve')}>
-                          <Check className="h-3.5 w-3.5" /> Approve &amp; Apply
-                        </Button>
-                        <Button size="sm" variant="outline" className="gap-1" onClick={() => decide(r.id, 'reject')}>
-                          <XCircle className="h-3.5 w-3.5" /> Reject
-                        </Button>
-                      </div>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex-row items-center justify-between space-y-0">
-            <div className="flex items-center gap-2">
-              <Clock className="h-4 w-4 text-muted-foreground" />
-              <CardTitle className="text-sm">Auto Silver Rate</CardTitle>
-            </div>
-            <Badge variant={autoStatus?.enabled ? 'success' : 'muted'} dot>
-              {autoStatus?.enabled ? 'Enabled' : 'Disabled'}
-            </Badge>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {autoStatus ? (
-              <>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="rounded-lg border p-3">
-                    <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">Schedule</p>
-                    <p className="mt-0.5 text-[13px] font-semibold text-foreground">{autoStatus.schedule ? describeRateSchedule(autoStatus.schedule) : 'Every day at 09:00 IST'}</p>
-                    <p className="text-[11px] text-muted-foreground">Next: {formatDateTime(autoStatus.nextRunAt)}</p>
-                  </div>
-                  <div className="rounded-lg border p-3">
-                    <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">Last fetch</p>
-                    <p className="mt-0.5 text-[13px] font-semibold text-foreground">
-                      {autoStatus.lastRate != null ? `₹${autoStatus.lastRate.toFixed(2)} / gm` : autoStatus.lastResult ?? '—'}
-                    </p>
-                    <p className="text-[11px] text-muted-foreground">
-                      {autoStatus.lastRunAt ? formatDateTime(autoStatus.lastRunAt) : 'Never run'}
-                      {autoStatus.lastResult ? ` · ${autoStatus.lastResult}` : ''}
-                    </p>
-                  </div>
+      {/* ── Hero: current rate + status at a glance ─────────────────────── */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        <Card className="overflow-hidden border-primary-100 bg-gradient-to-br from-primary-700 to-primary-900 text-white md:col-span-2">
+          <CardContent className="p-5">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-primary-200">
+                  <Tag className="h-4 w-4" />
+                  <p className="text-xs font-semibold uppercase tracking-wide">Current silver rate</p>
                 </div>
-                {autoStatus.lastError ? (
-                  <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50/60 px-3 py-2 text-xs text-red-700">
-                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>{autoStatus.lastError}</span>
-                  </div>
-                ) : null}
-                {!autoStatus.apiUrlConfigured ? (
-                  <p className="text-[11px] text-muted-foreground">
-                    Rate source not configured — set <code className="rounded bg-muted px-1">SILVER_RATE_API_URL</code> to enable spot-rate fetching.
+                <div className="mt-2 flex flex-wrap items-end gap-3">
+                  <p className="text-4xl font-bold tabular-nums tracking-tight sm:text-5xl">
+                    ₹{currentRate.rate.toFixed(2)}
                   </p>
-                ) : null}
-                {!canApprove ? (
-                  <p className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50/60 px-3 py-2 text-[11px] text-amber-800">
-                    <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>Fetching applies the live spot rate and reprices products, so only Admin or Super Admin can run it.</span>
-                  </p>
-                ) : null}
-                <div className="flex gap-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="gap-1.5"
-                    onClick={fetchNow}
-                    disabled={fetchingNow || !autoStatus.apiUrlConfigured || !canApprove}
-                    title={canApprove ? undefined : 'Only Admin or Super Admin can fetch and apply the live silver rate'}
+                  <Badge
+                    variant="success"
+                    className={cn(
+                      'mb-1.5 border-white/20',
+                      currentRate.change > 0
+                        ? 'bg-success-500/20 text-success-100'
+                        : currentRate.change < 0
+                          ? 'bg-red-500/20 text-red-100'
+                          : 'bg-white/10 text-primary-100',
+                    )}
                   >
-                    <RefreshCw className={cn('h-3.5 w-3.5', fetchingNow && 'animate-spin')} />
-                    {fetchingNow ? 'Fetching…' : 'Fetch spot rate now'}
-                  </Button>
-                  <Button size="sm" variant={autoStatus.enabled ? 'outline' : 'soft-primary'} onClick={toggleAuto} disabled={togglingAuto}>
-                    {togglingAuto ? 'Saving…' : autoStatus.enabled ? 'Disable auto rate' : 'Enable auto rate'}
-                  </Button>
-                  <Button size="sm" variant="outline" className="gap-1.5" onClick={openScheduleEditor}>
-                    <CalendarClock className="h-3.5 w-3.5" /> Edit schedule
-                  </Button>
+                    {`${currentRate.change > 0 ? '+' : currentRate.change < 0 ? '−' : ''}₹${Math.abs(currentRate.change).toFixed(2)} (${currentRate.change > 0 ? '+' : currentRate.change < 0 ? '−' : ''}${Math.abs(currentRate.changePercent).toFixed(2)}%)`}
+                  </Badge>
                 </div>
-              </>
-            ) : (
-              <p className="py-4 text-center text-[13px] text-muted-foreground">Auto-rate status unavailable.</p>
-            )}
+                <p className="text-sm font-medium text-primary-200">per gram · 92.5 sterling silver</p>
+                <p className="mt-3 flex items-center gap-1.5 text-xs text-primary-200">
+                  <Clock className="h-3.5 w-3.5" />
+                  Last updated <span className="font-medium text-white">{formatDateTime(currentRate.updatedAt)}</span>
+                </p>
+              </div>
+              {sparkRates.length >= 2 ? (
+                <div className="shrink-0 text-left sm:text-right">
+                  <p className="text-[10.5px] uppercase tracking-wide text-primary-200">
+                    Last {sparkRates.length} rates
+                  </p>
+                  <RateSparkline rates={sparkRates} />
+                </div>
+              ) : null}
+            </div>
           </CardContent>
         </Card>
 
-        <Card className="lg:col-span-2">
-          <CardHeader className="flex-row items-center justify-between space-y-0">
-            <div className="flex items-center gap-2">
-              <CalendarClock className="h-4 w-4 text-muted-foreground" />
-              <div>
-                <CardTitle className="text-sm">Scheduled Rate Changes</CardTitle>
-                <CardDescription className="mt-0.5">
-                  One-off: set a rate for an exact date &amp; time — applied automatically then, even while the
-                  app is closed (products repriced and pushed to Shopify).
-                </CardDescription>
+        <Card>
+          <CardContent className="p-5">
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Status</p>
+            <dl className="mt-3 divide-y divide-border/70">
+              <div className="flex items-center justify-between gap-3 pb-3">
+                <dt className="flex items-center gap-2 text-[13px] text-muted-foreground">
+                  <RefreshCw className="h-3.5 w-3.5" /> Shopify sync
+                </dt>
+                <dd>
+                  <Badge variant={syncBadge.variant} dot>{syncBadge.label}</Badge>
+                </dd>
               </div>
-            </div>
+              <div className="flex items-center justify-between gap-3 py-3">
+                <dt className="flex items-center gap-2 text-[13px] text-muted-foreground">
+                  <Gem className="h-3.5 w-3.5" /> Products repriced
+                </dt>
+                <dd className="text-sm font-bold tabular-nums text-foreground">{repriced.toLocaleString('en-IN')}</dd>
+              </div>
+              <div className="flex items-center justify-between gap-3 pt-3">
+                <dt className="flex items-center gap-2 text-[13px] text-muted-foreground">
+                  <ShieldCheck className="h-3.5 w-3.5" /> Pending approvals
+                </dt>
+                <dd>
+                  <Badge variant={pendingCount > 0 ? 'warning' : 'muted'} dot>
+                    {pendingCount}
+                  </Badge>
+                </dd>
+              </div>
+            </dl>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* ── Three compact cards ─────────────────────────────────────────── */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        <CompactCard
+          icon={ShieldCheck}
+          title="Approvals"
+          badge={
+            <Badge variant={pendingCount > 0 ? 'warning' : 'muted'} dot>
+              {pendingCount > 0 ? `${pendingCount} pending` : 'None pending'}
+            </Badge>
+          }
+          line={
+            pendingCount > 0
+              ? `${pendingCount} rate change request${pendingCount > 1 ? 's' : ''} waiting for a decision.`
+              : 'No rate changes waiting for approval.'
+          }
+        >
+          {pendingCount > 0 ? (
+            <Button size="sm" onClick={focusApprovals}>Review</Button>
+          ) : (
+            <Button size="sm" variant="outline" onClick={openUpdate}>Update rate</Button>
+          )}
+        </CompactCard>
+
+        <CompactCard
+          icon={CalendarClock}
+          title="Scheduled"
+          badge={
             <Badge variant={scheduled.length > 0 ? 'warning' : 'muted'} dot>
               {scheduled.length > 0 ? `${scheduled.length} queued` : 'None'}
             </Badge>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {!schOpen && schError ? (
-              <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50/60 px-3 py-2 text-xs text-red-700">
-                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>{schError}</span>
-              </div>
-            ) : null}
-            {schSuccess ? (
-              <div className="flex items-start gap-2 rounded-md border border-success-100 bg-success-50/60 px-3 py-2 text-xs text-success-700">
-                <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>{schSuccess}</span>
-              </div>
-            ) : null}
-            {canApprove ? (
-              <div className="flex flex-wrap items-center gap-2">
-                <Button className="gap-1.5" onClick={() => openScheduleDialog()}>
-                  <CalendarClock className="h-4 w-4" /> Schedule rate change
-                </Button>
-                <p className="text-[11px] text-muted-foreground">
-                  Changed your mind? Any queued change can be edited or cancelled until it applies.
-                </p>
-              </div>
-            ) : (
-              <p className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50/60 px-3 py-2 text-[11px] text-amber-800">
-                <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>
-                  Only Admin or Super Admin can schedule a rate change — submit a rate change request instead
-                  and it will be applied once approved.
-                </span>
-              </p>
-            )}
-            {scheduled.length === 0 ? (
-              <p className="text-[12px] text-muted-foreground">
-                Nothing scheduled yet — e.g. set Saturday's rate on Friday afternoon and forget about it.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {scheduled.map((c) => (
-                  <div key={c.id} className="rounded-lg border p-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-bold tabular-nums text-foreground">₹{c.rate.toFixed(2)} / gm</span>
-                        <Badge variant={c.rate >= currentRate.rate ? 'success' : 'danger'}>
-                          {c.rate >= currentRate.rate ? '+' : '−'}₹{Math.abs(c.rate - currentRate.rate).toFixed(2)} vs today
-                        </Badge>
-                        <Badge variant="warning" className="gap-1">
-                          <Clock className="h-3 w-3" /> {timeUntil(c.applyAt)}
-                        </Badge>
-                      </div>
-                      {canApprove ? (
-                        <div className="flex gap-2">
-                          <Button size="sm" variant="outline" className="gap-1" onClick={() => openScheduleDialog(c)}>
-                            <Pencil className="h-3.5 w-3.5" /> Edit
-                          </Button>
-                          <Button size="sm" variant="outline" onClick={() => cancelScheduled(c.id)}>
-                            Cancel
-                          </Button>
-                        </div>
-                      ) : null}
-                    </div>
-                    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-                      <span className="flex items-center gap-1">
-                        <CalendarClock className="h-3 w-3" /> {formatDateTime(c.applyAt)}
-                      </span>
-                      {c.note ? <span className="italic text-foreground">“{c.note}”</span> : null}
-                      {c.requestedBy ? <span>by {c.requestedBy}</span> : null}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <AppDialog
-          open={scheduleOpen}
-          onOpenChange={setScheduleOpen}
-          size="md"
-          isDirty={scheduleOpen}
-          title="Silver rate update schedule"
-          description="Choose the days and the time (IST) the automatic silver-rate update runs. Weekend days are allowed — note that MCX is closed on Saturdays and Sundays, so on those days the fetch may return the last traded rate or fail; manual entry stays available on this page."
-          footer={
-            <DialogFooter>
-              <Button variant="outline" size="sm" onClick={() => setScheduleOpen(false)}>
-                Cancel
-              </Button>
-              <Button size="sm" onClick={saveSchedule} disabled={savingSchedule || schedDays.length === 0}>
-                {savingSchedule ? 'Saving…' : 'Save schedule'}
-              </Button>
-            </DialogFooter>
+          }
+          line={
+            !canApprove
+              ? 'Only Admin or Super Admin can schedule a rate change.'
+              : nextScheduled
+                ? `₹${nextScheduled.rate.toFixed(2)} / gm · ${formatDateTime(nextScheduled.applyAt)} · ${timeUntil(nextScheduled.applyAt)}`
+                : 'No rate changes scheduled.'
           }
         >
-            <div className="space-y-4">
-              <div className="space-y-1.5">
-                <Label>Run on days</Label>
-                <div className="flex flex-wrap gap-1.5">
-                  {[1, 2, 3, 4, 5, 6, 0].map((d) => {
-                    const active = schedDays.includes(d)
-                    return (
-                      <button
-                        key={d}
-                        type="button"
-                        aria-pressed={active}
-                        onClick={() =>
-                          setSchedDays((prev) => (active ? prev.filter((x) => x !== d) : [...prev, d]))
-                        }
-                        className={cn(
-                          'h-9 w-11 rounded-md border text-xs font-semibold transition-colors',
-                          active
-                            ? 'border-primary-500 bg-primary-50 text-primary-700'
-                            : 'border-border bg-card text-muted-foreground hover:bg-muted',
-                        )}
-                      >
-                        {DAY_LABELS[d]}
-                      </button>
-                    )
-                  })}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => openScheduleDialog()}
+            disabled={!canApprove}
+            title={canApprove ? undefined : 'Only Admin or Super Admin can schedule a rate change'}
+          >
+            Schedule
+          </Button>
+        </CompactCard>
+
+        <CompactCard
+          icon={Clock}
+          title="Auto rate"
+          badge={
+            <Badge variant={autoStatus?.enabled ? 'success' : 'muted'} dot>
+              {autoStatus?.enabled ? 'Enabled' : 'Disabled'}
+            </Badge>
+          }
+          line={autoLine}
+        >
+          <Button
+            size="sm"
+            variant={autoStatus?.enabled ? 'outline' : 'soft-primary'}
+            onClick={toggleAuto}
+            disabled={togglingAuto || !autoStatus}
+          >
+            {togglingAuto ? 'Saving…' : autoStatus?.enabled ? 'Disable auto rate' : 'Enable auto rate'}
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="sm" variant="outline" className="gap-1" aria-label="More auto-rate actions">
+                <MoreHorizontal className="h-4 w-4" /> More
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                onClick={fetchNow}
+                disabled={fetchingNow || !autoStatus?.apiUrlConfigured || !canApprove}
+                title={canApprove ? undefined : 'Only Admin or Super Admin can fetch and apply the live silver rate'}
+              >
+                <RefreshCw className={cn('h-3.5 w-3.5', fetchingNow && 'animate-spin')} />
+                {fetchingNow ? 'Fetching…' : 'Fetch spot rate now'}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={openScheduleEditor} disabled={!autoStatus}>
+                <CalendarClock className="h-3.5 w-3.5" /> Edit schedule
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </CompactCard>
+      </div>
+
+      {!dialogOpen && !scheduleOpen && (error || schError || schSuccess) ? (
+        <div
+          role="status"
+          className={cn(
+            'flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm',
+            error || schError ? 'border-red-200 bg-red-50/60 text-red-700' : 'border-success-100 bg-success-50/60 text-success-700',
+          )}
+        >
+          {error || schError ? <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />}
+          <span>{error || schError || schSuccess}</span>
+        </div>
+      ) : null}
+
+      {/* ── Expanded lists: only when there is something to act on ──────── */}
+      {pendingCount > 0 ? (
+        <Card ref={approvalsRef} tabIndex={-1} className="focus:outline-none" id="pending-approvals">
+          <CardHeader className="flex-row items-center justify-between space-y-0">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-sm">Rate change approvals</CardTitle>
+            </div>
+            <Badge variant="warning" dot>{pendingCount} pending</Badge>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {sortedRequests.map((r) => (
+              <div key={r.id} className="rounded-lg border p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-bold tabular-nums text-foreground">₹{(r.rate ?? 0).toFixed(2)} / gm</span>
+                  <Badge variant={r.status === 'pending' ? 'warning' : r.status === 'approved' ? 'success' : 'danger'} dot>
+                    {r.status}
+                  </Badge>
+                  {r.previousRate != null ? (
+                    <span className="text-[11px] text-muted-foreground">from ₹{r.previousRate.toFixed(2)}</span>
+                  ) : null}
+                  <span className="ml-auto text-[11px] text-muted-foreground">
+                    {r.requestedBy ?? 'Unknown'}
+                    {r.requestedByRole ? ` · ${r.requestedByRole}` : ''} · {formatDateTime(r.requestedAt)}
+                  </span>
                 </div>
-                {schedDays.length === 0 ? (
-                  <p className="text-xs text-destructive">Pick at least one day — the update never runs otherwise.</p>
+                {r.decidedBy ? (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    {r.status === 'approved' ? 'Approved' : 'Rejected'} by {r.decidedBy} · {formatDateTime(r.decidedAt)}
+                    {r.decisionNote ? ` — "${r.decisionNote}"` : ''}
+                  </p>
+                ) : null}
+                {r.resultNote ? <p className="mt-1 text-[11px] text-muted-foreground">{r.resultNote}</p> : null}
+                {isApprover && r.status === 'pending' ? (
+                  <div className="mt-2 flex gap-2">
+                    <Button size="sm" variant="success" className="gap-1" onClick={() => decide(r.id, 'approve')}>
+                      <Check className="h-3.5 w-3.5" /> Approve &amp; Apply
+                    </Button>
+                    <Button size="sm" variant="outline" className="gap-1" onClick={() => decide(r.id, 'reject')}>
+                      <XCircle className="h-3.5 w-3.5" /> Reject
+                    </Button>
+                  </div>
                 ) : null}
               </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="rate-schedule-time">Run at (IST)</Label>
-                <Input
-                  id="rate-schedule-time"
-                  type="time"
-                  value={schedTime}
-                  onChange={(e) => setSchedTime(e.target.value)}
-                  className="w-40"
-                />
-              </div>
-              <p className="text-[11px] text-muted-foreground">
-                Currently active: {autoStatus?.schedule ? describeRateSchedule(autoStatus.schedule) : '—'}
-              </p>
-            </div>
-        </AppDialog>
+            ))}
+          </CardContent>
+        </Card>
+      ) : null}
 
-        <AppDialog
-          open={schOpen}
-          onOpenChange={(next) => {
-            setSchOpen(next)
-            if (!next) setSchError('')
-          }}
-          size="lg"
-          isDirty={schOpen && (schRate !== '' || schDate !== '' || schTime !== '' || schNote !== '')}
-          title={schEditId ? 'Edit scheduled rate change' : 'Schedule a silver rate change'}
-          description="Set the rate and the exact date & time to apply it — like pressing “Approve & Update Shopify” at that moment, automatically."
-          footer={
+      {scheduled.length > 0 ? (
+        <Card>
+          <CardHeader className="flex-row items-center justify-between space-y-0">
+            <div className="flex items-center gap-2">
+              <CalendarClock className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-sm">Scheduled rate changes</CardTitle>
+            </div>
+            <Badge variant="warning" dot>{scheduled.length} queued</Badge>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {scheduled.map((c) => (
+              <div key={c.id} className="rounded-lg border p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-bold tabular-nums text-foreground">₹{c.rate.toFixed(2)} / gm</span>
+                    <Badge variant={c.rate >= currentRate.rate ? 'success' : 'danger'}>
+                      {c.rate >= currentRate.rate ? '+' : '−'}₹{Math.abs(c.rate - currentRate.rate).toFixed(2)} vs today
+                    </Badge>
+                    <Badge variant="warning" className="gap-1">
+                      <Clock className="h-3 w-3" /> {timeUntil(c.applyAt)}
+                    </Badge>
+                  </div>
+                  {canApprove ? (
+                    <div className="flex gap-2">
+                      <Button size="sm" variant="outline" className="gap-1" onClick={() => openScheduleDialog(c)}>
+                        <Pencil className="h-3.5 w-3.5" /> Edit
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => cancelScheduled(c.id)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                  <span className="flex items-center gap-1">
+                    <CalendarClock className="h-3 w-3" /> {formatDateTime(c.applyAt)}
+                  </span>
+                  {c.note ? <span className="italic text-foreground">“{c.note}”</span> : null}
+                  {c.requestedBy ? <span>by {c.requestedBy}</span> : null}
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {/* ── History ─────────────────────────────────────────────────────── */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <History className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm">Rate history</CardTitle>
+          </div>
+          <CardDescription>Every rate change is logged with the admin who approved it.</CardDescription>
+        </CardHeader>
+        <CardContent className="p-0">
+          <div className="overflow-x-auto">
+            <Table className="min-w-[720px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Date</TableHead>
+                  <TableHead>Rate</TableHead>
+                  <TableHead>Change</TableHead>
+                  <TableHead>Approved by</TableHead>
+                  <TableHead className="text-center">Shopify</TableHead>
+                  <TableHead className="text-center">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {history.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
+                      No rate history yet.
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  history.map((h) => {
+                    const prev = h.previousRate ?? currentRate.previousRate
+                    const diff = Math.round((h.rate - prev) * 100) / 100
+                    const source = h.source ?? 'legacy'
+                    const sourceLabel = source === 'auto' ? 'Auto fetch' : source === 'approval' ? 'Approved request' : source === 'manual' ? 'Manual' : 'Legacy entry'
+                    return (
+                      <TableRow key={h.id}>
+                        <TableCell className="font-medium whitespace-nowrap">{formatDateTime(h.updatedAt)}</TableCell>
+                        <TableCell className="tabular-nums whitespace-nowrap">
+                          ₹{prev.toFixed(2)} <span className="text-muted-foreground">→</span>{' '}
+                          <span className="font-semibold text-foreground">₹{h.rate.toFixed(2)}</span>
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant={diff > 0 ? 'success' : diff < 0 ? 'danger' : 'muted'}>
+                            {diff > 0 ? '+' : diff < 0 ? '−' : ''}₹{Math.abs(diff).toFixed(2)}
+                          </Badge>
+                        </TableCell>
+                        <TableCell>
+                          <div className="leading-tight">
+                            <p className="font-medium text-foreground">{h.approvedBy ?? h.updatedBy ?? 'Unknown'}</p>
+                            <p className="text-[10.5px] text-muted-foreground">
+                              {sourceLabel}
+                              {h.approvedBy && h.approvedBy !== h.updatedBy ? ` · by ${h.updatedBy}` : ''}
+                            </p>
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-center">
+                          <Badge variant={h.syncStatus === 'synced' ? 'success' : h.syncStatus === 'failed' ? 'danger' : 'muted'} dot>
+                            {h.syncStatus === 'synced' ? 'Synced' : h.syncStatus === 'failed' ? 'Failed' : h.syncStatus === 'skipped' ? 'Skipped' : '—'}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-center">
+                          {h.rate !== currentRate.rate ? (
+                            <Button variant="ghost" size="sm" className="h-7 gap-1 px-2 text-primary" onClick={() => rollbackTo(h.rate)}>
+                              <Undo2 className="h-3.5 w-3.5" /> Restore
+                            </Button>
+                          ) : null}
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ── Recurring auto-update schedule editor ───────────────────────── */}
+      <AppDialog
+        open={scheduleOpen}
+        onOpenChange={setScheduleOpen}
+        size="md"
+        isDirty={scheduleOpen}
+        title="Silver rate update schedule"
+        description="Choose the days and the time (IST) the automatic silver-rate update runs. Weekend days are allowed — note that MCX is closed on Saturdays and Sundays, so on those days the fetch may return the last traded rate or fail; manual entry stays available on this page."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setScheduleOpen(false)}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={saveSchedule} disabled={savingSchedule || schedDays.length === 0}>
+              {savingSchedule ? 'Saving…' : 'Save schedule'}
+            </Button>
+          </DialogFooter>
+        }
+      >
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <Label>Run on days</Label>
+            <div className="flex flex-wrap gap-1.5">
+              {[1, 2, 3, 4, 5, 6, 0].map((d) => {
+                const active = schedDays.includes(d)
+                return (
+                  <button
+                    key={d}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() =>
+                      setSchedDays((prev) => (active ? prev.filter((x) => x !== d) : [...prev, d]))
+                    }
+                    className={cn(
+                      'h-9 w-11 rounded-md border text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1',
+                      active
+                        ? 'border-primary-500 bg-primary-50 text-primary-700'
+                        : 'border-border bg-card text-muted-foreground hover:bg-muted',
+                    )}
+                  >
+                    {DAY_LABELS[d]}
+                  </button>
+                )
+              })}
+            </div>
+            {schedDays.length === 0 ? (
+              <p className="text-xs text-destructive">Pick at least one day — the update never runs otherwise.</p>
+            ) : null}
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="rate-schedule-time">Run at (IST)</Label>
+            <Input
+              id="rate-schedule-time"
+              type="time"
+              value={schedTime}
+              onChange={(e) => setSchedTime(e.target.value)}
+              className="w-40"
+            />
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Currently active: {autoStatus?.schedule ? describeRateSchedule(autoStatus.schedule) : '—'}
+          </p>
+        </div>
+      </AppDialog>
+
+      {/* ── One drawer: apply now or schedule ───────────────────────────── */}
+      <AppDialog
+        open={dialogOpen && !rateMinimized}
+        onOpenChange={(open) => {
+          if (open) { setDialogOpen(true); return }
+          // Closing while the update runs minimises it to the floating pill —
+          // the request keeps running, it is not cancelled.
+          if (processing) setRateMinimized(true)
+          else {
+            setDialogOpen(false)
+            setSchError('')
+          }
+        }}
+        size="xl"
+        isDirty={dialogOpen && (mode === 'now' ? newRate !== '' : schRate !== '' || schDate !== '' || schTime !== '')}
+        title={
+          mode === 'now'
+            ? 'Update silver rate'
+            : schEditId
+              ? 'Edit scheduled rate change'
+              : 'Schedule a silver rate change'
+        }
+        description={
+          mode === 'now'
+            ? 'Reprice every product from the new 92.5% silver rate, review the impact, then push approved prices to Shopify.'
+            : 'Set a rate for an exact date & time — applied automatically then, even while the app is closed.'
+        }
+        footer={
+          step < 3 ? (
             <DialogFooter className="mt-2">
-              {schError ? (
+              {footerError ? (
                 <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>{schError}</span>
+                  <span>{footerError}</span>
                 </div>
               ) : null}
-              <Button variant="outline" onClick={() => setSchOpen(false)}>
-                Cancel
-              </Button>
-              {schStep > 0 ? (
-                <Button variant="outline" onClick={() => setSchStep((s) => s - 1)}>
-                  Back
-                </Button>
-              ) : null}
-              {schStep < 2 ? (
-                <Button onClick={schStep === 0 ? goNextFromRate : goNextFromWhen}>
-                  {schStep === 0 ? 'Next: when' : 'Next: preview'} <ArrowRight className="h-4 w-4" />
-                </Button>
+              <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+              {step === 1 ? (
+                mode === 'now' ? (
+                  <Button onClick={confirmChange} disabled={!rateValid}>
+                    Review prices <ArrowRight className="h-4 w-4" />
+                  </Button>
+                ) : (
+                  <Button onClick={reviewSchedule} disabled={!scheduleRateValid}>
+                    Review and schedule <ArrowRight className="h-4 w-4" />
+                  </Button>
+                )
+              ) : mode === 'now' ? (
+                <>
+                  {processing ? (
+                    <Button variant="ghost" size="sm" className="mr-auto" onClick={() => setRateMinimized(true)}>
+                      <Minimize2 className="h-3.5 w-3.5" /> Minimize
+                    </Button>
+                  ) : null}
+                  <Button variant="outline" onClick={() => setStep(1)} disabled={processing}>Back</Button>
+                  <Button variant="success" onClick={approve} disabled={processing}>
+                    {processing ? (
+                      <>
+                        <RefreshCw className="h-4 w-4 animate-spin" /> {rateProgress?.label ? `${rateProgress.label}…` : 'Updating prices...'}
+                      </>
+                    ) : (
+                      <>
+                        <ShieldCheck className="h-4 w-4" /> Approve &amp; Update Shopify
+                      </>
+                    )}
+                  </Button>
+                </>
               ) : (
-                <Button variant="success" onClick={submitSchedule} disabled={schSaving}>
-                  {schSaving ? (
-                    'Saving…'
-                  ) : schEditId ? (
-                    'Save changes'
-                  ) : (
-                    <>
-                      <CalendarClock className="h-4 w-4" /> Schedule change
-                    </>
-                  )}
-                </Button>
+                <>
+                  <Button variant="outline" onClick={() => setStep(1)} disabled={schSaving}>Back</Button>
+                  <Button variant="success" onClick={submitSchedule} disabled={schSaving}>
+                    {schSaving ? (
+                      'Saving…'
+                    ) : schEditId ? (
+                      'Save changes'
+                    ) : (
+                      <>
+                        <CalendarClock className="h-4 w-4" /> Schedule change
+                      </>
+                    )}
+                  </Button>
+                </>
               )}
             </DialogFooter>
-          }
-        >
+          ) : null
+        }
+      >
+        {step < 3 ? (
+          <div className="space-y-4">
+            {step === 1 ? (
+              <>
+                <Tabs
+                  value={mode}
+                  onValueChange={(v) => {
+                    const next = v as 'now' | 'schedule'
+                    if (next === 'schedule') seedScheduleDraft()
+                    setMode(next)
+                    setError('')
+                    setSchError('')
+                  }}
+                >
+                  <TabsList aria-label="When the rate applies">
+                    <TabsTrigger value="now">Apply now</TabsTrigger>
+                    <TabsTrigger value="schedule">Schedule</TabsTrigger>
+                  </TabsList>
+                </Tabs>
 
-            <ScheduleStepper step={schStep} />
-
-            {schStep === 0 ? (
-              <div className="space-y-4">
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div className="rounded-lg border bg-muted/40 p-3">
-                    <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Current rate</Label>
-                    <p className="mt-1 text-lg font-bold tabular-nums text-foreground">₹{currentRate.rate.toFixed(2)} / gm</p>
-                  </div>
-                  <div className="rounded-lg border border-primary-200 bg-primary-50/60 p-3">
-                    <Label htmlFor="sch-rate" className="text-[11px] uppercase tracking-wide text-primary-700">
-                      Rate to apply
-                      {scheduleRateValid
-                        ? ` (${scheduleDialogRate >= currentRate.rate ? '+' : '−'}₹${Math.abs(scheduleDialogRate - currentRate.rate).toFixed(2)} vs today)`
-                        : ''}
-                    </Label>
-                    <div className="mt-1 flex items-center gap-1.5">
-                      <span className="text-lg font-bold text-foreground">₹</span>
-                      <Input
-                        id="sch-rate"
-                        autoFocus
-                        type="number"
-                        min="0"
-                        step="0.1"
-                        value={schRate}
-                        onChange={(e) => setSchRate(e.target.value)}
-                        className="h-8 w-32 border-primary-200 font-bold tabular-nums focus-visible:ring-primary"
-                      />
-                      <span className="text-sm font-medium text-muted-foreground">/ gm</span>
-                    </div>
+                <div className="rounded-lg border border-primary-200 bg-primary-50/60 p-3">
+                  <Label htmlFor="silver-rate-input" className="text-[11px] uppercase tracking-wide text-primary-700">
+                    Rate (₹ / gm)
+                  </Label>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    <span className="text-lg font-bold text-foreground">₹</span>
+                    <Input
+                      id="silver-rate-input"
+                      autoFocus
+                      type="number"
+                      min="0"
+                      step="0.1"
+                      value={mode === 'now' ? newRate : schRate}
+                      onChange={(e) => setActiveRate(e.target.value)}
+                      className="h-9 w-32 border-primary-200 font-bold tabular-nums focus-visible:ring-primary"
+                    />
+                    <span className="text-sm font-medium text-muted-foreground">/ gm</span>
+                    {activeRateValid ? (
+                      <Badge variant={activeDelta >= 0 ? 'success' : 'danger'}>
+                        {activeDelta >= 0 ? '+' : '−'}₹{Math.abs(activeDelta).toFixed(2)} vs today
+                      </Badge>
+                    ) : null}
                   </div>
                 </div>
+
                 <div className="space-y-1.5">
-                  <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Quick adjustments</Label>
+                  <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                    Quick adjust (₹ / gm)
+                  </Label>
                   <div className="flex flex-wrap gap-1.5">
                     {[-1, -0.5, 0.5, 1].map((delta) => (
                       <button
                         key={delta}
                         type="button"
-                        onClick={() => {
-                          const base = Number.isFinite(parseFloat(schRate)) ? parseFloat(schRate) : currentRate.rate
-                          setSchRate((Math.round((base + delta) * 100) / 100).toFixed(2))
-                        }}
-                        className="h-9 rounded-md border border-border bg-card px-3 text-xs font-semibold tabular-nums text-muted-foreground transition-colors hover:bg-muted"
+                        aria-label={`Adjust rate ${delta > 0 ? 'up' : 'down'} by ${Math.abs(delta)} rupees`}
+                        onClick={() => adjustRate(delta)}
+                        className="h-9 rounded-md border border-border bg-card px-3 text-xs font-semibold tabular-nums text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
                       >
-                        {delta > 0 ? '+' : '−'}₹{Math.abs(delta).toFixed(2)}
+                        {delta > 0 ? '+' : '−'}{Math.abs(delta)}
                       </button>
                     ))}
                     <button
                       type="button"
-                      onClick={() => setSchRate(String(currentRate.rate))}
-                      className="h-9 rounded-md border border-border bg-card px-3 text-xs font-semibold text-muted-foreground transition-colors hover:bg-muted"
+                      onClick={resetRate}
+                      className="h-9 rounded-md border border-border bg-card px-3 text-xs font-semibold text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
                     >
-                      Same as today
+                      Reset
                     </button>
                   </div>
-                  <p className="text-[11px] text-muted-foreground">
-                    Adjustments apply to the number in the box. You'll see the product price impact before saving.
-                  </p>
                 </div>
-              </div>
-            ) : schStep === 1 ? (
-              <div className="space-y-4">
-                <div className="space-y-1.5">
-                  <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Quick picks</Label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {whenPresets.map((p) => {
-                      const active = schDate === toDateInputValue(p.date) && schTime === toTimeInputValue(p.date)
-                      return (
-                        <button
-                          key={p.key}
-                          type="button"
-                          aria-pressed={active}
-                          onClick={() => {
-                            setSchDate(toDateInputValue(p.date))
-                            setSchTime(toTimeInputValue(p.date))
-                          }}
-                          className={cn(
-                            'h-9 rounded-md border px-3 text-xs font-semibold transition-colors',
-                            active
-                              ? 'border-primary-500 bg-primary-50 text-primary-700'
-                              : 'border-border bg-card text-muted-foreground hover:bg-muted',
-                          )}
-                        >
-                          {p.label}
-                        </button>
-                      )
-                    })}
+
+                {mode === 'schedule' ? (
+                  <div className="space-y-4 border-t border-border/60 pt-4">
+                    <div className="space-y-1.5">
+                      <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Quick picks</Label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {whenPresets.map((p) => {
+                          const active = schDate === toDateInputValue(p.date) && schTime === toTimeInputValue(p.date)
+                          return (
+                            <button
+                              key={p.key}
+                              type="button"
+                              aria-pressed={active}
+                              onClick={() => {
+                                setSchDate(toDateInputValue(p.date))
+                                setSchTime(toTimeInputValue(p.date))
+                              }}
+                              className={cn(
+                                'h-9 rounded-md border px-3 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1',
+                                active
+                                  ? 'border-primary-500 bg-primary-50 text-primary-700'
+                                  : 'border-border bg-card text-muted-foreground hover:bg-muted',
+                              )}
+                            >
+                              {p.label}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-end gap-3">
+                      <div className="space-y-1">
+                        <Label htmlFor="sch-date" className="text-[11px] uppercase tracking-wide">Date</Label>
+                        <Input
+                          id="sch-date"
+                          type="date"
+                          value={schDate}
+                          onChange={(e) => setSchDate(e.target.value)}
+                          className="h-9 w-44"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor="sch-time" className="text-[11px] uppercase tracking-wide">Time (IST)</Label>
+                        <Input
+                          id="sch-time"
+                          type="time"
+                          value={schTime}
+                          onChange={(e) => setSchTime(e.target.value)}
+                          className="h-9 w-32"
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <Label htmlFor="sch-note" className="text-[11px] uppercase tracking-wide">Note (optional)</Label>
+                        <span className="text-[10px] tabular-nums text-muted-foreground">{schNote.length}/120</span>
+                      </div>
+                      <Input
+                        id="sch-note"
+                        maxLength={120}
+                        placeholder="e.g. weekend rate, festival offer…"
+                        value={schNote}
+                        onChange={(e) => setSchNote(e.target.value)}
+                        className="h-9"
+                      />
+                    </div>
                   </div>
-                </div>
-                <div className="flex flex-wrap items-end gap-3">
-                  <div className="space-y-1">
-                    <Label htmlFor="sch-date" className="text-[11px] uppercase tracking-wide">Date</Label>
-                    <Input
-                      id="sch-date"
-                      type="date"
-                      value={schDate}
-                      onChange={(e) => setSchDate(e.target.value)}
-                      className="h-9 w-44"
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label htmlFor="sch-time" className="text-[11px] uppercase tracking-wide">Time (IST)</Label>
-                    <Input
-                      id="sch-time"
-                      type="time"
-                      value={schTime}
-                      onChange={(e) => setSchTime(e.target.value)}
-                      className="h-9 w-32"
-                    />
-                  </div>
-                </div>
-                {scheduleInstant ? (
-                  <p className="text-[12px] text-foreground">
-                    Applies on <span className="font-semibold">{formatDateTime(scheduleInstant.toISOString())}</span>
-                    {' '}· <span className="text-muted-foreground">{timeUntil(scheduleInstant.toISOString())}</span>
-                  </p>
                 ) : null}
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between">
-                    <Label htmlFor="sch-note" className="text-[11px] uppercase tracking-wide">Note (optional)</Label>
-                    <span className="text-[10px] tabular-nums text-muted-foreground">{schNote.length}/120</span>
-                  </div>
-                  <Input
-                    id="sch-note"
-                    maxLength={120}
-                    placeholder="e.g. weekend rate, festival offer…"
-                    value={schNote}
-                    onChange={(e) => setSchNote(e.target.value)}
-                    className="h-9"
+
+                <dl className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-lg border bg-muted/40 p-3 sm:grid-cols-4">
+                  <SummaryItem label="Current rate" value={`₹${currentRate.rate.toFixed(2)}`} sub="per gram" />
+                  <SummaryItem
+                    label="Change"
+                    value={activeRateValid ? `${activeDelta >= 0 ? '+' : '−'}₹${Math.abs(activeDelta).toFixed(2)}` : '—'}
+                    sub={activeRateValid ? 'vs today' : 'enter a rate'}
+                    accent={activeRateValid ? (activeDelta >= 0 ? 'green' : 'red') : undefined}
+                  />
+                  <SummaryItem label="Products affected" value={`${products.length}`} sub="repriced" />
+                  <SummaryItem
+                    label={mode === 'now' ? 'Goes to Shopify' : 'Applies'}
+                    value={
+                      mode === 'now'
+                        ? 'After approval'
+                        : scheduleInstant
+                          ? formatDateTime(scheduleInstant.toISOString())
+                          : '—'
+                    }
+                    sub={
+                      mode === 'now'
+                        ? 'immediately'
+                        : scheduleInstant
+                          ? timeUntil(scheduleInstant.toISOString())
+                          : 'pick date & time'
+                    }
+                  />
+                </dl>
+              </>
+            ) : null}
+
+            {step === 2 && mode === 'now' ? (
+              <div className="space-y-4">
+                <div className="grid grid-cols-3 gap-3">
+                  <MiniBadge label="Old Rate" value={`₹${currentRate.rate.toFixed(2)}`} />
+                  <MiniBadge label="New Rate" value={`₹${rateValue.toFixed(2)}`} />
+                  <MiniBadge
+                    label="Change"
+                    value={`${rateValue >= currentRate.rate ? '+' : ''}₹${(rateValue - currentRate.rate).toFixed(2)}`}
+                    accent={rateValue >= currentRate.rate ? 'green' : 'red'}
                   />
                 </div>
+
+                <div>
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Preview — {products.length} products
+                    </p>
+                    <Badge variant="warning">{formatCurrency(totalDelta)} total shift</Badge>
+                  </div>
+                  <PreviewTable rows={affected} />
+                </div>
+
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-primary-100 bg-primary-50/40 p-3">
+                  <div className="flex items-start gap-2.5">
+                    <RefreshCw className="mt-0.5 h-4 w-4 shrink-0 text-primary-700" />
+                    <div className="text-xs text-primary-900">
+                      <p className="font-semibold">Sync all products from Shopify first</p>
+                      <p className="mt-0.5 text-primary-700/80">
+                        Imports the live Shopify catalog into billing and removes obsolete products before applying the new rate.
+                      </p>
+                    </div>
+                  </div>
+                  <Switch checked={syncFirst} onCheckedChange={setSyncFirst} aria-label="Sync all products from Shopify first" />
+                </div>
+
+                {processing ? (
+                  <div data-testid="rate-progress" className="rounded-lg border border-primary-100 bg-primary-50/40 p-3">
+                    <div className="flex items-center justify-between gap-2 text-xs font-medium text-primary-900">
+                      <span className="flex min-w-0 items-center gap-2">
+                        <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                        <span className="truncate">{rateProgress?.label || 'Applying the new silver rate…'}</span>
+                      </span>
+                      {rateProgress && rateProgress.total > 0 ? (
+                        <span className="shrink-0 tabular-nums text-primary-700">{rateProgress.done}/{rateProgress.total}</span>
+                      ) : null}
+                    </div>
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-primary-100">
+                      {rateProgress && rateProgress.total > 0 ? (
+                        <div
+                          className="h-full rounded-full bg-primary-600 transition-all duration-300"
+                          style={{ width: `${Math.min(100, Math.round((rateProgress.done / rateProgress.total) * 100))}%` }}
+                        />
+                      ) : (
+                        <div className="h-full w-1/3 animate-pulse rounded-full bg-primary-600" />
+                      )}
+                    </div>
+                    <p className="mt-1.5 text-[11px] text-primary-700/80">
+                      Phase: {rateProgress?.phase ?? 'working'} — you can minimize this and keep working; the update continues.
+                    </p>
+                  </div>
+                ) : null}
               </div>
-            ) : (
+            ) : null}
+
+            {step === 2 && mode === 'schedule' ? (
               <div className="space-y-4">
                 <div className="grid grid-cols-3 gap-3">
                   <MiniBadge label="Rate" value={`₹${scheduleDialogRate.toFixed(2)}`} />
@@ -970,469 +1360,99 @@ export default function SilverRatePage() {
                   />
                   <MiniBadge label="Applies" value={scheduleInstant ? formatDateTime(scheduleInstant.toISOString()) : '—'} />
                 </div>
+
                 {schNote.trim() ? (
                   <p className="text-[12px] text-muted-foreground">
                     Note: <span className="italic text-foreground">“{schNote.trim()}”</span>
                   </p>
                 ) : null}
-                {scheduleImpact ? (
-                  <div>
-                    <div className="mb-2 flex items-center justify-between">
-                      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                        Preview — price changes ({products.length} products)
-                      </p>
-                      <Badge variant="warning">{formatCurrency(scheduleTotalDelta)} total shift</Badge>
-                    </div>
-                    <div className="max-h-64 overflow-auto rounded-lg border">
-                      <Table>
-                        <TableHeader>
-                          <TableRow className="sticky top-0 bg-muted/60">
-                            <TableHead>Product</TableHead>
-                            <TableHead className="text-right">Net Wt</TableHead>
-                            <TableHead className="text-right">Old Price</TableHead>
-                            <TableHead className="text-right">New Price</TableHead>
-                            <TableHead className="text-right">Difference</TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {scheduleImpact.map(({ product, oldPrice, newPrice }) => {
-                            const diff = newPrice - oldPrice
-                            const rounded = Math.abs(diff) < 0.01
-                            return (
-                              <TableRow key={product.id}>
-                                <TableCell>
-                                  <div className="flex items-center gap-2">
-                                    <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                                      <Gem className="h-3.5 w-3.5" />
-                                    </div>
-                                    <div>
-                                      <p className="font-medium text-foreground">{product.name}</p>
-                                      <p className="text-[10px] text-muted-foreground">{product.sku}</p>
-                                    </div>
-                                  </div>
-                                </TableCell>
-                                <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(product.netWeight)}</TableCell>
-                                <TableCell className="text-right tabular-nums">{formatCurrency(oldPrice)}</TableCell>
-                                <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatCurrency(newPrice)}</TableCell>
-                                <TableCell className="text-right">
-                                  <span className={cn('font-semibold tabular-nums', rounded ? 'text-muted-foreground' : diff > 0 ? 'text-success-700' : 'text-red-600 dark:text-red-400')}>
-                                    {rounded ? '—' : `${diff > 0 ? '+' : ''}${formatCurrency(diff)}`}
-                                  </span>
-                                </TableCell>
-                              </TableRow>
-                            )
-                          })}
-                        </TableBody>
-                      </Table>
-                    </div>
+
+                <div>
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Preview — {products.length} products
+                    </p>
+                    <Badge variant="warning">{formatCurrency(scheduleTotalDelta)} total shift</Badge>
                   </div>
-                ) : null}
+                  <PreviewTable rows={scheduleImpact ?? []} />
+                </div>
+
+                <p className="rounded-lg border border-primary-100 bg-primary-50/40 p-3 text-xs text-primary-900">
+                  Applies {scheduleInstant ? formatDateTime(scheduleInstant.toISOString()) : '—'}
+                  {scheduleInstant ? ` · ${timeUntil(scheduleInstant.toISOString())}` : ''} — products are repriced and
+                  pushed to Shopify automatically at that moment.
+                </p>
               </div>
-            )}
-        </AppDialog>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-        <Card className="overflow-hidden border-primary-100 bg-gradient-to-br from-primary-700 to-primary-900 text-white lg:col-span-1">
-          <CardContent className="p-5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-primary-200">
-                <Tag className="h-4 w-4" />
-                <p className="text-xs font-semibold uppercase tracking-wide">Current Silver Rate</p>
-              </div>
-              <Badge variant="success" className="bg-success-500/20 text-success-100 border-success-500/30">
-                92.5 Sterling Silver
-              </Badge>
-            </div>
-            <p className="mt-3 text-4xl font-bold tabular-nums tracking-tight">₹{currentRate.rate.toFixed(2)}</p>
-            <p className="text-sm font-medium text-primary-200">per gram</p>
-            <div className="mt-4 flex items-center gap-2 rounded-md bg-white/10 px-3 py-2 text-xs">
-              <Clock className="h-3.5 w-3.5" />
-              <span className="text-primary-200">Last updated:</span>
-              <span className="font-medium text-white">{formatDateTime(currentRate.updatedAt)}</span>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="lg:col-span-1">
-          <CardContent className="p-5">
-            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Today's Change</p>
-            <div className="mt-2 flex items-end gap-3">
-              <p className="text-3xl font-bold tabular-nums text-foreground">
-                +₹{currentRate.change.toFixed(2)}
-              </p>
-              <Badge variant="success" className="mb-1">+{currentRate.changePercent.toFixed(2)}%</Badge>
-            </div>
-            <p className="mt-1 text-xs text-muted-foreground">vs previous rate ₹{currentRate.previousRate.toFixed(2)} / gm</p>
-            <div className="mt-4 rounded-md bg-success-50 px-3 py-2 text-xs font-medium text-success-700">
-              Last update synced approved prices to {products.length} Shopify products
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="lg:col-span-1">
-          <CardContent className="p-5">
-            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Price Change Impact</p>
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <ImpactTile label="Products Affected" value={`${products.length}`} icon={Gem} tint="text-primary-700 bg-primary-50" />
-              <ImpactTile label="Total Value Shift" value={rateValid ? formatCurrency(totalDelta) : '—'} icon={IndianRupee} tint="text-warning-700 bg-warning-50" />
-              <ImpactTile label="Avg. Price Change" value={rateValid ? formatCurrency(totalDelta / products.length) : '—'} icon={TrendingUp} tint="text-success-700 bg-success-50" />
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <div className="flex items-center gap-2">
-            <History className="h-4 w-4 text-muted-foreground" />
-            <CardTitle className="text-sm">Rate History & Approvals</CardTitle>
+            ) : null}
           </div>
-          <CardDescription>Every rate change is logged with the admin who approved it.</CardDescription>
-        </CardHeader>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Date</TableHead>
-                <TableHead>Old Rate</TableHead>
-                <TableHead>New Rate</TableHead>
-                <TableHead>Change</TableHead>
-                <TableHead>Approved By</TableHead>
-                <TableHead className="text-center">Shopify Sync</TableHead>
-                <TableHead className="text-center">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {history.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
-                    No rate history yet.
-                  </TableCell>
-                </TableRow>
-              ) : (
-                history.map((h) => {
-                  const prev = h.previousRate ?? currentRate.previousRate
-                  const diff = Math.round((h.rate - prev) * 100) / 100
-                  const source = h.source ?? 'legacy'
-                  const sourceLabel = source === 'auto' ? 'Auto fetch' : source === 'approval' ? 'Approved request' : source === 'manual' ? 'Manual' : 'Legacy entry'
-                  return (
-                    <TableRow key={h.id}>
-                      <TableCell className="font-medium">{formatDateTime(h.updatedAt)}</TableCell>
-                      <TableCell className="tabular-nums">₹{prev.toFixed(2)}</TableCell>
-                      <TableCell className="tabular-nums font-semibold">₹{h.rate.toFixed(2)}</TableCell>
-                      <TableCell>
-                        <Badge variant={diff > 0 ? 'success' : diff < 0 ? 'danger' : 'muted'}>
-                          {diff > 0 ? '+' : diff < 0 ? '−' : ''}₹{Math.abs(diff).toFixed(2)}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        <div className="leading-tight">
-                          <p className="font-medium text-foreground">{h.updatedBy ?? 'Unknown'}</p>
-                          <p className="text-[10.5px] text-muted-foreground">
-                            {sourceLabel}
-                            {h.approvedBy && h.approvedBy !== h.updatedBy ? ` · approved by ${h.approvedBy}` : ''}
-                          </p>
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-center">
-                        <Badge variant={h.syncStatus === 'synced' ? 'success' : h.syncStatus === 'failed' ? 'danger' : 'muted'} dot>
-                          {h.syncStatus === 'synced' ? 'Synced' : h.syncStatus === 'failed' ? 'Failed' : h.syncStatus === 'skipped' ? 'Skipped' : '—'}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="text-center">
-                        {h.rate !== currentRate.rate ? (
-                          <Button variant="ghost" size="sm" className="h-7 gap-1 px-2 text-primary" onClick={() => rollbackTo(h.rate)}>
-                            <Undo2 className="h-3.5 w-3.5" /> Restore
-                          </Button>
-                        ) : (
-                          <Badge variant="muted" className="text-[10px]">Current</Badge>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  )
-                })
-              )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-
-        <AppDialog
-          open={dialogOpen && !rateMinimized}
-          onOpenChange={(open) => {
-            if (open) { setDialogOpen(true); return }
-            // Closing while the update runs minimises it to the floating pill —
-            // the request keeps running, it is not cancelled.
-            if (processing) setRateMinimized(true)
-            else setDialogOpen(false)
-          }}
-          size="xl"
-          isDirty={dialogOpen && newRate !== ''}
-          title="Update Silver Rate"
-          description="Set the new 92.5% silver rate. All product prices will be recomputed and previewed before syncing to Shopify."
-          footer={
-            step < 3 ? (
-              <DialogFooter className="mt-2">
-                {error ? (
-                  <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
-                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>{error}</span>
-                  </div>
-                ) : null}
-                {step === 1 ? (
-                  <>
-                    <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-                    <Button onClick={confirmChange} disabled={!rateValid}>
-                      Preview Changes <ArrowRight className="h-4 w-4" />
-                    </Button>
-                  </>
-                ) : (
-                  <>
-                    {processing ? (
-                      <Button variant="ghost" size="sm" className="mr-auto" onClick={() => setRateMinimized(true)}>
-                        <Minimize2 className="h-3.5 w-3.5" /> Minimize
-                      </Button>
-                    ) : null}
-                    <Button variant="outline" onClick={() => setStep(1)} disabled={processing}>Back</Button>
-                    <Button variant="success" onClick={approve} disabled={processing}>
-                      {processing ? (
-                        <>
-                          <RefreshCw className="h-4 w-4 animate-spin" /> {rateProgress?.label ? `${rateProgress.label}…` : 'Updating prices...'}
-                        </>
-                      ) : (
-                        <>
-                          <ShieldCheck className="h-4 w-4" /> Approve & Update Shopify
-                        </>
-                      )}
-                    </Button>
-                  </>
-                )}
-              </DialogFooter>
-            ) : null
-          }
-        >
-
-          {step < 3 ? (
-            <>
-              <Stepper step={step} />
-
-              {step === 1 && (
-                <div className="space-y-4">
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    <div className="rounded-lg border bg-muted/40 p-3">
-                      <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Old Rate</Label>
-                      <p className="mt-1 text-lg font-bold tabular-nums text-foreground">₹{currentRate.rate.toFixed(2)} / gm</p>
-                    </div>
-                    <div className="rounded-lg border border-primary-200 bg-primary-50/60 p-3">
-                      <Label className="text-[11px] uppercase tracking-wide text-primary-700">New Rate</Label>
-                      <div className="mt-1 flex items-center gap-1.5">
-                        <span className="text-lg font-bold text-foreground">₹</span>
-                        <Input
-                          autoFocus
-                          type="number"
-                          min="0"
-                          step="0.1"
-                          value={newRate}
-                          onChange={(e) => setNewRate(e.target.value)}
-                          className="h-8 w-32 border-primary-200 font-bold tabular-nums focus-visible:ring-primary"
-                        />
-                        <span className="text-sm font-medium text-muted-foreground">/ gm</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="rounded-lg border border-warning-100 bg-warning-50/70 p-3">
-                    <div className="flex items-start gap-2.5">
-                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning-700" />
-                      <div className="text-xs text-warning-700">
-                        <p className="font-semibold">Affects {products.length} products</p>
-                        <p className="mt-0.5">
-                          {rateValid
-                            ? `Estimated total price change across catalog: ${formatCurrency(totalDelta)}.`
-                            : 'Enter a valid rate to see the estimated impact.'}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {step === 2 && rateValid && (
-                <div className="space-y-4">
-                  <div className="grid grid-cols-3 gap-3">
-                    <MiniBadge label="Old Rate" value={`₹${currentRate.rate.toFixed(2)}`} />
-                    <MiniBadge label="New Rate" value={`₹${rateValue.toFixed(2)}`} />
-                    <MiniBadge label="Change" value={`${rateValue >= currentRate.rate ? '+' : ''}₹${(rateValue - currentRate.rate).toFixed(2)}`} accent={rateValue >= currentRate.rate ? 'green' : 'red'} />
-                  </div>
-
-                  <div>
-                    <div className="mb-2 flex items-center justify-between">
-                      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                        Preview — estimated price changes ({products.length} products)
-                      </p>
-                      <Badge variant="warning">{formatCurrency(totalDelta)} total shift</Badge>
-                    </div>
-                    <div className="max-h-64 overflow-auto rounded-lg border">
-                      <Table>
-                        <TableHeader>
-                          <TableRow className="sticky top-0 bg-muted/60">
-                            <TableHead>Product</TableHead>
-                            <TableHead className="text-right">Net Wt</TableHead>
-                            <TableHead className="text-right">Old Price</TableHead>
-                            <TableHead className="text-right">New Price</TableHead>
-                            <TableHead className="text-right">Difference</TableHead>
-                            <TableHead className="text-center">Shopify</TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {affected.map(({ product, oldPrice, newPrice }) => {
-                            const diff = newPrice - oldPrice
-                            const rounded = Math.abs(diff) < 0.01
-                            return (
-                              <TableRow key={product.id}>
-                                <TableCell>
-                                  <div className="flex items-center gap-2">
-                                    <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                                      <Gem className="h-3.5 w-3.5" />
-                                    </div>
-                                    <div>
-                                      <p className="font-medium text-foreground">{product.name}</p>
-                                      <p className="text-[10px] text-muted-foreground">{product.sku}</p>
-                                    </div>
-                                  </div>
-                                </TableCell>
-                                <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(product.netWeight)}</TableCell>
-                                <TableCell className="text-right tabular-nums">{formatCurrency(oldPrice)}</TableCell>
-                                <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatCurrency(newPrice)}</TableCell>
-                                <TableCell className="text-right">
-                                  <span className={cn('font-semibold tabular-nums', rounded ? 'text-muted-foreground' : diff > 0 ? 'text-success-700' : 'text-red-600 dark:text-red-400')}>
-                                    {rounded ? '—' : `${diff > 0 ? '+' : ''}${formatCurrency(diff)}`}
-                                  </span>
-                                </TableCell>
-                                <TableCell className="text-center">
-                                  <Badge variant={product.shopifyStatus === 'synced' ? 'success' : 'warning'} dot>
-                                    {product.shopifyStatus === 'synced' ? 'Synced' : 'Pending'}
-                                  </Badge>
-                                </TableCell>
-                              </TableRow>
-                            )
-                          })}
-                        </TableBody>
-                      </Table>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between gap-3 rounded-lg border border-primary-100 bg-primary-50/40 p-3">
-                    <div className="flex items-start gap-2.5">
-                      <RefreshCw className="mt-0.5 h-4 w-4 shrink-0 text-primary-700" />
-                      <div className="text-xs text-primary-900">
-                        <p className="font-semibold">Sync all products from Shopify first</p>
-                        <p className="mt-0.5 text-primary-700/80">
-                          Imports the live Shopify catalog into billing and removes obsolete products before applying the new rate.
-                        </p>
-                      </div>
-                    </div>
-                    <Switch checked={syncFirst} onCheckedChange={setSyncFirst} aria-label="Sync all products from Shopify first" />
-                  </div>
-                </div>
-              )}
-
-              {processing ? (
-                <div data-testid="rate-progress" className="rounded-lg border border-primary-100 bg-primary-50/40 p-3">
-                  <div className="flex items-center justify-between gap-2 text-xs font-medium text-primary-900">
-                    <span className="flex min-w-0 items-center gap-2">
-                      <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
-                      <span className="truncate">{rateProgress?.label || 'Applying the new silver rate…'}</span>
-                    </span>
-                    {rateProgress && rateProgress.total > 0 ? (
-                      <span className="shrink-0 tabular-nums text-primary-700">{rateProgress.done}/{rateProgress.total}</span>
-                    ) : null}
-                  </div>
-                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-primary-100">
-                    {rateProgress && rateProgress.total > 0 ? (
-                      <div
-                        className="h-full rounded-full bg-primary-600 transition-all duration-300"
-                        style={{ width: `${Math.min(100, Math.round((rateProgress.done / rateProgress.total) * 100))}%` }}
-                      />
-                    ) : (
-                      <div className="h-full w-1/3 animate-pulse rounded-full bg-primary-600" />
-                    )}
-                  </div>
-                  <p className="mt-1.5 text-[11px] text-primary-700/80">
-                    Phase: {rateProgress?.phase ?? 'working'} — you can minimize this and keep working; the update continues.
-                  </p>
-                </div>
-              ) : null}
-            </>
-          ) : (
-            <div className="flex flex-col items-center gap-3 py-6 text-center">
-              <div className={cn('flex h-14 w-14 items-center justify-center rounded-full', result && !result.ok ? 'bg-red-50 text-red-600 dark:text-red-400' : 'bg-success-50 text-success-700')}>
-                {result && !result.ok ? <AlertTriangle className="h-7 w-7" /> : <CheckCircle2 className="h-7 w-7" />}
-              </div>
-              {pendingResult ? (
-                <>
-                  <p className="text-base font-semibold text-foreground">Request submitted for approval</p>
-                  <p className="max-w-sm text-sm text-muted-foreground">
-                    {pendingResult.message} You asked for ₹{pendingResult.rate.toFixed(2)}/gm — an Admin or Super Admin must approve it before prices change.
-                  </p>
-                </>
-              ) : (
-                <p className="text-base font-semibold text-foreground">
-                  {result && !result.ok ? 'Silver rate saved, but Shopify sync had errors' : 'Price update approved & synced'}
-                </p>
-              )}
-              {result?.steps && result.steps.length > 0 ? (
-                <div className="w-full max-w-md space-y-2 py-2 text-left">
-                  {result.steps.map((s) => (
-                    <div key={s.key} className="flex items-start gap-2.5 rounded-lg border px-3 py-2">
-                      {s.status === 'done' ? (
-                        <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-success-700" />
-                      ) : s.status === 'failed' ? (
-                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
-                      ) : (
-                        <CircleDollarSign className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                      )}
-                      <div className="min-w-0">
-                        <p className="text-[13px] font-semibold text-foreground">{s.label}</p>
-                        {s.detail ? <p className="text-xs text-muted-foreground">{s.detail}</p> : null}
-                      </div>
-                      <span
-                        className={cn(
-                          'ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide',
-                          s.status === 'done' && 'bg-success-50 text-success-700',
-                          s.status === 'failed' && 'bg-red-50 text-red-600 dark:text-red-400',
-                          s.status === 'skipped' && 'bg-muted text-muted-foreground',
-                        )}
-                      >
-                        {s.status}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="max-w-sm text-sm text-muted-foreground">
-                  New silver rate ₹{rateValue.toFixed(2)}/gm applied to {result ? result.affected : products.length} products
-                  {result ? ` · ${result.updated} pushed to Shopify · ${result.skipped} skipped · ${result.matched} matched` : ''}.
-                </p>
-              )}
-              {result && result.errors.length > 0 ? (
-                <div className="max-h-24 w-full max-w-sm overflow-auto rounded-lg border border-red-200 bg-red-50/60 p-2 text-left text-xs text-red-700">
-                  {result.errors.slice(0, 5).map((msg, i) => (
-                    <p key={i} className="font-mono">{msg}</p>
-                  ))}
-                </div>
-              ) : null}
-              <div className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
-                <CircleDollarSign className="h-3.5 w-3.5 text-success-700" />
-                Prices were recomputed from the new silver rate and synced to Shopify
-              </div>
-              <Button className="mt-2" onClick={() => setDialogOpen(false)}>
-                <Check className="h-4 w-4" /> Done
-              </Button>
+        ) : (
+          <div className="flex flex-col items-center gap-3 py-6 text-center">
+            <div className={cn('flex h-14 w-14 items-center justify-center rounded-full', result && !result.ok ? 'bg-red-50 text-red-600 dark:text-red-400' : 'bg-success-50 text-success-700')}>
+              {result && !result.ok ? <AlertTriangle className="h-7 w-7" /> : <CheckCircle2 className="h-7 w-7" />}
             </div>
-          )}
-        </AppDialog>
+            {pendingResult ? (
+              <>
+                <p className="text-base font-semibold text-foreground">Request submitted for approval</p>
+                <p className="max-w-sm text-sm text-muted-foreground">
+                  {pendingResult.message} You asked for ₹{pendingResult.rate.toFixed(2)}/gm — an Admin or Super Admin must approve it before prices change.
+                </p>
+              </>
+            ) : (
+              <p className="text-base font-semibold text-foreground">
+                {result && !result.ok ? 'Silver rate saved, but Shopify sync had errors' : 'Price update approved & synced'}
+              </p>
+            )}
+            {result?.steps && result.steps.length > 0 ? (
+              <div className="w-full max-w-md space-y-2 py-2 text-left">
+                {result.steps.map((s) => (
+                  <div key={s.key} className="flex items-start gap-2.5 rounded-lg border px-3 py-2">
+                    {s.status === 'done' ? (
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-success-700" />
+                    ) : s.status === 'failed' ? (
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+                    ) : (
+                      <CircleDollarSign className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                    )}
+                    <div className="min-w-0">
+                      <p className="text-[13px] font-semibold text-foreground">{s.label}</p>
+                      {s.detail ? <p className="text-xs text-muted-foreground">{s.detail}</p> : null}
+                    </div>
+                    <span
+                      className={cn(
+                        'ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide',
+                        s.status === 'done' && 'bg-success-50 text-success-700',
+                        s.status === 'failed' && 'bg-red-50 text-red-600 dark:text-red-400',
+                        s.status === 'skipped' && 'bg-muted text-muted-foreground',
+                      )}
+                    >
+                      {s.status}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="max-w-sm text-sm text-muted-foreground">
+                New silver rate ₹{rateValue.toFixed(2)}/gm applied to {result ? result.affected : products.length} products
+                {result ? ` · ${result.updated} pushed to Shopify · ${result.skipped} skipped · ${result.matched} matched` : ''}.
+              </p>
+            )}
+            {result && result.errors.length > 0 ? (
+              <div className="max-h-24 w-full max-w-sm overflow-auto rounded-lg border border-red-200 bg-red-50/60 p-2 text-left text-xs text-red-700">
+                {result.errors.slice(0, 5).map((msg, i) => (
+                  <p key={i} className="font-mono">{msg}</p>
+                ))}
+              </div>
+            ) : null}
+            <div className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+              <CircleDollarSign className="h-3.5 w-3.5 text-success-700" />
+              Prices were recomputed from the new silver rate and synced to Shopify
+            </div>
+            <Button className="mt-2" onClick={() => setDialogOpen(false)}>
+              <Check className="h-4 w-4" /> Done
+            </Button>
+          </div>
+        )}
+      </AppDialog>
 
       {/* Minimised live-progress pill — the update keeps running server-side
           while the wizard is hidden; click the expand icon to bring it back. */}
@@ -1454,7 +1474,7 @@ export default function SilverRatePage() {
               type="button"
               aria-label="Restore rate update"
               onClick={() => setRateMinimized(false)}
-              className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground"
+              className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <Maximize2 className="h-3.5 w-3.5" />
             </button>
@@ -1485,38 +1505,154 @@ export default function SilverRatePage() {
   )
 }
 
-function Stepper({ step }: { step: number }) {
+/** Badge + one line + one action — the three status cards share this shell. */
+function CompactCard({
+  icon: Icon,
+  title,
+  badge,
+  line,
+  children,
+}: {
+  icon: LucideIcon
+  title: string
+  badge: ReactNode
+  line: string
+  children: ReactNode
+}) {
   return (
-    <div className="flex items-center gap-2">
-      {steps.map((s, i) => {
-        const done = i < step
-        const active = i === step
-        return (
-          <div key={s.key} className="flex min-w-0 flex-1 items-center gap-2">
-            <div className="flex min-w-0 flex-1 items-center gap-2">
-              <div
-                className={cn(
-                  'flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold',
-                  done && 'border-success bg-success-50 text-success-700',
-                  active && 'border-primary bg-primary text-white shadow-sm',
-                  !done && !active && 'border-border text-muted-foreground',
-                )}
-              >
-                {done ? <Check className="h-3.5 w-3.5" /> : i + 1}
-              </div>
-              <div className="min-w-0">
-                <p className={cn('truncate text-xs font-semibold', active ? 'text-foreground' : done ? 'text-success-700' : 'text-muted-foreground')}>
-                  {s.label}
-                </p>
-              </div>
-            </div>
-            {i < steps.length - 1 ? (
-              <div className={cn('h-px flex-1', i < step ? 'bg-success/40' : 'bg-border')} />
-            ) : null}
-          </div>
-        )
-      })}
+    <Card>
+      <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+        <div className="flex items-center gap-2">
+          <Icon className="h-4 w-4 text-muted-foreground" />
+          <CardTitle className="text-sm">{title}</CardTitle>
+        </div>
+        {badge}
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-[13px] leading-snug text-muted-foreground">{line}</p>
+        <div className="flex flex-wrap items-center gap-2">{children}</div>
+      </CardContent>
+    </Card>
+  )
+}
+
+/** One cell of the drawer's summary grid (`<dl>` item). */
+function SummaryItem({
+  label,
+  value,
+  sub,
+  accent,
+}: {
+  label: string
+  value: string
+  sub?: string
+  accent?: 'green' | 'red'
+}) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-[10.5px] uppercase tracking-wide text-muted-foreground">{label}</dt>
+      <dd
+        className={cn(
+          'mt-0.5 truncate text-sm font-bold tabular-nums',
+          accent === 'green' ? 'text-success-700' : accent === 'red' ? 'text-red-600 dark:text-red-400' : 'text-foreground',
+        )}
+      >
+        {value}
+      </dd>
+      {sub ? <dd className="truncate text-[11px] text-muted-foreground">{sub}</dd> : null}
     </div>
+  )
+}
+
+/** Old → new retail prices for the review step (scrollable, mobile-safe). */
+function PreviewTable({ rows }: { rows: PreviewRow[] }) {
+  if (rows.length === 0) {
+    return (
+      <p className="rounded-lg border px-3 py-6 text-center text-[13px] text-muted-foreground">
+        No products to preview yet.
+      </p>
+    )
+  }
+  return (
+    <div className="max-h-64 overflow-auto rounded-lg border">
+      <Table>
+        <TableHeader>
+          <TableRow className="sticky top-0 bg-muted/60">
+            <TableHead>Product</TableHead>
+            <TableHead className="text-right">Net Wt</TableHead>
+            <TableHead className="text-right">Old Price</TableHead>
+            <TableHead className="text-right">New Price</TableHead>
+            <TableHead className="text-right">Difference</TableHead>
+            <TableHead className="text-center">Shopify</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map(({ product, oldPrice, newPrice }) => {
+            const diff = newPrice - oldPrice
+            const rounded = Math.abs(diff) < 0.01
+            return (
+              <TableRow key={product.id}>
+                <TableCell>
+                  <div className="flex items-center gap-2">
+                    <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                      <Gem className="h-3.5 w-3.5" />
+                    </div>
+                    <div>
+                      <p className="font-medium text-foreground">{product.name}</p>
+                      <p className="text-[10px] text-muted-foreground">{product.sku}</p>
+                    </div>
+                  </div>
+                </TableCell>
+                <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(product.netWeight)}</TableCell>
+                <TableCell className="text-right tabular-nums">{formatCurrency(oldPrice)}</TableCell>
+                <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatCurrency(newPrice)}</TableCell>
+                <TableCell className="text-right">
+                  <span className={cn('font-semibold tabular-nums', rounded ? 'text-muted-foreground' : diff > 0 ? 'text-success-700' : 'text-red-600 dark:text-red-400')}>
+                    {rounded ? '—' : `${diff > 0 ? '+' : ''}${formatCurrency(diff)}`}
+                  </span>
+                </TableCell>
+                <TableCell className="text-center">
+                  <Badge variant={product.shopifyStatus === 'synced' ? 'success' : 'warning'} dot>
+                    {product.shopifyStatus === 'synced' ? 'Synced' : 'Pending'}
+                  </Badge>
+                </TableCell>
+              </TableRow>
+            )
+          })}
+        </TableBody>
+      </Table>
+    </div>
+  )
+}
+
+/** Tiny trend line of the last few rates for the hero card. */
+function RateSparkline({ rates }: { rates: number[] }) {
+  if (rates.length < 2) return null
+  const w = 150
+  const h = 44
+  const pad = 5
+  const min = Math.min(...rates)
+  const max = Math.max(...rates)
+  const span = max - min || 1
+  const points = rates.map((rate, i) => {
+    const x = pad + (i * (w - pad * 2)) / (rates.length - 1)
+    const y = h - pad - ((rate - min) / span) * (h - pad * 2)
+    return { x, y }
+  })
+  const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')
+  const last = points[points.length - 1]
+  return (
+    <svg
+      width={w}
+      height={h}
+      viewBox={`0 0 ${w} ${h}`}
+      role="img"
+      aria-label={`Last ${rates.length} rates: ₹${rates[0].toFixed(2)} to ₹${rates[rates.length - 1].toFixed(2)} per gram`}
+      className="mt-1"
+    >
+      <path d={path} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={last.x} cy={last.y} r="3.5" fill="currentColor" />
+    </svg>
   )
 }
 
@@ -1527,20 +1663,6 @@ function MiniBadge({ label, value, accent }: { label: string; value: string; acc
       <p className={cn('mt-0.5 text-sm font-bold tabular-nums', accent === 'green' ? 'text-success-700' : accent === 'red' ? 'text-red-600 dark:text-red-400' : 'text-foreground')}>
         {value}
       </p>
-    </div>
-  )
-}
-
-function ImpactTile({ label, value, icon: Icon, tint }: { label: string; value: string; icon: LucideIcon; tint: string }) {
-  return (
-    <div className="flex items-center gap-2.5 rounded-md border bg-card p-2.5">
-      <div className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-md', tint)}>
-        <Icon className="h-4 w-4" />
-      </div>
-      <div className="min-w-0">
-        <p className="truncate text-[10.5px] uppercase tracking-wide text-muted-foreground">{label}</p>
-        <p className="truncate text-[13px] font-semibold tabular-nums text-foreground">{value}</p>
-      </div>
     </div>
   )
 }
@@ -1590,6 +1712,11 @@ function toTimeInputValue(d: Date): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+/** One hour from now — the default instant for a new scheduled change. */
+function hourFromNow(from = new Date()): Date {
+  return new Date(from.getTime() + 60 * 60_000)
+}
+
 /**
  * The next local-time instant at `weekday, hour:minute` that is still ahead
  * (today counts when the time hasn't passed yet; otherwise next week).
@@ -1609,42 +1736,4 @@ function presetLabel(d: Date, prefix: string): string {
   const h12 = d.getHours() % 12 === 0 ? 12 : d.getHours() % 12
   const ampm = d.getHours() >= 12 ? 'PM' : 'AM'
   return `${prefix} ${h12}:${String(d.getMinutes()).padStart(2, '0')} ${ampm}`
-}
-
-const SCHEDULE_STEP_LABELS = ['Set the rate', 'Pick date & time', 'Preview & confirm']
-
-function ScheduleStepper({ step }: { step: number }) {
-  return (
-    <div className="flex items-center gap-2">
-      {SCHEDULE_STEP_LABELS.map((label, i) => {
-        const done = i < step
-        const active = i === step
-        return (
-          <div key={label} className="flex min-w-0 flex-1 items-center gap-2">
-            <div
-              className={cn(
-                'flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold',
-                done && 'border-success bg-success-50 text-success-700',
-                active && 'border-primary bg-primary text-white shadow-sm',
-                !done && !active && 'border-border text-muted-foreground',
-              )}
-            >
-              {done ? <Check className="h-3.5 w-3.5" /> : i + 1}
-            </div>
-            <p
-              className={cn(
-                'min-w-0 truncate text-xs font-semibold',
-                active ? 'text-foreground' : done ? 'text-success-700' : 'text-muted-foreground',
-              )}
-            >
-              {label}
-            </p>
-            {i < SCHEDULE_STEP_LABELS.length - 1 ? (
-              <div className={cn('h-px flex-1', done ? 'bg-success/40' : 'bg-border')} />
-            ) : null}
-          </div>
-        )
-      })}
-    </div>
-  )
 }
