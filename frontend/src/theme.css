@@ -16,6 +16,8 @@
   --color-ring: hsl(var(--ring));
   --color-background: hsl(var(--background));
   --color-foreground: hsl(var(--foreground));
+  --color-link: hsl(var(--link));
+  --color-grid: hsl(var(--grid));
 
   --color-primary: hsl(var(--primary));
   --color-primary-foreground: hsl(var(--primary-foreground));
@@ -94,12 +96,12 @@
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   /* ── Shadows ─────────────────────────────────────────────────────────── */
-  --shadow-card: 0 1px 2px 0 rgb(16 24 40 / 0.05);
+  --shadow-card: 0 1px 2px 0 rgb(16 24 40 / 0.04), 0 8px 24px -18px rgb(16 24 40 / 0.18);
   --shadow-card-hover:
-    0 1px 2px 0 rgb(16 24 40 / 0.05), 0 8px 24px -8px rgb(76 29 149 / 0.12);
+    0 1px 2px 0 rgb(16 24 40 / 0.05), 0 12px 28px -14px rgb(16 24 40 / 0.2);
   --shadow-popover:
     0 8px 24px -4px rgb(16 24 40 / 0.12), 0 2px 6px -2px rgb(16 24 40 / 0.08);
-  --shadow-kpi: 0 1px 2px 0 rgb(16 24 40 / 0.04);
+  --shadow-kpi: 0 1px 2px 0 rgb(16 24 40 / 0.04), 0 10px 24px -18px rgb(16 24 40 / 0.2);
 
   /* ── Animations ──────────────────────────────────────────────────────── */
   --animate-fade-in: fade-in 0.2s ease-out;

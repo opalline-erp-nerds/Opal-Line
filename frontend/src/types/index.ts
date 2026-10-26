@@ -172,7 +172,116 @@ export interface TopProduct {
   qty: number
   weight: number
   revenue: number
+  image?: string | null
   icon: string
+}
+
+/** One bucket of the Order Summary grouped bars. */
+export interface OrderSummaryPoint {
+  label: string
+  online: number
+  inStore: number
+  revenue: number
+}
+
+export interface OrderSummary {
+  grain: 'week' | 'month' | 'year'
+  label: string
+  points: OrderSummaryPoint[]
+}
+
+/** A filled chart bucket (day, hour or month, per the page range). */
+export interface DashboardSeriesPoint {
+  date: string
+  label: string
+  value: number
+  status?: string
+}
+
+/** Status split for the purchase/sales order donuts. */
+export interface DashboardStatusSegment {
+  status: string
+  count: number
+  value: number
+}
+
+export interface SupplierPaymentRow {
+  id: string
+  ref: string
+  supplier: string
+  purchaseStatus: string
+  paymentStatus: string
+  method: string
+  total: number
+  date: string | null
+}
+
+export interface SupplierPaymentsWidget {
+  points: DashboardSeriesPoint[]
+  rows: SupplierPaymentRow[]
+}
+
+export interface PurchaseOrderRow {
+  id: string
+  number: string
+  supplier: string
+  expectedDate: string | null
+  status: string
+  total: number
+  date: string | null
+}
+
+export interface PurchaseOrdersWidget {
+  segments: DashboardStatusSegment[]
+  rows: PurchaseOrderRow[]
+}
+
+export interface CustomerPaymentRow {
+  id: string
+  ref: string
+  customer: string
+  invoice: string
+  fulfillment: string
+  paymentStatus: string
+  method: string
+  total: number
+  date: string | null
+}
+
+export interface CustomerPaymentsWidget {
+  points: DashboardSeriesPoint[]
+  rows: CustomerPaymentRow[]
+}
+
+export interface SalesOrderRow {
+  id: string
+  number: string
+  customer: string
+  fulfillment: string
+  status: string
+  total: number
+  date: string | null
+}
+
+export interface SalesOrdersWidget {
+  segments: DashboardStatusSegment[]
+  rows: SalesOrderRow[]
+}
+
+export interface RecentInvoiceRow {
+  id: string
+  number: string
+  customer: string
+  total: number
+  paymentStatus: string
+  status: string
+  date: string | null
+}
+
+export interface RecentInvoicesWidget {
+  points: DashboardSeriesPoint[]
+  statusPoints: DashboardSeriesPoint[]
+  rows: RecentInvoiceRow[]
 }
 
 export interface ProfitMonthPoint {
@@ -304,6 +413,15 @@ export interface AgingInvoice {
 
 /** Preset windows of the dashboard Silver Rate History chart. */
 export type SilverHistoryDays = 7 | 30 | 90
+
+/** Selected tab: one of the presets or the custom date range. */
+export type SilverHistoryWindow = SilverHistoryDays | 'custom'
+
+/** Inclusive custom window for the Silver Rate History chart. */
+export interface SilverHistoryRange {
+  from: string
+  to: string
+}
 
 /** One backfilled silver-rate point: `date` is an IST calendar day (YYYY-MM-DD). */
 export interface SilverRatePoint {

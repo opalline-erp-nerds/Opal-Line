@@ -353,7 +353,7 @@ export default function BarcodeLabelsPage() {
       return
     }
     if (grid.overflow) {
-      toast.error('Label size does not fit the page ΓÇö reduce size or margins')
+      toast.error('Label size does not fit the page — reduce size or margins')
       return
     }
     setGenerating(true)
@@ -415,7 +415,7 @@ export default function BarcodeLabelsPage() {
             </Button>
             <Button onClick={printLabels} disabled={generating || expandedCount === 0}>
               <Printer className="h-4 w-4" />
-              {generating ? 'PreparingΓÇª' : `Print ${expandedCount} Label${expandedCount === 1 ? '' : 's'}`}
+              {generating ? 'Preparing…' : `Print ${expandedCount} Label${expandedCount === 1 ? '' : 's'}`}
             </Button>
           </>
         }
@@ -508,7 +508,7 @@ export default function BarcodeLabelsPage() {
               {grid.overflow && (
                 <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  Label + margins exceed the page ΓÇö reduce size or margins.
+                  Label + margins exceed the page — reduce size or margins.
                 </div>
               )}
             </CardContent>
@@ -523,7 +523,7 @@ export default function BarcodeLabelsPage() {
             <CardContent className="space-y-3">
               <ToggleRow label="Product name" checked={cfg.showName} onCheckedChange={(v) => patch({ showName: v })} />
               <ToggleRow label="SKU" checked={cfg.showSku} onCheckedChange={(v) => patch({ showSku: v })} />
-              <ToggleRow label="Price (Γé╣)" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
+              <ToggleRow label="Price (₹)" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
               <ToggleRow label="Net weight" checked={cfg.showWeight} onCheckedChange={(v) => patch({ showWeight: v })} />
               <ToggleRow label="HUID" checked={cfg.showHuid} onCheckedChange={(v) => patch({ showHuid: v })} />
               <ToggleRow label="Category" checked={cfg.showCategory} onCheckedChange={(v) => patch({ showCategory: v })} />
@@ -733,11 +733,11 @@ export default function BarcodeLabelsPage() {
                         </div>
                         <div className="shrink-0 text-right">
                           <p className="text-sm font-semibold text-primary-700">
-                            Γé╣{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
+                            ₹{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
                           </p>
                           <p className="text-[11px] text-muted-foreground">
                             {product.netWeight ? `${product.netWeight}g` : ''}
-                            {product.stock !== undefined ? ` ┬╖ ${product.stock} pcs` : ''}
+                            {product.stock !== undefined ? ` · ${product.stock} pcs` : ''}
                           </p>
                         </div>
                       </div>
