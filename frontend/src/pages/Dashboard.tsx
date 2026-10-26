@@ -113,7 +113,7 @@ const quickActions: { label: string; icon: LucideIcon; path: string; module: str
 export default function DashboardPage() {
   const navigate = useNavigate()
   const { currentUser } = useAuth()
-  // Security snapshot is Admin / Super Admin only ΓÇö the endpoint 403s for
+  // Security snapshot is Admin / Super Admin only — the endpoint 403s for
   // everyone else, so don't even fetch it (and never render the card).
   const securityAdmin = currentUser?.role === 'Admin' || currentUser?.role === 'Super Admin'
 const [kpis, setKpis] = useState<KpiCardData[]>([])
@@ -146,7 +146,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
     try {
       sessionStorage.setItem(RANGE_STORAGE_KEY, JSON.stringify({ period, range: customRange }))
     } catch {
-      /* storage unavailable ΓÇö the range just won't persist */
+      /* storage unavailable — the range just won't persist */
     }
   }, [period, customRange])
 
@@ -193,7 +193,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
         return {}
       }
 
-      // KPIs: fulfilled ΓåÆ real data, rejected ΓåÆ error state
+      // KPIs: fulfilled → real data, rejected → error state
       const kpis = kpisResult.status === 'fulfilled' ? kpisResult.value : []
       const kpisError = kpisResult.status === 'rejected' ? 'Couldn\'t load sales data' : null
 
@@ -321,9 +321,9 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       />
 
       <div className="hidden print:block">
-        <h1 className="text-lg font-bold text-foreground">Opal Line Billing ΓÇö Dashboard</h1>
+        <h1 className="text-lg font-bold text-foreground">Opal Line Billing — Dashboard</h1>
         <p className="text-xs text-muted-foreground">
-          Generated {new Date().toLocaleString('en-IN')} ┬╖ {resolveClientRange(period, customRange).rangeText}
+          Generated {new Date().toLocaleString('en-IN')} · {resolveClientRange(period, customRange).rangeText}
         </p>
       </div>
 
@@ -384,7 +384,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                   <EmptyState
                     icon={TrendingUp}
                     title="Nothing to report yet"
-                    description="Add products, set today's silver rate or create your first invoice ΓÇö the dashboard fills up as you work."
+                    description="Add products, set today's silver rate or create your first invoice — the dashboard fills up as you work."
                     action={
                       <Button size="sm" variant="soft-primary" onClick={() => navigate('/inventory/products')}>
                         Add Products
@@ -415,7 +415,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                   <EmptyState
                     icon={ShoppingBag}
                     title="No orders imported yet"
-                    description="Run Orders Sync to import your paid Shopify orders ΓÇö invoices and sales will appear here automatically."
+                    description="Run Orders Sync to import your paid Shopify orders — invoices and sales will appear here automatically."
                     action={
                       <Button size="sm" variant="soft-primary" onClick={() => navigate('/shopify/orders')}>
                         Run Orders Sync
@@ -610,7 +610,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                             <div className="h-full rounded-full bg-primary-500" style={{ width: `${Math.max(4, Math.round((c.revenue / max) * 100))}%` }} />
                           </div>
                           <p className="text-[10.5px] text-muted-foreground">
-                            {formatNumber(c.qty)} pcs ┬╖ {formatWeight(c.weight)}
+                            {formatNumber(c.qty)} pcs · {formatWeight(c.weight)}
                           </p>
                         </div>
                       )
@@ -746,7 +746,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                               {expanded ? (
                                 <div className="mt-2 space-y-1.5 rounded-md border bg-muted/30 p-2">
                                   {list === 'loading' ? (
-                                    <p className="py-1 text-center text-[11.5px] text-muted-foreground">Loading invoicesΓÇª</p>
+                                    <p className="py-1 text-center text-[11.5px] text-muted-foreground">Loading invoices…</p>
                                   ) : list && list.length > 0 ? (
                                     list.map((inv) => (
                                       <div key={inv.id} className="flex items-center justify-between gap-2 text-[11.5px]">
@@ -754,7 +754,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                                           <p className="truncate font-medium text-foreground">{inv.customer || inv.number}</p>
                                           <p className="truncate text-muted-foreground">
                                             {inv.number}
-                                            {inv.dueDate ? ` ┬╖ due ${formatDate(inv.dueDate)}` : ' ┬╖ no due date'}
+                                            {inv.dueDate ? ` · due ${formatDate(inv.dueDate)}` : ' · no due date'}
                                           </p>
                                         </div>
                                         <div className="shrink-0 text-right">
@@ -810,7 +810,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                     <div className="grid grid-cols-2 gap-3">
                       <div className="rounded-lg border p-3">
                         <p className="text-2xl font-bold text-foreground">{security.failedLogins}</p>
-                        <p className="text-[11px] text-muted-foreground">Failed logins ┬╖ {resolveClientRange(period, customRange).rangeText}</p>
+                        <p className="text-[11px] text-muted-foreground">Failed logins · {resolveClientRange(period, customRange).rangeText}</p>
                       </div>
                       <div className="rounded-lg border p-3">
                         <p className={`text-2xl font-bold ${security.lockedAccounts > 0 ? 'text-destructive' : 'text-foreground'}`}>{security.lockedAccounts}</p>
@@ -867,7 +867,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                           {a.detail ? <p className="text-[11.5px] text-muted-foreground">{a.detail}</p> : null}
                           <div className="mt-0.5 flex items-center gap-2 text-[10.5px] text-muted-foreground">
                             <span className="font-medium text-primary-700">by {a.actor}</span>
-                            <span>┬╖</span>
+                            <span>·</span>
                             <span>{a.time}</span>
                           </div>
                         </div>
@@ -1128,7 +1128,7 @@ function AnalyticsCard({ stat }: { stat: AnalyticsStat }) {
             <Minus className="h-3 w-3" />
           )}
           {stat.delta}
-          {stat.prevLabel ? <span className="font-normal text-muted-foreground">┬╖ {stat.prevLabel}</span> : null}
+          {stat.prevLabel ? <span className="font-normal text-muted-foreground">· {stat.prevLabel}</span> : null}
         </span>
       ) : stat.rangeLabel ? (
         <span className="mt-1 block text-[11px] text-muted-foreground">{stat.rangeLabel}</span>
@@ -1152,7 +1152,7 @@ function ConnectionBanner({ rate, shopifyStatus }: { rate: number | null; shopif
         </div>
         <div className="leading-tight">
           <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">Silver Rate</p>
-          <p className="text-sm font-bold text-foreground">{rate != null ? `Γé╣${rate.toFixed(2)} / gm` : 'ΓÇö'}</p>
+          <p className="text-sm font-bold text-foreground">{rate != null ? `₹${rate.toFixed(2)} / gm` : '—'}</p>
         </div>
       </div>
       <div className="h-8 w-px bg-border" />
