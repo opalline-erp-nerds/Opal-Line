@@ -190,6 +190,7 @@ export const dbApi = {
       pendingPayments: number
       totalOrders: number
       totalInvoices: number
+      lastSyncAt: string | null
     }>(rangePath('/db/dashboard/summary', range)),
   getSalesOverview: (range: DashboardRangeInput | string = 'week'): Promise<SalesOverviewPoint[]> => request(rangePath('/db/dashboard/sales-overview', range)),
   getTopProducts: (range?: DashboardRangeInput): Promise<TopProduct[]> => request(rangePath('/db/dashboard/top-products', range)),

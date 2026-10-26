@@ -2,8 +2,6 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { resolveClientRange, rangeToQuery } from '@/lib/dashboardRange'
 import {
-  ArrowDownRight,
-  ArrowUpRight,
   ArrowRight,
   Banknote,
   Boxes,
@@ -15,7 +13,6 @@ import {
   Gem,
   IndianRupee,
   Landmark,
-  Minus,
   PackageX,
   Plus,
   Repeat,
@@ -61,7 +58,6 @@ import type {
   LowStockItem,
   PaymentStatusSegment,
   SalesOverviewPoint,
-  SilverRate,
   TopCategory,
   TopProduct,
   PeriodKey,
@@ -110,7 +106,7 @@ const quickActions: { label: string; icon: LucideIcon; path: string; module: str
 export default function DashboardPage() {
   const navigate = useNavigate()
   const [kpis, setKpis] = useState<KpiCardData[]>([])
-  const [summary, setSummary] = useState<Record<string, string | number> | null>(null)
+  const [summary, setSummary] = useState<Record<string, string | number | null> | null>(null)
   const [salesData, setSalesData] = useState<SalesOverviewPoint[]>([])
   const [topProducts, setTopProducts] = useState<TopProduct[]>([])
   const [topProductsError, setTopProductsError] = useState<string | null>(null)
@@ -118,7 +114,6 @@ export default function DashboardPage() {
   const [topCategoryError, setTopCategoryError] = useState<string | null>(null)
   const [paymentStatus, setPaymentStatus] = useState<{ segments: PaymentStatusSegment[]; total: number } | null>(null)
   const [paymentStatusError, setPaymentStatusError] = useState<string | null>(null)
-  const [silverRate, setSilverRate] = useState<SilverRate | null>(null)
   const [lowStock, setLowStock] = useState<LowStockItem[]>([])
   const [activities, setActivities] = useState<Activity[]>([])
   const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
@@ -152,7 +147,6 @@ export default function DashboardPage() {
       dbApi.getTopProducts(range),
       dbApi.getTopCategory(range),
       dbApi.getPaymentStatus(range),
-      dbApi.getSilverRate(),
       dbApi.getLowStock(),
       dbApi.getRecentActivities(range),
       dbApi.getAnalyticsStats(range),
@@ -165,11 +159,10 @@ export default function DashboardPage() {
       const topProductsResult = results[3]
       const topCategoryResult = results[4]
       const paymentStatusResult = results[5]
-      const silverRateResult = results[6]
-      const lowStockResult = results[7]
-      const activitiesResult = results[8]
-      const analyticsResult = results[9]
-      const shopifyStatusResult = results[10]
+      const lowStockResult = results[6]
+      const activitiesResult = results[7]
+      const analyticsResult = results[8]
+      const shopifyStatusResult = results[9]
 
       // Helper: if fulfilled, return value; if rejected, log error and return default
       const safe = (result: PromiseSettledResult<any>): any => {
@@ -199,6 +192,7 @@ export default function DashboardPage() {
         pendingPayments: summary.pendingPayments ?? 0,
         totalOrders: summary.totalOrders ?? 0,
         totalInvoices: summary.totalInvoices ?? 0,
+        lastSyncAt: summary.lastSyncAt ?? null,
       }
 
       // Sales Overview
@@ -215,9 +209,6 @@ export default function DashboardPage() {
       // Payment Status
       const paymentStatus = paymentStatusResult.status === 'fulfilled' ? paymentStatusResult.value : { segments: [], total: 0 }
       const paymentStatusError = paymentStatusResult.status === 'rejected' ? 'Couldn\'t load payment status' : null
-
-      // Silver Rate
-      const silverRate = silverRateResult.status === 'fulfilled' ? silverRateResult.value : null
 
       // Low Stock
       const lowStock = lowStockResult.status === 'fulfilled' ? lowStockResult.value : []
@@ -241,7 +232,6 @@ export default function DashboardPage() {
       setTopCategoryError(topCategoryError ?? null)
       setPaymentStatus(paymentStatus)
       setPaymentStatusError(paymentStatusError ?? null)
-      setSilverRate(silverRate)
       setLowStock(lowStock)
       setActivities(Array.isArray(activities) ? activities : [])
       setAnalytics(analytics)
@@ -290,7 +280,10 @@ export default function DashboardPage() {
         </p>
       </div>
 
-                <ConnectionBanner rate={silverRate?.rate ?? null} shopifyStatus={shopifyStatus} />
+      <ConnectionBanner
+        lastSyncAt={typeof summary?.lastSyncAt === 'string' ? summary.lastSyncAt : null}
+        shopifyStatus={shopifyStatus}
+      />
 
       {dbError ? (
         <Card className="mb-6">
@@ -310,12 +303,6 @@ export default function DashboardPage() {
         <DashboardSkeleton />
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
-            {analytics.map((s) => (
-              <AnalyticsCard key={s.label} stat={s} />
-            ))}
-          </div>
-
           {kpisError ? (
               <Card>
                 <CardContent>
@@ -365,7 +352,7 @@ export default function DashboardPage() {
               </Card>
             ))}
 
-          {summary ? <OperationalStrip summary={summary} /> : null}
+          {summary ? <OperationalStrip summary={summary} analytics={analytics} /> : null}
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <Card className="xl:col-span-2">
@@ -964,61 +951,27 @@ function PeriodSelect({
   )
 }
 
-function AnalyticsCard({ stat }: { stat: AnalyticsStat }) {
-  return (
-    <Card className="p-4 shadow-kpi">
-      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{stat.label}</p>
-      <p className="mt-1.5 text-base font-bold tabular-nums text-foreground">{stat.value}</p>
-      {stat.delta ? (
-        <span
-          className={cn(
-            'mt-1 flex items-center gap-0.5 text-[11px] font-semibold',
-            stat.trend === 'up' && 'text-success-700',
-            stat.trend === 'down' && 'text-red-600 dark:text-red-400',
-            stat.trend === 'flat' && 'text-muted-foreground',
-          )}
-        >
-          {stat.trend === 'up' ? (
-            <ArrowUpRight className="h-3 w-3" />
-          ) : stat.trend === 'down' ? (
-            <ArrowDownRight className="h-3 w-3" />
-          ) : (
-            <Minus className="h-3 w-3" />
-          )}
-          {stat.delta}
-          {stat.prevLabel ? <span className="font-normal text-muted-foreground">· {stat.prevLabel}</span> : null}
-        </span>
-      ) : stat.rangeLabel ? (
-        <span className="mt-1 block text-[11px] text-muted-foreground">{stat.rangeLabel}</span>
-      ) : null}
-    </Card>
-  )
-}
-
-function ConnectionBanner({ rate, shopifyStatus }: { rate: number | null; shopifyStatus: ShopifyStatus | null }) {
-  const lastSyncAt = shopifyStatus
+function ConnectionBanner({
+  lastSyncAt,
+  shopifyStatus,
+}: {
+  lastSyncAt: string | null
+  shopifyStatus: ShopifyStatus | null
+}) {
+  const fallbackSync = shopifyStatus
     ? Object.values(shopifyStatus.lastSync ?? {})
         .filter(Boolean)
         .sort()
         .pop() ?? null
     : null
+  const syncedAt = lastSyncAt ?? fallbackSync
   return (
     <Card className="flex flex-wrap items-center gap-x-6 gap-y-2 border-primary-100 bg-gradient-to-r from-primary-50/70 via-card to-card px-4 py-3">
-      <div className="flex items-center gap-2">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-600 text-white shadow-sm">
-          <Tag className="h-4 w-4" />
-        </div>
-        <div className="leading-tight">
-          <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">Silver Rate</p>
-          <p className="text-sm font-bold text-foreground">{rate != null ? `₹${rate.toFixed(2)} / gm` : '—'}</p>
-        </div>
-      </div>
-      <div className="h-8 w-px bg-border" />
       <StatusPill healthy={Boolean(shopifyStatus?.configured)} label="Shopify" sublabel={shopifyStatus?.configured ? 'Connected' : 'Not configured'} />
       <StatusPill healthy label="System" sublabel="Healthy" />
       <div className="ml-auto hidden items-center gap-1.5 text-xs text-muted-foreground md:flex">
         <CloudCog className="h-3.5 w-3.5 text-info-700" />
-        Last sync: {lastSyncAt ? formatDateTime(lastSyncAt) : 'Never'}
+        Last sync: {syncedAt ? formatDateTime(syncedAt) : 'Never'}
       </div>
     </Card>
   )
@@ -1061,7 +1014,14 @@ function QuickActions() {
   )
 }
 
-function OperationalStrip({ summary }: { summary: Record<string, string | number> }) {
+function OperationalStrip({
+  summary,
+  analytics,
+}: {
+  summary: Record<string, string | number | null>
+  analytics: AnalyticsStat[]
+}) {
+  const statValue = (label: string) => analytics.find((s) => s.label === label)?.value ?? '—'
   const items: { label: string; value: string; icon: LucideIcon; tint: string }[] = [
     { label: 'Total Products', value: `${summary.totalProducts}`, icon: Gem, tint: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300' },
     { label: 'Total Customers', value: `${summary.totalCustomers}`, icon: Users, tint: 'bg-info-50 text-info-700' },
@@ -1070,10 +1030,13 @@ function OperationalStrip({ summary }: { summary: Record<string, string | number
     { label: 'Total Stock (Wt)', value: formatWeight(Number(summary.totalStockWeight)), icon: ScaleIcon, tint: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300' },
     { label: "Today's Expenses", value: compactCurrency(Number(summary.todayExpenses)), icon: Wallet, tint: 'bg-warning-50 text-warning-700' },
     { label: 'Pending Payments', value: compactCurrency(Number(summary.pendingPayments)), icon: Clock, tint: 'bg-red-50 text-red-600 dark:text-red-400' },
+    { label: 'Avg Order Value', value: statValue('Average Order Value'), icon: IndianRupee, tint: 'bg-success-50 text-success-700' },
+    { label: 'Return Rate', value: statValue('Return Rate'), icon: Repeat, tint: 'bg-info-50 text-info-700' },
+    { label: 'Inventory Value', value: statValue('Inventory Value'), icon: Boxes, tint: 'bg-warning-50 text-warning-700' },
   ]
   return (
     <Card className="divide-y divide-border overflow-hidden">
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3 px-4 py-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-3 px-4 py-3 sm:grid-cols-3 lg:grid-cols-5">
         {items.map((it, i) => (
           <div key={it.label} className={cn('flex items-center gap-2.5', i < items.length - 1 && 'xl:border-r xl:border-border/70 xl:pr-4')}>
             <div className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-md', it.tint)}>
@@ -1115,6 +1078,7 @@ function DashboardSkeleton() {
     </div>
   )
 }
+
 
 
 

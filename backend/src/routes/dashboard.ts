@@ -44,6 +44,11 @@ const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(mi
 // the string-format quirks ('T' vs ' ') that JS-side string compares had.
 const OUTSTANDING_WHERE = sql`(payment_status in ('pending','partial') or status = 'overdue')`
 
+// One receivable definition everywhere: the unpaid part of open invoices,
+// after successful payments. Shared by the Outstanding KPI, the summary strip
+// and the Receivable Summary so their totals and counts always agree.
+const UNPAID_INVOICE = sql`greatest(coalesce(${schema.salesInvoices.grandTotal}, 0) - coalesce((select sum(coalesce(${schema.payments.amount}, 0)) from ${schema.payments} where ${schema.payments.invoice} = ${schema.salesInvoices.number} and ${schema.payments.status} = 'success'), 0), 0)`
+
 // B2B vs B2C GST split heuristic. The JS pattern is the original matcher; the
 // string form runs the same alternation in Postgres via case-insensitive ~*.
 const BUSINESS_NAME_PATTERN = /house|jewels|llp|pvt|ltd|exports|trading|industries|firm|company|corp/i
@@ -154,7 +159,10 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
       returnsTotal(range.from, range.to),
       returnsTotal(range.prevFrom, range.prevTo),
       db!.select({ n: sql<number>`count(*)` }).from(schema.products).where(lowStockWhere()),
-      db!.select({ total: sql<number>`coalesce(sum(grand_total), 0)`, count: sql<number>`count(*)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      db!.select({
+        total: sql<number>`coalesce(sum(${UNPAID_INVOICE}), 0)`,
+        count: sql<number>`count(*) filter (where ${UNPAID_INVOICE} > 0)`,
+      }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
     ])
 
     // Returns (credit notes) reduce the period's sales, so a returned sale
@@ -181,8 +189,8 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
       { key: 'orders', label: 'Orders', value: String(curOrders), trend: orderCompare.trend, delta: orderCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'shopping-bag', accent: 'blue' },
       { key: 'invoices', label: 'Invoices', value: String(cur.count), trend: invoiceCompare.trend, delta: invoiceCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'file-text', accent: 'green' },
       { key: 'grossProfit', label: 'Gross Profit', value: hasCost ? inr(cur.profit) : 'N/A', trend: profitCompare.trend, delta: profitCompare.delta, deltaLabel: profitCaption, rangeLabel: range.label, icon: 'trending-up', accent: 'orange' },
-      { key: 'outstanding', label: 'Outstanding', value: inr(outstanding), trend: 'flat', delta: '—', deltaLabel: `${outstandingCount} invoices`, rangeLabel: range.label, icon: 'clock', accent: 'red' },
-      { key: 'lowStock', label: 'Low Stock Items', value: String(Number(lowStockRows[0]?.n ?? 0)), trend: 'flat', delta: '—', deltaLabel: 'Needs Reorder', rangeLabel: range.label, icon: 'package-x', accent: 'slate' },
+      { key: 'outstanding', label: 'Outstanding', value: inr(outstanding), trend: 'flat', delta: '—', deltaLabel: `${outstandingCount} invoices`, rangeLabel: 'As of now', icon: 'clock', accent: 'red' },
+      { key: 'lowStock', label: 'Low Stock Items', value: String(Number(lowStockRows[0]?.n ?? 0)), trend: 'flat', delta: '—', deltaLabel: 'Needs Reorder', rangeLabel: 'As of now', icon: 'package-x', accent: 'slate' },
     ])
   } catch {
     res.status(500).json({ error: 'Internal server error' })
@@ -198,7 +206,7 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
     const todayEnd = localDayStart(1)
     // Aggregated in SQL: full-table loads here scaled with every product,
     // customer, supplier, expense and invoice row for a handful of numbers.
-    const [productAgg, customerAgg, supplierAgg, expenseAgg, outstandingRows, orderAgg, invoiceAgg] = await Promise.all([
+    const [productAgg, customerAgg, supplierAgg, expenseAgg, outstandingRows, orderAgg, invoiceAgg, lastSyncRows] = await Promise.all([
       db!.select({
         total: sql<number>`count(*)`,
         active: sql<number>`count(*) filter (where status = 'active')`,
@@ -217,9 +225,10 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
         today: sql<number>`coalesce(sum(coalesce(amount, 0)) filter (where date >= ${todayStart} and date < ${todayEnd}), 0)`,
         ranged: sql<number>`coalesce(sum(coalesce(amount, 0)) filter (where date >= ${range.from} and date < ${range.to}), 0)`,
       }).from(schema.expenses),
-      db!.select({ total: sql<number>`coalesce(sum(grand_total), 0)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      db!.select({ total: sql<number>`coalesce(sum(${UNPAID_INVOICE}), 0)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
       db!.select({ total: sql<number>`count(*)` }).from(schema.salesOrders),
       db!.select({ total: sql<number>`count(*)` }).from(schema.salesInvoices),
+      db!.select({ at: sql<string | null>`max(${schema.syncLogs.time})` }).from(schema.syncLogs),
     ])
 
     res.json({
@@ -239,6 +248,7 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
       // orders but no invoices (e.g. all unpaid), so both are reported.
       totalOrders: Number(orderAgg[0]?.total ?? 0),
       totalInvoices: Number(invoiceAgg[0]?.total ?? 0),
+      lastSyncAt: lastSyncRows[0]?.at ?? null,
     })
   } catch {
     res.status(500).json({ error: 'Internal server error' })
