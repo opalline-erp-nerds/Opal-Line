@@ -521,7 +521,6 @@ export function CustomerPaymentsCard({ range }: { range: RangeQuery }) {
                 <TableRow>
                   <TableHead className="text-[11px]">Payment ID</TableHead>
                   <TableHead className="text-[11px]">Customer</TableHead>
-                  <TableHead className="text-[11px]">Fulfilment status</TableHead>
                   <TableHead className="text-[11px]">Collection status</TableHead>
                   <TableHead className="text-right text-[11px]">Total</TableHead>
                 </TableRow>
@@ -531,9 +530,6 @@ export function CustomerPaymentsCard({ range }: { range: RangeQuery }) {
                   <TableRow key={row.id}>
                     <TableCell className="font-medium text-foreground">{row.ref}</TableCell>
                     <TableCell className="max-w-[150px] truncate text-muted-foreground">{row.customer}</TableCell>
-                    <TableCell>
-                      <StatusPill status={row.fulfillment} />
-                    </TableCell>
                     <TableCell>
                       <StatusPill status={row.paymentStatus} />
                     </TableCell>

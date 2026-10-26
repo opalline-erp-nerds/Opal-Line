@@ -1096,6 +1096,7 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
   try {
     const q = req.query as Record<string, unknown>
     const limit = clamp(Number(q.limit ?? 8) || 8, 1, 100)
+    const latest = q.scope === 'latest'
     const cursor = typeof q.cursor === 'string' ? q.cursor.trim() : ''
     let cursorTs: string | null = null
     let cursorId: string | null = null
@@ -1117,16 +1118,20 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
 
     // Merge activity_logs and audit_logs by (timestamp, id) desc using UNION ALL
     // for stable cursor pagination.
+    const actWindow = latest
+      ? sql`true`
+      : and(gte(schema.activityLogs.timestamp, range.from), sql`${schema.activityLogs.timestamp} < ${range.to}`)
+    const audWindow = latest
+      ? sql`true`
+      : and(gte(schema.auditLogs.timestamp, range.from), sql`${schema.auditLogs.timestamp} < ${range.to}`)
     const actWhere = and(
-      gte(schema.activityLogs.timestamp, range.from),
-      sql`${schema.activityLogs.timestamp} < ${range.to}`,
+      actWindow,
       cursorTs && cursorId
         ? sql`(${schema.activityLogs.timestamp} < ${cursorTs} OR (${schema.activityLogs.timestamp} = ${cursorTs} AND ${schema.activityLogs.id} < ${cursorId}))`
         : sql`true`,
     )
     const audWhere = and(
-      gte(schema.auditLogs.timestamp, range.from),
-      sql`${schema.auditLogs.timestamp} < ${range.to}`,
+      audWindow,
       cursorTs && cursorId
         ? sql`(${schema.auditLogs.timestamp} < ${cursorTs} OR (${schema.auditLogs.timestamp} = ${cursorTs} AND ${schema.auditLogs.id} < ${cursorId}))`
         : sql`true`,
@@ -1134,14 +1139,8 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
 
     // Count total in range (for "Showing X of total")
     const [totalAct, totalAud] = await Promise.all([
-      db!
-        .select({ n: sql<number>`count(*)` })
-        .from(schema.activityLogs)
-        .where(and(gte(schema.activityLogs.timestamp, range.from), sql`${schema.activityLogs.timestamp} < ${range.to}`)),
-      db!
-        .select({ n: sql<number>`count(*)` })
-        .from(schema.auditLogs)
-        .where(and(gte(schema.auditLogs.timestamp, range.from), sql`${schema.auditLogs.timestamp} < ${range.to}`)),
+      db!.select({ n: sql<number>`count(*)` }).from(schema.activityLogs).where(actWindow),
+      db!.select({ n: sql<number>`count(*)` }).from(schema.auditLogs).where(audWindow),
     ])
     const total = Number(totalAct[0]?.n ?? 0) + Number(totalAud[0]?.n ?? 0)
 

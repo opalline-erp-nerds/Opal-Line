@@ -236,7 +236,7 @@ export const dbApi = {
   getLowStock: (): Promise<LowStockItem[]> => request('/db/dashboard/low-stock'),
   getRecentActivities: (
     range?: DashboardRangeInput | string,
-    params?: { limit?: number; cursor?: string | null },
+    params?: { limit?: number; cursor?: string | null; latest?: boolean },
   ): Promise<{ items: Activity[]; total: number; nextCursor: string | null }> => {
     const query = new URLSearchParams()
     if (typeof range === 'string') {
@@ -248,6 +248,7 @@ export const dbApi = {
     }
     if (typeof params?.limit === 'number') query.set('limit', String(params.limit))
     if (params?.cursor) query.set('cursor', params.cursor)
+    if (params?.latest) query.set('scope', 'latest')
     const qs = query.toString()
     return request(qs ? `/db/dashboard/activities?${qs}` : '/db/dashboard/activities')
   },

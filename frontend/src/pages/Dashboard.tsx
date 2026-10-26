@@ -149,7 +149,7 @@ export default function DashboardPage() {
       dbApi.getTopCategory(range),
       dbApi.getPaymentStatus(range),
       dbApi.getLowStock(),
-      dbApi.getRecentActivities(range),
+      dbApi.getRecentActivities(range, { latest: true }),
       dbApi.getAnalyticsStats(range),
       shopifyApi.getStatus(),
     ]).then((results) => {
