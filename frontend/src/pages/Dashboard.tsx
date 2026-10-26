@@ -354,8 +354,8 @@ export default function DashboardPage() {
 
           {summary ? <OperationalStrip summary={summary} analytics={analytics} /> : null}
 
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-            <Card className="xl:col-span-2">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+            <Card className="lg:col-span-2">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="flex items-center gap-2 text-sm">
@@ -388,7 +388,7 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
-            <Card className="xl:col-span-1">
+            <Card className="lg:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="flex items-center gap-2 text-sm">
@@ -452,23 +452,8 @@ export default function DashboardPage() {
             </Card>
           </div>
 
-          <OrderSummaryCard />
-
-          {/* Self-fetching: independent of the page-wide range above. */}
-          <FinancialAnalytics />
-
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-            <SupplierPaymentsCard range={range} />
-            <PurchaseOrdersCard range={range} />
-          </div>
-
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-            <CustomerPaymentsCard range={range} />
-            <SalesOrdersCard range={range} />
-          </div>
-
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-            <Card className="xl:col-span-1">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+            <Card className="lg:col-span-5 lg:row-span-2">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="text-sm">Top Selling Products</CardTitle>
@@ -545,7 +530,22 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
-            <Card className="xl:col-span-1">
+            <div className="grid grid-cols-1 gap-4 lg:col-span-7 lg:row-span-2 lg:grid-cols-7">
+              <div className="lg:col-span-4">
+                <SupplierPaymentsCard range={range} />
+              </div>
+              <div className="lg:col-span-3">
+                <PurchaseOrdersCard range={range} />
+              </div>
+              <div className="lg:col-span-4">
+                <CustomerPaymentsCard range={range} />
+              </div>
+              <div className="lg:col-span-3">
+                <SalesOrdersCard range={range} />
+              </div>
+            </div>
+
+            <Card className="lg:col-span-4">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="text-sm">Top Selling Category</CardTitle>
@@ -616,12 +616,19 @@ export default function DashboardPage() {
                 ))}
               </CardContent>
             </Card>
+
+            <div className="lg:col-span-8">
+              <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
+            </div>
           </div>
 
-          <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
+          <OrderSummaryCard />
 
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-            <Card className="xl:col-span-1">
+          {/* Self-fetching: independent of the page-wide range above. */}
+          <FinancialAnalytics />
+
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <Card>
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="text-sm">Low Stock Alert</CardTitle>
