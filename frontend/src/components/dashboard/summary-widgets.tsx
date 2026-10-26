@@ -231,7 +231,7 @@ export function SupplierPaymentsCard({ range }: { range: RangeQuery }) {
   ]
 
   return (
-    <Card className="xl:col-span-2">
+    <Card className="h-full">
       <CardHeader className="flex-row flex-wrap items-center justify-between gap-2 space-y-0">
         <div>
           <CardTitle className="flex items-center gap-2 text-sm">
@@ -359,7 +359,7 @@ export function PurchaseOrdersCard({ range }: { range: RangeQuery }) {
     })) ?? []
 
   return (
-    <Card>
+    <Card className="h-full">
       <CardHeader className="flex-row items-center justify-between space-y-0">
         <div>
           <CardTitle className="flex items-center gap-2 text-sm">
@@ -460,7 +460,7 @@ export function CustomerPaymentsCard({ range }: { range: RangeQuery }) {
   ]
 
   return (
-    <Card className="xl:col-span-2">
+    <Card className="h-full">
       <CardHeader className="flex-row flex-wrap items-center justify-between gap-2 space-y-0">
         <div>
           <CardTitle className="flex items-center gap-2 text-sm">
@@ -584,7 +584,7 @@ export function SalesOrdersCard({ range }: { range: RangeQuery }) {
     })) ?? []
 
   return (
-    <Card>
+    <Card className="h-full">
       <CardHeader className="flex-row items-center justify-between space-y-0">
         <div>
           <CardTitle className="flex items-center gap-2 text-sm">
