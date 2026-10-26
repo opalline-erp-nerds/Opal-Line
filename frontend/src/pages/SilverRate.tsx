@@ -35,6 +35,7 @@ import { AppDialog } from '@/components/ui/app-dialog'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { useSilverRate } from '@/lib/silver-rate-context'
+import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
 import type { PendingRateChange, Product, SilverRate, SilverRateAutoStatus, SilverRateProgress, SilverRateRequestRow, SilverRateRow } from '@/types'
 import { formatCurrency, formatDateTime, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
@@ -143,7 +144,9 @@ export default function SilverRatePage() {
   const rateValid = !isNaN(rateValue) && rateValue > 0
 
   const affected = useMemo(() => {
-    return products.map((p) => {
+    // Piece Rate Products keep their fixed price — the backend never reprices
+    // them, so they are excluded from this preview as well.
+    return products.filter((p) => !p.pieceRateProduct).map((p) => {
       const silverValue = p.netWeight * currentRate.rate
       const makingTotal = p.netWeight * p.makingCharge
       const subtotal = silverValue + makingTotal
@@ -251,7 +254,8 @@ export default function SilverRatePage() {
   /** Old → new prices for every product at the dialog's rate (preview step). */
   const scheduleImpact = useMemo(() => {
     if (!scheduleRateValid || !scheduleInstant) return null
-    return products.map((p) => {
+    // Piece-rate products are never repriced, so they carry no schedule impact.
+    return products.filter((p) => !p.pieceRateProduct).map((p) => {
       const makingTotal = p.netWeight * p.makingCharge
       const gstPct = p.gst ?? 3
       const oldPrice = (p.netWeight * currentRate.rate + makingTotal) * (1 + gstPct / 100)
@@ -1081,6 +1085,8 @@ export default function SilverRatePage() {
           </CardContent>
         </Card>
       </div>
+
+      <SilverRateHistoryCard onSetRate={openUpdate} />
 
       <Card>
         <CardHeader>
