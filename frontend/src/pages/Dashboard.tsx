@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { resolveClientRange, rangeToQuery } from '@/lib/dashboardRange'
 import {
@@ -341,7 +341,8 @@ export default function DashboardPage() {
                     delta={kpi.delta}
                     deltaLabel={kpi.deltaLabel}
                     support={kpi.rangeLabel}
-                    accent={kpi.accent as 'purple'}
+                    accent={kpi.accent}
+                    variant="gradient"
                   />
                 ))}
               </div>
@@ -472,7 +473,7 @@ export default function DashboardPage() {
                   <CardTitle className="text-sm">Top Selling Products</CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
                 </div>
-                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
               </CardHeader>
@@ -547,7 +548,7 @@ export default function DashboardPage() {
                   <CardTitle className="text-sm">Top Selling Category</CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">Revenue grouped by product category</p>
                 </div>
-                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
               </CardHeader>
@@ -607,7 +608,7 @@ export default function DashboardPage() {
                   <CardTitle className="text-sm">Low Stock Alert</CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">At or below their reorder level</p>
                 </div>
-                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/inventory/low-stock')}>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/inventory/low-stock')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
               </CardHeader>
@@ -670,7 +671,7 @@ export default function DashboardPage() {
                 <CardTitle className="text-sm">Recent Activities</CardTitle>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoice, payment and sync events</p>
               </div>
-              <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/system/activity')}>
+              <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/system/activity')}>
                 View All <ArrowRight className="h-3.5 w-3.5" />
               </Button>
             </CardHeader>
@@ -697,7 +698,7 @@ export default function DashboardPage() {
                           <p className="text-[13px] font-medium leading-snug text-foreground">{a.title}</p>
                           {a.detail ? <p className="text-[11.5px] text-muted-foreground">{a.detail}</p> : null}
                           <div className="mt-0.5 flex items-center gap-2 text-[10.5px] text-muted-foreground">
-                            <span className="font-medium text-primary-700">by {a.actor}</span>
+                            <span className="font-medium text-link">by {a.actor}</span>
                             <span>·</span>
                             <span>{a.time}</span>
                           </div>

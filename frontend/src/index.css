@@ -10,10 +10,10 @@
    * because gold at large areas reads cheap rather than premium.
    */
   :root {
-    --background: 220 33% 98%;
-    --foreground: 222 47% 11%;
+    --background: 218 50% 97%;
+    --foreground: 224 42% 20%;
     --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
+    --card-foreground: 224 42% 20%;
     --popover: 0 0% 100%;
     --popover-foreground: 222 47% 11%;
     --primary: 222 64% 28%;
@@ -31,7 +31,7 @@
     --secondary: 220 22% 94%;
     --secondary-foreground: 222 47% 14%;
     --muted: 220 24% 95%;
-    --muted-foreground: 220 12% 42%;
+    --muted-foreground: 233 12% 59%;
     --accent: 43 78% 94%;
     --accent-foreground: 35 62% 24%;
     --destructive: 0 72% 45%;
@@ -39,6 +39,9 @@
     --border: 220 18% 87%;
     --input: 220 12% 60%;
     --ring: 222 64% 34%;
+    /* Dashboard accents: links and chart grid lines. */
+    --link: 221 83% 53%;
+    --grid: 240 21% 93%;
 
     /* Gold — the single premium accent. Deliberately not a full ramp; only
      * these four are ever referenced. */
@@ -110,6 +113,8 @@
     --border: 220 18% 22%;
     --input: 218 12% 50%;
     --ring: 43 74% 52%;
+    --link: 217 91% 65%;
+    --grid: 240 15% 20%;
 
     /* Lifted for dark backgrounds so gold keeps its metallic read instead of
      * going muddy against near-black. */
@@ -192,6 +197,53 @@
 @layer utilities {
   .text-balance {
     text-wrap: balance;
+  }
+}
+
+@layer components {
+  /* Dashboard status chips — one hue per state so tables scan quickly. */
+  .status-chip {
+    @apply inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-[10.5px] font-medium;
+  }
+  .status-chip-success {
+    background-color: #e7f8ee;
+    color: #15803d;
+  }
+  .status-chip-warning {
+    background-color: #fff4e5;
+    color: #b45309;
+  }
+  .status-chip-danger {
+    background-color: #feeceb;
+    color: #b42318;
+  }
+  .status-chip-info {
+    background-color: #e8f0ff;
+    color: #1d4ed8;
+  }
+  .status-chip-neutral {
+    background-color: #f1f3f9;
+    color: #64748b;
+  }
+  .dark .status-chip-success {
+    background-color: rgb(22 163 74 / 0.18);
+    color: #86efac;
+  }
+  .dark .status-chip-warning {
+    background-color: rgb(245 158 11 / 0.18);
+    color: #fcd34d;
+  }
+  .dark .status-chip-danger {
+    background-color: rgb(239 68 68 / 0.18);
+    color: #fca5a5;
+  }
+  .dark .status-chip-info {
+    background-color: rgb(59 130 246 / 0.18);
+    color: #93c5fd;
+  }
+  .dark .status-chip-neutral {
+    background-color: rgb(148 163 184 / 0.18);
+    color: #cbd5e1;
   }
 }
 

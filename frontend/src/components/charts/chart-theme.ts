@@ -9,15 +9,18 @@ import { useEffect, useState } from 'react'
  */
 
 export const INCOME = '#7C5CE6'
-export const EXPENSE = '#3DBA7E'
-export const PROFIT = '#3DBA7E'
+export const EXPENSE = '#2FBF71'
+export const PROFIT = '#2FBF71'
 export const LOSS = '#E5484D'
 
-/** Fixed order for expense slices: purple, green, amber, blue, red, then extras. */
-export const SLICE_COLORS = ['#7C5CE6', '#3DBA7E', '#F0A500', '#4F8EF0', '#E5484D', '#64748B', '#9D7BE0']
+/** Dashboard series order: purple, blue, green, orange, navy, yellow, teal. */
+export const SERIES_COLORS = ['#7C5CE6', '#2F5BE0', '#2FBF71', '#F5821F', '#1E2A6B', '#F5C518', '#25B8C4']
+
+/** Fixed order for slices/legends; repeats the series palette, then extras. */
+export const SLICE_COLORS = [...SERIES_COLORS, '#E5484D', '#9D7BE0']
 
 /** Receivable aging ramp — current (healthy) through older (worst). */
-export const AGING_COLORS = ['#3DBA7E', '#4F8EF0', '#F0A500', '#7C5CE6', '#E5484D', '#7F1D1D']
+export const AGING_COLORS = ['#2FBF71', '#2F5BE0', '#F5821F', '#7C5CE6', '#E5484D', '#7F1D1D']
 
 export interface ChartTheme {
   grid: string
