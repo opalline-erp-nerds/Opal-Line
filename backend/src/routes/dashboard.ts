@@ -825,17 +825,25 @@ dashboardRouter.get('/dashboard/recent-invoices', async (req, res) => {
     ])
 
     const values = new Map(seriesRows.map((r) => [String(r.bucket ?? ''), num(r.value)]))
+    const invoiceRows = rows.map((r) => ({
+      id: r.id,
+      number: r.number,
+      customer: r.customer ?? 'Walk-in customer',
+      total: round2(num(r.total)),
+      paymentStatus: r.paymentStatus ?? 'pending',
+      status: r.status ?? 'issued',
+      date: r.date,
+    }))
     res.json({
       points: seriesPoints(range, values),
-      rows: rows.map((r) => ({
-        id: r.id,
-        number: r.number,
-        customer: r.customer ?? 'Walk-in customer',
-        total: round2(num(r.total)),
-        paymentStatus: r.paymentStatus ?? 'pending',
-        status: r.status ?? 'issued',
-        date: r.date,
+      // One bar per latest invoice so the chart can colour by payment state.
+      statusPoints: invoiceRows.map((r) => ({
+        date: r.date ?? '',
+        label: r.number ?? '',
+        value: r.total,
+        status: r.paymentStatus,
       })),
+      rows: invoiceRows,
     })
   } catch {
     res.status(500).json({ error: 'Internal server error' })

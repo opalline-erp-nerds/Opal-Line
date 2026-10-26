@@ -33,8 +33,9 @@ export function OrderSummaryBarChart({ data }: { data: OrderSummaryPoint[] }) {
             tickLine={false}
             axisLine={false}
             width={44}
+            allowDecimals={false}
             tick={{ fontSize: 10, fill: theme.axis }}
-            tickFormatter={(value) => compactCurrency(Number(value))}
+            tickFormatter={(value) => formatNumber(Number(value))}
           />
           <Tooltip
             cursor={{ fill: 'rgba(124, 92, 230, 0.06)' }}
@@ -65,15 +66,31 @@ export function OrderSummaryBarChart({ data }: { data: OrderSummaryPoint[] }) {
 export function WidgetBarChart({
   data,
   color = SERIES_COLORS[0],
+  getBarColor,
   height = 84,
   tooltipLabel = 'Value',
+  emptyMessage = 'No activity in this period',
 }: {
   data: DashboardSeriesPoint[]
   color?: string
+  getBarColor?: (point: DashboardSeriesPoint) => string
   height?: number
   tooltipLabel?: string
+  emptyMessage?: string
 }) {
   const theme = useChartTheme()
+  const hasData = data.some((d) => Number(d.value) > 0)
+  if (!hasData) {
+    return (
+      <div
+        style={{ height }}
+        className="relative flex w-full items-center justify-center rounded-md bg-muted/20"
+      >
+        <span className="absolute inset-x-0 bottom-2 h-px bg-border" />
+        <p className="relative text-[11px] text-muted-foreground">{emptyMessage}</p>
+      </div>
+    )
+  }
   return (
     <div style={{ height }} className="w-full">
       <ResponsiveContainer width="100%" height="100%">
@@ -86,15 +103,20 @@ export function WidgetBarChart({
             content={({ active, payload }) => {
               if (!active || !payload?.length) return null
               const point = payload[0].payload as DashboardSeriesPoint
+              const rowColor = getBarColor?.(point) ?? color
               return (
                 <ChartTooltipBox
                   title={point.label}
-                  rows={[{ label: tooltipLabel, value: compactCurrency(point.value), color }]}
+                  rows={[{ label: tooltipLabel, value: compactCurrency(point.value), color: rowColor }]}
                 />
               )
             }}
           />
-          <Bar dataKey="value" fill={color} radius={[3, 3, 0, 0]} maxBarSize={16} />
+          <Bar dataKey="value" fill={color} radius={[3, 3, 0, 0]} maxBarSize={16}>
+            {getBarColor
+              ? data.map((point, i) => <Cell key={`${point.label}-${i}`} fill={getBarColor(point)} />)
+              : null}
+          </Bar>
         </BarChart>
       </ResponsiveContainer>
     </div>

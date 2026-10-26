@@ -196,6 +196,7 @@ export interface DashboardSeriesPoint {
   date: string
   label: string
   value: number
+  status?: string
 }
 
 /** Status split for the purchase/sales order donuts. */
@@ -280,6 +281,7 @@ export interface RecentInvoiceRow {
 
 export interface RecentInvoicesWidget {
   points: DashboardSeriesPoint[]
+  statusPoints: DashboardSeriesPoint[]
   rows: RecentInvoiceRow[]
 }
 

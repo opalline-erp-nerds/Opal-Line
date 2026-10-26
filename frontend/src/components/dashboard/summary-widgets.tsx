@@ -28,35 +28,18 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { OrderSummaryBarChart, StatusDonutChart, WidgetBarChart } from '@/components/charts/dashboard-widget-charts'
 import { SERIES_COLORS } from '@/components/charts/chart-theme'
+import { StatusPill } from '@/components/ui/status-pill'
+import { humanizeStatus, statusTone } from '@/lib/status'
 import { compactCurrency, formatDate, formatNumber } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-type Tone = 'success' | 'warning' | 'danger' | 'info' | 'neutral'
-
-const SUCCESS = new Set(['paid', 'settled', 'received', 'fulfilled', 'completed', 'closed', 'delivered', 'active'])
-const WARNING = new Set(['pending', 'partial', 'partially_paid', 'open', 'processing', 'cod', 'bank', 'unallocated', 'unfulfilled'])
-const DANGER = new Set(['failed', 'cancelled', 'voided', 'overdue', 'rejected'])
-const INFO = new Set(['imported', 'confirmed', 'draft', 'issued', 'sent'])
-
-function statusTone(status: string): Tone {
-  const key = status.toLowerCase()
-  if (SUCCESS.has(key)) return 'success'
-  if (WARNING.has(key)) return 'warning'
-  if (DANGER.has(key)) return 'danger'
-  if (INFO.has(key)) return 'info'
-  return 'neutral'
-}
-
-function humanize(status: string): string {
-  if (!status) return '—'
-  return status
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase())
-}
-
-function StatusChip({ status }: { status: string }) {
-  return <span className={cn('status-chip', `status-chip-${statusTone(status)}`)}>{humanize(status)}</span>
-}
+const STATUS_BAR_COLORS = {
+  success: SERIES_COLORS[2],
+  warning: SERIES_COLORS[3],
+  danger: '#E5484D',
+  info: SERIES_COLORS[1],
+  neutral: '#94A3B8',
+} as const
 
 function WidgetAction({ label, onClick }: { label: string; onClick: () => void }) {
   return (
@@ -264,7 +247,12 @@ export function SupplierPaymentsCard({ range }: { range: RangeQuery }) {
         ) : error ? (
           <ErrorRow message={error} />
         ) : (
-          <WidgetBarChart data={data?.points ?? []} color={SERIES_COLORS[0]} tooltipLabel="Paid" />
+          <WidgetBarChart
+            data={data?.points ?? []}
+            color={SERIES_COLORS[1]}
+            tooltipLabel="Paid"
+            emptyMessage="No supplier payments in this period"
+          />
         )}
 
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
@@ -315,10 +303,10 @@ export function SupplierPaymentsCard({ range }: { range: RangeQuery }) {
                     <TableCell className="font-medium text-foreground">{row.ref}</TableCell>
                     <TableCell className="max-w-[150px] truncate text-muted-foreground">{row.supplier}</TableCell>
                     <TableCell>
-                      <StatusChip status={row.purchaseStatus} />
+                      <StatusPill status={row.purchaseStatus} />
                     </TableCell>
                     <TableCell>
-                      <StatusChip status={row.paymentStatus} />
+                      <StatusPill status={row.paymentStatus} />
                     </TableCell>
                     <TableCell className="text-right font-semibold tabular-nums text-foreground">
                       {compactCurrency(row.total)}
@@ -365,7 +353,7 @@ export function PurchaseOrdersCard({ range }: { range: RangeQuery }) {
   const totalOrders = data?.segments.reduce((sum, s) => sum + s.count, 0) ?? 0
   const slices =
     data?.segments.map((segment, index) => ({
-      name: humanize(segment.status),
+      name: humanizeStatus(segment.status),
       value: segment.count,
       color: SERIES_COLORS[index % SERIES_COLORS.length],
     })) ?? []
@@ -415,7 +403,7 @@ export function PurchaseOrdersCard({ range }: { range: RangeQuery }) {
                       {row.supplier} · {row.expectedDate ? formatDate(row.expectedDate) : 'No ETA'}
                     </p>
                   </div>
-                  <StatusChip status={row.status} />
+                  <StatusPill status={row.status} />
                   <span className="w-16 text-right text-[11px] font-semibold tabular-nums text-foreground">
                     {compactCurrency(row.total)}
                   </span>
@@ -488,7 +476,12 @@ export function CustomerPaymentsCard({ range }: { range: RangeQuery }) {
         ) : error ? (
           <ErrorRow message={error} />
         ) : (
-          <WidgetBarChart data={data?.points ?? []} color={SERIES_COLORS[2]} tooltipLabel="Collected" />
+          <WidgetBarChart
+            data={data?.points ?? []}
+            color={SERIES_COLORS[2]}
+            tooltipLabel="Collected"
+            emptyMessage="No collections in this period"
+          />
         )}
 
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
@@ -539,10 +532,10 @@ export function CustomerPaymentsCard({ range }: { range: RangeQuery }) {
                     <TableCell className="font-medium text-foreground">{row.ref}</TableCell>
                     <TableCell className="max-w-[150px] truncate text-muted-foreground">{row.customer}</TableCell>
                     <TableCell>
-                      <StatusChip status={row.fulfillment} />
+                      <StatusPill status={row.fulfillment} />
                     </TableCell>
                     <TableCell>
-                      <StatusChip status={row.paymentStatus} />
+                      <StatusPill status={row.paymentStatus} />
                     </TableCell>
                     <TableCell className="text-right font-semibold tabular-nums text-foreground">
                       {compactCurrency(row.total)}
@@ -589,7 +582,7 @@ export function SalesOrdersCard({ range }: { range: RangeQuery }) {
   const totalOrders = data?.segments.reduce((sum, s) => sum + s.count, 0) ?? 0
   const slices =
     data?.segments.map((segment, index) => ({
-      name: humanize(segment.status),
+      name: humanizeStatus(segment.status),
       value: segment.count,
       color: SERIES_COLORS[index % SERIES_COLORS.length],
     })) ?? []
@@ -639,7 +632,7 @@ export function SalesOrdersCard({ range }: { range: RangeQuery }) {
                       {row.customer} · {formatDate(row.date)}
                     </p>
                   </div>
-                  <StatusChip status={row.status} />
+                  <StatusPill status={row.status} />
                   <span className="w-16 text-right text-[11px] font-semibold tabular-nums text-foreground">
                     {compactCurrency(row.total)}
                   </span>
@@ -701,7 +694,13 @@ export function RecentInvoicesCard({ range }: { range: RangeQuery }) {
           <EmptyRow message="No invoices in this period" />
         ) : (
           <>
-            <WidgetBarChart data={data?.points ?? []} color={SERIES_COLORS[4]} height={62} tooltipLabel="Invoiced" />
+            <WidgetBarChart
+              data={data?.statusPoints ?? []}
+              getBarColor={(point) => STATUS_BAR_COLORS[statusTone(point.status ?? '')]}
+              height={62}
+              tooltipLabel="Invoiced"
+              emptyMessage="No invoices in this period"
+            />
             <div className="mt-2 divide-y">
               {data?.rows.map((row) => (
                 <button
@@ -715,7 +714,7 @@ export function RecentInvoicesCard({ range }: { range: RangeQuery }) {
                       {row.customer} · {formatDate(row.date)}
                     </p>
                   </div>
-                  <StatusChip status={row.paymentStatus} />
+                  <StatusPill status={row.paymentStatus} />
                   <span className="w-16 text-right text-[11px] font-semibold tabular-nums text-foreground">
                     {compactCurrency(row.total)}
                   </span>

@@ -31,6 +31,7 @@ import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { StatusPill } from '@/components/ui/status-pill'
 import { StatCard } from '@/components/ui/stat-card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -650,8 +651,18 @@ export default function DashboardPage() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {lowStock.slice(0, 5).map((l) => (
-                      <TableRow key={l.id} className="border-b-0">
+                    {lowStock.slice(0, 5).map((l) => {
+                      const critical = l.stock === 0 || l.status === 'critical'
+                      return (
+                      <TableRow
+                        key={l.id}
+                        className={cn(
+                          'border-b-0',
+                          critical
+                            ? 'bg-red-50/60 hover:bg-red-50 dark:bg-red-500/10 dark:hover:bg-red-500/15'
+                            : 'bg-amber-50/40 hover:bg-amber-50 dark:bg-amber-500/10 dark:hover:bg-amber-500/15',
+                        )}
+                      >
                         <TableCell>
                           <div className="flex items-center gap-2.5">
                             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-warning-50 text-warning-700">
@@ -666,12 +677,11 @@ export default function DashboardPage() {
                         <TableCell className="text-right font-semibold tabular-nums text-red-600 dark:text-red-400">{formatPieces(l.stock)}</TableCell>
                         <TableCell className="text-right tabular-nums text-muted-foreground">{formatPieces(l.reorderLevel)}</TableCell>
                         <TableCell className="text-center">
-                          <Badge variant={l.stock === 0 || l.status === 'critical' ? 'danger' : 'warning'} dot>
-                            {l.stock === 0 ? 'Out of Stock' : l.status === 'critical' ? 'Critical' : 'Low'}
-                          </Badge>
+                          <StatusPill status={l.stock === 0 ? 'Out of Stock' : l.status === 'critical' ? 'Critical' : 'Low'} />
                         </TableCell>
                       </TableRow>
-                    ))}
+                      )
+                    })}
                   </TableBody>
                 </Table>
                 ) : (
@@ -974,8 +984,8 @@ function ConnectionBanner({
   const syncedAt = lastSyncAt ?? fallbackSync
   return (
     <Card className="flex flex-wrap items-center gap-x-6 gap-y-2 border-primary-100 bg-gradient-to-r from-primary-50/70 via-card to-card px-4 py-3">
-      <StatusPill healthy={Boolean(shopifyStatus?.configured)} label="Shopify" sublabel={shopifyStatus?.configured ? 'Connected' : 'Not configured'} />
-      <StatusPill healthy label="System" sublabel="Healthy" />
+      <ConnectionPill healthy={Boolean(shopifyStatus?.configured)} label="Shopify" sublabel={shopifyStatus?.configured ? 'Connected' : 'Not configured'} />
+        <ConnectionPill healthy label="System" sublabel="Healthy" />
       <div className="ml-auto hidden items-center gap-1.5 text-xs text-muted-foreground md:flex">
         <CloudCog className="h-3.5 w-3.5 text-info-700" />
         Last sync: {syncedAt ? formatDateTime(syncedAt) : 'Never'}
@@ -984,7 +994,7 @@ function ConnectionBanner({
   )
 }
 
-function StatusPill({ healthy, label, sublabel }: { healthy: boolean; label: string; sublabel: string }) {
+function ConnectionPill({ healthy, label, sublabel }: { healthy: boolean; label: string; sublabel: string }) {
   return (
     <div className="flex items-center gap-2">
       <span className="relative flex h-2 w-2">
