@@ -347,7 +347,13 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
         <DashboardSkeleton />
       ) : (
         <>
-{kpisError ? (
+          <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
+            {analytics.map((s) => (
+              <AnalyticsCard key={s.label} stat={s} />
+            ))}
+          </div>
+
+          {kpisError ? (
               <Card>
                 <CardContent>
                   <EmptyState
@@ -397,14 +403,13 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
 
           {summary ? <OperationalStrip summary={summary} /> : null}
 
-          {/* Self-fetching: independent of the page-wide range above. */}
-          <FinancialAnalytics />
-
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-            <Card className="xl:col-span-1">
+            <Card className="xl:col-span-2">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
-                  <CardTitle className="text-sm">Sales Overview</CardTitle>
+                  <CardTitle className="flex items-center gap-2 text-sm">
+                    <TrendingUp className="h-4 w-4 text-primary-700" /> Sales Overview
+                  </CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">{resolveClientRange(period, customRange).rangeText}</p>
                 </div>
               </CardHeader>
@@ -435,82 +440,9 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
-                  <CardTitle className="text-sm">Top Selling Products</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
-                </div>
-                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
-                  View All <ArrowRight className="h-3.5 w-3.5" />
-                </Button>
-              </CardHeader>
-              <CardContent className="p-0">
-                {topProductsError ? (
-              <Card>
-                <CardContent>
-                  <EmptyState
-                    icon={ShieldAlert}
-                    title="Couldn't load top products"
-                    description="There was an error fetching top selling products. Please try again."
-                    action={
-                      <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
-                        Retry
-                      </Button>
-                    }
-                  />
-                </CardContent>
-              </Card>
-            ) : (topProducts.length > 0 ? (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Product</TableHead>
-                      <TableHead className="text-right">Qty</TableHead>
-                      <TableHead className="text-right">Weight</TableHead>
-                      <TableHead className="text-right">Revenue</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {topProducts.map((p) => {
-                      const Icon = productIcons[p.icon] ?? Package
-                      return (
-                        <TableRow key={p.id} className="border-b-0">
-                          <TableCell>
-                            <div className="flex items-center gap-2.5">
-                              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                                <Icon className="h-4 w-4" />
-                              </div>
-                              <div>
-                                <p className="font-medium text-foreground">{p.name}</p>
-                                <p className="text-[11px] text-muted-foreground">{p.sku}</p>
-                              </div>
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-right font-medium tabular-nums">{formatNumber(p.qty)}</TableCell>
-                          <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(p.weight)}</TableCell>
-                          <TableCell className="text-right font-semibold tabular-nums text-foreground">{compactCurrency(p.revenue)}</TableCell>
-                        </TableRow>
-                      )
-                    })}
-                  </TableBody>
-                </Table>
-                ) : (
-                  <EmptyState
-                    icon={ShoppingBag}
-                    title="No sales recorded yet"
-                    description="Your best sellers will appear here once the first invoice is raised."
-                    action={
-                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/sales/invoices')}>
-                        Create Invoice
-                      </Button>
-                    }
-                  />
-                ))}
-              </CardContent>
-            </Card>
-
-            <Card className="xl:col-span-1">
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="text-sm">Payment Status</CardTitle>
+                  <CardTitle className="flex items-center gap-2 text-sm">
+                    <IndianRupee className="h-4 w-4 text-primary-700" /> Payment Status
+                  </CardTitle>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">Invoices grouped by payment state</p>
                 </div>
                 <Badge variant="muted" className="text-[10px]">{formatCurrency(paymentStatus?.total ?? 0, { compact: true })}</Badge>
@@ -569,7 +501,85 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
             </Card>
           </div>
 
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+          {/* Self-fetching: independent of the page-wide range above. */}
+          <FinancialAnalytics />
+
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            <Card className="xl:col-span-1">
+              <CardHeader className="flex-row items-center justify-between space-y-0">
+                <div>
+                  <CardTitle className="text-sm">Top Selling Products</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
+                </div>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
+                  View All <ArrowRight className="h-3.5 w-3.5" />
+                </Button>
+              </CardHeader>
+              <CardContent className="p-0">
+                {topProductsError ? (
+                  <Card>
+                    <CardContent>
+                      <EmptyState
+                        icon={ShieldAlert}
+                        title="Couldn't load top products"
+                        description="There was an error fetching top selling products. Please try again."
+                        action={
+                          <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
+                            Retry
+                          </Button>
+                        }
+                      />
+                    </CardContent>
+                  </Card>
+                ) : topProducts.length > 0 ? (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Product</TableHead>
+                        <TableHead className="text-right">Qty</TableHead>
+                        <TableHead className="text-right">Weight</TableHead>
+                        <TableHead className="text-right">Revenue</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {topProducts.map((p) => {
+                        const Icon = productIcons[p.icon] ?? Package
+                        return (
+                          <TableRow key={p.id} className="border-b-0">
+                            <TableCell>
+                              <div className="flex items-center gap-2.5">
+                                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                                  <Icon className="h-4 w-4" />
+                                </div>
+                                <div>
+                                  <p className="font-medium text-foreground">{p.name}</p>
+                                  <p className="text-[11px] text-muted-foreground">{p.sku}</p>
+                                </div>
+                              </div>
+                            </TableCell>
+                            <TableCell className="text-right font-medium tabular-nums">{formatNumber(p.qty)}</TableCell>
+                            <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(p.weight)}</TableCell>
+                            <TableCell className="text-right font-semibold tabular-nums text-foreground">{compactCurrency(p.revenue)}</TableCell>
+                          </TableRow>
+                        )
+                      })}
+                    </TableBody>
+                  </Table>
+                ) : (
+                  <EmptyState
+                    icon={ShoppingBag}
+                    title="No sales recorded yet"
+                    description="Your best sellers will appear here once the first invoice is raised."
+                    action={
+                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/sales/invoices')}>
+                        Create Invoice
+                      </Button>
+                    }
+                  />
+                )}
+              </CardContent>
+            </Card>
+
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
@@ -625,9 +635,11 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                 ))}
               </CardContent>
             </Card>
+          </div>
 
-            <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
+          <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
 
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
@@ -837,26 +849,32 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
             ) : null}
+          </div>
 
-            <Card className="xl:col-span-1">
-              <CardHeader>
+          <Card>
+            <CardHeader className="flex-row items-center justify-between space-y-0">
+              <div>
                 <CardTitle className="text-sm">Recent Activities</CardTitle>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoice, payment and sync events</p>
-              </CardHeader>
-              <CardContent className="p-0">
-                <div className="relative h-[400px] overflow-y-auto px-5 pb-5">
-                  {activities.length === 0 ? (
-                    <EmptyState
-                      icon={Repeat}
-                      title="No activity yet"
-                      description="Invoice, payment and sync events will show up here as you work."
-                    />
-                  ) : (
-                  activities.map((a, i) => {
+              </div>
+              <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/system/activity')}>
+                View All <ArrowRight className="h-3.5 w-3.5" />
+              </Button>
+            </CardHeader>
+            <CardContent className="p-0">
+              <div className="relative px-5 pb-5">
+                {activities.length === 0 ? (
+                  <EmptyState
+                    icon={Repeat}
+                    title="No activity yet"
+                    description="Invoice, payment and sync events will show up here as you work."
+                  />
+                ) : (
+                  activities.slice(0, 8).map((a, i) => {
                     const cfg = activityIcons[a.type]
                     return (
                       <div key={a.id} className="relative flex gap-3 pb-4 last:pb-0">
-                        {i < activities.length - 1 ? (
+                        {i < Math.min(activities.length, 8) - 1 ? (
                           <span className="absolute left-[15px] top-8 h-[calc(100%-28px)] w-px bg-border" />
                         ) : null}
                         <div className={cn('z-10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full', cfg.className)}>
@@ -874,17 +892,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                       </div>
                     )
                   })
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
-            {analytics.map((s) => (
-              <AnalyticsCard key={s.label} stat={s} />
-            ))}
-          </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
         </>
       )}
     </div>
