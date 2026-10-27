@@ -1150,34 +1150,66 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
           await database.update(schema.products).set({ options: null }).where(eq(schema.products.id, productId))
           return
         }
-        const seenSku = new Set<string>()
-        await database.insert(schema.productVariants).values(
-          liveVariants.map((v) => {
-            const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
-            let sku = String(v.sku ?? '').trim() || `SHOP-V${v.id}`
-            // The variant sku index is unique — a store with duplicate SKUs
-            // must not abort the whole pull, so clashes get a numeric tail.
-            while (seenSku.has(sku.toLowerCase())) sku = `${sku}-2`
-            seenSku.add(sku.toLowerCase())
-            return {
-              id: randomUUID(),
-              productId,
-              title,
-              optionValues: [v.option1, v.option2, v.option3]
-                .filter((x): x is string => Boolean(x) && String(x).trim() !== ''),
-              sku,
-              barcode: v.barcode ?? null,
-              sellingPrice: Number(v.price) || null,
-              compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
-              costPrice: null,
-              grossWeight: null,
-              stock: Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0)),
-              reorderLevel: null,
-              status: 'active',
-              createdAt: new Date().toISOString(),
+        // Build a global set of existing variant SKUs (across all products) to avoid
+        // cross-product collisions against the unique index.
+        const existingVariantSkus = await database.select({ sku: schema.productVariants.sku }).from(schema.productVariants)
+        const seenSku = new Set<string>(existingVariantSkus.map((r) => String(r.sku ?? '').trim().toLowerCase()).filter(Boolean))
+        // Also avoid colliding with product SKUs
+        const existingProductSkus = await database.select({ sku: schema.products.sku }).from(schema.products)
+        for (const r of existingProductSkus) {
+          const k = String(r.sku ?? '').trim().toLowerCase()
+          if (k) seenSku.add(k)
+        }
+        // Track barcodes to avoid unique barcode collisions
+        const existingVariantBarcodes = await database.select({ barcode: schema.productVariants.barcode }).from(schema.productVariants)
+        const seenBarcode = new Set<string>(existingVariantBarcodes.map((r) => String(r.barcode ?? '').trim().toLowerCase()).filter(Boolean))
+        const existingProductBarcodes = await database.select({ barcode: schema.products.barcode }).from(schema.products)
+        for (const r of existingProductBarcodes) {
+          const k = String(r.barcode ?? '').trim().toLowerCase()
+          if (k) seenBarcode.add(k)
+        }
+        const values = liveVariants.map((v) => {
+          const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
+          let sku = String(v.sku ?? '').trim() || `SHOP-V${v.id}`
+          if (!sku) sku = `SHOP-V${randomUUID().slice(0, 8)}`
+          let baseSku = sku
+          let n = 2
+          while (seenSku.has(sku.toLowerCase())) {
+            sku = `${baseSku}-${n++}`
+          }
+          seenSku.add(sku.toLowerCase())
+          let barcode = v.barcode != null && String(v.barcode).trim() !== '' ? String(v.barcode).trim() : null
+          if (barcode) {
+            const bKey = barcode.toLowerCase()
+            if (seenBarcode.has(bKey)) {
+              // Make barcode unique if it collides
+              let baseB = barcode
+              let bn = 2
+              while (seenBarcode.has(barcode.toLowerCase())) {
+                barcode = `${baseB}-${bn++}`
+              }
             }
-          }),
-        )
+            seenBarcode.add(barcode.toLowerCase())
+          }
+          return {
+            id: randomUUID(),
+            productId,
+            title,
+            optionValues: [v.option1, v.option2, v.option3]
+              .filter((x): x is string => Boolean(x) && String(x).trim() !== ''),
+            sku,
+            barcode,
+            sellingPrice: Number(v.price) || null,
+            compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
+            costPrice: null,
+            grossWeight: null,
+            stock: Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0)),
+            reorderLevel: null,
+            status: 'active',
+            createdAt: new Date().toISOString(),
+          }
+        })
+        await database.insert(schema.productVariants).values(values)
         await database.update(schema.products).set({ options: options ?? null }).where(eq(schema.products.id, productId))
       },
     })
