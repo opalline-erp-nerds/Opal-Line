@@ -660,6 +660,14 @@ export interface Product {
   supplierId?: string | null
   silverRate: number
   sellingPrice: number
+  /**
+   * Piece Rate Product: sellingPrice is a fixed price per piece rather than a
+   * silver-rate calculation. Silver-rate changes and Shopify syncs never
+   * recompute or overwrite it.
+   */
+  pieceRateProduct?: boolean | null
+  /** Fixed piece rate (₹/pc) used when pieceRateProduct is set. */
+  fixedPieceRate?: number | null
   /** Weighted-average unit cost, maintained from purchase invoices. */
   costPrice?: number | null
   compareAtPrice?: number | null

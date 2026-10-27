@@ -42,6 +42,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { useSilverRate } from '@/lib/silver-rate-context'
+<<<<<<< HEAD
 import {
   RateUpdateDetailDialog,
   SilverRatePipeline,
@@ -50,6 +51,9 @@ import {
   ViewUpdateButton,
 } from '@/components/dashboard/silver-rate-pipeline'
 import { pipelineSucceeded, plannedSteps, stepsFromPhase, stepsFromResult, stepsFromStepLog } from '@/lib/silverRatePipeline'
+=======
+import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
+>>>>>>> origin/master
 import type { PendingRateChange, Product, SilverRate, SilverRateAutoStatus, SilverRateProgress, SilverRateRequestRow, SilverRateRow } from '@/types'
 import { formatCurrency, formatDateTime, formatWeight, istDateKey } from '@/lib/format'
 import { cn } from '@/lib/utils'
@@ -161,7 +165,9 @@ export default function SilverRatePage() {
   const rateValid = !isNaN(rateValue) && rateValue > 0
 
   const affected = useMemo(() => {
-    return products.map((p) => {
+    // Piece Rate Products keep their fixed price — the backend never reprices
+    // them, so they are excluded from this preview as well.
+    return products.filter((p) => !p.pieceRateProduct).map((p) => {
       const silverValue = p.netWeight * currentRate.rate
       const makingTotal = p.netWeight * p.makingCharge
       const subtotal = silverValue + makingTotal
@@ -272,7 +278,8 @@ export default function SilverRatePage() {
   /** Old → new prices for every product at the dialog's rate (review step). */
   const scheduleImpact = useMemo(() => {
     if (!scheduleRateValid || !scheduleInstant) return null
-    return products.map((p) => {
+    // Piece-rate products are never repriced, so they carry no schedule impact.
+    return products.filter((p) => !p.pieceRateProduct).map((p) => {
       const makingTotal = p.netWeight * p.makingCharge
       const gstPct = p.gst ?? 3
       const oldPrice = (p.netWeight * currentRate.rate + makingTotal) * (1 + gstPct / 100)
@@ -1496,7 +1503,71 @@ export default function SilverRatePage() {
                   pushed to Shopify automatically at that moment.
                 </p>
               </div>
+<<<<<<< HEAD
             ) : null}
+=======
+            )}
+        </AppDialog>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        <Card className="overflow-hidden border-primary-100 bg-gradient-to-br from-primary-700 to-primary-900 text-white lg:col-span-1">
+          <CardContent className="p-5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-primary-200">
+                <Tag className="h-4 w-4" />
+                <p className="text-xs font-semibold uppercase tracking-wide">Current Silver Rate</p>
+              </div>
+              <Badge variant="success" className="bg-success-500/20 text-success-100 border-success-500/30">
+                92.5 Sterling Silver
+              </Badge>
+            </div>
+            <p className="mt-3 text-4xl font-bold tabular-nums tracking-tight">₹{currentRate.rate.toFixed(2)}</p>
+            <p className="text-sm font-medium text-primary-200">per gram</p>
+            <div className="mt-4 flex items-center gap-2 rounded-md bg-white/10 px-3 py-2 text-xs">
+              <Clock className="h-3.5 w-3.5" />
+              <span className="text-primary-200">Last updated:</span>
+              <span className="font-medium text-white">{formatDateTime(currentRate.updatedAt)}</span>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="lg:col-span-1">
+          <CardContent className="p-5">
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Today's Change</p>
+            <div className="mt-2 flex items-end gap-3">
+              <p className="text-3xl font-bold tabular-nums text-foreground">
+                +₹{currentRate.change.toFixed(2)}
+              </p>
+              <Badge variant="success" className="mb-1">+{currentRate.changePercent.toFixed(2)}%</Badge>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">vs previous rate ₹{currentRate.previousRate.toFixed(2)} / gm</p>
+            <div className="mt-4 rounded-md bg-success-50 px-3 py-2 text-xs font-medium text-success-700">
+              Last update synced approved prices to {products.length} Shopify products
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="lg:col-span-1">
+          <CardContent className="p-5">
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Price Change Impact</p>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <ImpactTile label="Products Affected" value={`${products.length}`} icon={Gem} tint="text-primary-700 bg-primary-50" />
+              <ImpactTile label="Total Value Shift" value={rateValid ? formatCurrency(totalDelta) : '—'} icon={IndianRupee} tint="text-warning-700 bg-warning-50" />
+              <ImpactTile label="Avg. Price Change" value={rateValid ? formatCurrency(totalDelta / products.length) : '—'} icon={TrendingUp} tint="text-success-700 bg-success-50" />
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <SilverRateHistoryCard onSetRate={openUpdate} />
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <History className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm">Rate History & Approvals</CardTitle>
+>>>>>>> origin/master
           </div>
         ) : (
           <div className="flex flex-col items-center gap-3 py-6 text-center">
