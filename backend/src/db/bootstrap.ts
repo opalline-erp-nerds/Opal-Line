@@ -121,6 +121,48 @@ const STOCK_LEDGER_DDL: string[] = [
     status text,
     created_at timestamp
   )`,
+  // Existing installs can have an older colour-only product_variants table
+  // (colour_name/colour_hex/price/shopify_variant_id/…). CREATE TABLE IF NOT
+  // EXISTS leaves that shape untouched, so the Shopify sync then fails when it
+  // writes title/option_values/selling_price. Add the current columns in place.
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS title text`,
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS option_values jsonb`,
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS selling_price numeric`,
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS compare_at_price numeric`,
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS cost_price numeric`,
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS gross_weight numeric`,
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS reorder_level integer`,
+  // Carry the legacy colour/price data forward. The column checks keep this
+  // safe on fresh installs, where those columns do not exist.
+  `DO $$ BEGIN
+     IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'product_variants'
+                  AND column_name = 'colour_name') THEN
+       UPDATE product_variants
+          SET title = COALESCE(NULLIF(colour_name, ''), 'Default Title')
+        WHERE title IS NULL;
+       UPDATE product_variants
+          SET option_values = CASE
+                WHEN NULLIF(colour_name, '') IS NULL THEN '["Default Title"]'::jsonb
+                ELSE to_jsonb(ARRAY[colour_name])
+              END
+        WHERE option_values IS NULL;
+     ELSE
+       UPDATE product_variants
+          SET title = 'Default Title'
+        WHERE title IS NULL;
+       UPDATE product_variants
+          SET option_values = '["Default Title"]'::jsonb
+        WHERE option_values IS NULL;
+     END IF;
+     IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'product_variants'
+                  AND column_name = 'price') THEN
+       UPDATE product_variants
+          SET selling_price = price
+        WHERE selling_price IS NULL AND price IS NOT NULL;
+     END IF;
+   END $$`,
   `CREATE UNIQUE INDEX IF NOT EXISTS product_variants_sku_idx ON product_variants (sku)`,
   `CREATE INDEX IF NOT EXISTS product_variants_product_id_idx ON product_variants (product_id)`,
 ]
@@ -1595,6 +1637,9 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS source text`,
       `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS sync_status text`,
       `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS approved_by text`,
+      // Per-step record of each rate update (timestamps, counts, error text)
+      // behind the pipeline tracker + history View dialog.
+      `ALTER TABLE silver_rates ADD COLUMN IF NOT EXISTS step_log jsonb`,
       `CREATE TABLE IF NOT EXISTS silver_rate_requests (
         id text PRIMARY KEY,
         rate numeric,

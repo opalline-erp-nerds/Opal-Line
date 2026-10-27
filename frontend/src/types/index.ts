@@ -429,6 +429,27 @@ export interface SilverRatePoint {
   rate: number
 }
 
+/** One step of a silver-rate update, as persisted by the backend (step_log). */
+export interface SilverRateStepRecord {
+  key: 'sync' | 'rate' | 'reprice' | 'match' | 'push'
+  label: string
+  status: 'done' | 'failed' | 'skipped'
+  startedAt: string
+  finishedAt: string
+  detail?: string
+  /** Failure text for a failed step ("Shopify sync failed: …"). */
+  error?: string
+}
+
+/** Full record of one rate update (silver_rates.step_log). */
+export interface SilverRateStepLog {
+  startedAt: string
+  finishedAt: string
+  ok: boolean
+  counts: { repriced: number; matched: number; pushed: number; skipped: number }
+  steps: SilverRateStepRecord[]
+}
+
 /** A row of the silver rate history table (audit-enriched). */
 export interface SilverRateRow {
   id: string
@@ -443,6 +464,8 @@ export interface SilverRateRow {
   /** synced | skipped | failed (null on legacy rows) */
   syncStatus: string | null
   approvedBy: string | null
+  /** Per-step record of this update; null on rows from before step tracking. */
+  stepLog?: SilverRateStepLog | null
 }
 
 /** Staff silver-rate change request awaiting admin approval. */

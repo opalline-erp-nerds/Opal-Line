@@ -3,6 +3,7 @@ import path from 'node:path'
 import { desc, eq, inArray, isNotNull, isNull, like, or, sql } from 'drizzle-orm'
 import { config, isConfigured, normalizeShopDomain } from './config'
 import { db, schema } from './db/client'
+import type { SilverRateStepLog, SilverRateStepRecord } from './db/schema'
 import type { SyncCustomer, SyncLogEntry, SyncOrder, SyncPrice, SyncProduct, SyncResource, SyncStore } from './types'
 import { CONSTANTS } from './constants'
 import { logger } from './logger'
@@ -2753,10 +2754,42 @@ export async function applySilverRate(
   const previous = await getLatestSilverRate()
   const previousRate = previous?.rate ?? 92.8
 
+  // Per-step record of this run, persisted on the rate row (silver_rates.step_log)
+  // so the history log can still show timestamps, counts and error text after
+  // the in-memory result is gone. Only exists once a rate row does — a failure
+  // in the optional catalog sync below leaves no history entry at all, which
+  // matches what the history table has always recorded.
+  const stepLog: SilverRateStepLog = {
+    startedAt: new Date().toISOString(),
+    finishedAt: '',
+    ok: false,
+    counts: { repriced: 0, matched: 0, pushed: 0, skipped: 0 },
+    steps: [],
+  }
+  const recordStep = (
+    step: Omit<SilverRateStepRecord, 'startedAt' | 'finishedAt'> & { startedAt?: string },
+  ): void => {
+    stepLog.steps.push({
+      startedAt: step.startedAt ?? new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      ...step,
+    })
+  }
+  // History annotation is best-effort: a failed write must never mask the
+  // result of the rate change itself.
+  const persistStepLog = async (rateRowId: string): Promise<void> => {
+    if (!db) return
+    try {
+      await db.update(schema.silverRates).set({ stepLog }).where(eq(schema.silverRates.id, rateRowId))
+    } catch { /* best-effort */ }
+  }
+
   if (options?.syncFirst) {
-    const synced = await syncProductsToDb()
-    if (!synced.ok) {
-      setSilverRateProgress({ running: false, phase: 'done', label: 'Product sync failed before repricing', error: synced.errors.join('; ') })
+    const syncStartedAt = new Date().toISOString()
+    // A throw here used to escape applySilverRate, leaving progress running
+    // forever — report it exactly like a sync that returned ok:false.
+    const syncFailed = (message: string): SilverUpdateResult => {
+      setSilverRateProgress({ running: false, phase: 'done', label: 'Product sync failed before repricing', error: message })
       return {
         ok: false,
         rate,
@@ -2765,10 +2798,24 @@ export async function applySilverRate(
         matched: 0,
         updated: 0,
         skipped: 0,
-        errors: [`Product sync failed before silver rate update: ${synced.errors.join('; ')}`],
+        errors: [`Product sync failed before silver rate update: ${message}`],
         message: 'Product sync failed before silver rate update',
       }
     }
+    let synced: ProductsDbSyncResult
+    try {
+      synced = await syncProductsToDb()
+    } catch (err) {
+      return syncFailed(err instanceof Error ? err.message : 'Product sync failed')
+    }
+    if (!synced.ok) return syncFailed(synced.errors.join('; '))
+    recordStep({
+      key: 'sync',
+      label: 'Sync catalog from Shopify',
+      status: 'done',
+      startedAt: syncStartedAt,
+      detail: `${synced.synced} synced (${synced.created} created, ${synced.updated} updated, ${synced.removed} removed)`,
+    })
   }
 
   if (!db) {
@@ -2783,9 +2830,13 @@ export async function applySilverRate(
   const actorName = options?.actorName?.trim() || 'Admin'
   const source = options?.source ?? 'manual'
 
+  // The row id is captured so the step log and sync status land on THIS run's
+  // row — the old code re-queried "the latest row", which races a second apply.
+  const rateRowId = randomUUID()
+  const rateStartedAt = new Date().toISOString()
   try {
     await db.insert(schema.silverRates).values({
-      id: randomUUID(),
+      id: rateRowId,
       purity: 92.5,
       rate,
       previousRate,
@@ -2803,107 +2854,158 @@ export async function applySilverRate(
     return { ok: false, rate, previousRate, affected: 0, matched: 0, updated: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Failed to save silver rate'] }
   }
 
-  const rows = await db
-    .select({
-      id: schema.products.id,
-      netWeight: schema.products.netWeight,
-      makingCharge: schema.products.makingCharge,
-      sellingPrice: schema.products.sellingPrice,
-      pieceRateProduct: schema.products.pieceRateProduct,
-    })
-    .from(schema.products)
+  // Step 1 of the run: the rate row itself. The pre-reprice price snapshot and
+  // the reprice loop live in the try below (chandru1's step reporting), so
+  // master's separately-hoisted snapshot is deliberately NOT duplicated here —
+  // two snapshot loops would write two history rows per product.
+  const rateDetail = `₹${previousRate.toFixed(2)} → ₹${rate.toFixed(2)}/gm`
+  const steps: NonNullable<SilverUpdateResult['steps']> = [
+    { key: 'rate', label: 'Save new rate', status: 'done', detail: rateDetail },
+  ]
+  recordStep({ key: 'rate', label: 'Save new rate', status: 'done', startedAt: rateStartedAt, detail: rateDetail })
 
-  const snapshotAt = previous?.updatedAt ?? now
-  for (const row of rows) {
-    if (row.sellingPrice == null) continue
-    try {
-      await db.insert(schema.productPriceHistory).values({
-        id: randomUUID(),
-        productId: row.id,
-        sellingPrice: Number(row.sellingPrice),
-        recordedAt: snapshotAt,
-      })
-    } catch { /* history must not block a rate change */ }
-  }
-
+  const repriceStartedAt = new Date().toISOString()
   let recomputed = 0
-  setSilverRateProgress({ phase: 'repricing', label: `Repricing ${rows.length} product(s) from the new rate`, done: 0, total: rows.length })
-  for (const row of rows) {
-    // Piece Rate Products carry a fixed price per piece — a silver-rate change
-    // must never recompute (and thereby overwrite) their selling price.
-    if (row.pieceRateProduct) continue
-    const netWeight = Number(row.netWeight)
-    const makingCharge = Number(row.makingCharge)
-    if (!netWeight || netWeight <= 0) continue
-    const sellingPrice = computeSellingPrice(rate, netWeight, makingCharge)
-    await db.update(schema.products).set({ sellingPrice, silverRate: rate }).where(eq(schema.products.id, row.id))
-    try {
-      await db.insert(schema.productPriceHistory).values({
-        id: randomUUID(),
-        productId: row.id,
-        sellingPrice,
-        recordedAt: now,
-      })
-    } catch { /* history must not block a rate change */ }
-    recomputed++
-    setSilverRateProgress({ done: recomputed })
+  try {
+    const rows = await db
+      .select({ id: schema.products.id, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge, sellingPrice: schema.products.sellingPrice, pieceRateProduct: schema.products.pieceRateProduct })
+      .from(schema.products)
+
+    const snapshotAt = previous?.updatedAt ?? now
+    for (const row of rows) {
+      if (row.sellingPrice == null) continue
+      try {
+        await db.insert(schema.productPriceHistory).values({
+          id: randomUUID(),
+          productId: row.id,
+          sellingPrice: Number(row.sellingPrice),
+          recordedAt: snapshotAt,
+        })
+      } catch { /* history must not block a rate change */ }
+    }
+
+    setSilverRateProgress({ phase: 'repricing', label: `Repricing ${rows.length} product(s) from the new rate`, done: 0, total: rows.length })
+    for (const row of rows) {
+      // Piece Rate Products carry a fixed price per piece — a silver-rate change
+      // must never recompute (and thereby overwrite) their selling price.
+      if (row.pieceRateProduct) continue
+      const netWeight = Number(row.netWeight)
+      const makingCharge = Number(row.makingCharge)
+      if (!netWeight || netWeight <= 0) continue
+      const sellingPrice = computeSellingPrice(rate, netWeight, makingCharge)
+      await db.update(schema.products).set({ sellingPrice, silverRate: rate }).where(eq(schema.products.id, row.id))
+      try {
+        await db.insert(schema.productPriceHistory).values({
+          id: randomUUID(),
+          productId: row.id,
+          sellingPrice,
+          recordedAt: now,
+        })
+      } catch { /* history must not block a rate change */ }
+      recomputed++
+      setSilverRateProgress({ done: recomputed })
+    }
+  } catch (err) {
+    // The rate row exists but the catalogue is only partly repriced: name the
+    // step that failed, stop (never continue to the Shopify steps) and release
+    // the progress flag — it used to stay running forever and spin the UI.
+    const message = err instanceof Error ? err.message : 'Failed to reprice products'
+    const detail = `${recomputed} product(s) updated before the failure`
+    steps.push({ key: 'reprice', label: 'Reprice products', status: 'failed', detail })
+    recordStep({ key: 'reprice', label: 'Reprice products', status: 'failed', startedAt: repriceStartedAt, detail, error: message })
+    stepLog.finishedAt = new Date().toISOString()
+    stepLog.ok = false
+    stepLog.counts.repriced = recomputed
+    await persistStepLog(rateRowId)
+    setSilverRateProgress({ running: false, phase: 'done', label: 'Repricing failed', error: message })
+    return { ok: false, rate, previousRate, affected: recomputed, matched: 0, updated: 0, skipped: 0, errors: [message], steps }
   }
 
-  await recordAudit({
-    timestamp: now,
-    user: actorName,
-    action: `Silver rate updated to ₹${rate.toFixed(2)}/gm`,
-    module: 'Silver',
-    entity: 'silver_rates',
-    changes: `previous=${previousRate}, rate=${rate}, source=${source}`,
-    ip: null,
-  })
+  const repriceDetail = `${recomputed} product(s) recomputed from the new rate`
+  steps.push({ key: 'reprice', label: 'Reprice products', status: 'done', detail: repriceDetail })
+  recordStep({ key: 'reprice', label: 'Reprice products', status: 'done', startedAt: repriceStartedAt, detail: repriceDetail })
+
+  // The audit trail must never block (or look like a hang on) a rate change.
+  try {
+    await recordAudit({
+      timestamp: now,
+      user: actorName,
+      action: `Silver rate updated to ₹${rate.toFixed(2)}/gm`,
+      module: 'Silver',
+      entity: 'silver_rates',
+      changes: `previous=${previousRate}, rate=${rate}, source=${source}`,
+      ip: null,
+    })
+  } catch { /* audit is best-effort */ }
 
   let matched = 0
   let updated = 0
   let skipped = 0
   const errors: string[] = []
-  const steps: NonNullable<SilverUpdateResult['steps']> = [
-    { key: 'rate', label: 'Save new rate', status: 'done', detail: `₹${previousRate.toFixed(2)} → ₹${rate.toFixed(2)}/gm` },
-    { key: 'reprice', label: 'Reprice products', status: 'done', detail: `${recomputed} product(s) recomputed from the new rate` },
-  ]
 
   if (isConfigured()) {
+    const matchStartedAt = new Date().toISOString()
     try {
       setSilverRateProgress({ phase: 'matching', label: 'Matching local products to the Shopify catalog', done: 0, total: 0 })
       await syncPrices()
       const pending = store.price.filter((p) => p.status === 'update')
+      const unmatched = store.price.filter((p) => p.status === 'no-match').length
       matched = store.price.filter((p) => p.status !== 'no-match').length
-      steps.push({ key: 'match', label: 'Match products to Shopify', status: 'done', detail: `${matched} matched, ${store.price.filter((p) => p.status === 'no-match').length} without a Shopify match` })
+      const matchDetail = `${matched} matched, ${unmatched} without a Shopify match`
+      steps.push({ key: 'match', label: 'Match products to Shopify', status: 'done', detail: matchDetail })
+      recordStep({ key: 'match', label: 'Match products to Shopify', status: 'done', startedAt: matchStartedAt, detail: matchDetail })
       if (pending.length > 0) {
+        const pushStartedAt = new Date().toISOString()
         setSilverRateProgress({ phase: 'pushing', label: 'Pushing the new prices to Shopify', done: 0, total: pending.length })
         const result = await applyPriceSync((done) => setSilverRateProgress({ done }))
         updated = result.updated ?? 0
         skipped = result.skipped ?? 0
         errors.push(...(result.errors ?? []))
+        const pushDetail = `${updated} pushed, ${skipped} skipped${errors.length ? `, ${errors.length} error(s)` : ''}`
         steps.push({
           key: 'push',
           label: 'Push prices to Shopify',
           status: errors.length === 0 ? 'done' : 'failed',
-          detail: `${updated} pushed, ${skipped} skipped${errors.length ? `, ${errors.length} error(s)` : ''}`,
+          detail: pushDetail,
+        })
+        recordStep({
+          key: 'push',
+          label: 'Push prices to Shopify',
+          status: errors.length === 0 ? 'done' : 'failed',
+          startedAt: pushStartedAt,
+          detail: pushDetail,
+          ...(errors.length > 0 ? { error: errors.join('; ') } : {}),
         })
       } else {
-        steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: 'All Shopify prices already match the new rate' })
+        const pushDetail = 'All Shopify prices already match the new rate'
+        steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: pushDetail })
+        recordStep({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: pushDetail })
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error'
       store.lastError = message
       errors.push(message)
-      steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'failed', detail: message })
+      // The try block spans matching + pushing: blame the step that actually
+      // failed instead of always reporting the push.
+      const failedKey = steps.some((s) => s.key === 'match') ? 'push' : 'match'
+      const failedLabel = failedKey === 'match' ? 'Match products to Shopify' : 'Push prices to Shopify'
+      steps.push({ key: failedKey, label: failedLabel, status: 'failed', detail: message })
+      recordStep({ key: failedKey, label: failedLabel, status: 'failed', startedAt: matchStartedAt, detail: message, error: message })
       await persistLog({ entity: 'Price', direction: 'out', action: 'Silver Rate Update', status: 'failed', error: message, retry: true })
     }
   } else {
-    steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: 'Shopify is not configured — prices updated locally only' })
+    const pushDetail = 'Shopify is not configured — prices updated locally only'
+    steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: pushDetail })
+    recordStep({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: pushDetail })
     await persistLog({ entity: 'Silver', direction: 'in', action: 'Rate Update (Shopify not configured)', status: 'success' })
   }
 
-  // Record the Shopify push outcome on the rate row for the history table.
+  // Record the Shopify push outcome AND the full step log on this run's rate
+  // row for the history table (best-effort, never masks the result).
   const syncStatus = !isConfigured() ? 'skipped' : errors.length === 0 ? 'synced' : 'failed'
+  stepLog.finishedAt = new Date().toISOString()
+  stepLog.ok = errors.length === 0
+  stepLog.counts = { repriced: recomputed, matched, pushed: updated, skipped }
   setSilverRateProgress({
     running: false,
     phase: 'done',
@@ -2914,12 +3016,7 @@ export async function applySilverRate(
   })
   if (db) {
     try {
-      const [latestRow] = await db
-        .select({ id: schema.silverRates.id })
-        .from(schema.silverRates)
-        .orderBy(desc(schema.silverRates.updatedAt))
-        .limit(1)
-      if (latestRow) await db.update(schema.silverRates).set({ syncStatus }).where(eq(schema.silverRates.id, latestRow.id))
+      await db.update(schema.silverRates).set({ syncStatus, stepLog }).where(eq(schema.silverRates.id, rateRowId))
     } catch {
       // History annotation is best-effort.
     }
