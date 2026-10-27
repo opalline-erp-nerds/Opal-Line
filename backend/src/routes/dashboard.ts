@@ -1152,6 +1152,12 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
       .from(schema.auditLogs)
       .where(audWhere)
 
+    // db.execute() hands back the driver's own column names, and UNION ALL
+    // names its output after the FIRST branch — so every row is keyed
+    // `details` (the activity_logs column), carrying the audit branch's
+    // `changes` value on audit rows. The `detail` key only exists in the
+    // select shape above, which is why reading l.detail yielded undefined and
+    // the widget lost its second line.
     const rows = await db!.execute<{
       id: string
       timestamp: string | null
@@ -1159,7 +1165,7 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
       action: string | null
       module: string | null
       entity: string | null
-      detail: string | null
+      details: string | null
     }>(
       sql`(${actSelect}) UNION ALL (${audSelect}) ORDER BY timestamp DESC, id DESC LIMIT ${limit + 1}`,
     )
@@ -1177,7 +1183,7 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
       id: l.id,
       type: activityType(l.module, l.action),
       title: `${l.action ?? 'Activity'}${l.entity && !String(l.action ?? '').includes(l.entity) ? ` · ${l.entity}` : ''}`,
-      detail: l.detail ?? undefined,
+      detail: l.details ?? undefined,
       actor: l.user ?? 'System',
       time: friendlyTime(l.timestamp),
       timestamp: l.timestamp,
