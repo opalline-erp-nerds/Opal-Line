@@ -78,6 +78,22 @@ export function todayIST(): string {
 
 const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
+/** Chart axis/tooltip label for a saved rate timestamp or IST calendar day. */
+export function rateAxisLabel(value: string | null | undefined): string {
+  const s = String(value ?? '')
+  if (!s.includes('T')) return rateDayLabel(s)
+  const d = toDate(s)
+  if (!d) return s
+  return d.toLocaleString('en-IN', {
+    timeZone: IST_TIMEZONE,
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+  })
+}
+
 /** Chart axis/tooltip label for an IST calendar day: "2026-10-05" → "5 Oct". */
 export function rateDayLabel(isoDay: string): string {
   const [, m, d] = String(isoDay).split('-')

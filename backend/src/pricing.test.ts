@@ -109,6 +109,46 @@ describe('normalizeInvoiceItems (invoice line pricing)', () => {
   })
 })
 
+describe('applyPieceRateItems (piece-rate invoice lines)', () => {
+  test('bills the fixed piece rate × qty instead of weight x rate + making', () => {
+    const rows = dbRoutes.applyPieceRateItems(
+      [{ product: 'Bangle', sku: 'BLG-001', qty: 3, weight: 12, silverRate: 92.5, makingCharge: 200, amount: 1310 }],
+      new Map([['blg-001', 450]]),
+    )
+    assert.equal(rows[0].amount, 1350) // 450 x 3 — not the silver-rate total
+    assert.equal(rows[0].silverRate, 0)
+    assert.equal(rows[0].makingCharge, 0)
+  })
+
+  test('matches the SKU case-insensitively and rounds to two decimals', () => {
+    const rows = dbRoutes.applyPieceRateItems(
+      [{ product: 'Ring', sku: ' RNG-9 ', qty: 1, amount: 999 }],
+      new Map([['rng-9', 333.335]]),
+    )
+    assert.equal(rows[0].amount, 333.34)
+  })
+
+  test('leaves non piece-rate lines untouched', () => {
+    const items = [{ product: 'Chain', sku: 'CHN-1', qty: 2, weight: 10, silverRate: 92.5, makingCharge: 100, amount: 1950 }]
+    const rows = dbRoutes.applyPieceRateItems(items, new Map([['other-sku', 500]]))
+    assert.deepEqual(rows, items)
+    assert.equal(rows[0].amount, 1950)
+  })
+
+  test('is a no-op with an empty rate map (nothing looked up)', () => {
+    const items = [{ product: 'Pin', sku: 'PIN-1', qty: 1, amount: 150 }]
+    assert.equal(dbRoutes.applyPieceRateItems(items, new Map()), items)
+  })
+
+  test('a zero or invalid fixed rate falls back to the line as sent', () => {
+    const rows = dbRoutes.applyPieceRateItems(
+      [{ product: 'Pin', sku: 'PIN-2', qty: 2, amount: 300 }],
+      new Map([['pin-2', 0]]),
+    )
+    assert.equal(rows[0].amount, 300)
+  })
+})
+
 describe('quotation normalization and totals', () => {
   test('computes line amount as round2(weight x (rate + makingChargePerGram))', () => {
     // Correct formula: amount = weight × (silverRate + makingChargePerGram)

@@ -6,7 +6,7 @@ import * as s from '../db/schema'
 import { requirePermission } from '../rbac'
 import { recordActivity } from '../activity'
 import { actorFromRequest } from '../activity'
-import { num, round2 } from './db'
+import { applyPieceRateInvoiceItems, num, round2 } from './db'
 import { routeParam } from '../lib/routeParams'
 import { applyStockMovement, assertStockAvailable, InsufficientStockError } from '../stock'
 
@@ -206,7 +206,7 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
     if (!db) { res.status(503).json({ error: 'Database unavailable' }); return }
     try {
       const body = (req.body ?? {}) as Record<string, unknown>
-      const items = normalizeQuotationItems(body.items)
+      const items = await applyPieceRateInvoiceItems(normalizeQuotationItems(body.items), db)
       if (items.length === 0) { res.status(400).json({ error: 'At least one line item is required' }); return }
       const gstRate = num(body.gst, 3)
       const discount = num(body.discount, 0)
@@ -248,7 +248,7 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
       if (existing.convertedInvoice) { res.status(400).json({ error: 'Quotation already converted to an invoice' }); return }
 
       const clean = sanitizeCustomer(body)
-      const items = normalizeQuotationItems(body.items)
+      const items = await applyPieceRateInvoiceItems(normalizeQuotationItems(body.items), db)
       const gstRate = num(body.gst, num(existing.gst, 3))
       const discount = num(body.discount, num(existing.discount, 0))
       let totals = {
@@ -425,16 +425,19 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
       if (items.length === 0) { res.status(400).json({ error: 'Quotation has no line items' }); return }
 
       // Build invoice items (same shape as manual invoice items)
-      const invoiceItems = items.map((it) => ({
-        product: it.product ?? '',
-        sku: it.sku ?? '',
-        qty: it.qty ?? 1,
-        weight: it.weight ?? 0,
-        silverRate: it.silverRate ?? 0,
-        makingCharge: it.makingCharge ?? 0,
-        tax: 0,
-        amount: it.amount ?? 0,
-      }))
+      const invoiceItems = await applyPieceRateInvoiceItems(
+        items.map((it) => ({
+          product: it.product ?? '',
+          sku: it.sku ?? '',
+          qty: it.qty ?? 1,
+          weight: it.weight ?? 0,
+          silverRate: it.silverRate ?? 0,
+          makingCharge: it.makingCharge ?? 0,
+          tax: 0,
+          amount: it.amount ?? 0,
+        })),
+        db,
+      )
 
       // Reuse the manual invoice numbering + creation logic by inserting directly
       const { default: crypto } = await import('node:crypto')

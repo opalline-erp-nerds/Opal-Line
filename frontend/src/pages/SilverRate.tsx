@@ -50,6 +50,7 @@ import {
   ViewUpdateButton,
 } from '@/components/dashboard/silver-rate-pipeline'
 import { pipelineSucceeded, plannedSteps, stepsFromPhase, stepsFromResult, stepsFromStepLog } from '@/lib/silverRatePipeline'
+import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
 import type { PendingRateChange, Product, SilverRate, SilverRateAutoStatus, SilverRateProgress, SilverRateRequestRow, SilverRateRow } from '@/types'
 import { formatCurrency, formatDateTime, formatWeight, istDateKey } from '@/lib/format'
 import { cn } from '@/lib/utils'
@@ -161,7 +162,9 @@ export default function SilverRatePage() {
   const rateValid = !isNaN(rateValue) && rateValue > 0
 
   const affected = useMemo(() => {
-    return products.map((p) => {
+    // Piece Rate Products keep their fixed price — the backend never reprices
+    // them, so they are excluded from this preview as well.
+    return products.filter((p) => !p.pieceRateProduct).map((p) => {
       const silverValue = p.netWeight * currentRate.rate
       const makingTotal = p.netWeight * p.makingCharge
       const subtotal = silverValue + makingTotal
@@ -272,7 +275,8 @@ export default function SilverRatePage() {
   /** Old → new prices for every product at the dialog's rate (review step). */
   const scheduleImpact = useMemo(() => {
     if (!scheduleRateValid || !scheduleInstant) return null
-    return products.map((p) => {
+    // Piece-rate products are never repriced, so they carry no schedule impact.
+    return products.filter((p) => !p.pieceRateProduct).map((p) => {
       const makingTotal = p.netWeight * p.makingCharge
       const gstPct = p.gst ?? 3
       const oldPrice = (p.netWeight * currentRate.rate + makingTotal) * (1 + gstPct / 100)
@@ -938,6 +942,10 @@ export default function SilverRatePage() {
       ) : null}
 
       {/* ── History ─────────────────────────────────────────────────────── */}
+      {/* Rate trend chart (master's silver-rate history card): the table below
+          carries the step log, this one carries the plotted series. */}
+      <SilverRateHistoryCard onSetRate={openUpdate} />
+
       <Card>
         <CardHeader className="flex-row flex-wrap items-end justify-between gap-3 space-y-0">
           <div>

@@ -129,7 +129,7 @@ function sanitize(body: Record<string, unknown>, table: any): Record<string, unk
       if (!Number.isFinite(n) || n < 0) throw new Error('Reorder level cannot be negative')
       out.reorderLevel = Math.floor(n)
     }
-    for (const priceField of ['sellingPrice', 'compareAtPrice', 'costPrice', 'silverRate', 'makingCharge'] as const) {
+    for (const priceField of ['sellingPrice', 'compareAtPrice', 'costPrice', 'silverRate', 'makingCharge', 'fixedPieceRate'] as const) {
       if (out[priceField] !== undefined) {
         const n = Number(out[priceField])
         if (!Number.isFinite(n) || n < 0) throw new Error(`${priceField} cannot be negative`)
@@ -1220,6 +1220,51 @@ export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number):
     .filter((it) => String(it.sku) !== '' || String(it.product) !== '')
 }
 
+/**
+ * Piece-rate override for invoice lines, given the fixed piece rates keyed by
+ * lowercased SKU.
+ *
+ * A Piece Rate Product bills at its fixed rate × qty: the silver-rate
+ * calculation (weight × rate + making charge) that normally produces the line
+ * amount does not apply, so the components are cleared with it and the invoice
+ * header sums (silverValue / makingCharge) stay consistent with the total.
+ */
+export function applyPieceRateItems<T extends Record<string, unknown>>(
+  items: T[],
+  fixedRatesBySku: Map<string, number>,
+): T[] {
+  if (fixedRatesBySku.size === 0) return items
+  return items.map((it) => {
+    const fixed = fixedRatesBySku.get(String(it.sku ?? '').trim().toLowerCase())
+    if (fixed == null || !(fixed > 0)) return it
+    return { ...it, silverRate: 0, makingCharge: 0, amount: round2(fixed * num(it.qty, 1)) } as T
+  })
+}
+
+/**
+ * Loads the fixed piece rates for an invoice's SKUs and rewrites every line
+ * that belongs to a Piece Rate Product. Returns the items untouched when no
+ * line maps to one, so ordinary invoices never pay for the lookup.
+ */
+export async function applyPieceRateInvoiceItems<T extends Record<string, unknown>>(
+  items: T[],
+  client: any = db,
+): Promise<T[]> {
+  if (items.length === 0 || !client) return items
+  const skus = [...new Set(items.map((it) => String(it.sku ?? '').trim()).filter(Boolean))]
+  if (skus.length === 0) return items
+  const rows = await client
+    .select({ sku: s.products.sku, fixedPieceRate: s.products.fixedPieceRate })
+    .from(s.products)
+    .where(and(inArray(s.products.sku, skus), eq(s.products.pieceRateProduct, true)))
+  const rates = new Map<string, number>()
+  for (const r of rows) {
+    const rate = Number(r.fixedPieceRate)
+    if (Number.isFinite(rate) && rate > 0) rates.set(String(r.sku ?? '').trim().toLowerCase(), rate)
+  }
+  return applyPieceRateItems(items, rates)
+}
+
 // Duplicate an existing invoice into a fresh draft (same items/customer, new number, no payment)
 dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
@@ -1299,7 +1344,6 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
   if (!requireDb(res)) return
   try {
     const body = req.body ?? {}
-
     // Fetch the authoritative silver rate from Silver Rate Management for new pricing.
     const latestRate = await getLatestSilverRate()
     if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
@@ -1307,7 +1351,7 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     }
     const silverRate = latestRate.rate
 
-    const items = normalizeInvoiceItems(body.items, silverRate)
+    const items = await applyPieceRateInvoiceItems(normalizeInvoiceItems(body.items, silverRate))
     const clean = sanitize(body, s.salesInvoices)
     delete clean.id
     delete clean.items
@@ -1405,7 +1449,7 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     const row = await db!.transaction(async (tx) => {
       const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
       if (!existing) return null
-      const items = normalizeInvoiceItems(body.items, silverRate)
+      const items = await applyPieceRateInvoiceItems(normalizeInvoiceItems(body.items, silverRate), tx)
       if (items.length > 0) {
         // First, restore old stock
         const oldItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))

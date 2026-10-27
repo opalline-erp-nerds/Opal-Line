@@ -47,6 +47,8 @@ import type { Product } from '@/types'
 import { formatCurrency, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { productImageSrc } from '@/lib/product-image'
+import { PreviousSilverRate } from '@/components/products/previous-silver-rate'
+import { useSilverRate } from '@/lib/silver-rate-context'
 
 const shopifyVariant: Record<NonNullable<Product['shopifyStatus']>, { label: string; variant: 'success' | 'warning' | 'muted' | 'danger' }> = {
   synced: { label: 'Synced', variant: 'success' },
@@ -76,6 +78,7 @@ const productTints: Record<string, { bg: string; text: string }> = {
 
 export default function ProductsPage() {
   const navigate = useNavigate()
+  const { rate: silverRate } = useSilverRate()
   const [products, setProducts] = useState<Product[]>([])
   const [lastDayById, setLastDayById] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
@@ -322,6 +325,7 @@ export default function ProductsPage() {
       { accessorKey: 'netWeight', header: 'Net Wt', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">{formatWeight(row.original.netWeight)}</span>, meta: { align: 'right' as const } },
       { accessorKey: 'makingCharge', header: 'Making', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">{row.original.makingCharge != null ? `${row.original.makingCharge} ₹/g` : '—'}</span>, meta: { align: 'right' as const } },
       { accessorKey: 'silverRate', header: 'Silver Rate', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">₹{row.original.silverRate?.toFixed(2) ?? '—'}/g</span>, meta: { align: 'right' as const } },
+      { id: 'previousSilverRate', header: 'Previous Silver Rate', cell: () => <PreviousSilverRate previousRate={silverRate?.previousRate} />, meta: { align: 'right' as const } },
       { accessorKey: 'sellingPrice', header: 'Selling Price', cell: ({ row }) => <span className="font-semibold tabular-nums text-foreground">{formatCurrency(row.original.sellingPrice)}</span>, meta: { align: 'right' as const } },
       {
         id: 'lastDayPrice',
@@ -464,7 +468,7 @@ export default function ProductsPage() {
         ),
       },
     ],
-    [pushProducts, pushing, toggleStatus, duplicateProduct, deleteProduct, printLabelsFor, lastDayById],
+    [pushProducts, pushing, toggleStatus, duplicateProduct, deleteProduct, printLabelsFor, lastDayById, silverRate],
   )
 
   return (

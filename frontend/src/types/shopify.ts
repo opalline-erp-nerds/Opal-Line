@@ -55,7 +55,7 @@ export interface SyncInventory {
   title: string
 }
 
-export type SyncPriceStatus = 'up-to-date' | 'update' | 'updated' | 'no-match'
+export type SyncPriceStatus = 'up-to-date' | 'update' | 'updated' | 'skipped' | 'no-match'
 
 export interface SyncPrice {
   productId: number
