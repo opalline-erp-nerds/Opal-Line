@@ -4889,6 +4889,9 @@ for (const [name, table] of Object.entries(resources)) {
       }
       const [existing] = await db!.select().from(table).where(eq(table.id, routeParam(req.params.id))).limit(1)
       if (!existing) return res.status(404).json({ error: 'Not found' })
+      if (name === 'products') {
+        await db!.delete(s.productVariants).where(eq(s.productVariants.productId, routeParam(req.params.id)))
+      }
       await db!.delete(table).where(eq(table.id, routeParam(req.params.id)))
       recordCrud(name, 'Deleted', req, existing)
       res.json({ ok: true, id: routeParam(req.params.id) })
