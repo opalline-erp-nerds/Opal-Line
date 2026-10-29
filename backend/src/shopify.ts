@@ -914,6 +914,14 @@ export interface CatalogRow {
   shopifyId: string | null
   shopifyStatus: string | null
   status: string | null
+  /**
+   * Stable pricing-collection / category links (products.collection_id /
+   * category_id). When a row carries either, its grouping text is owned
+   * locally: the pull must not rewrite it with a Shopify product type or
+   * collection label, or the ids and the text would disagree.
+   */
+  collectionId?: string | null
+  categoryId?: string | null
 }
 
 /** Insert payload built by the pull — exactly what `insert(schema.products).values()` takes. */
@@ -1007,11 +1015,17 @@ export async function applyLiveCatalog(
     if (existing) {
       const hasWeight = existing.netWeight != null && Number(existing.netWeight) > 0
       const pricing = hasWeight ? null : backComputePricing(price, pricingRate)
+      // Products created through the product dialog are linked to a pricing
+      // collection and category; that grouping is local and stable, so the pull
+      // leaves the text alone (the ids would otherwise point at names Shopify
+      // overwrote). Rows without a link keep the original behaviour.
+      const linked =
+        String(existing.collectionId ?? '').trim() !== '' || String(existing.categoryId ?? '').trim() !== ''
       const patch: CatalogPatch = {
         name: p.title || existing.name,
         barcode: p.barcode ?? existing.barcode,
-        category: p.productType || existing.category,
-        collection: p.collection || p.productType || existing.collection,
+        category: linked ? existing.category : p.productType || existing.category,
+        collection: linked ? existing.collection : p.collection || p.productType || existing.collection,
         stock: Number.isFinite(p.inventoryQuantity) ? p.inventoryQuantity : existing.stock,
         shopifyId: String(p.id),
         shopifyStatus: 'synced',
@@ -1037,6 +1051,10 @@ export async function applyLiveCatalog(
       updated++
     } else {
       const pricing = backComputePricing(price, pricingRate)
+      // A product that only exists on Shopify has no local collection or
+      // category link: it is created unlinked (silver-rate pricing applies
+      // until someone assigns it a collection), never by guessing from a
+      // Shopify collection/product-type label.
       const values: CatalogInsertValues = {
         id: randomUUID(),
         name: p.title || sku,

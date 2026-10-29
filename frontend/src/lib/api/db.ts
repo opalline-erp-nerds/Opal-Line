@@ -72,6 +72,8 @@ import type {
   StockAgingResponse,
   Shipment,
   NotificationLogEntry,
+  ProductCategory,
+  ProductCollection,
 } from '@/types'
 import { request, list, maybe, withItems, PAGED } from './core'
 import type { SearchResults, SalesInvoiceRow } from './core'
@@ -486,6 +488,20 @@ export const dbApi = {
       { method: 'PATCH', body: JSON.stringify(locationId ? { stock, locationId } : { stock }) },
     ),
   /**
+   * Next free SKU for a category, computed by the backend from live product +
+   * variant codes under the same advisory lock the create path uses. The
+   * product dialog fills its SKU field from this; POST /products re-validates
+   * (and claims) the code under the lock when the product is saved. `categoryId`
+   * (a Collections & Categories row) supplies that category's own prefix, so a
+   * proposal for a fixed-price collection's category matches what will be saved.
+   */
+  getNextSku: (category: string, categoryId?: string | null) =>
+    request<{ sku: string; category: string }>(
+      `/db/products/next-sku?category=${encodeURIComponent(category)}${
+        categoryId ? `&categoryId=${encodeURIComponent(categoryId)}` : ''
+      }`,
+    ),
+  /**
    * Shopify-style variants: the option definitions on the parent plus one row
    * per option-value combination. Saving is replace-all (the product dialog
    * owns the whole set) and the backend rolls the stock difference into the
@@ -658,6 +674,35 @@ export const dbApi = {
   getPurchaseReturns: () => list<PurchaseReturn>('/db/purchase-returns', PAGED),
   getStockTransfers: () => list<StockTransfer>('/db/inventory/transfers', PAGED),
   getInventoryLocations: () => list<InventoryLocation>('/db/inventory/locations', PAGED),
+  /**
+   * Inventory pricing collections (Silver Jewels → silver-rate, Other
+   * Products → fixed price). Foundation only: no pricing path reads them yet.
+   */
+  getCollections: async (): Promise<ProductCollection[]> => {
+    const res = await request<{ data: ProductCollection[] }>('/db/inventory/collections')
+    return Array.isArray(res?.data) ? res.data : []
+  },
+  /** Rename a collection. Its stable id — and every reference to it — is unchanged. */
+  renameCollection: (collectionId: string, name: string) =>
+    request<ProductCollection>(`/db/inventory/collections/${encodeURIComponent(collectionId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+    }),
+  getProductCategories: async (collectionId?: string): Promise<ProductCategory[]> => {
+    const suffix = collectionId ? `?collectionId=${encodeURIComponent(collectionId)}` : ''
+    const res = await request<{ data: ProductCategory[] }>(`/db/inventory/categories${suffix}`)
+    return Array.isArray(res?.data) ? res.data : []
+  },
+  createProductCategory: (body: { collectionId: string; name: string; prefix: string }) =>
+    request<ProductCategory>('/db/inventory/categories', { method: 'POST', body: JSON.stringify(body) }),
+  updateProductCategory: (
+    categoryId: string,
+    body: { name?: string; prefix?: string; collectionId?: string },
+  ) =>
+    request<ProductCategory & { productsUpdated: number }>(
+      `/db/inventory/categories/${encodeURIComponent(categoryId)}`,
+      { method: 'PATCH', body: JSON.stringify(body) },
+    ),
   getBankAccounts: () => list<BankAccount>('/db/bank-accounts', PAGED),
   getLedgerEntries: () => list<LedgerEntry>('/db/ledger', PAGED),
   getExpenses: () => list<Expense>('/db/expenses', PAGED),
@@ -743,8 +788,12 @@ export const dbApi = {
     const res = await request(`/db/inventory/levels${qs}`)
     return res as Array<{ productId: string; sku: string | null; locationId: string; qty: number }>
   },
-  /** Create a pending transfer. Stock moves on dispatch, not on creation. */
-  createStockTransfer: async (body: { sku: string; qty: number; from: string; to: string; number?: string; weight?: number }) => {
+  /**
+   * Create a pending transfer. Stock moves on dispatch, not on creation, and
+   * the transfer number is minted server-side — never derived from a client
+   * list count, which goes stale under multi-computer use.
+   */
+  createStockTransfer: async (body: { sku: string; qty: number; from: string; to: string; weight?: number }) => {
     return request<{ id: string; number: string; status: string }>('/db/inventory/transfers', {
       method: 'POST',
       body: JSON.stringify(body),

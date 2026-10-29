@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import { duplicateScanMessage, inactiveProductMessage, normalizeScanCode, scanCodeError } from './scanCode'
+import { generateSku } from './lib/productCodes'
 
 test('normalizeScanCode strips keyboard-wedge CR/LF, spaces and control characters', () => {
   // A QR code encoding "OL-RNG-001" scanned through a wedge scanner arrives
@@ -26,6 +27,16 @@ test('scanCodeError rejects blank and single-character input', () => {
 
 test('scan codes are capped so an over-long paste cannot be used as input', () => {
   assert.equal(normalizeScanCode('9'.repeat(500)).length, 128)
+})
+
+test('auto-generated category SKUs scan back unchanged', () => {
+  // Labels encode the generated SKU (OL-CHN-001) in their QR code; a scanner's
+  // CR/LF padding must normalise to exactly that code, so a scan resolves the
+  // product the label was printed for.
+  const sku = generateSku(['OL-RNG-001'], 'Chains')
+  assert.equal(sku, 'OL-CHN-001')
+  assert.equal(normalizeScanCode(`${sku}\r\n`), sku)
+  assert.equal(scanCodeError(sku), null)
 })
 
 test('duplicate and inactive-product messages are actionable', () => {

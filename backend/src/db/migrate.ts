@@ -245,6 +245,17 @@ async function main() {
   await client.unsafe(`INSERT INTO "inventory_locations" ("id", "name", "type") VALUES ('LOC-DEFAULT', 'Main Store', 'store') ON CONFLICT DO NOTHING;`)
   await client.unsafe(`ALTER TABLE "stock_transfers" ADD COLUMN IF NOT EXISTS "received_qty" integer;`)
   await client.unsafe(`ALTER TABLE "stock_transfers" ADD COLUMN IF NOT EXISTS "variance" integer;`)
+  // Mirror of the transfer location backfill in bootstrap.ts STOCK_LEDGER_DDL:
+  // legacy rows store display names; migrate them to canonical location IDs.
+  // Rows that are already an ID, or unresolvable, are left untouched.
+  await client.unsafe(`UPDATE stock_transfers t SET "from" = l.id FROM inventory_locations l
+     WHERE t."from" IS NOT NULL AND t."from" <> ''
+       AND l.name = t."from"
+       AND NOT EXISTS (SELECT 1 FROM inventory_locations i WHERE i.id = t."from");`)
+  await client.unsafe(`UPDATE stock_transfers t SET "to" = l.id FROM inventory_locations l
+     WHERE t."to" IS NOT NULL AND t."to" <> ''
+       AND l.name = t."to"
+       AND NOT EXISTS (SELECT 1 FROM inventory_locations i WHERE i.id = t."to");`)
   await client.unsafe(`ALTER TABLE "sales_orders" ADD COLUMN IF NOT EXISTS "location_id" text;`)
   await client.unsafe(`ALTER TABLE "purchase_invoices" ADD COLUMN IF NOT EXISTS "location_id" text;`)
 

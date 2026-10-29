@@ -11,6 +11,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import argon2 from 'argon2'
 import { logger } from '../logger'
+import { ensureCollectionFoundation } from './collectionsSeed'
 
 /**
  * First-run database bootstrap.
@@ -87,6 +88,21 @@ const STOCK_LEDGER_DDL: string[] = [
   // idempotent, which keeps this array safe to run on every boot.
   `ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS received_qty integer`,
   `ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS variance integer`,
+  // Transfer routes used to store the location's display NAME in from/to and
+  // pass it around the ledger by re-resolving it on every transition — a rename
+  // orphaned the reference. New transfers store canonical inventory_locations
+  // IDs; this backfill migrates the legacy rows in place. Row values that are
+  // already an existing ID, or whose name can no longer be resolved, are left
+  // exactly as they are: the migration never rewrites or drops history it
+  // cannot confidently map. Idempotent like every statement in this array.
+  `UPDATE stock_transfers t SET "from" = l.id FROM inventory_locations l
+     WHERE t."from" IS NOT NULL AND t."from" <> ''
+       AND l.name = t."from"
+       AND NOT EXISTS (SELECT 1 FROM inventory_locations i WHERE i.id = t."from")`,
+  `UPDATE stock_transfers t SET "to" = l.id FROM inventory_locations l
+     WHERE t."to" IS NOT NULL AND t."to" <> ''
+       AND l.name = t."to"
+       AND NOT EXISTS (SELECT 1 FROM inventory_locations i WHERE i.id = t."to")`,
   // Which location a sale or a purchase belongs to. Without these the movements
   // fall back to the default store, so a sale rung up at a branch debits the
   // wrong balance. Existing documents keep NULL and resolve to the default,
@@ -123,6 +139,43 @@ const STOCK_LEDGER_DDL: string[] = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS product_variants_sku_idx ON product_variants (sku)`,
   `CREATE INDEX IF NOT EXISTS product_variants_product_id_idx ON product_variants (product_id)`,
+]
+
+/**
+ * Inventory pricing collections and their categories. Declared once and
+ * applied from both createSchema (fresh installs) and applyUpgrades (existing
+ * installs), like STOCK_LEDGER_DDL. The rows themselves are seeded separately
+ * (src/db/collectionsSeed.ts) so a rename survives every boot.
+ */
+const COLLECTIONS_DDL: string[] = [
+  `CREATE TABLE IF NOT EXISTS collections (
+    id text PRIMARY KEY,
+    name text NOT NULL,
+    pricing_type text NOT NULL DEFAULT 'fixed',
+    is_system boolean NOT NULL DEFAULT false,
+    created_at timestamp,
+    updated_at timestamp
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS collections_name_unique ON collections (name)`,
+  `CREATE TABLE IF NOT EXISTS product_categories (
+    id text PRIMARY KEY,
+    collection_id text NOT NULL REFERENCES collections(id),
+    name text NOT NULL,
+    prefix text NOT NULL,
+    created_at timestamp,
+    updated_at timestamp
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS product_categories_name_unique ON product_categories (name)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS product_categories_prefix_unique ON product_categories (prefix)`,
+  `CREATE INDEX IF NOT EXISTS product_categories_collection_idx ON product_categories (collection_id)`,
+  // Products link to their collection/category by stable id. Existing rows stay
+  // NULL and keep their free-text category/collection (and their pricing), so
+  // the catalogue is untouched; new products created through the dialog carry
+  // the link. Same statements as drizzle/0012_product_collection_links.sql.
+  `ALTER TABLE products ADD COLUMN IF NOT EXISTS collection_id text`,
+  `ALTER TABLE products ADD COLUMN IF NOT EXISTS category_id text`,
+  `CREATE INDEX IF NOT EXISTS products_collection_id_idx ON products (collection_id)`,
+  `CREATE INDEX IF NOT EXISTS products_category_id_idx ON products (category_id)`,
 ]
 
 async function createSchema(sql: postgres.Sql): Promise<void> {
@@ -669,6 +722,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
     await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS stock_transfers_number_idx ON stock_transfers (number)`)
 
     for (const stmt of STOCK_LEDGER_DDL) await tx.unsafe(stmt)
+    for (const stmt of COLLECTIONS_DDL) await tx.unsafe(stmt)
 
     // ── Finance ───────────────────────────────────────────────────────────
     await tx.unsafe(`
@@ -1277,6 +1331,9 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
       // seedDefaults inserts columns (settings.pan, TDS/UPI flags, …) that
       // createSchema's baseline DDL does not include yet.
       await applyUpgrades(sql)
+      // Foundation rows (collections + categories) before defaults, so a fresh
+      // install can open Inventory → Collections & Categories immediately.
+      await ensureCollectionFoundation(sql)
       const drizzleDb = drizzle(sql, { schema })
       const seeded = await seedDefaults(drizzleDb)
       await import('../supplierLinking')
@@ -1287,6 +1344,9 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
 
     // Existing DB: apply idempotent additions for upgrades
     await applyUpgrades(sql)
+    // Seed the collection foundation without touching rows that already exist
+    // (a renamed collection or an edited category is left exactly as it is).
+    await ensureCollectionFoundation(sql)
     const upgradeDb = drizzle(sql, { schema })
     await repairAdminRolePermissions(upgradeDb).catch(() => undefined)
     await repairAdminUserOverride(upgradeDb).catch(() => undefined)
@@ -1322,6 +1382,7 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
 async function applyUpgrades(sql: postgres.Sql): Promise<void> {
   const upgrades: string[] = [
     ...STOCK_LEDGER_DDL,
+    ...COLLECTIONS_DDL,
     // Login lockout became a per-install switch (Settings → Security → Login
     // lockout), off by default. Existing installs get the column as false,
     // which keeps today's behaviour (no lockout) until it is turned on.

@@ -548,6 +548,38 @@ export interface LocationStockSummary {
   valueAtCost: number
 }
 
+/** How a pricing collection's products are priced. */
+export type CollectionPricingType = 'silver' | 'fixed'
+
+/**
+ * Inventory pricing collection (Inventory → Collections & Categories).
+ * `id` is the stable identity; `name` is only the display label, so renaming
+ * "Other Products" never changes what the collection refers to.
+ */
+export interface ProductCollection {
+  id: string
+  name: string
+  pricingType: CollectionPricingType
+  /** Silver Jewels is the immutable, silver-rate-priced system collection. */
+  isSystem: boolean
+  categoryCount: number
+  productCount: number
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+/** A category inside a pricing collection, with its future SKU prefix. */
+export interface ProductCategory {
+  id: string
+  collectionId: string
+  name: string
+  /** Uppercase 2–5 letter SKU prefix, unique across every collection (RNG). */
+  prefix: string
+  productCount: number
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
 export type TransferStatus = 'pending' | 'in-transit' | 'received' | 'cancelled'
 
 export interface StockTransfer {
@@ -625,6 +657,13 @@ export interface Product {
   huid?: string | null
   category: string
   collection: string
+  /**
+   * Stable link to the pricing collection (collections.id). `collection` stays
+   * the display name; the id decides the pricing model (silver-rate vs fixed).
+   */
+  collectionId?: string | null
+  /** Stable link to the category row (product_categories.id) whose prefix mints new SKUs. */
+  categoryId?: string | null
   purity: number
   grossWeight: number
   stoneWeight: number

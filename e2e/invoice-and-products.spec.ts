@@ -214,7 +214,13 @@ test.describe('invoice mutations round-trip', () => {
       const dialog = page.getByRole('dialog')
       await expect(dialog).toBeVisible({ timeout: 10000 })
       await dialog.getByPlaceholder('e.g. Silver Classic Ring').fill(name)
-      await dialog.getByPlaceholder('e.g. SLV-RNG-00001').fill(sku)
+      // The category picks the pricing group and the collection picks the
+      // product grouping, which determines the auto-generated SKU prefix; a
+      // manually typed SKU stays possible on a new product.
+      await dialog.getByLabel('Category').selectOption('Silver Jewels')
+      await dialog.getByRole('button', { name: 'Select a collection…' }).click()
+      await page.getByRole('button', { name: 'Rings', exact: true }).click()
+      await dialog.getByLabel('Product SKU').fill(sku)
       // The dialog refuses to save without a priceable product: a valid silver
       // rate is mandatory and net weight drives the auto-computed selling price.
       // Both inputs carry no placeholder, so address them by their field label.
