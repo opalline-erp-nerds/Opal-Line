@@ -2,7 +2,7 @@ import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { Copy, Download, Eye, FileText, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, Printer, RefreshCw, Search, Trash2, Undo2, X } from 'lucide-react'
+import { Copy, Download, Eye, FileText, Loader2, Mail, MessageCircle, MoreHorizontal, Pencil, Plus, Printer, RefreshCw, Search, Trash2, Undo2, X } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -24,6 +24,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { dbApi } from '@/lib/api'
 import { ManualInvoiceDialog } from '@/components/manual-invoice-dialog'
+import { InvoiceReturnDialog } from '@/components/invoice-return-dialog'
 import { exportTable } from '@/lib/export'
 import type { Invoice, InvoiceItem } from '@/types'
 import { formatCurrency, formatDate } from '@/lib/format'
@@ -43,6 +44,8 @@ const statusBadge: Record<Invoice['status'], { label: string; variant: 'success'
   overdue: { label: 'Overdue', variant: 'danger' },
   cancelled: { label: 'Cancelled', variant: 'muted' },
   refunded: { label: 'Refunded', variant: 'warning' },
+  partially_returned: { label: 'Partially Returned', variant: 'warning' },
+  fully_returned: { label: 'Fully Returned', variant: 'muted' },
 }
 
 export default function SalesInvoicesPage() {
@@ -57,7 +60,7 @@ export default function SalesInvoicesPage() {
   const [statusFilter, setStatusFilter] = useState('')
   const [viewInvoice, setViewInvoice] = useState<Invoice | null>(null)
   const [invoiceItems, setInvoiceItems] = useState<InvoiceItem[]>([])
-  const [customers, setCustomers] = useState<Array<{ name: string; phone?: string | null }>>([])
+  const [customers, setCustomers] = useState<Array<{ name: string; email?: string | null; phone?: string | null }>>([])
 
   // Header-field edit state (customer, payment, dates, discount, GST).
   // Line items are intentionally not editable here — the backend PATCH keeps
@@ -80,6 +83,19 @@ export default function SalesInvoicesPage() {
   // invoice, no sales order involved. The dialog owns its own draft state; this
   // page only tracks whether it is open and what it produced.
   const [createOpen, setCreateOpen] = useState(false)
+
+  // Shared quantity-aware return dialog (same component the invoice detail
+  // page uses): it loads per-line sold/returned/remaining quantities and
+  // submits an idempotent request. After a return lands the derived status is
+  // written straight onto the row so the badge updates without a refetch.
+  const [returnTarget, setReturnTarget] = useState<Invoice | null>(null)
+  const onReturnProcessed = (opts: { returnStatus: Invoice['status'] | null }) => {
+    const next = opts.returnStatus
+    if (next !== 'partially_returned' && next !== 'fully_returned' || returnTarget === null) return
+    setInvoices((prev) => prev.map((x) => (x.id === returnTarget.id ? { ...x, status: next } : x)))
+    setViewInvoice((v) => (v && v.id === returnTarget.id ? { ...v, status: next } : v))
+    setReturnTarget(null)
+  }
 
   // Permanent delete: the backend reverses the invoice's stock in the same
   // transaction, and the loyalty points it earned are reversed right after.
@@ -238,6 +254,24 @@ export default function SalesInvoicesPage() {
     })
   }, [invoices, query, paymentFilter, statusFilter])
 
+  // Emails the bill PDF to the customer's mail through the same backend
+  // chain the detail page uses (POST /db/invoices/:id/email): the recipient
+  // resolves server-side from the request body, the invoice row, then the
+  // customer record. A missing address is a clear toast, not a silent no-op.
+  const [emailingId, setEmailingId] = useState<string | null>(null)
+  const emailInvoice = useCallback(async (inv: Invoice) => {
+    setEmailingId(inv.id)
+    try {
+      const r = await dbApi.emailInvoice(inv.id, inv.customerEmail || undefined)
+      if (r.ok) toast.success(`Invoice ${inv.number} emailed to ${r.to}`)
+      else toast.error(r.error || 'Email send failed')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Email send failed')
+    } finally {
+      setEmailingId(null)
+    }
+  }, [])
+
   const duplicateInvoice = async (inv: Invoice) => {
     if (!(await confirmDialog({ title: `Create a draft copy of ${inv.number}?`, description: "The draft gets a new number, today's date, and pending payment.", confirmLabel: 'Duplicate' }))) return
     setDuplicatingId(inv.id)
@@ -361,6 +395,20 @@ export default function SalesInvoicesPage() {
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`Email invoice ${row.original.number}`}
+                disabled={emailingId === row.original.id}
+                onClick={() => void emailInvoice(row.original)}
+              >
+                {emailingId === row.original.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Mail className="h-3.5 w-3.5" />}
+              </Button>
+              </TooltipTrigger>
+              <TooltipContent>Email bill to the customer</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
               <Button variant="ghost" size="icon-sm" aria-label={`Edit invoice ${row.original.number}`} onClick={() => openEdit(row.original)}>
                 <Pencil className="h-3.5 w-3.5" />
               </Button>
@@ -388,8 +436,20 @@ export default function SalesInvoicesPage() {
             </DropdownMenuTrigger>              <DropdownMenuContent align="end">
               <DropdownMenuLabel className="text-xs text-muted-foreground">More actions</DropdownMenuLabel>
               <DropdownMenuItem onClick={() => openEdit(row.original)}><Pencil className="h-3.5 w-3.5" /> Edit invoice</DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={emailingId === row.original.id}
+                onClick={() => void emailInvoice(row.original)}
+              >
+                {emailingId === row.original.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Mail className="h-3.5 w-3.5" />} Email bill
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={() => navigate(`/sales/invoices/${row.original.id}`)}><Download className="h-3.5 w-3.5" /> Download PDF</DropdownMenuItem>
               <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={row.original.status === 'refunded' || row.original.status === 'cancelled' || row.original.status === 'fully_returned'}
+                onClick={() => setReturnTarget(row.original)}
+              >
+                <Undo2 className="h-3.5 w-3.5" /> Return items
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={() => setInvoiceStatus(row.original, 'refunded')}><Undo2 className="h-3.5 w-3.5" /> Refund</DropdownMenuItem>
               <DropdownMenuItem onClick={() => setInvoiceStatus(row.original, 'cancelled')}><X className="h-3.5 w-3.5" /> Cancel</DropdownMenuItem>
               <DropdownMenuItem
@@ -412,7 +472,7 @@ export default function SalesInvoicesPage() {
         ),
       },
     ],
-    [navigate, duplicatingId, openEdit, deletingId, reinvoiceId, reinvoice],
+    [navigate, duplicatingId, deletingId, emailingId, emailInvoice, openEdit, reinvoiceId, reinvoice],
   )
 
   return (
@@ -501,6 +561,21 @@ export default function SalesInvoicesPage() {
             <Button variant="outline" onClick={() => void printCurrentPage()}>
               <Printer className="h-4 w-4" /> Print / PDF
             </Button>
+            {(() => {
+              const inv = viewInvoice
+              if (!inv) return null
+              const mail = inv.customerEmail || customers.find((c) => c.name === inv.customer)?.email
+              if (!mail) return null
+              return (
+                <Button
+                  variant="outline"
+                  disabled={emailingId === inv.id}
+                  onClick={() => void emailInvoice(inv)}
+                >
+                  {emailingId === inv.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Mail className="h-4 w-4" />} Email Bill
+                </Button>
+              )
+            })()}
             {(() => {
               const inv = viewInvoice
               if (!inv) return null
@@ -641,6 +716,13 @@ export default function SalesInvoicesPage() {
           </div>
         </div>
       </AppDialog>
+
+      <InvoiceReturnDialog
+        invoice={returnTarget}
+        open={returnTarget !== null}
+        onOpenChange={(o) => { if (!o) setReturnTarget(null) }}
+        onProcessed={onReturnProcessed}
+      />
 
       <ManualInvoiceDialog
         open={createOpen}

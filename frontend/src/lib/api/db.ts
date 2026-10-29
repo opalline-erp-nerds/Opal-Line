@@ -371,11 +371,14 @@ export const dbApi = {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
-  createReturn: (invoiceId: string, payload: { items?: Array<{ sku: string; qty: number }>; restock?: boolean }) =>
-    request<{ creditNoteNumber: string; amount: number; restocked: boolean }>(`/db/invoices/${invoiceId}/return`, {
+  createReturn: (invoiceId: string, payload: { items?: Array<{ sku: string; qty: number }>; restock?: boolean; idempotencyKey?: string }) =>
+    request<{ creditNoteNumber: string; invoiceNumber: string; amount: number; restocked: boolean; replayed?: boolean; returnStatus?: 'partially_returned' | 'fully_returned' | null; lines?: Array<{ sku: string; product: string; sold: number; returned: number; remaining: number }> }>(`/db/invoices/${invoiceId}/return`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  /** Per-line sold / previously returned / remaining quantities for the return dialog. */
+  getInvoiceReturnStatus: (invoiceId: string) =>
+    request<{ invoiceId: string; number: string; status: Invoice['status']; returnStatus: 'partially_returned' | 'fully_returned' | null; anyReturnable: boolean; totalReturnedAmount: number; lines: Array<{ sku: string; product: string; sold: number; returned: number; remaining: number }> }>(`/db/invoices/${encodeURIComponent(invoiceId)}/return-status`),
   createBooking: (payload: { customer: string; items: Array<{ product: string; sku?: string; qty: number; price: number }>; advanceAmount?: number; discount?: number }) =>
     request<SalesOrder>('/db/bookings', { method: 'POST', body: JSON.stringify(payload) }),
   updateBooking: (orderId: string, payload: { customer?: string; items?: Array<{ product: string; sku?: string; qty: number; price: number }>; advanceAmount?: number; discount?: number }) =>
@@ -440,7 +443,7 @@ export const dbApi = {
   },
   getSalesOrders: () => list<SalesOrder>('/db/sales-orders', PAGED),
   getShipments: () => request<{ data: Shipment[] }>('/db/shipments'),
-  dispatchShipment: (orderId: string, opts?: { courier?: string; trackingNumber?: string; expectedDelivery?: string; notes?: string }) =>
+  dispatchShipment: (orderId: string, opts?: { courier?: string | null; trackingNumber?: string | null; expectedDelivery?: string | null; notes?: string | null }) =>
     request<{ ok: boolean }>('/db/shipments/dispatch', { method: 'POST', body: JSON.stringify({ orderId, ...opts }) }),
   confirmDelivery: (shipmentId: string) =>
     request<{ ok: boolean }>(`/db/shipments/${encodeURIComponent(shipmentId)}/delivered`, { method: 'POST' }),

@@ -738,7 +738,9 @@ export interface Invoice {
   paymentMethod: string
   paymentStatus: 'paid' | 'partial' | 'pending' | 'failed' | 'refunded'
   paymentId?: string
-  status: 'paid' | 'draft' | 'issued' | 'overdue' | 'cancelled' | 'refunded'
+  // 'partially_returned' / 'fully_returned' are derived by the backend return
+  // endpoint from per-line returned quantities — never set manually.
+  status: 'paid' | 'draft' | 'issued' | 'overdue' | 'cancelled' | 'refunded' | 'partially_returned' | 'fully_returned'
   date: string
   dueDate?: string | null
   /** GST e-invoice fields, present once an IRN has been generated. */
