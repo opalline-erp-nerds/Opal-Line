@@ -6,6 +6,7 @@ import {
   QrCode,
   Search,
   FileDown,
+  FileCode,
   Eye,
   Settings2,
   SlidersHorizontal,
@@ -31,6 +32,8 @@ import {
   computeGrid,
   configFromPreset,
   expandLabels,
+  labelBrandText,
+  labelDesignFor,
   MM_TO_PX,
   PAGE_SIZES,
   clamp,
@@ -124,20 +127,24 @@ function ToggleRow({
   label,
   icon,
   checked,
+  disabled,
+  title,
   onCheckedChange,
 }: {
   label: string
   icon?: ReactNode
   checked: boolean
+  disabled?: boolean
+  title?: string
   onCheckedChange: (v: boolean) => void
 }) {
   return (
     <div className="flex items-center justify-between gap-2">
-      <span className="flex items-center gap-2 text-sm text-foreground">
+      <span className="flex items-center gap-2 text-sm text-foreground" title={title}>
         {icon}
         {label}
       </span>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} />
+      <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} />
     </div>
   )
 }
@@ -260,6 +267,10 @@ export default function BarcodeLabelsPage() {
   }, [products, filtered, selected])
 
   const grid = useMemo(() => computeGrid(cfg), [cfg])
+  // Reference sizes render from the approved transcribed artwork, whose field
+  // positions and type sizes are fixed — controls the artwork does not carry
+  // are disabled rather than silently ignored.
+  const designActive = useMemo(() => labelDesignFor(cfg.widthMm, cfg.heightMm) !== null, [cfg.widthMm, cfg.heightMm])
   const expandedCount = useMemo(() => expandLabels(labelProducts, cfg).length, [labelProducts, cfg])
   const sheetCount = Math.max(1, Math.ceil(expandedCount / grid.labelsPerPage))
   const pageSize = PAGE_SIZES[cfg.page]
@@ -328,11 +339,15 @@ export default function BarcodeLabelsPage() {
     }
     backupApi.downloadAllLabels({
       preset: cfg.presetKey === 'custom' ? undefined : cfg.presetKey,
+      showName: cfg.showName,
+      showSku: cfg.showSku,
       showPrice: cfg.showPrice,
       showWeight: cfg.showWeight,
+      showCategory: cfg.showCategory,
       showQR: cfg.showQr,
+      page: cfg.page,
       copies: cfg.copies,
-      brandName: 'OPAL LINE',
+      brandName: labelBrandText(cfg),
       width: cfg.widthMm,
       height: cfg.heightMm,
       columns: grid.columns,
@@ -343,13 +358,43 @@ export default function BarcodeLabelsPage() {
     })
   }
 
+  // Raw ZPL for a Zebra printer (or a ZPL print server): the printer's own
+  // language, generated from the same template the preview shows. Impact and
+  // sheet printers keep using Print above — the two workflows deliberately do
+  // not share a path. The geometry comes from a saved template, so a custom
+  // size has no ZPL equivalent and is refused instead of silently printing on
+  // the wrong stock.
+  const downloadZpl = () => {
+    if (expandedCount === 0) {
+      toast.info('No labels to export')
+      return
+    }
+    if (cfg.presetKey === 'custom') {
+      toast.error('ZPL is generated from a saved label template — pick a template size first')
+      return
+    }
+    const ids = selected.size > 0 ? [...selected] : filtered.map((p) => p.id)
+    void backupApi
+      .downloadLabelsZpl(ids, {
+        preset: cfg.presetKey,
+        copies: cfg.copies,
+        showPrice: cfg.showPrice,
+        showWeight: cfg.showWeight,
+        showQR: cfg.showQr,
+        showBrand: cfg.showCompany,
+        ...(cfg.showCompany ? { brandName: labelBrandText(cfg) } : {}),
+      })
+      .then(() => toast.success('ZPL file saved'))
+      .catch((err: unknown) => toast.error(err instanceof Error ? err.message : 'ZPL export failed'))
+  }
+
   const printLabels = () => {
     if (expandedCount === 0) {
       toast.info('No labels to print')
       return
     }
     if (grid.overflow) {
-      toast.error('Label size does not fit the page ΓÇö reduce size or margins')
+      toast.error('Label size does not fit the page — reduce size or margins')
       return
     }
     setGenerating(true)
@@ -409,9 +454,13 @@ export default function BarcodeLabelsPage() {
               <FileDown className="h-4 w-4" />
               PDF
             </Button>
+            <Button variant="outline" onClick={downloadZpl} disabled={expandedCount === 0}>
+              <FileCode className="h-4 w-4" />
+              ZPL
+            </Button>
             <Button onClick={printLabels} disabled={generating || expandedCount === 0}>
               <Printer className="h-4 w-4" />
-              {generating ? 'PreparingΓÇª' : `Print ${expandedCount} Label${expandedCount === 1 ? '' : 's'}`}
+              {generating ? 'Preparing…' : `Print ${expandedCount} Label${expandedCount === 1 ? '' : 's'}`}
             </Button>
           </>
         }
@@ -504,7 +553,7 @@ export default function BarcodeLabelsPage() {
               {grid.overflow && (
                 <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  Label + margins exceed the page ΓÇö reduce size or margins.
+                  Label + margins exceed the page — reduce size or margins.
                 </div>
               )}
             </CardContent>
@@ -519,9 +568,15 @@ export default function BarcodeLabelsPage() {
             <CardContent className="space-y-3">
               <ToggleRow label="Product name" checked={cfg.showName} onCheckedChange={(v) => patch({ showName: v })} />
               <ToggleRow label="SKU" checked={cfg.showSku} onCheckedChange={(v) => patch({ showSku: v })} />
-              <ToggleRow label="Price (Γé╣)" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
+              <ToggleRow label="Price (₹)" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
               <ToggleRow label="Net weight" checked={cfg.showWeight} onCheckedChange={(v) => patch({ showWeight: v })} />
-              <ToggleRow label="HUID" checked={cfg.showHuid} onCheckedChange={(v) => patch({ showHuid: v })} />
+              <ToggleRow
+                label="HUID"
+                checked={cfg.showHuid}
+                disabled={designActive}
+                title={designActive ? 'The approved reference templates have no HUID field' : undefined}
+                onCheckedChange={(v) => patch({ showHuid: v })}
+              />
               <ToggleRow label="Category" checked={cfg.showCategory} onCheckedChange={(v) => patch({ showCategory: v })} />
               <ToggleRow
                 label="QR code (encodes the SKU)"
@@ -529,7 +584,13 @@ export default function BarcodeLabelsPage() {
                 checked={cfg.showQr}
                 onCheckedChange={(v) => patch({ showQr: v })}
               />
-              <ToggleRow label="Border" checked={cfg.showBorder} onCheckedChange={(v) => patch({ showBorder: v })} />
+              <ToggleRow
+                label="Border"
+                checked={cfg.showBorder}
+                disabled={designActive}
+                title={designActive ? 'Reference labels print without borders' : undefined}
+                onCheckedChange={(v) => patch({ showBorder: v })}
+              />
               <ToggleRow label="Company name" checked={cfg.showCompany} onCheckedChange={(v) => patch({ showCompany: v })} />
               {cfg.showCompany && (
                 <Input
@@ -538,6 +599,12 @@ export default function BarcodeLabelsPage() {
                   placeholder="Company name"
                   className="h-8 text-sm"
                 />
+              )}
+              {designActive && (
+                <p className="text-xs text-muted-foreground">
+                  Reference template active — field positions and type sizes come from the approved layout, so it
+                  always prints brand, name, rate, code and QR.
+                </p>
               )}
             </CardContent>
           </Card>
@@ -729,11 +796,11 @@ export default function BarcodeLabelsPage() {
                         </div>
                         <div className="shrink-0 text-right">
                           <p className="text-sm font-semibold text-primary-700">
-                            Γé╣{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
+                            ₹{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
                           </p>
                           <p className="text-[11px] text-muted-foreground">
                             {product.netWeight ? `${product.netWeight}g` : ''}
-                            {product.stock !== undefined ? ` ┬╖ ${product.stock} pcs` : ''}
+                            {product.stock !== undefined ? ` · ${product.stock} pcs` : ''}
                           </p>
                         </div>
                       </div>

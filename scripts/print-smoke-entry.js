@@ -19,6 +19,7 @@ const { tmpdir } = require('node:os')
 app.setPath('userData', join(tmpdir(), 'opal-line-smoke-userdata'))
 
 const PDF_PATH = process.env.OPAL_SMOKE_PDF_PATH
+const LETTER_PDF_PATH = process.env.OPAL_SMOKE_LETTER_PDF_PATH
 
 // Transient print windows come and go — without this listener Electron's
 // default "all windows closed → quit" would kill this (otherwise windowless)
@@ -46,6 +47,20 @@ app.whenReady()
     if (PDF_PATH) {
       const pdf = await pdfFromHtml(html, { savePath: PDF_PATH, title: 'Opal Line Billing print smoke' })
       console.log('SMOKE_PDF ' + JSON.stringify(pdf))
+    }
+
+    // "Save as PDF" must honour the stock the DOCUMENT declares: label sheets
+    // and invoices emit @page{size:…;margin:0} themselves, and a Letter sheet
+    // used to be exported on A4 paper (scaled and shifted), which is what made
+    // saved label PDFs land off the labels. A doc with no @page keeps A4.
+    if (LETTER_PDF_PATH) {
+      const letterHtml =
+        '<!doctype html><html><head><title>letter stock</title><style>' +
+        '@page{size:letter;margin:0;} *{margin:0;padding:0}' +
+        'body{background:#fff} .sheet{width:215.9mm;height:279.4mm;background:#fff;}' +
+        '</style></head><body><div class="sheet"><h1>Letter sheet</h1></div></body></html>'
+      const letter = await pdfFromHtml(letterHtml, { savePath: LETTER_PDF_PATH, title: 'Letter stock' })
+      console.log('SMOKE_PDF_LETTER ' + JSON.stringify(letter))
     }
 
     app.exit(0)

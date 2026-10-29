@@ -886,12 +886,23 @@ function printBridge(): PrintBridge | undefined {
   return (window as unknown as { electronAPI?: PrintBridge }).electronAPI
 }
 
-function popupWithPrint(html: string): void {
+const POPUP_BLOCKED_ERROR =
+  'The print window was blocked by the browser — allow pop-ups for this site, then try again.'
+
+/**
+ * Open the built document in a popup that prints itself on load.
+ * Returns false when the popup was refused. Callers must surface that: a
+ * blocked window used to end in a "Labels saved as PDF" toast with no file
+ * written anywhere, which is exactly what "Save as PDF does nothing" looked
+ * like from the user's side.
+ */
+function popupWithPrint(html: string): boolean {
   const w = window.open('', '_blank', 'width=900,height=760')
-  if (!w) return
+  if (!w) return false
   w.opener = null
   w.document.write(html + `<script>window.onload=function(){window.focus();window.print();}</script>`)
   w.document.close()
+  return true
 }
 
 /** Ask how to print: native chooser (Default printer / Save as PDF… /
@@ -933,7 +944,10 @@ export async function printHtmlToPrinter(
   const picked = mode ?? (await choosePrintMode())
   if (picked === 'cancel') return
   if (picked === 'pdf') {
-    await exportHtmlPdf(html, title)
+    const res = await exportHtmlPdf(html, title)
+    // A failed save must reach the caller — swallowing it is how a blocked
+    // popup used to look like a successful export.
+    if (!res.ok && !res.cancelled) throw new Error(res.error || 'PDF export failed')
     return
   }
   const api = printBridge()
@@ -946,7 +960,7 @@ export async function printHtmlToPrinter(
     }
     return
   }
-  popupWithPrint(html)
+  if (!popupWithPrint(html)) throw new Error(POPUP_BLOCKED_ERROR)
 }
 
 /**
@@ -1001,7 +1015,12 @@ export async function openHtmlPreview(html: string, title?: string): Promise<voi
     return
   }
   const w = window.open('', '_blank', 'width=900,height=760')
-  if (!w) return
+  if (!w) {
+    // Preview is a look-only flow, so a blocked popup is reported rather than
+    // thrown: the page keeps working and the console explains the silence.
+    console.warn('[preview] blocked:', POPUP_BLOCKED_ERROR)
+    return
+  }
   w.opener = null
   w.document.write(html)
   w.document.close()
@@ -1024,7 +1043,10 @@ export async function exportHtmlPdf(
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   }
-  popupWithPrint(html)
+  // Plain browser: the popup is where the user picks Chrome's own
+  // "Save as PDF". If it never opened, no PDF will ever exist — say so
+  // instead of reporting a success the user cannot find on disk.
+  if (!popupWithPrint(html)) return { ok: false, error: POPUP_BLOCKED_ERROR }
   return { ok: true }
 }
 
@@ -1052,5 +1074,9 @@ export function printDocument(
       return
     }
     await printHtmlToPrinter(html, undefined, picked)
-  })()
+  })().catch((err) => {
+    // A blocked popup (or any print-stage failure) must not surface as an
+    // unhandled rejection — it is reported like every other print failure.
+    console.warn('[print] failed:', err)
+  })
 }

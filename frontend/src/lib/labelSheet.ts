@@ -77,7 +77,7 @@ export const DEFAULT_LABEL_CONFIG: LabelConfig = {
   showPrice: true,
   showWeight: true,
   showHuid: true,
-  showCategory: false,
+  showCategory: true,
   showCompany: true,
   showQr: true,
   showBorder: true,
@@ -287,9 +287,9 @@ export function textEmWidth(text: string): number {
   return counted === 0 ? text.length * 0.556 : sum / 1000
 }
 
-export function labelAttributes(product: { category?: string; collection?: string; weight?: number }, opts: { showWeight?: boolean }): string[] {
+export function labelAttributes(product: { category?: string; collection?: string; weight?: number }, opts: { showWeight?: boolean; showCategory?: boolean }): string[] {
   const out: string[] = []
-  if (product.category) out.push(String(product.category))
+  if (opts.showCategory !== false && product.category) out.push(String(product.category))
   if (product.collection) out.push(String(product.collection))
   else if (opts.showWeight !== false && product.weight) out.push(`${product.weight}g`)
   return out
@@ -302,11 +302,20 @@ export interface DesignFieldText {
 
 export function designFieldTexts(
   product: LabelProduct,
-  opts: { showPrice?: boolean; showWeight?: boolean; showBrand?: boolean; brand?: string; codeLength?: number },
+  opts: {
+    showPrice?: boolean
+    showWeight?: boolean
+    showBrand?: boolean
+    showName?: boolean
+    showSku?: boolean
+    showCategory?: boolean
+    brand?: string
+    codeLength?: number
+  },
   design: LabelDesign,
 ): DesignFieldText[] {
   const out: DesignFieldText[] = []
-  const attrs = labelAttributes(product, { showWeight: opts.showWeight })
+  const attrs = labelAttributes(product, { showWeight: opts.showWeight, showCategory: opts.showCategory })
   for (const field of design.fields) {
     switch (field.kind) {
       case 'brand': {
@@ -315,8 +324,12 @@ export function designFieldTexts(
         break
       }
       case 'name': {
-        const name = (String(product.name ?? '').trim() || 'Product').toLocaleUpperCase()
-        out.push({ kind: 'name', text: name })
+        // The preview's name toggle must hide the line in the PDF too, so both
+        // renderers read the same `showName` flag (default: shown).
+        if (opts.showName !== false) {
+          const name = (String(product.name ?? '').trim() || 'Product').toLocaleUpperCase()
+          out.push({ kind: 'name', text: name })
+        }
         break
       }
       case 'rate':
@@ -325,7 +338,7 @@ export function designFieldTexts(
       case 'code': {
         const rawCode = (product.sku ?? '').trim()
         const code = opts.codeLength ? rawCode.slice(0, opts.codeLength) : rawCode
-        if (code) out.push({ kind: 'code', text: design.height <= 12 ? code : `Code: ${code}` })
+        if (code && opts.showSku !== false) out.push({ kind: 'code', text: design.height <= 12 ? code : `Code: ${code}` })
         break
       }
       case 'attr1':
@@ -463,12 +476,24 @@ function buildAdaptiveLabelHtml(p: LabelProduct, cfg: LabelConfig, qrCode: strin
     </div>`
 }
 
+/**
+ * Brand line for a label sheet: the approved reference templates always print
+ * a brand, defaulting to OPAL LINE. The custom company name only replaces it
+ * while its toggle is on — and the PDF receives the same resolved string.
+ */
+export function labelBrandText(cfg: Pick<LabelConfig, 'showCompany' | 'companyName'>): string {
+  return cfg.showCompany ? cfg.companyName.trim() || 'OPAL LINE' : 'OPAL LINE'
+}
+
 function buildDesignLabelHtml(p: LabelProduct, cfg: LabelConfig, qrCode: string | null, design: LabelDesign): string {
   const showQR = cfg.showQr && !!qrCode
-  const brand = cfg.showCompany ? (cfg.companyName.trim() || 'OPAL LINE') : 'OPAL LINE'
+  const brand = labelBrandText(cfg)
   const opts = {
     showPrice: cfg.showPrice,
     showWeight: cfg.showWeight,
+    showName: cfg.showName,
+    showSku: cfg.showSku,
+    showCategory: cfg.showCategory,
     showBrand: true,
     brand,
     codeLength: undefined as number | undefined,
@@ -502,7 +527,7 @@ function buildDesignLabelHtml(p: LabelProduct, cfg: LabelConfig, qrCode: string 
   }
 
   const qrHtml = showQR && qrCode
-    ? `<div style="position:absolute;left:${design.qr.x}mm;top:${qrTopMm(design)}mm;width:${design.qr.size}mm;height:${design.qr.size}mm;">${qrCode}</div>`
+    ? `<div class="qr" style="position:absolute;left:${design.qr.x}mm;top:${qrTopMm(design)}mm;width:${design.qr.size}mm;height:${design.qr.size}mm;">${qrCode}</div>`
     : ''
 
   return `<div class="lbl">${lines.join('')}${qrHtml}</div>`
@@ -560,7 +585,9 @@ export function buildLabelSheet(products: LabelProduct[], cfg: LabelConfig, opts
     pages.push(`<div class="page">${cells.join('')}</div>`)
   }
 
-  const borderCss = cfg.showBorder ? 'border:0.15mm solid #9aa1ad;' : 'border:none;'
+  // Reference labels print borderless — the approved artwork and the PDF have
+  // no frame — so only the legacy layout honours the border toggle.
+  const borderCss = !design && cfg.showBorder ? 'border:0.15mm solid #9aa1ad;' : 'border:none;'
 
   const screenCss = `@media screen{
       body{background:#e8ebf0;padding:6mm;}

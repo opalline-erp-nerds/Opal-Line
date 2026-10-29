@@ -62,6 +62,41 @@ function tempHtmlFile(): string {
   return join(app.getPath('temp'), `opal-doc-${randomBytes(8).toString('hex')}.html`)
 }
 
+/** Paper geometry a job must print on. */
+type PrintJobOptions = {
+  margins?: { marginType: 'default' | 'none' | 'printableArea' | 'custom' }
+  pageSize?: 'A3' | 'A4' | 'A5' | 'Legal' | 'Letter' | 'Tabloid'
+}
+
+/**
+ * The page geometry a built document declares for itself in its own `@page`
+ * rule (label sheets and invoices both emit `@page{size:…;margin:0;}` and lay
+ * their content out inside that box, margins included).
+ *
+ * Chromium honours that rule when printing a window, but `printToPDF` answers
+ * with its own defaults instead — 1 cm margins and "scale the content to fit
+ * the paper" — which is what shrank label sheets onto a normal-looking page
+ * and pushed the artwork 1 cm in from the sheet edge. Reading the declaration
+ * back lets the desktop pipeline print and save exactly what the document asks
+ * for: its own stock, its own margins, no scaling.
+ */
+function declaredPage(html: string): { size?: PrintJobOptions['pageSize']; marginZero: boolean } {
+  const rule = /@page\s*\{([^}]*)\}/.exec(html)?.[1] ?? ''
+  const sizes: Record<string, NonNullable<PrintJobOptions['pageSize']>> = {
+    a3: 'A3',
+    a4: 'A4',
+    a5: 'A5',
+    letter: 'Letter',
+    legal: 'Legal',
+  }
+  const size = /(?:^|[;\s])size\s*:\s*(a3|a4|a5|letter|legal)\b/i.exec(rule)
+  const marginZero = /(?:^|[;\s])margin\s*:\s*0(?:\.0+)?(?:px)?\s*(?:;|$)/i.test(rule)
+  return {
+    size: size ? sizes[size[1].toLowerCase()] : undefined,
+    marginZero,
+  }
+}
+
 /**
  * Write the HTML to a temp file, render it in a hidden window, run `fn` with
  * the loaded webContents, then always destroy the window and delete the file.
@@ -116,8 +151,8 @@ function withRenderedDocument<T>(html: string, title: string, fn: (win: BrowserW
   })
 }
 
-function printOnce(win: BrowserWindow, silent: boolean): Promise<boolean> {
-  return printAttempt(win.webContents, silent)
+function printOnce(win: BrowserWindow, silent: boolean, opts?: PrintJobOptions): Promise<boolean> {
+  return printAttempt(win.webContents, silent, opts)
 }
 
 /**
@@ -132,7 +167,7 @@ function printOnce(win: BrowserWindow, silent: boolean): Promise<boolean> {
 const SILENT_PRINT_TIMEOUT_MS = 30_000
 const DIALOG_PRINT_TIMEOUT_MS = 300_000
 
-function printAttempt(wc: WebContents, silent: boolean): Promise<boolean> {
+function printAttempt(wc: WebContents, silent: boolean, opts?: PrintJobOptions): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false
     const done = (ok: boolean) => {
@@ -142,7 +177,10 @@ function printAttempt(wc: WebContents, silent: boolean): Promise<boolean> {
       resolve(ok)
     }
     const timer = setTimeout(() => done(false), silent ? SILENT_PRINT_TIMEOUT_MS : DIALOG_PRINT_TIMEOUT_MS)
-    try { wc.print({ silent }, (ok) => done(ok)) } catch { done(false) }
+    // `opts` carries the document's own paper/margins: without them Electron
+    // prints on the printer's default stock with its default margins, which
+    // shifts label sheets off the labels they are laid out for.
+    try { wc.print({ silent, ...opts }, (ok) => done(ok)) } catch { done(false) }
   })
 }
 
@@ -180,17 +218,22 @@ export function printHtml(
 ): Promise<PrintResult> {
   const title = opts.title ?? 'Opal Line Billing — Print'
   const silent = opts.mode !== 'dialog'
+  const geo = declaredPage(html)
+  const job: PrintJobOptions = {
+    ...(geo.marginZero ? { margins: { marginType: 'none' as const } } : {}),
+    ...(geo.size ? { pageSize: geo.size } : {}),
+  }
   return enqueue(async () => {
     try {
       return await withRenderedDocument(html, title, async (win) => {
-        if (silent && await printOnce(win, true)) return { ok: true }
+        if (silent && await printOnce(win, true, job)) return { ok: true }
         if (silent && opts.fallbackToDialog === false) {
           return { ok: false, error: 'silent print to the default printer failed (is a default printer configured?)' }
         }
         // The default printer refused — show the document and let the system
         // print dialog take over rather than failing silently.
         win.show()
-        const ok = await printOnce(win, false)
+        const ok = await printOnce(win, false, job)
         return ok ? { ok: true } : { ok: false, error: 'the system print dialog reported a failure' }
       })
     } catch (err) {
@@ -223,10 +266,21 @@ export function pdfFromHtml(
   html: string,
   opts: { suggestedName?: string; title?: string; savePath?: string } = {},
 ): Promise<PdfResult> {
+  // The document declares its own stock and margins (see declaredPage): use
+  // them instead of printToPDF's defaults (1 cm margins + scale-to-fit), which
+  // is what made "Save as PDF" produce a shrunk, offset sheet.
+  const geo = declaredPage(html)
+  const pdfOptions = {
+    printBackground: true,
+    ...(geo.size
+      ? { pageSize: geo.size, preferCSSPageSize: true }
+      : { pageSize: 'A4' as const }),
+    ...(geo.marginZero ? { margins: { top: 0, bottom: 0, left: 0, right: 0 } } : {}),
+  }
   return enqueue(async () => {
     try {
       const data = await withRenderedDocument(html, opts.title ?? 'Opal Line Billing', (win) =>
-        win.webContents.printToPDF({ printBackground: true, pageSize: 'A4' }),
+        win.webContents.printToPDF(pdfOptions),
       )
       return await savePdfData(data, opts)
     } catch (err) {
