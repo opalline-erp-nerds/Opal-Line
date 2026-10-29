@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNotNull, lt } from 'drizzle-orm'
+import { and, desc, eq, inArray, isNotNull, lt, sql } from 'drizzle-orm'
 import type { NextFunction, Request, Response } from 'express'
 import { randomUUID } from 'node:crypto'
 import { db } from '../db/client'
@@ -177,13 +177,50 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
       // Keep the list honest: anything past its valid-until date reads expired.
       await expireStaleQuotations()
       const statusFilter = typeof req.query.status === 'string' && isQuotationStatus(req.query.status) ? req.query.status : null
-      const quotes = await db
-        .select()
-        .from(s.quotations)
-        .where(statusFilter ? eq(s.quotations.status, statusFilter) : undefined)
-        .orderBy(desc(s.quotations.date))
-        .limit(200)
-      res.json({ page: 1, pageSize: 200, total: quotes.length, status: statusFilter ?? 'all', data: quotes })
+      const where = statusFilter ? eq(s.quotations.status, statusFilter) : undefined
+
+      // Honor page/limit so API pagination clients (list()) don't re-read the
+      // same first page forever.
+      const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1)
+      const pageSize = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '200'), 10) || 200))
+
+      const [quotes, countRows] = await Promise.all([
+        db
+          .select()
+          .from(s.quotations)
+          .where(where)
+          .orderBy(desc(s.quotations.date))
+          .limit(pageSize)
+          .offset((page - 1) * pageSize),
+        db.select({ count: sql<number>`count(*)::int` }).from(s.quotations).where(where),
+      ])
+      const total = Number(countRows[0]?.count ?? 0)
+
+      // Attach line items per quotation: the UI reads items straight off the
+      // list rows (view dialog, printing, edit prefill), so an items-less row
+      // renders/print the quotation with zero line items.
+      const items =
+        quotes.length > 0
+          ? await db
+              .select()
+              .from(s.quotationItems)
+              .where(inArray(s.quotationItems.quotationId, quotes.map((q) => q.id)))
+              .orderBy(s.quotationItems.id)
+          : []
+      const itemsByQuote = new Map<string, typeof items>()
+      for (const it of items) {
+        const list = itemsByQuote.get(it.quotationId) ?? []
+        list.push(it)
+        itemsByQuote.set(it.quotationId, list)
+      }
+
+      res.json({
+        page,
+        pageSize,
+        total,
+        status: statusFilter ?? 'all',
+        data: quotes.map((q) => ({ ...q, items: itemsByQuote.get(q.id) ?? [] })),
+      })
     } catch {
       res.status(500).json({ error: 'Failed to list quotations' })
     }
