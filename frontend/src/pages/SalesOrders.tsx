@@ -504,7 +504,9 @@ export default function SalesOrdersPage() {
       if (res.ok) {
         setSyncMsg({
           ok: true,
-          text: `Synced Shopify orders: ${res.imported} new, ${res.updated} updated.`,
+          text:
+            `Synced Shopify orders: ${res.imported} new, ${res.updated} updated.` +
+            (res.piiRedacted ? ` ⚠ ${res.piiRedacted.message}` : ''),
         })
         reload()
       } else {

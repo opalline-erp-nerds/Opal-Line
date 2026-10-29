@@ -1372,6 +1372,12 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
     `ALTER TABLE settings ADD COLUMN IF NOT EXISTS lockout_duration_minutes integer DEFAULT 15`,
     `ALTER TABLE settings ADD COLUMN IF NOT EXISTS rate_schedule jsonb`,
     `ALTER TABLE settings ADD COLUMN IF NOT EXISTS scheduled_rate_changes jsonb`,
+    // Idempotency for sales returns: an optional client key on each credit
+    // note so a retried / double-submitted return replays the original note
+    // instead of restocking the same units twice. NULLs are unique-exempt,
+    // so existing returns without a key are unaffected.
+    `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS idempotency_key text`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS sales_returns_idempotency_key_idx ON sales_returns (idempotency_key)`,
     // products.created_at was a DATE, which tied every product created the
     // same day and made "newest first" meaningless within a day. Upgrade it
     // to a full timestamp (existing rows become midnight); guarded by the

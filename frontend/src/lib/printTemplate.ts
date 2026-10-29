@@ -450,8 +450,8 @@ export function buildBarcodeLabelHtml(doc: PrintDoc, config: PrintDesignerConfig
     (c.labelShowFront ? sideSheet(frontLabel) : '') +
     (c.labelShowBack ? sideSheet(backLabel) : '')
 
-  return `<!doctype html><html><head><title>Product Labels</title><style>
-      @page{margin:0;}
+   return `<!doctype html><html><head><title>Product Labels</title><style>
+      @page{size:${lw}mm ${lh}mm;margin:0;}
       *{margin:0;padding:0;box-sizing:border-box;}
       body{font-family:${fontStack};color:#232733;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact;margin:0;padding:0;}
       .sheet{width:${lw}mm;height:${lh}mm;padding:0;margin:0;page-break-after:avoid;display:flex;align-items:flex-start;justify-content:flex-start;}

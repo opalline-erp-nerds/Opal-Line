@@ -116,8 +116,8 @@ function withRenderedDocument<T>(html: string, title: string, fn: (win: BrowserW
   })
 }
 
-function printOnce(win: BrowserWindow, silent: boolean): Promise<boolean> {
-  return printAttempt(win.webContents, silent)
+function printOnce(win: BrowserWindow, silent: boolean, html?: string): Promise<boolean> {
+  return printAttempt(win.webContents, silent, html)
 }
 
 /**
@@ -132,7 +132,7 @@ function printOnce(win: BrowserWindow, silent: boolean): Promise<boolean> {
 const SILENT_PRINT_TIMEOUT_MS = 30_000
 const DIALOG_PRINT_TIMEOUT_MS = 300_000
 
-function printAttempt(wc: WebContents, silent: boolean): Promise<boolean> {
+function printAttempt(wc: WebContents, silent: boolean, html?: string): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false
     const done = (ok: boolean) => {
@@ -142,7 +142,21 @@ function printAttempt(wc: WebContents, silent: boolean): Promise<boolean> {
       resolve(ok)
     }
     const timer = setTimeout(() => done(false), silent ? SILENT_PRINT_TIMEOUT_MS : DIALOG_PRINT_TIMEOUT_MS)
-    try { wc.print({ silent }, (ok) => done(ok)) } catch { done(false) }
+    // Chromium (and therefore Electron) hard-codes A4 media when print() gets
+    // no pageSize, so a custom-sized document — thermal / jewellery-tag label
+    // HTML with `@page{size:NNmm NNmm}` — spools on A4 with the printer's
+    // default margins. Derive the media size from the document's own @page
+    // CSS and zero the margins for those documents (same unit printToPDF
+    // already uses; Chromium validates a ≥353 micron minimum).
+    const printOptions: { silent: boolean; pageSize?: { width: number; height: number }; margins?: { marginType: string } } = { silent }
+    if (html) {
+      const page = pageSizeFromHtml(html)
+      if (typeof page === 'object') {
+        printOptions.pageSize = page
+        printOptions.margins = { marginType: 'none' }
+      }
+    }
+    try { wc.print(printOptions as never, (ok) => done(ok)) } catch { done(false) }
   })
 }
 
@@ -183,20 +197,33 @@ export function printHtml(
   return enqueue(async () => {
     try {
       return await withRenderedDocument(html, title, async (win) => {
-        if (silent && await printOnce(win, true)) return { ok: true }
+        if (silent && await printOnce(win, true, html)) return { ok: true }
         if (silent && opts.fallbackToDialog === false) {
           return { ok: false, error: 'silent print to the default printer failed (is a default printer configured?)' }
         }
         // The default printer refused — show the document and let the system
         // print dialog take over rather than failing silently.
         win.show()
-        const ok = await printOnce(win, false)
+        const ok = await printOnce(win, false, html)
         return ok ? { ok: true } : { ok: false, error: 'the system print dialog reported a failure' }
       })
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   })
+}
+
+function pageSizeFromHtml(html: string): string | { width: number; height: number } {
+  const match = html.match(/@page\s*\{[^}]*size\s*:\s*([^;}]+)/i)
+  const raw = match ? match[1].trim() : ''
+  if (!raw) return 'A4'
+  if (/^A4$/i.test(raw)) return 'A4'
+  if (/^Letter$/i.test(raw)) return 'Letter'
+  const mm = raw.match(/^([\d.]+)\s*mm\s+([\d.]+)\s*mm$/i)
+  if (mm) {
+    return { width: Math.round(Number(mm[1]) * 1000), height: Math.round(Number(mm[2]) * 1000) }
+  }
+  return 'A4'
 }
 
 /** Prompt for a save location (unless `savePath` skips it, e.g. tests) and
@@ -225,9 +252,10 @@ export function pdfFromHtml(
 ): Promise<PdfResult> {
   return enqueue(async () => {
     try {
-      const data = await withRenderedDocument(html, opts.title ?? 'Opal Line Billing', (win) =>
-        win.webContents.printToPDF({ printBackground: true, pageSize: 'A4' }),
-      )
+    const pageSize = pageSizeFromHtml(html)
+    const data = await withRenderedDocument(html, opts.title ?? 'Opal Line Billing', (win) =>
+        win.webContents.printToPDF({ printBackground: true, pageSize: pageSize as any }),
+    )
       return await savePdfData(data, opts)
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }

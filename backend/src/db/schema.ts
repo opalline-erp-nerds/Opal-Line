@@ -425,10 +425,15 @@ export const salesReturns = pgTable('sales_returns', {
   amount: numericNumber('amount'),
   status: text('status'),
   date: ts('date'),
+  // Optional client idempotency key: a retried submission with the same key
+  // replays the original credit note instead of restocking the units again.
+  idempotencyKey: text('idempotency_key'),
 }, (table) => ({
   numberIdx: uniqueIndex('sales_returns_number_idx').on(table.number),
   customerIdx: index('sales_returns_customer_idx').on(table.customer),
   dateIdx: index('sales_returns_date_idx').on(table.date),
+  // Unique only over non-null keys — NULLs never block new returns.
+  idempotencyIdx: uniqueIndex('sales_returns_idempotency_key_idx').on(table.idempotencyKey),
 }))
 
 export const orderEvents = pgTable('order_events', {

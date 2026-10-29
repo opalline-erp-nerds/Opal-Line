@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Truck, RefreshCw, PackageCheck, PackageOpen } from 'lucide-react'
+import { toast } from '@/components/ui/confirm'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -27,6 +28,12 @@ export default function DispatchPage() {
   const [tracking, setTracking] = useState('')
   const [expected, setExpected] = useState('')
   const [saving, setSaving] = useState(false)
+  // Snapshot taken when the dialog opens; isDirty compares the live fields to
+  // it so Cancel only warns when something actually changed (an always-on
+  // courier preset made the old check warn on untouched dialogs too).
+  const [baseline, setBaseline] = useState('')
+
+  const dirtySnapshot = JSON.stringify({ courier, customCourier, tracking, expected })
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -49,34 +56,77 @@ export default function DispatchPage() {
     })
   }, [load])
 
-  const dispatchable = useMemo(
-    () => orders.filter((o) => o.status !== 'cancelled' && !['delivered'].includes(shipments.find((sh) => sh.orderId === o.id)?.status ?? '')),
-    [orders, shipments],
-  )
   const shipmentByOrder = useMemo(() => new Map(shipments.map((sh) => [sh.orderId, sh])), [shipments])
+
+  /** Can this order still go out? Mirrors the backend's eligibility rules —
+   * see backend/src/dispatch.ts — so the page never shows a Dispatch action
+   * the API would reject: not cancelled, not already delivered, and a
+   * fulfilled order without a shipment (fulfilled inside Shopify, never
+   * dispatched here) is not dispatchable — its goods already left via the
+   * outside flow. */
+  const isEligible = useCallback((o: SalesOrder) => {
+    const sh = shipmentByOrder.get(o.id)
+    if (o.status === 'cancelled') return false
+    if (sh?.status === 'delivered') return false
+    if (!sh && o.status === 'fulfilled') return false
+    return true
+  }, [shipmentByOrder])
+  const dispatchable = useMemo(
+    () => orders.filter((o) => isEligible(o)),
+    [orders, isEligible],
+  )
 
   const openDispatch = useCallback((o: SalesOrder) => {
     const existing = shipmentByOrder.get(o.id)
-    setCourier(existing?.courier && COURIERS.includes(existing.courier) ? existing.courier : 'BlueDart')
-    setCustomCourier(existing && !COURIERS.includes(existing.courier ?? '') ? existing.courier ?? '' : '')
-    setTracking(existing?.trackingNumber ?? '')
-    setExpected(existing?.expectedDelivery?.slice(0, 10) ?? '')
+    const existingCourier = existing?.courier ?? null
+    let nextCourier: string
+    if (existingCourier && COURIERS.includes(existingCourier)) {
+      // A stored courier on the preset list comes back selected as itself.
+      nextCourier = existingCourier
+    } else if (existingCourier) {
+      // A custom courier must come back as "Other" with its name intact;
+      // defaulting to BlueDart here silently overwrote custom couriers
+      // (e.g. "XPRS Beu") with BlueDart on save.
+      nextCourier = 'Other'
+    } else {
+      nextCourier = 'BlueDart'
+    }
+    const nextCustom = existing && !COURIERS.includes(existing.courier ?? '') ? existing.courier ?? '' : ''
+    const nextTracking = existing?.trackingNumber ?? ''
+    const nextExpected = existing?.expectedDelivery?.slice(0, 10) ?? ''
+    setCourier(nextCourier)
+    setCustomCourier(nextCustom)
+    setTracking(nextTracking)
+    setExpected(nextExpected)
+    setBaseline(JSON.stringify({ courier: nextCourier, customCourier: nextCustom, tracking: nextTracking, expected: nextExpected }))
     setDispatchFor(o)
   }, [shipmentByOrder])
 
   const saveDispatch = async () => {
-    if (!dispatchFor) return
+    if (!dispatchFor || saving) return
+    const courierValue = (courier === 'Other' ? customCourier : courier).trim()
+    if (courier === 'Other' && !courierValue) return // button is disabled before it can fire
     setSaving(true)
+    setError('')
     try {
       await dbApi.dispatchShipment(dispatchFor.id, {
-        courier: courier === 'Other' ? customCourier : courier,
-        trackingNumber: tracking || undefined,
-        expectedDelivery: expected || undefined,
+        // Present-with-empty means "clear"; omitted means "keep" (see
+        // backend/src/dispatch.ts). The dialog pre-fills every editable
+        // field, so an emptied field is always an intentional clearing.
+        courier: courierValue || null,
+        trackingNumber: tracking || null,
+        expectedDelivery: expected || null,
       })
       setDispatchFor(null)
+      toast.success(`Dispatched ${dispatchFor.internalId || dispatchFor.shopifyId || 'order'}`)
       await load()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Dispatch failed')
+      // Trust the backend's wording (eligibility + unexpected failures) — it
+      // names the exact rule that fired; the page never claims success when
+      // the API failed because it only toasts inside the try block.
+      const message = err instanceof Error ? err.message : 'Dispatch failed'
+      setError(message)
+      toast.error(message)
     } finally {
       setSaving(false)
     }
@@ -85,6 +135,7 @@ export default function DispatchPage() {
   const confirmDelivered = useCallback(async (sh: Shipment) => {
     try {
       await dbApi.confirmDelivery(sh.id)
+      toast.success('Delivery confirmed')
       await load()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to confirm delivery')
@@ -107,11 +158,14 @@ export default function DispatchPage() {
     } },
     { id: 'actions', header: '', meta: { align: 'right' as const }, cell: ({ row }) => {
       const sh = shipmentByOrder.get(row.original.id)
-      const isCancelled = row.original.status === 'cancelled'
-      if (isCancelled) return null
+      // Same rule as the eligibility gate: nothing actionable on cancelled or
+      // delivered orders; a displayed delivered shipment stays as an easy
+      // "confirm again is harmless" (idempotent) action.
+      if (row.original.status === 'cancelled') return null
       if (sh?.status === 'delivered') {
         return <span className="flex items-center gap-1 text-xs text-emerald-600"><PackageCheck className="h-3.5 w-3.5" /> Delivered</span>
       }
+      if (!isEligible(row.original)) return null
       return (
         <div className="flex items-center gap-1.5">
           <Button size="sm" variant="outline" className="h-7 text-xs" onClick={(e) => { e.stopPropagation(); openDispatch(row.original) }}>
@@ -125,7 +179,7 @@ export default function DispatchPage() {
         </div>
       )
     } },
-  ], [shipmentByOrder, openDispatch, confirmDelivered])
+  ], [shipmentByOrder, isEligible, openDispatch, confirmDelivered])
 
   const dispatched = shipments.filter((sh) => sh.status === 'dispatched').length
   const delivered = shipments.filter((sh) => sh.status === 'delivered').length
@@ -152,7 +206,10 @@ export default function DispatchPage() {
 
       <Card>
         <CardContent className="p-0">
-          <DataTable columns={columns} data={orders} loading={loading} emptyMessage="No orders" />
+          {/* Eligible orders stay actionable; orders already delivered or
+              fulfilled outside dispatch stay visible for their shipment info
+              but their action cell renders empty. */}
+          <DataTable columns={columns} data={orders} loading={loading} emptyMessage="No orders awaiting dispatch" />
         </CardContent>
       </Card>
 
@@ -179,13 +236,13 @@ export default function DispatchPage() {
         open={dispatchFor !== null}
         onOpenChange={(open) => { if (!open) setDispatchFor(null) }}
         size="md"
-        isDirty={dispatchFor !== null && Boolean(courier || customCourier || tracking || expected)}
+        isDirty={dispatchFor !== null && dirtySnapshot !== baseline}
         title={`Dispatch order ${dispatchFor?.internalId || dispatchFor?.shopifyId || ''}`}
         description="The customer is notified automatically with tracking details once dispatched."
         footer={
           <DialogFooter>
             <Button variant="outline" size="sm" onClick={() => setDispatchFor(null)}>Cancel</Button>
-            <Button size="sm" onClick={saveDispatch} disabled={saving}>
+            <Button size="sm" onClick={saveDispatch} disabled={saving || (courier === 'Other' && !customCourier.trim())}>
               <Truck className="h-4 w-4" /> {saving ? 'Saving…' : 'Dispatch & notify'}
             </Button>
           </DialogFooter>
@@ -203,7 +260,12 @@ export default function DispatchPage() {
                 ))}
               </div>
               {courier === 'Other' && (
-                <Input value={customCourier} onChange={(e) => setCustomCourier(e.target.value)} placeholder="Courier name" className="mt-1.5" />
+                <>
+                  <Input value={customCourier} onChange={(e) => setCustomCourier(e.target.value)} placeholder="Courier name" className="mt-1.5" />
+                  {!customCourier.trim() && (
+                    <p className="text-xs text-red-500">Name the courier before dispatching</p>
+                  )}
+                </>
               )}
             </div>
             <div className="space-y-1.5">
