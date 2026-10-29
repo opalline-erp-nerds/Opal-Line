@@ -18,6 +18,7 @@ export interface ProductLabel {
 interface LabelOptions {
   width: number       // mm
   height: number      // mm
+  page?: 'a4' | 'letter'
   columns: number
   rows: number
   /** Outer page margin in mm (A4/Letter stock). */
@@ -520,16 +521,18 @@ export function labelCode(product: Pick<ProductLabel, 'sku'>): string {
  * (`^FDLA,<data>` means "level L, auto data type"), and keeping the module count
  * whole is what stops a tiny label's code from being blurred by resampling.
  */
-export async function generateLabelQrBuffer(data: string, sizeMm: number): Promise<Buffer> {
-  const qr = await QRCode.create(data, { errorCorrectionLevel: 'L' })
+export async function generateLabelQrBuffer(data: string, sizeMm: number): Promise<Buffer | null> {
+  const code = (data ?? '').trim()
+  if (!code || code.length < 2) return null
+  const qr = await QRCode.create(code, { errorCorrectionLevel: 'M' })
   const modules = qr.modules.size
   // ~12 device pixels per point keeps the symbol crisp on a high-res print.
   const targetPx = mmToPt(sizeMm) * 12
   const px = Math.max(modules, Math.round(targetPx / modules) * modules)
-  return QRCode.toBuffer(data, {
+  return QRCode.toBuffer(code, {
     width: px,
-    margin: 0,
-    errorCorrectionLevel: 'L',
+    margin: 2,
+    errorCorrectionLevel: 'M',
     color: { dark: '#000000', light: '#ffffff' },
   })
 }
@@ -930,12 +933,27 @@ export async function generateLabelsPDF(
 
   const resolved = resolveLabelPreset(options.preset, options)
 
+  const pageFormat = resolved.page === 'letter' ? 'letter' : 'a4'
+  const pageDimsMm = pageFormat === 'letter' ? { width: 215.9, height: 279.4 } : { width: 210, height: 297 }
+  const pageSizeName = pageFormat === 'letter' ? 'Letter' : 'A4'
+
   const labelW = mmToPt(resolved.width)
   const labelH = mmToPt(resolved.height)
   // The four supplied sizes print from their transcribed reference design; any
   // other (legacy) size keeps the adaptive layout it has always used.
   const design = labelDesignFor(resolved.width, resolved.height)
   const geometry = computeLabelGeometry(labelW, labelH, resolved.showQR)
+
+  let columns = Math.floor(Number(resolved.columns))
+  let rows = Math.floor(Number(resolved.rows))
+  if (!Number.isFinite(columns) || columns < 1 || !Number.isFinite(rows) || rows < 1) {
+    const margin = clamp(resolved.margin, 0, 40)
+    const gap = clamp(resolved.gap, 0, 20)
+    const usableW = pageDimsMm.width - margin * 2
+    const usableH = pageDimsMm.height - margin * 2
+    columns = Math.max(1, Math.floor((usableW + gap) / (resolved.width + gap)))
+    rows = Math.max(1, Math.floor((usableH + gap) / (resolved.height + gap)))
+  }
 
   const copies = Math.min(Math.max(Math.floor(resolved.copies) || 1, 1), 999)
   const expanded: ProductLabel[] = []
@@ -954,8 +972,8 @@ export async function generateLabelsPDF(
 
   return new Promise((resolve) => {
     const doc = new PDFDocument({
-      size: 'A4',
-      margins: { top: 20, bottom: 20, left: 20, right: 20 },
+      size: pageSizeName,
+      margins: { top: 0, bottom: 0, left: 0, right: 0 },
     })
     const chunks: Buffer[] = []
     doc.on('data', (chunk: Buffer) => chunks.push(chunk))
@@ -966,17 +984,16 @@ export async function generateLabelsPDF(
     const gapPt = mmToPt(clamp(resolved.gap, 0, 20))
     const stepX = labelW + gapPt
     const stepY = labelH + gapPt
-    const columns = Math.max(1, Math.floor(resolved.columns))
-    const rows = Math.max(1, Math.floor(resolved.rows))
+    const columnsCount = Math.max(1, columns)
+    const rowsCount = Math.max(1, rows)
     let col = 0
     let row = 0
 
     for (let i = 0; i < expanded.length; i++) {
       const product = expanded[i]
 
-      // Check if we need a new page
-      if (row >= rows) {
-        doc.addPage()
+      if (row >= rowsCount) {
+        doc.addPage({ size: pageSizeName })
         col = 0
         row = 0
       }
@@ -992,7 +1009,7 @@ export async function generateLabelsPDF(
 
       // Advance position
       col++
-      if (col >= columns) {
+      if (col >= columnsCount) {
         col = 0
         row++
       }
