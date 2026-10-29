@@ -8,8 +8,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
-import { applyPriceSync, applySilverRate, createShopifyDraftOrder, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
-import { round2 } from './routes/db'
+import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
 import { buildPricedOrder, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
@@ -1436,7 +1435,9 @@ app.post('/api/v1/shopify/orders/sync', requirePermission('shopify', 'create'), 
       action: 'Imported Shopify Orders',
       module: 'shopify',
       entity: 'Orders',
-      details: result.ok ? `${result.imported ?? 0} imported, ${result.updated ?? 0} updated` : `Order sync failed: ${result.errors?.join('; ') ?? 'unknown error'}`,
+      details: result.ok
+        ? `${result.imported ?? 0} imported, ${result.updated ?? 0} updated${result.piiRedacted ? `, ${result.piiRedacted.count} order(s) with redacted customer PII (approve Protected Customer Data in the Shopify admin)` : ''}`
+        : `Order sync failed: ${result.errors?.join('; ') ?? 'unknown error'}`,
       userId: actor.userId,
       ip: actor.ip,
     })
@@ -1760,7 +1761,8 @@ app.post('/api/v1/shopify/enrich', requirePermission('shopify', 'view'), async (
       userId: actor.userId,
       ip: actor.ip,
     })
-    res.json({ ok: true, ...result })
+    // ACCESS_DENIED is a blocked batch, not a successful one — say so.
+    res.json({ ok: !result.piiAccessDenied, ...result })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(500).json({ ok: false, enriched: 0, failed: 0, skipped: 0, errors: [message], message: 'Enrichment failed' })
@@ -1811,11 +1813,11 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
   const now = new Date()
   const internalId = `MO-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}-${now.getTime().toString().slice(-6)}`
 
-  // For Shopify draft order, we need GST-inclusive prices
-  const shopifyLineItems = itemsWithCalculatedPrice.map((li: typeof itemsWithCalculatedPrice[0]) => ({
-    ...li,
-    price: round2(li.amount * 1.03), // Convert line subtotal to GST-inclusive price
-  }))
+  // For Shopify draft order, the ERP line price is already PER-UNIT and
+  // GST-inclusive — exactly what a draft line's originalUnitPrice expects.
+  // (Remapping it to the full line total amount × 1.03 made Shopify bill that
+  // total per unit, so a qty-3 manual order arrived on Shopify at ~3× its value.)
+  const shopifyLineItems = draftOrderInputLines(itemsWithCalculatedPrice)
 
   let draft: { ok: boolean; draftId?: string; name?: string; customerId?: string; errors: string[]; message?: string } | null = null
   let shopifyId = internalId
@@ -1882,6 +1884,11 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
           billingAddress: billingAddress ?? null,
           shippingAddress: shippingAddress ?? null,
           locationId,
+          // Keep the order's own contact row filled even when the customer
+          // record lookup above matches nothing — the invoice generator and
+          // the PII repair both read these columns.
+          ...(email ? { customerEmail: String(email).trim() } : {}),
+          ...(phone ? { customerPhone: String(phone).trim() } : {}),
         })
         .returning()
       order = row
@@ -1974,7 +1981,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       .limit(1)
     if (!existing) return res.status(404).json({ error: 'Order not found' })
 
-    const { customer, email, payment: rawPayment, fulfillment: rawFulfillment, status, date, note, items, shippingAddress, syncToShopify } = req.body
+    const { customer, email, phone, payment: rawPayment, fulfillment: rawFulfillment, status, date, note, items, shippingAddress, syncToShopify } = req.body
 
     // Normalize payment and fulfillment values
     const payment = rawPayment === 'Online' || rawPayment === 'online' ? 'paid' : rawPayment
@@ -2061,15 +2068,41 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       updated = u
     }
 
-    let shopifySync: { ok: boolean; errors: string[]; message?: string } | null = null
-    if (syncToShopify && typeof updated.shopifyId === 'string' && updated.shopifyId.startsWith('#')) {
-      shopifySync = await updateShopifyOrder({
-        orderName: updated.shopifyId,
-        email: email ? String(email).trim() : undefined,
-        note: note ? String(note).trim() : undefined,
-        tags: 'manual-order',
-        shippingAddress,
-      })
+    let shopifySync: { ok: boolean; errors: string[]; message?: string; name?: string; draftId?: string } | null = null
+    if (syncToShopify) {
+      const storedShopifyId = typeof updated.shopifyId === 'string' ? updated.shopifyId : ''
+      if (storedShopifyId.startsWith('#')) {
+        shopifySync = await updateShopifyOrder({
+          orderName: storedShopifyId,
+          email: email ? String(email).trim() : undefined,
+          note: note ? String(note).trim() : undefined,
+          tags: 'manual-order',
+          shippingAddress,
+        })
+      } else if (storedShopifyId) {
+        // First-time sync retry: an ERP-native order (shopifyId is the internal
+        // "MO-…" reference) that was saved while Shopify was down, unconfigured,
+        // or when its first draft attempt failed. The old code only updated '#'
+        // orders, so such an order could never reach Shopify — creating the draft
+        // now from the stored order; its returned name becomes the canonical id.
+        shopifySync = await createShopifyDraftOrder({
+          customerName: String(updated.customer ?? '').trim() || undefined,
+          customerEmail: email ? String(email).trim() : (updated.customerEmail ?? undefined) || undefined,
+          customerPhone: phone ? String(phone).trim() : (updated.customerPhone ?? undefined) || undefined,
+          payment: String(updated.payment ?? 'pending'),
+          billingAddress: (updated.billingAddress as DraftOrderAddressInput | null | undefined) ?? undefined,
+          shippingAddress: ((shippingAddress ?? updated.shippingAddress) as DraftOrderAddressInput | null | undefined) ?? undefined,
+          note: note ? String(note).trim() : undefined,
+          tags: 'manual-order',
+          lineItems: draftOrderInputLines(updated.lineItems as ReadonlyArray<unknown> | null),
+        })
+        if (shopifySync.ok && shopifySync.name) {
+          await db
+            .update(schema.salesOrders)
+            .set({ shopifyId: shopifySync.name })
+            .where(eq(schema.salesOrders.id, routeParam(req.params.id)))
+        }
+      }
     }
 
     if (affectedProductIds.length > 0) {
