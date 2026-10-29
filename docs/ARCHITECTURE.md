@@ -75,7 +75,7 @@ backend/            Express + Drizzle + PostgreSQL API
   drizzle/          generated SQL migrations
 frontend/           React 19 + Vite 8 + Tailwind 4 UI
   src/
-    pages/          one file per route (63 pages)
+    pages/          one file per route (64 pages)
     components/ui/  the design-system primitives
     components/     feature components (dialogs, charts, layout, shopify)
     lib/api/        typed API client, one module per backend domain
