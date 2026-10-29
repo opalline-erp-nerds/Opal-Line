@@ -90,6 +90,16 @@ jobs:
         env:
           UPGRADE_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
 
+      # Stock-transfer reliability test: real dispatch/receive/cancel routes
+      # with concurrency, on a throwaway database created and bootstrapped
+      # inside the test file (never the container's default database).
+      - name: Stock-transfer reliability test (needs PostgreSQL)
+        run: node --import tsx --test --test-force-exit "src/stockTransfers.test.ts"
+        working-directory: backend
+        env:
+          DASHBOARD_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres_ci_transfer_scratch
+          DASHBOARD_TEST_CREATE: '1'
+
       # Shopify product sync integration test: the real sync code (push,
       # pull, price push, inventory push) against an in-memory mock of the
       # Shopify Admin REST API, in a throwaway database. Needs PostgreSQL, so
