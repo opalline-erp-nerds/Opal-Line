@@ -9,6 +9,7 @@ import {
   Maximize2,
   Search,
   FileDown,
+  FileCode,
   Eye,
   Settings2,
   SlidersHorizontal,
@@ -20,6 +21,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { PageHeader } from '@/components/ui/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Select } from '@/components/ui/select'
@@ -33,7 +35,8 @@ import {
   computeGrid,
   configFromPreset,
   expandLabels,
-  LABEL_PRESETS,
+  labelBrandText,
+  labelDesignFor,
   MM_TO_PX,
   PAGE_SIZES,
   clamp,
@@ -63,14 +66,14 @@ function loadConfig(): LabelConfig {
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<LabelConfig>
       if (parsed && typeof parsed === 'object' && typeof parsed.widthMm === 'number') {
-        const base = configFromPreset(parsed.presetKey ?? 'jewellery-tag-55x20')
+        const base = configFromPreset(parsed.presetKey ?? 'label-50x40')
         return { ...base, ...parsed, labelType: parsed.labelType ?? base.labelType }
       }
     }
   } catch {
     // fall through to defaults
   }
-  return configFromPreset('jewellery-tag-55x20')
+  return configFromPreset('label-50x40')
 }
 
 function toLabelProduct(p: Product): LabelProduct {
@@ -82,6 +85,7 @@ function toLabelProduct(p: Product): LabelProduct {
     weight: p.netWeight || undefined,
     purity: p.purity,
     category: p.category,
+    collection: p.collection || undefined,
     huid: p.huid || undefined,
   }
 }
@@ -129,20 +133,24 @@ function ToggleRow({
   label,
   icon,
   checked,
+  disabled,
+  title,
   onCheckedChange,
 }: {
   label: string
   icon?: ReactNode
   checked: boolean
+  disabled?: boolean
+  title?: string
   onCheckedChange: (v: boolean) => void
 }) {
   return (
     <div className="flex items-center justify-between gap-2">
-      <span className="flex items-center gap-2 text-sm text-foreground">
+      <span className="flex items-center gap-2 text-sm text-foreground" title={title}>
         {icon}
         {label}
       </span>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} />
+      <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} />
     </div>
   )
 }
@@ -154,7 +162,7 @@ export default function BarcodeLabelsPage() {
   const [duplicates, setDuplicates] = useState<Set<string>>(new Set())
   const [printMode, setPrintMode] = useState<'sheet' | 'label'>('label')
   const [cfg, setCfg] = useState<LabelConfig>(loadConfig)
-  const [, setPresets] = useState<LabelPreset[]>(FALLBACK_LABEL_PRESETS)
+  const [presets, setPresets] = useState<LabelPreset[]>(FALLBACK_LABEL_PRESETS)
   const [generating, setGenerating] = useState(false)
 
   const [search, setSearch] = useState('')
@@ -208,7 +216,9 @@ export default function BarcodeLabelsPage() {
       }),
       dbApi.getSettings().then((s) => {
         if (active && s?.businessName) setCfg((prev) => ({ ...prev, companyName: prev.companyName || s.businessName }))
-      }).catch(() => undefined),
+      }).catch((error: unknown) => {
+        if (active) toast.error(error instanceof Error ? error.message : 'Could not load business name')
+      }),
     ]).finally(() => {
       if (active) setLoading(false)
     })
@@ -267,10 +277,14 @@ export default function BarcodeLabelsPage() {
     return source.map(toLabelProduct)
   }, [products, filtered, selected])
 
+  const isTagLabel = cfg.labelType === 'tag'
   const grid = useMemo(() => computeGrid(cfg), [cfg])
+  // Reference sizes render from the approved transcribed artwork, whose field
+  // positions and type sizes are fixed — controls the artwork does not carry
+  // are disabled rather than silently ignored.
+  const designActive = useMemo(() => !isTagLabel && labelDesignFor(cfg.widthMm, cfg.heightMm) !== null, [cfg.widthMm, cfg.heightMm, isTagLabel])
   const expandedCount = useMemo(() => expandLabels(labelProducts, cfg).length, [labelProducts, cfg])
 
-  const isTagLabel = cfg.labelType === 'tag'
   // The preview frame is sized from the SAME derivation the sheet/printer
   // HTML uses (labelCellSize), so the iframe can never contradict the paper.
   const stem = tagStem(cfg)
@@ -331,6 +345,15 @@ export default function BarcodeLabelsPage() {
     })
   }
 
+  const openFullPreview = () => {
+    if (expandedCount === 0) {
+      toast.info('No labels to preview')
+      return
+    }
+    const { html } = buildLabelSheet(labelProducts, cfg, { mode: 'preview', paper: printMode })
+    void openHtmlPreview(html, 'Product Labels Preview')
+  }
+
   const testPrint = () => {
     if (expandedCount === 0) {
       toast.info('No labels to print')
@@ -350,6 +373,36 @@ export default function BarcodeLabelsPage() {
       if (!res.ok && !res.cancelled) toast.error(res.error || 'PDF export failed')
       else if (res.ok) toast.success('Labels saved as PDF')
     })
+  }
+
+  // Raw ZPL for a Zebra printer (or a ZPL print server): the printer's own
+  // language, generated from the same template the preview shows. Impact and
+  // sheet printers keep using Print above — the two workflows deliberately do
+  // not share a path. The geometry comes from a saved template, so a custom
+  // size has no ZPL equivalent and is refused instead of silently printing on
+  // the wrong stock.
+  const downloadZpl = () => {
+    if (expandedCount === 0) {
+      toast.info('No labels to export')
+      return
+    }
+    if (cfg.presetKey === 'custom') {
+      toast.error('ZPL is generated from a saved label template — pick a template size first')
+      return
+    }
+    const ids = selected.size > 0 ? [...selected] : filtered.map((p) => p.id)
+    void backupApi
+      .downloadLabelsZpl(ids, {
+        preset: cfg.presetKey,
+        copies: cfg.copies,
+        showPrice: cfg.showPrice,
+        showWeight: cfg.showWeight,
+        showQR: cfg.showQr,
+        showBrand: cfg.showCompany,
+        ...(cfg.showCompany ? { brandName: labelBrandText(cfg) } : {}),
+      })
+      .then(() => toast.success('ZPL file saved'))
+      .catch((err: unknown) => toast.error(err instanceof Error ? err.message : 'ZPL export failed'))
   }
 
   const printLabels = () => {
@@ -412,18 +465,38 @@ export default function BarcodeLabelsPage() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4 p-4 lg:p-6">
-      <div className="flex shrink-0 items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-primary-50 text-primary-700 ring-1 ring-primary-100 dark:bg-primary-50/60 dark:text-primary-300">
-            <Tag className="h-5 w-5" />
-          </div>
-          <div>
-            <h1 className="text-xl font-bold tracking-tight text-foreground">QR & Barcode Labels</h1>
-            <p className="text-sm text-muted-foreground">Design, preview and print labels at true physical size from your product catalog</p>
-          </div>
-        </div>
-      </div>
+    <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+      <PageHeader
+        title={
+          <span className="flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300 ring-1 ring-primary-100">
+              <Tag className="h-5 w-5" />
+            </div>
+            <span>QR Labels</span>
+          </span>
+        }
+        subtitle="Design, preview and print labels at true physical size from your product catalog"
+        actions={
+          <>
+            <Button variant="outline" onClick={openFullPreview} disabled={expandedCount === 0}>
+              <Eye className="h-4 w-4" />
+              Preview
+            </Button>
+            <Button variant="outline" onClick={downloadPdf} disabled={expandedCount === 0}>
+              <FileDown className="h-4 w-4" />
+              PDF
+            </Button>
+            <Button variant="outline" onClick={downloadZpl} disabled={expandedCount === 0}>
+              <FileCode className="h-4 w-4" />
+              ZPL
+            </Button>
+            <Button onClick={printLabels} disabled={generating || expandedCount === 0}>
+              <Printer className="h-4 w-4" />
+              {generating ? 'Preparing…' : `Print ${expandedCount} Label${expandedCount === 1 ? '' : 's'}`}
+            </Button>
+          </>
+        }
+      />
 
       <div className="grid shrink-0 grid-cols-1 gap-3 md:grid-cols-3">
         {[
@@ -473,7 +546,7 @@ export default function BarcodeLabelsPage() {
                 <label className="text-xs font-medium text-muted-foreground">Preset</label>
                 <Select
                   className="mt-1"
-                  options={LABEL_PRESETS.map((p) => ({ value: p.key, label: p.label }))}
+                  options={(presets.length ? presets : FALLBACK_LABEL_PRESETS).map((p) => ({ value: p.key, label: p.label }))}
                   value={cfg.presetKey}
                   onValueChange={applyPreset}
                 />
@@ -575,7 +648,13 @@ export default function BarcodeLabelsPage() {
               <ToggleRow label="SKU" checked={cfg.showSku} onCheckedChange={(v) => patch({ showSku: v })} />
               <ToggleRow label="Price" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
               <ToggleRow label="Net weight" checked={cfg.showWeight} onCheckedChange={(v) => patch({ showWeight: v })} />
-              <ToggleRow label="HUID" checked={cfg.showHuid} onCheckedChange={(v) => patch({ showHuid: v })} />
+              <ToggleRow
+                label="HUID"
+                checked={cfg.showHuid}
+                disabled={designActive}
+                title={designActive ? 'The approved reference templates have no HUID field' : undefined}
+                onCheckedChange={(v) => patch({ showHuid: v })}
+              />
               <ToggleRow label="Category" checked={cfg.showCategory} onCheckedChange={(v) => patch({ showCategory: v })} />
               <ToggleRow
                 label="QR code (encodes the SKU)"
@@ -583,7 +662,13 @@ export default function BarcodeLabelsPage() {
                 checked={cfg.showQr}
                 onCheckedChange={(v) => patch({ showQr: v })}
               />
-              <ToggleRow label="Border" checked={cfg.showBorder} onCheckedChange={(v) => patch({ showBorder: v })} />
+              <ToggleRow
+                label="Border"
+                checked={cfg.showBorder}
+                disabled={designActive}
+                title={designActive ? 'Reference labels print without borders' : undefined}
+                onCheckedChange={(v) => patch({ showBorder: v })}
+              />
               <ToggleRow label="Company name" checked={cfg.showCompany} onCheckedChange={(v) => patch({ showCompany: v })} />
               {cfg.showCompany && (
                 <Input
@@ -592,6 +677,12 @@ export default function BarcodeLabelsPage() {
                   placeholder="Company name"
                   className="h-8 text-sm"
                 />
+              )}
+              {designActive && (
+                <p className="text-xs text-muted-foreground">
+                  Reference template active — field positions and type sizes come from the approved layout, so it
+                  always prints brand, name, rate, code and QR.
+                </p>
               )}
             </CardContent>
           </Card>

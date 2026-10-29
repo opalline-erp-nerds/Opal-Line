@@ -111,7 +111,7 @@ Gating variables in use:
 | Variable | Used by |
 |---|---|
 | `UPGRADE_TEST_DATABASE_URL` | `backend/src/db/upgrade.test.ts` |
-| `DASHBOARD_TEST_DATABASE_URL` | `backend/src/routes/dashboard*.test.ts` |
+| `DASHBOARD_TEST_DATABASE_URL` | `backend/src/routes/dashboard*.test.ts`, `backend/src/stockTransfers.test.ts`, `backend/src/stockAvailability.test.ts` and the other route-level tests |
 
 ### The upgrade-path test
 

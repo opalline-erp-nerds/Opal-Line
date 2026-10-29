@@ -29,6 +29,10 @@ interface LabelOptions {
   showWeight: boolean
   showQR: boolean
   showBrand: boolean
+  /** Content toggles shared with the preview, so the two never disagree. */
+  showName?: boolean
+  showSku?: boolean
+  showCategory?: boolean
   brand: string
   copies: number
   codeLength?: number
@@ -45,8 +49,12 @@ const DEFAULT_OPTIONS: LabelOptions = {
   showWeight: true,
   showQR: true,
   showBrand: true,
+  showName: true,
+  showSku: true,
+  showCategory: true,
   brand: 'OPAL LINE',
   copies: 1,
+  page: 'a4',
 }
 
 // ─── Reference designs ───────────────────────────────────────────
@@ -287,7 +295,7 @@ export function textEmWidth(text: string): number {
  */
 export function labelAttributes(product: LabelLineInput, opts: LabelLineOptions): string[] {
   const out: string[] = []
-  if (product.category) out.push(String(product.category))
+  if (opts.showCategory !== false && product.category) out.push(String(product.category))
   if (product.collection) out.push(String(product.collection))
   else if (opts.showWeight !== false && product.weight) out.push(`${product.weight}g`)
   return out
@@ -315,9 +323,12 @@ export function designFieldTexts(
       }
       case 'name': {
         // Every reference size prints a name line; a product without one still
-        // gets the placeholder rather than an empty field.
-        const name = (String(product.name ?? '').trim() || 'Product').toLocaleUpperCase()
-        out.push({ kind: 'name', text: name })
+        // gets the placeholder rather than an empty field. The preview's name
+        // toggle maps to `showName` so PDF and preview hide it together.
+        if (opts.showName !== false) {
+          const name = (String(product.name ?? '').trim() || 'Product').toLocaleUpperCase()
+          out.push({ kind: 'name', text: name })
+        }
         break
       }
       case 'rate':
@@ -330,8 +341,9 @@ export function designFieldTexts(
         const rawCode = labelCode(product)
         const code = opts.codeLength ? rawCode.slice(0, opts.codeLength) : rawCode
         // The slim 50×10 reference prints the bare identifier; every other size
-        // prefixes it with "Code:" exactly like the samples.
-        if (code) out.push({ kind: 'code', text: design.height <= 12 ? code : `Code: ${code}` })
+        // prefixes it with "Code:" exactly like the samples. The SKU toggle only
+        // hides the printed line — the QR payload never changes when present.
+        if (code && opts.showSku !== false) out.push({ kind: 'code', text: design.height <= 12 ? code : `Code: ${code}` })
         break
       }
       case 'attr1':
@@ -469,7 +481,10 @@ export async function fetchProductLabels(productIds: string[]): Promise<ProductL
   if (!client || productIds.length === 0) return []
   try {
     const products = await client.unsafe(
-      `SELECT name, sku, selling_price, net_weight, category, collection, hsn, huid FROM products WHERE id = ANY($1)`,
+      // `id` must come back: the rows are re-keyed by it below to keep the
+      // caller's order, and without it every lookup misses and the export
+      // reports "Products not found" for products that ARE in the catalogue.
+      `SELECT id, name, sku, selling_price, net_weight, category, collection, hsn, huid FROM products WHERE id = ANY($1)`,
       [productIds]
     )
     // Preserve the caller's order — the printed sheet should match the order the
@@ -602,6 +617,9 @@ export interface LabelLineOptions {
   showWeight: boolean
   showBrand?: boolean
   brand?: string
+  showName?: boolean
+  showSku?: boolean
+  showCategory?: boolean
   /** On very short labels the "Code:" prefix wastes room — drop it. */
   compact?: boolean
   codeLength?: number
@@ -651,11 +669,11 @@ export function computeLabelLines(
   // until the block fits, so a tiny label keeps brand + name + price.
   const stack: Array<{ kind: LabelLineKind; text: string; size: number }> = []
   if (showBrand) stack.push({ kind: 'brand', text: opts.brand as string, size: brandSize })
-  if (product.name) stack.push({ kind: 'name', text: product.name, size: nameSize })
-  if (code) {
+  if (product.name && opts.showName !== false) stack.push({ kind: 'name', text: product.name, size: nameSize })
+  if (code && opts.showSku !== false) {
     stack.push({ kind: 'code', text: opts.compact ? code : `Code: ${code}`, size: metaSize })
   }
-  if (product.category && !opts.compact) {
+  if (product.category && !opts.compact && opts.showCategory !== false) {
     stack.push({ kind: 'category', text: product.category, size: categorySize })
   }
 
@@ -761,6 +779,9 @@ function drawLabel(
       showWeight: opts.showWeight,
       showBrand: opts.showBrand,
       brand: opts.brand,
+      showName: opts.showName,
+      showSku: opts.showSku,
+      showCategory: opts.showCategory,
       compact: opts.height <= 12,
     },
   )

@@ -234,8 +234,11 @@ export const backupApi = {
     showWeight?: boolean
     showQR?: boolean
     showBrand?: boolean
-    copies?: number
+    showName?: boolean
+    showSku?: boolean
+    showCategory?: boolean
     page?: 'a4' | 'letter'
+    copies?: number
     brandName?: string
     ids?: string[]
     width?: number
@@ -251,6 +254,10 @@ export const backupApi = {
     if (opts?.showWeight === false) params.set('weight', 'false')
     if (opts?.showQR === false) params.set('qr', 'false')
     if (opts?.showBrand === false) params.set('brand', 'false')
+    if (opts?.showName === false) params.set('name', 'false')
+    if (opts?.showSku === false) params.set('sku', 'false')
+    if (opts?.showCategory === false) params.set('category', 'false')
+    if (opts?.page) params.set('page', opts.page)
     if (opts?.copies && opts.copies > 1) params.set('copies', String(opts.copies))
     if (opts?.brandName) params.set('brandName', opts.brandName)
     if (opts?.page) params.set('page', opts.page)

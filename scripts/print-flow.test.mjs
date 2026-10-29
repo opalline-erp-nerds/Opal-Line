@@ -32,6 +32,15 @@ execSync('npx tsc', { cwd: join(repoRoot, 'electron'), stdio: 'pipe', timeout: 1
 
 const workDir = mkdtempSync(join(tmpdir(), 'opal-print-smoke-'))
 const pdfPath = join(workDir, 'smoke.pdf')
+const letterPdfPath = join(workDir, 'smoke-letter.pdf')
+
+/** Width × height of the PDF's first page, in points. */
+function mediaBox(path) {
+  const s = readFileSync(path).toString('latin1')
+  const m = s.match(/\/MediaBox\s*\[\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)/)
+  assert.ok(m, `PDF must declare a page size: ${path}`)
+  return { width: Number(m[3]), height: Number(m[4]) }
+}
 
 after(() => rmSync(workDir, { recursive: true, force: true }))
 
@@ -39,7 +48,7 @@ function runSmoke() {
   return new Promise((resolve, reject) => {
     const child = spawn(electronPath, [entry], {
       cwd: repoRoot,
-      env: { ...process.env, OPAL_SMOKE_PDF_PATH: pdfPath },
+      env: { ...process.env, OPAL_SMOKE_PDF_PATH: pdfPath, OPAL_SMOKE_LETTER_PDF_PATH: letterPdfPath },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -90,6 +99,23 @@ test('silent print, page print and PDF export run in a real Electron process', a
   const bytes = readFileSync(pdfPath)
   assert.ok(bytes.length > 200, `PDF too small: ${bytes.length} bytes`)
   assert.equal(bytes.subarray(0, 5).toString('latin1'), '%PDF-', 'file must start with the PDF magic number')
+
+  // 3b. …and it must land on the paper the DOCUMENT declares: a doc without a
+  // @page keeps A4 (within Chromium's sub-point rounding), while a Letter label
+  // sheet must NOT be exported on A4 — that mismatch is what made saved label
+  // PDFs come out scaled and offset from the labels.
+  const a4 = mediaBox(pdfPath)
+  assert.ok(
+    Math.abs(a4.width - 595.28) <= 3 && Math.abs(a4.height - 841.89) <= 3,
+    `default export must be A4, got ${a4.width}×${a4.height}pt`,
+  )
+  const letter = parse(out, 'SMOKE_PDF_LETTER')
+  assert.equal(letter.ok, true, `Letter PDF export must succeed, got: ${letter.error}`)
+  const box = mediaBox(letterPdfPath)
+  assert.ok(
+    Math.abs(box.width - 612) <= 1 && Math.abs(box.height - 792) <= 1,
+    `a document declaring @page{size:letter} must export on Letter paper, got ${box.width}×${box.height}pt`,
+  )
 
   // 4. Temp render files are cleaned up (ignore files younger than 10s —
   //    another process could be mid-print right now).

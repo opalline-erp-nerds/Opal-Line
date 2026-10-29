@@ -1,16 +1,30 @@
 import { escapeHtml, numberToIndianWords } from '@/lib/utils'
-import type { Invoice } from '@/types'
+import type { Invoice, PurchaseInvoiceDetail, PurchaseOrder, Supplier } from '@/types'
 
 /**
  * Shared print-template builder — one source of truth for printable documents.
  * The Print Designer page renders live previews with it AND the real print
- * flows (invoice detail, quotations, sales orders) build their printouts with
- * it, so a saved design instantly applies to every document of that type.
+ * flows (invoice detail, quotations, sales orders, purchase documents) build
+ * their printouts with it, so a saved design instantly applies to every
+ * document of that type.
  *
  * Keep the defaults in sync with backend/src/routes/printTemplates.ts
  * (defaultPrintConfig + sanitizePrintConfig); the backend clamps and stores
  * the config, this side renders it.
  */
+
+/** Every document type the Print Designer and saved-template API support. */
+export const PRINT_DOC_TYPES = [
+  'invoice',
+  'quotation',
+  'order',
+  'packing-slip',
+  'pick-list',
+  'purchase-order',
+  'purchase-invoice',
+  'barcode-label',
+] as const
+export type PrintDocType = (typeof PRINT_DOC_TYPES)[number]
 
 export interface PrintDesignerConfig {
   accent: string
@@ -324,6 +338,121 @@ export function invoicePrintDoc(
   return doc
 }
 
+const round2 = (n: number) => Math.round(n * 100) / 100
+
+/**
+ * Map a persisted purchase order onto the shared print document. Purchase
+ * orders have no line-level GST snapshot, so the printed GST column stays
+ * empty and the order-level GST is shown in the totals box only. Line weight
+ * is stored per piece (qty × per-piece weight is the line's total weight), so
+ * the printed weight column matches the order's stored header weight.
+ */
+export function purchaseOrderPrintDoc(
+  order: PurchaseOrder,
+  opts: { supplier?: Supplier | null; business?: Partial<PrintDoc> } = {},
+): PrintDoc {
+  const lines = order.lines ?? []
+  const subtotal = Number(order.value) || round2(lines.reduce((a, l) => a + (Number(l.amount) || 0), 0))
+  const gst = Number(order.gst ?? 3) || 0
+  const gstAmount = Number(order.gstAmount ?? round2((subtotal * gst) / 100)) || 0
+  const discount = Number(order.discount ?? 0) || 0
+  const grandTotal = Number(order.grandTotal ?? round2(subtotal + gstAmount - discount)) || 0
+  const supplier = opts.supplier ?? null
+  const doc: PrintDoc = {
+    number: order.number,
+    customer: order.supplier || supplier?.name || null,
+    customerEmail: supplier?.email ?? null,
+    customerPhone: supplier?.phone ?? null,
+    customerAddress: supplier?.address ?? null,
+    customerCity: supplier?.city ?? null,
+    customerState: null,
+    customerPincode: null,
+    customerGstin: supplier?.gstin ?? null,
+    gst,
+    gstAmount,
+    discount,
+    subtotal,
+    grandTotal,
+    paymentStatus: order.status,
+    date: order.date,
+    items: lines.map((l) => {
+      const qty = Math.max(1, Math.floor(Number(l.qty) || 1))
+      return {
+        product: l.product,
+        sku: l.sku,
+        qty,
+        // PO lines persist the per-piece weight; the print column shows the
+        // line total so it sums to the order's stored weight.
+        weight: round2(qty * (Number(l.weight) || 0)),
+        rate: Number(l.rate) || 0,
+        amount: Number(l.amount) || 0,
+        // No line-level tax is stored on a purchase order.
+        tax: 0,
+      }
+    }),
+  }
+  if (opts.business) Object.assign(doc, opts.business)
+  return doc
+}
+
+/**
+ * Map a persisted purchase invoice (with lines) onto the shared print
+ * document. Stored line `amount` is cost + tax, so `amount` here carries the
+ * GST-exclusive cost and `tax` the stored line GST — the builder adds them
+ * back for the printed Amount column without double counting.
+ *
+ * The invoice total excludes TCS. The printed grand total is the payable
+ * amount (invoice total + stored TCS) and the TCS itself is printed as its
+ * own total row, so the paper reconciles while the stored values stay intact.
+ */
+export function purchaseInvoicePrintDoc(
+  invoice: PurchaseInvoiceDetail,
+  opts: { supplier?: Supplier | null; business?: Partial<PrintDoc> } = {},
+): PrintDoc {
+  const lines = invoice.lines ?? []
+  const subtotal = Number(invoice.cost) || round2(lines.reduce((a, l) => a + (Number(l.cost) || 0), 0))
+  const cgst = Number(invoice.cgst) || 0
+  const sgst = Number(invoice.sgst) || 0
+  const igst = Number(invoice.igst) || 0
+  const splitTax = round2(cgst + sgst + igst)
+  const gstAmount = splitTax > 0 ? splitTax : Number(invoice.tax) || 0
+  const gst = subtotal > 0 ? round2((gstAmount / subtotal) * 100) : 0
+  const tcsAmount = Number(invoice.tcsAmount) || 0
+  const invoiceTotal = Number(invoice.total) || round2(subtotal + gstAmount)
+  const supplier = opts.supplier ?? null
+  const doc: PrintDoc = {
+    number: invoice.number,
+    customer: invoice.supplier || supplier?.name || null,
+    customerEmail: supplier?.email ?? null,
+    customerPhone: supplier?.phone ?? null,
+    customerAddress: supplier?.address ?? null,
+    customerCity: supplier?.city ?? null,
+    customerState: invoice.supplierState ?? null,
+    customerPincode: null,
+    customerGstin: invoice.supplierGstin ?? supplier?.gstin ?? null,
+    gst,
+    gstAmount,
+    discount: 0,
+    subtotal,
+    grandTotal: round2(invoiceTotal + tcsAmount),
+    paymentStatus: invoice.status,
+    date: invoice.date,
+    items: lines.map((l) => ({
+      product: l.product,
+      sku: l.sku,
+      qty: l.qty,
+      weight: Number(l.weight) || 0,
+      rate: Number(l.rate) || 0,
+      // `amount` on the stored line is cost + tax; split it back out so the
+      // shared builder's amount + tax calculation prints the stored gross.
+      amount: Number(l.cost) || 0,
+      tax: Number(l.tax) || 0,
+    })),
+  }
+  if (opts.business) Object.assign(doc, opts.business)
+  return doc
+}
+
 /** Open one or more built documents in print windows (batch = one window per
  *  doc). The print chooser is shown ONCE for the whole batch, and a Cancel
  *  aborts every document — asking per-document would spam a dialog per order. */
@@ -336,7 +465,7 @@ export async function printDocuments(
 }
 
 export interface PrintDocExtras {
-  docType: 'invoice' | 'quotation' | 'order' | 'packing-slip' | 'pick-list' | 'barcode-label'
+  docType: PrintDocType
   /** Sub-line under the business name in the header. */
   tagline?: string
   /** Extra key/value box (e.g. "Valid Until" on quotations). */
@@ -351,6 +480,14 @@ export interface PrintDocExtras {
   terms?: string
   /** Show product thumbnails on fulfilment docs (packing slip / pick list). */
   showImages?: boolean
+  /** Label for the second info box (default "Order Details"). */
+  detailsLabel?: string
+  /** Value for the second info box (defaults to the Shopify order id). */
+  detailsValue?: string
+  /** Stored input-tax split (purchase invoices) — printed instead of a derived split. */
+  taxSplit?: { cgst?: number; sgst?: number; igst?: number }
+  /** Additional total rows (e.g. purchase-invoice TCS) printed above the grand total. */
+  extraTotalRows?: Array<{ label: string; value: number }>
 }
 
 const FONTS: Record<PrintDesignerConfig['font'], string> = {
@@ -526,7 +663,10 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
   // the invoice-level gstAmount was real — the printed GST column dashed every
   // row because of it. Reconcile at render time so each line carries its share
   // of the STORED document GST (never a freshly derived base → no double count).
-  const items = extras.docType === 'invoice' ? applyLineTax(docItems, totalTax) : docItems
+  // Purchase invoices carry a real per-line GST snapshot, but legacy rows get
+  // the same fallback so their GST column never prints as a dash.
+  const lineTaxDoc = extras.docType === 'invoice' || extras.docType === 'purchase-invoice'
+  const items = lineTaxDoc ? applyLineTax(docItems, totalTax) : docItems
   // Supply type: a buyer GSTIN in another state than the business GSTIN means
   // an inter-state supply, taxed as IGST instead of CGST + SGST — the same
   // GSTIN-prefix rule backend/src/purchases.ts uses for the input-tax split.
@@ -535,6 +675,24 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
   const buyStateCode = stateCode(doc.customerGstin)
   const interState = bizStateCode !== null && buyStateCode !== null && bizStateCode !== buyStateCode
   const halfTax = Math.round((totalTax / 2) * 100) / 100
+  // Purchase invoices persist the actual input-tax split. Print those stored
+  // amounts rather than re-deriving a split that might disagree with the row.
+  const storedCgst = Number(extras.taxSplit?.cgst) || 0
+  const storedSgst = Number(extras.taxSplit?.sgst) || 0
+  const storedIgst = Number(extras.taxSplit?.igst) || 0
+  const hasStoredTaxSplit = storedCgst + storedSgst + storedIgst > 0
+  const gstSplitRows = gstRate > 0
+    ? hasStoredTaxSplit
+      ? storedIgst > 0
+        ? `<div class="row"><span>IGST @ ${gstRate}%</span><span>₹${fmt(storedIgst)}</span></div>`
+        : `<div class="row"><span>CGST @ ${gstRate / 2}%</span><span>₹${fmt(storedCgst)}</span></div><div class="row"><span>SGST @ ${gstRate / 2}%</span><span>₹${fmt(storedSgst)}</span></div><div class="row"><span>Total GST</span><span>₹${fmt(storedCgst + storedSgst)}</span></div>`
+      : interState
+        ? `<div class="row"><span>IGST @ ${gstRate}%</span><span>₹${fmt(totalTax)}</span></div>`
+        : `<div class="row"><span>CGST @ ${gstRate / 2}%</span><span>₹${fmt(halfTax)}</span></div><div class="row"><span>SGST @ ${gstRate / 2}%</span><span>₹${fmt(halfTax)}</span></div><div class="row"><span>Total GST</span><span>₹${fmt(totalTax)}</span></div>`
+    : ''
+  const extraTotalRows = (extras.extraTotalRows ?? [])
+    .map((r) => `<div class="row"><span>${escapeHtml(r.label)}</span><span>₹${fmt(r.value)}</span></div>`)
+    .join('')
   const hsnCodes = [...new Set(items.map((i) => String(i.hsn ?? '')).filter(Boolean))]
   const hsnDisplay = hsnCodes.length > 0 ? hsnCodes.join(', ') : '7113'
   const totalWeight = items.reduce((a, i) => a + (Number(i.weight) || 0), 0)
@@ -548,16 +706,22 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     : extras.docType === 'order' ? 'SALES ORDER'
     : extras.docType === 'packing-slip' ? 'PACKING SLIP'
     : extras.docType === 'pick-list' ? 'PICK LIST'
+    : extras.docType === 'purchase-order' ? 'PURCHASE ORDER'
+    : extras.docType === 'purchase-invoice' ? 'PURCHASE INVOICE'
     : 'TAX INVOICE'
   const docNumberLabel =
     extras.docType === 'quotation' ? 'Quotation No'
     : extras.docType === 'order' ? 'Order No'
     : extras.docType === 'packing-slip' || extras.docType === 'pick-list' ? 'Order No'
+    : extras.docType === 'purchase-order' ? 'Order No'
     : 'Invoice No'
   const tagline = extras.tagline || '92.5 Sterling Silver Jewellery'
   // Fulfilment documents (packing slip / pick list) are internal: no GST
   // math, no amounts, no payment box — just products, SKUs and quantities.
   const fulfilmentDoc = extras.docType === 'packing-slip' || extras.docType === 'pick-list'
+  // Purchase documents share the invoice layout but never show HSN or making
+  // charges: those fields are not part of the purchase models.
+  const purchaseDoc = extras.docType === 'purchase-order' || extras.docType === 'purchase-invoice'
 
   const cellBorder =
     c.borderStyle === 'full' ? 'border:1px solid #e5e7eb;' : c.borderStyle === 'rows' ? 'border-bottom:1px solid #e5e7eb;' : ''
@@ -617,6 +781,20 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
       // customer pays for the line (confirmed replacement for the old ex-GST
       // figure); the GST portion stays separately visible in GST AMOUNT.
       const lineAmount = (Number(i.amount) || 0) + (Number(i.tax) || 0)
+      if (purchaseDoc) {
+        // Purchases only have Product, Qty, Weight, Rate, line GST and Amount.
+        // HSN and making charges do not exist on these models, so those
+        // columns are never emitted (even if the shared design toggles them).
+        return `<tr style="${zebra(idx)}">
+          ${imgCell}
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
+          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
+          ${c.showRate ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.rate)}</td>` : ''}
+          ${c.showTax ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.tax)}</td>` : ''}
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(lineAmount)}</td>
+        </tr>`
+      }
       return `<tr style="${zebra(idx)}">
           ${imgCell}
           <td style="padding:7px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
@@ -630,22 +808,35 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     })
     .join('')
 
-  const headCols =
-    (extras.showImages ? `<th style="width:56px;"></th>` : '') +
-    `<th>Product</th>` +
-    (c.showHsn ? `<th style="text-align:center;">HSN</th>` : '') +
-    `<th style="text-align:right;">Qty</th>` +
-    (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '') +
-    (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making Value (₹)</th>` : '') +
-    (c.showTax ? `<th style="text-align:right;">GST AMOUNT (₹)</th>` : '') +
-    `<th style="text-align:right;">Amount (₹)</th>`
-  const footSpans =
-    `<td colspan="${(extras.showImages ? 1 : 0) + (c.showHsn ? 2 : 1)}" style="padding:7px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item(s)</td>` +
-    `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalQty}</td>` +
-    (c.showWeight ? `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalWeight.toFixed(2)} g</td>` : '') +
-    (c.showRate ? `<td colspan="2"></td>` : '') +
-    (c.showTax ? `<td></td>` : '') +
-    `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:11px;">₹${fmt(doc.grandTotal)}</td>`
+  const headCols = purchaseDoc
+    ? (extras.showImages ? `<th style="width:56px;"></th>` : '') +
+      `<th>Product</th>` +
+      `<th style="text-align:right;">Qty</th>` +
+      (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '') +
+      (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th>` : '') +
+      (c.showTax ? `<th style="text-align:right;">GST AMOUNT (₹)</th>` : '') +
+      `<th style="text-align:right;">Amount (₹)</th>`
+    : (extras.showImages ? `<th style="width:56px;"></th>` : '') +
+      `<th>Product</th>` +
+      (c.showHsn ? `<th style="text-align:center;">HSN</th>` : '') +
+      `<th style="text-align:right;">Qty</th>` +
+      (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '') +
+      (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making Value (₹)</th>` : '') +
+      (c.showTax ? `<th style="text-align:right;">GST AMOUNT (₹)</th>` : '') +
+      `<th style="text-align:right;">Amount (₹)</th>`
+  const footSpans = purchaseDoc
+    ? `<td colspan="${extras.showImages ? 2 : 1}" style="padding:7px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item(s)</td>` +
+      `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalQty}</td>` +
+      (c.showWeight ? `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalWeight.toFixed(2)} g</td>` : '') +
+      (c.showRate ? `<td></td>` : '') +
+      (c.showTax ? `<td></td>` : '') +
+      `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:11px;">₹${fmt(doc.grandTotal)}</td>`
+    : `<td colspan="${(extras.showImages ? 1 : 0) + (c.showHsn ? 2 : 1)}" style="padding:7px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item(s)</td>` +
+      `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalQty}</td>` +
+      (c.showWeight ? `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalWeight.toFixed(2)} g</td>` : '') +
+      (c.showRate ? `<td colspan="2"></td>` : '') +
+      (c.showTax ? `<td></td>` : '') +
+      `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:11px;">₹${fmt(doc.grandTotal)}</td>`
 
   const logoImg = c.showLogo && c.logoDataUrl ? `<img class="logo" src="${c.logoDataUrl}" alt="logo"/>` : ''
   const logoLeft = c.logoAlign === 'left'
@@ -705,7 +896,13 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
       </div>`
     : ''
 
-  const supplyLine = interState ? `Inter-state supply · IGST @ ${gstRate}%` : `Intra-state supply · GST @ ${gstRate}%`
+  const supplyLine = purchaseDoc
+    ? interState
+      ? `Inter-state purchase · IGST @ ${gstRate}%`
+      : `Intra-state purchase · CGST + SGST @ ${gstRate}%`
+    : interState
+      ? `Inter-state supply · IGST @ ${gstRate}%`
+      : `Intra-state supply · GST @ ${gstRate}%`
   const gstinLine =
     extras.docType !== 'order'
       ? `<div class="meta-line">${c.showGSTIN && doc.businessGstin ? `GSTIN: ${escapeHtml(doc.businessGstin)} · ` : ''}${supplyLine}</div>`
@@ -811,11 +1008,12 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
           <div class="name">${escapeHtml(doc.customer || 'Guest')}</div>
           <div class="detail">${[doc.customerEmail, doc.customerPhone].filter(Boolean).map((v) => escapeHtml(String(v))).join('<br/>')}</div>
           ${doc.customerAddress || doc.customerCity || doc.customerState || doc.customerPincode ? `<div class="detail" style="margin-top:4px;white-space:pre-line;">${escapeHtml([doc.customerAddress, [doc.customerCity, doc.customerState, doc.customerPincode].filter(Boolean).join(', ')].filter(Boolean).join('\n'))}</div>` : ''}
+          ${doc.customerGstin ? `<div class="detail" style="margin-top:4px;">GSTIN: ${escapeHtml(doc.customerGstin)}</div>` : ''}
           ${extras.notes ? `<div class="detail" style="margin-top:6px;font-style:italic;">${escapeHtml(extras.notes)}</div>` : ''}
         </div>
         <div class="billto-box">
-          <div class="label">Order Details</div>
-          <div class="value">${escapeHtml(doc.shopifyOrder ?? '')}</div>
+          <div class="label">${escapeHtml(extras.detailsLabel ?? 'Order Details')}</div>
+          <div class="value">${escapeHtml(extras.detailsValue ?? doc.shopifyOrder ?? '')}</div>
           ${gstinLine}
         </div>
       </div>
@@ -832,9 +1030,8 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
         ${qrBlock}
         <div class="totals-box">
           <div class="row"><span>Taxable Value</span><span>₹${fmt(taxable)}</span></div>
-          ${gstRate > 0 ? (interState
-            ? `<div class="row"><span>IGST @ ${gstRate}%</span><span>₹${fmt(totalTax)}</span></div>`
-            : `<div class="row"><span>CGST @ ${gstRate / 2}%</span><span>₹${fmt(halfTax)}</span></div><div class="row"><span>SGST @ ${gstRate / 2}%</span><span>₹${fmt(halfTax)}</span></div><div class="row"><span>Total GST</span><span>₹${fmt(totalTax)}</span></div>`) : ''}
+          ${gstSplitRows}
+          ${extraTotalRows}
           ${Number(doc.discount) > 0 ? `<div class="row" style="color:#dc2626;"><span>Discount</span><span>- ₹${fmt(doc.discount)}</span></div>` : ''}
           <div class="grand"><span>${escapeHtml(extras.totalLabel ?? 'GRAND TOTAL')}</span><span>₹${fmt(doc.grandTotal)}</span></div>
         </div>
@@ -886,12 +1083,23 @@ function printBridge(): PrintBridge | undefined {
   return (window as unknown as { electronAPI?: PrintBridge }).electronAPI
 }
 
-function popupWithPrint(html: string): void {
+const POPUP_BLOCKED_ERROR =
+  'The print window was blocked by the browser — allow pop-ups for this site, then try again.'
+
+/**
+ * Open the built document in a popup that prints itself on load.
+ * Returns false when the popup was refused. Callers must surface that: a
+ * blocked window used to end in a "Labels saved as PDF" toast with no file
+ * written anywhere, which is exactly what "Save as PDF does nothing" looked
+ * like from the user's side.
+ */
+function popupWithPrint(html: string): boolean {
   const w = window.open('', '_blank', 'width=900,height=760')
-  if (!w) return
+  if (!w) return false
   w.opener = null
   w.document.write(html + `<script>window.onload=function(){window.focus();window.print();}</script>`)
   w.document.close()
+  return true
 }
 
 /** Ask how to print: native chooser (Default printer / Save as PDF… /
@@ -933,7 +1141,10 @@ export async function printHtmlToPrinter(
   const picked = mode ?? (await choosePrintMode())
   if (picked === 'cancel') return
   if (picked === 'pdf') {
-    await exportHtmlPdf(html, title)
+    const res = await exportHtmlPdf(html, title)
+    // A failed save must reach the caller — swallowing it is how a blocked
+    // popup used to look like a successful export.
+    if (!res.ok && !res.cancelled) throw new Error(res.error || 'PDF export failed')
     return
   }
   const api = printBridge()
@@ -946,7 +1157,7 @@ export async function printHtmlToPrinter(
     }
     return
   }
-  popupWithPrint(html)
+  if (!popupWithPrint(html)) throw new Error(POPUP_BLOCKED_ERROR)
 }
 
 /**
@@ -1001,7 +1212,12 @@ export async function openHtmlPreview(html: string, title?: string): Promise<voi
     return
   }
   const w = window.open('', '_blank', 'width=900,height=760')
-  if (!w) return
+  if (!w) {
+    // Preview is a look-only flow, so a blocked popup is reported rather than
+    // thrown: the page keeps working and the console explains the silence.
+    console.warn('[preview] blocked:', POPUP_BLOCKED_ERROR)
+    return
+  }
   w.opener = null
   w.document.write(html)
   w.document.close()
@@ -1024,7 +1240,10 @@ export async function exportHtmlPdf(
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   }
-  popupWithPrint(html)
+  // Plain browser: the popup is where the user picks Chrome's own
+  // "Save as PDF". If it never opened, no PDF will ever exist — say so
+  // instead of reporting a success the user cannot find on disk.
+  if (!popupWithPrint(html)) return { ok: false, error: POPUP_BLOCKED_ERROR }
   return { ok: true }
 }
 
@@ -1052,5 +1271,9 @@ export function printDocument(
       return
     }
     await printHtmlToPrinter(html, undefined, picked)
-  })()
+  })().catch((err) => {
+    // A blocked popup (or any print-stage failure) must not surface as an
+    // unhandled rejection — it is reported like every other print failure.
+    console.warn('[print] failed:', err)
+  })
 }

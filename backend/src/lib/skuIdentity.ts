@@ -14,20 +14,56 @@
  */
 import { sql } from 'drizzle-orm'
 import { schema as s } from '../db/client'
-import { categoryCode, generateSku } from './productCodes'
+import { categoryCode, generateSku, type ProductCodeSettings } from './productCodes'
+
+/**
+ * Settings → Product codes, read inside the caller's transaction so the code
+ * that is minted matches the configured prefix/format/sequence length.
+ * `undefined` when no settings row exists yet (the shipped defaults apply).
+ */
+export async function productCodeSettings(tx: any): Promise<ProductCodeSettings | null> {
+  const [row] = await tx
+    .select({
+      skuPrefix: s.settings.skuPrefix,
+      skuSuffix: s.settings.skuSuffix,
+      skuFormat: s.settings.skuFormat,
+      skuSeqLength: s.settings.skuSeqLength,
+    })
+    .from(s.settings)
+    .limit(1)
+  return row ?? null
+}
 
 /**
  * Next free SKU for a category, computed INSIDE the caller's transaction after
  * taking the category's advisory lock. `tx` is any drizzle transaction/db
  * handle — the shapes used here (execute/select) are identical for both.
+ * `settings` is the Settings → Product codes slice when the caller has already
+ * read it; omitted, the shipped OL defaults apply.
  */
-export async function generateUniqueSku(tx: any, category: string): Promise<string> {
-  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${'sku:gen:' + categoryCode(category)}))`)
+export async function generateUniqueSku(
+  tx: any,
+  category: string,
+  settings?: ProductCodeSettings | null,
+  /**
+   * The category's own SKU prefix (product_categories.prefix) when the product
+   * belongs to a catalogue category. It wins over the name-derived code, so a
+   * category created in Inventory → Collections & Categories mints exactly its
+   * stated prefix. The advisory lock is keyed on the same code, so products of
+   * any categories sharing a code still serialise.
+   */
+  prefix?: string | null,
+): Promise<string> {
+  const code = categoryCode(category)
+  const lockCode = String(prefix ?? '').replace(/[^a-zA-Z]/g, '').toUpperCase() || code
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${'sku:gen:' + lockCode}))`)
   const rows = await tx.select({ sku: s.products.sku }).from(s.products)
   const variantRows = await tx.select({ sku: s.productVariants.sku }).from(s.productVariants)
   return generateSku(
     [...rows.map((r: { sku: string | null }) => r.sku), ...variantRows.map((r: { sku: string | null }) => r.sku)],
     category,
+    settings ?? undefined,
+    prefix,
   )
 }
 

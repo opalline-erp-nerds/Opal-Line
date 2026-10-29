@@ -9,10 +9,10 @@ import {
   normalizeScanCode,
   scanCodeError,
 } from '../scanCode'
-import { findProductsBySku, generateUniqueSku } from '../lib/skuIdentity'
+import { findProductsBySku, generateUniqueSku, productCodeSettings } from '../lib/skuIdentity'
 import { isGenericSku, migrationWarnings, planSkuMigration, type SkuReferences } from '../lib/skuMigration'
+import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, resolveMovementLocation, type Tx } from '../stock'
 import { applyInvoiceReturn, aggregateReturnedBySku, nextInvoiceStatus, summarizeReturnLines } from '../invoiceReturn'
-import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, resolveMovementLocation } from '../stock'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
   validate,
@@ -44,6 +44,23 @@ import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockC
 import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
 import { escapeHtml } from '../htmlEscape'
 import { routeParam } from '../lib/routeParams'
+import {
+  categoryNameError,
+  categoryPrefixError,
+  collectionNameError,
+  fixedPriceError,
+  normalizeCategoryName,
+  normalizeCollectionName,
+  normalizeCategoryPrefix,
+} from '../lib/collections'
+import {
+  findCategoryById,
+  findCollection,
+  importRowAssociation,
+  loadCollectionLookup,
+  resolveProductAssociation,
+  type CollectionLookup,
+} from '../lib/collectionStore'
 
 export const dbRouter = Router()
 
@@ -337,6 +354,38 @@ dbRouter.get('/products', listOf(s.products, s.products.createdAt))
 // barcodes anywhere in the product workflow. The generation and scan-lookup
 // helpers live in src/lib/skuIdentity.ts so they can be unit-tested.
 
+// Next free SKU for a category, read from LIVE product + variant codes inside
+// the same per-category advisory lock the create path uses. The product dialog
+// fills its SKU field from this, so the proposal is database-derived instead of
+// client-side only; POST /products re-validates/claims the code under the lock
+// on save. `categoryId` (a Collections & Categories row) supplies the category's
+// own prefix, so the proposal and the saved code agree. Registered before
+// /products/:id to avoid param capture.
+dbRouter.get('/products/next-sku', requirePermission('inventory', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  const requestedName = String(req.query.category ?? '').trim()
+  const categoryId = String(req.query.categoryId ?? '').trim()
+  if (!requestedName && !categoryId) {
+    return res.status(400).json({ error: 'A category is required to generate a SKU' })
+  }
+  try {
+    const result = await db!.transaction(async (tx) => {
+      // A stale id falls back to the name the caller sent; an id whose row still
+      // exists is authoritative for both the name and the SKU prefix.
+      const row = categoryId ? await findCategoryById(tx, categoryId) : null
+      const category = row?.name ?? requestedName
+      if (!category) return null
+      const sku = await generateUniqueSku(tx, category, await productCodeSettings(tx), row?.prefix)
+      return { sku, category }
+    })
+    if (!result) return res.status(400).json({ error: 'Unknown category' })
+    res.json(result)
+  } catch (err) {
+    logger.error({ err }, 'next SKU lookup failed')
+    res.status(500).json({ error: 'Could not generate a SKU' })
+  }
+})
+
 // QR Code labels (must be before /products/:id to avoid param capture)
 dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'), async (_req, res) => {
   const { LABEL_PRESET_LIST } = await import('../barcodeLabels')
@@ -383,6 +432,9 @@ async function labelRequestOptions(source: Record<string, unknown>) {
     showWeight: source.weight !== 'false' && source.showWeight !== false,
     showQR: source.qr !== 'false' && source.showQR !== false,
     showBrand: source.brand !== 'false' && source.showBrand !== false,
+    showName: source.name !== 'false' && source.showName !== false,
+    showSku: source.sku !== 'false' && source.showSku !== false,
+    showCategory: source.category !== 'false' && source.showCategory !== false,
     copies: copiesRaw == null ? 1 : Number(copiesRaw),
     page: source.page === 'letter' || source.pageSize === 'letter' ? 'letter' : (source.page === 'a4' ? 'a4' : undefined),
   })
@@ -1694,6 +1746,67 @@ function toNum(v: unknown): number | null {
   return Number.isFinite(n) ? n : null
 }
 
+/** The text columns both CSV import routes write for every row. */
+function importRowText(mapped: Record<string, string>): Record<string, string | null> {
+  return {
+    name: mapped.name ?? '',
+    category: mapped.category ?? 'Imported',
+    hsn: mapped.hsn ?? null,
+    supplier: mapped.supplier ?? null,
+    status: mapped.status ?? 'active',
+    vendor: mapped.vendor ?? null,
+    productType: mapped.productType ?? null,
+    tags: mapped.tags ?? null,
+    huid: mapped.huid ?? null,
+  }
+}
+
+/**
+ * One CSV row's write plan, shared by /products/bulk-import and
+ * /products/import-csv so both apply the same collection rules:
+ *   • a `collection` cell naming a pricing collection links the row by stable
+ *     id (and to that collection's matching category, if any);
+ *   • a fixed-price collection requires one of its categories (that is where
+ *     the SKU prefix comes from) and a selling price, and stores the price as
+ *     the product's fixed price — never as silver-rate input;
+ *   • rows without a collection cell keep their existing grouping and their
+ *     silver-rate pricing, exactly as before.
+ * `error` means the row must be skipped and reported.
+ */
+function planImportRow(
+  lookup: CollectionLookup,
+  mapped: Record<string, string>,
+  numeric: { sellingPrice: number | null },
+  rowNo: number,
+  sku: string,
+  existingPrice?: number | null,
+): { text: Record<string, string | null>; pricing: Record<string, unknown> | null; error: string | null } {
+  const association = importRowAssociation(lookup, mapped, importRowText(mapped))
+  const { text, collection, category } = association
+  const fixed = collection?.pricingType === 'fixed'
+  if (fixed && !category) {
+    return {
+      text,
+      pricing: null,
+      error: `Row ${rowNo} (${sku}): "${collection!.name}" is fixed-price and needs one of its categories — create it under Inventory → Collections & Categories first — skipped`,
+    }
+  }
+  if (!fixed) return { text, pricing: null, error: null }
+  const price = numeric.sellingPrice ?? existingPrice ?? null
+  if (price == null || !Number.isFinite(price) || price <= 0) {
+    return {
+      text,
+      pricing: null,
+      error: `Row ${rowNo} (${sku}): fixed-price products need a selling price — skipped`,
+    }
+  }
+  return {
+    text,
+    pricing: { sellingPrice: price, fixedPieceRate: price, pieceRateProduct: true, silverRate: null },
+    error: null,
+  }
+}
+
 dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
@@ -1706,8 +1819,16 @@ dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), a
     let updated = 0
 
     // Load existing products by normalized SKU for upsert
-    const existing = await db!.select({ id: s.products.id, sku: s.products.sku }).from(s.products)
+    const existing = await db!
+      .select({ id: s.products.id, sku: s.products.sku, sellingPrice: s.products.sellingPrice })
+      .from(s.products)
     const bySku = new Map(existing.map((p) => [p.sku.trim().toLowerCase(), p]))
+
+    // A `collection` cell that names a pricing collection links to it by stable
+    // id, so the row lands in the right group with the right pricing model.
+    // Rows without that column keep exactly the old behaviour: free-text
+    // grouping, silver-rate pricing, no association written.
+    const lookup = await loadCollectionLookup(db!)
 
     for (let i = 0; i < rawRows.length; i++) {
       const raw = rawRows[i] as Record<string, unknown>
@@ -1736,23 +1857,16 @@ dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), a
         stock: toNum(mapped.stock),
         reorderLevel: toNum(mapped.reorderLevel),
       }
-      const text = {
-        name,
-        category: mapped.category ?? 'Imported',
-        collection: mapped.collection ?? null,
-        hsn: mapped.hsn ?? null,
-        supplier: mapped.supplier ?? null,
-        status: mapped.status ?? 'active',
-        vendor: mapped.vendor ?? null,
-        productType: mapped.productType ?? null,
-        tags: mapped.tags ?? null,
-        huid: mapped.huid ?? null,
-      }
+      const hit = bySku.get(skuKey)
+      const plan = planImportRow(lookup, mapped, numeric, rowNo, sku, hit?.sellingPrice ?? null)
+      if (plan.error) { errors.push(plan.error); continue }
+      const text = plan.text
       try {
-        const hit = bySku.get(skuKey)
         if (hit) {
           const patch: Record<string, unknown> = { ...text }
           for (const [k, v] of Object.entries(numeric)) if (v != null) patch[k] = v
+          // The collection's pricing model wins over whatever the columns say.
+          Object.assign(patch, plan.pricing ?? {})
           await db!.update(s.products).set(patch).where(eq(s.products.id, hit.id))
           updated++
         } else {
@@ -1767,8 +1881,9 @@ dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), a
             // same-day products must not tie.
             createdAt: new Date().toISOString(),
           }
+          Object.assign(values, plan.pricing ?? {})
           const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
-          bySku.set(skuKey, { id: row.id, sku })
+          bySku.set(skuKey, { id: row.id, sku, sellingPrice: row.sellingPrice })
           created++
         }
       } catch (rowErr) {
@@ -1864,8 +1979,14 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
     let created = 0
     let updated = 0
 
-    const existing = await db!.select({ id: s.products.id, sku: s.products.sku }).from(s.products)
+    const existing = await db!
+      .select({ id: s.products.id, sku: s.products.sku, sellingPrice: s.products.sellingPrice })
+      .from(s.products)
     const bySku = new Map(existing.map((p) => [p.sku.trim().toLowerCase(), p]))
+
+    // See planImportRow: a `collection` cell links the row to its stable
+    // collection/category and applies that collection's pricing model.
+    const lookup = await loadCollectionLookup(db!)
 
     for (let i = 0; i < rawRows.length; i++) {
       const raw = rawRows[i]
@@ -1893,23 +2014,16 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
         stock: toNum(mapped.stock),
         reorderLevel: toNum(mapped.reorderLevel),
       }
-      const text = {
-        name,
-        category: mapped.category ?? 'Imported',
-        collection: mapped.collection ?? null,
-        hsn: mapped.hsn ?? null,
-        supplier: mapped.supplier ?? null,
-        status: mapped.status ?? 'active',
-        vendor: mapped.vendor ?? null,
-        productType: mapped.productType ?? null,
-        tags: mapped.tags ?? null,
-        huid: mapped.huid ?? null,
-      }
+      const hit = bySku.get(skuKey)
+      const plan = planImportRow(lookup, mapped, numeric, rowNo, sku, hit?.sellingPrice ?? null)
+      if (plan.error) { errors.push(plan.error); continue }
+      const text = plan.text
       try {
-        const hit = bySku.get(skuKey)
         if (hit) {
           const patch: Record<string, unknown> = { ...text }
           for (const [k, v] of Object.entries(numeric)) if (v != null) patch[k] = v
+          // The collection's pricing model wins over whatever the columns say.
+          Object.assign(patch, plan.pricing ?? {})
           await db!.update(s.products).set(patch).where(eq(s.products.id, hit.id))
           updated++
         } else {
@@ -1924,8 +2038,9 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
             // same-day products must not tie.
             createdAt: new Date().toISOString(),
           }
+          Object.assign(values, plan.pricing ?? {})
           const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
-          bySku.set(skuKey, { id: row.id, sku })
+          bySku.set(skuKey, { id: row.id, sku, sellingPrice: row.sellingPrice })
           created++
         }
       } catch (rowErr) {
@@ -2020,10 +2135,7 @@ dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), asyn
       .limit(1)
     if (!invoice) return res.status(404).json({ error: 'Invoice not found' })
 
-    // One write at a time: the invoice row lock serialises concurrent return
-    // submissions (double-click, refresh, retry) so the second call re-reads
-    // the first call's remaining quantities inside the same locked snapshot —
-    // it merges or is rejected, never restocking the same unit twice.
+    // Lock the invoice before applying the idempotent return transaction.
     const outcome = await db!.transaction(async (tx) => {
       await tx.select({ id: s.salesInvoices.id })
         .from(s.salesInvoices)
@@ -2042,7 +2154,6 @@ dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), asyn
     if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error })
     const { result } = outcome
     recordCrud('sales-returns', 'Created', req, { id: result.returnId, number: result.creditNoteNumber, invoiceId: routeParam(req.params.id), amount: result.amount, quantity: result.quantity })
-
     // Give back the points earned on the value being returned.
     void import('../loyalty')
       .then(({ reverseEarnedForInvoice }) =>
@@ -2055,7 +2166,6 @@ dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), asyn
         }),
       )
       .catch(() => undefined)
-
     await insertOrderEvent(invoice.id, 'Return Processed', `Credit note ${result.creditNoteNumber} — ${result.quantity} item(s), ₹${result.amount.toLocaleString('en-IN')}${result.restocked ? ', restocked' : ''}`, actorFromRequest(req).userId ?? 'system')
     void import('../statusNotifications').then((m) => m.notifyReturnProcessed({ customer: invoice.customer, invoiceNumber: result.invoiceNumber, amount: result.amount, restocked: result.restocked, creditNoteNumber: result.creditNoteNumber })).catch(() => undefined)
 
@@ -2069,8 +2179,11 @@ dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), asyn
       lines: result.lines,
     })
   } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    const cause = (err as { cause?: unknown })?.cause instanceof Error ? (err as Error & { cause: Error }).cause.message : ''
     logger.error({ err }, 'invoice return failed')
-    res.status(500).json({ error: 'Failed to process return' })
+    const isDuplicate = /unique|duplicate key/i.test(`${msg} ${cause}`)
+    res.status(isDuplicate ? 400 : 500).json({ error: isDuplicate ? 'That credit note number already exists — retry the return' : 'Failed to process return' })
   }
 })
 
@@ -3616,6 +3729,259 @@ dbRouter.post('/inventory/locations', requirePermission('inventory', 'edit'), as
 
 dbRouter.get('/inventory/locations/:id', oneOf(s.inventoryLocations, s.inventoryLocations.id))
 
+// ─── Inventory pricing collections & categories ───────────────────────────
+// Foundation only: these routes describe how products are grouped (Silver
+// Jewels → silver-rate pricing, Other Products → fixed-price pricing). They do
+// not read or write product prices, SKUs, sales or Shopify, and products keep
+// their free-text category/collection columns exactly as they are. Category
+// names are globally unique so products.category stays unambiguous; SKU
+// prefixes are globally unique so future category-based codes cannot collide.
+
+dbRouter.get('/inventory/collections', requirePermission('inventory', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!
+      .select({
+        id: s.collections.id,
+        name: s.collections.name,
+        pricingType: s.collections.pricingType,
+        isSystem: s.collections.isSystem,
+        createdAt: s.collections.createdAt,
+        updatedAt: s.collections.updatedAt,
+        categoryCount: sql<number>`count(distinct ${s.productCategories.id})::int`,
+        productCount: sql<number>`count(${s.products.id})::int`,
+      })
+      .from(s.collections)
+      .leftJoin(s.productCategories, eq(s.productCategories.collectionId, s.collections.id))
+      // Products still store their category as text; matching on the name is
+      // what lets the page show how much of the catalogue each group holds.
+      .leftJoin(s.products, eq(s.products.category, s.productCategories.name))
+      .groupBy(s.collections.id)
+      .orderBy(desc(s.collections.isSystem), s.collections.name)
+    res.json({ data: rows })
+  } catch (err) {
+    logger.error({ err }, 'collections list failed')
+    res.status(500).json({ error: 'Could not load collections' })
+  }
+})
+
+/**
+ * Rename a collection. The id is the identity: only the display name changes,
+ * so categories, products and any future references keep pointing at the same
+ * row. System collections (Silver Jewels) and the pricing type are immutable.
+ */
+dbRouter.patch('/inventory/collections/:id', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const id = routeParam(req.params.id)
+    const [collection] = await db!.select().from(s.collections).where(eq(s.collections.id, id)).limit(1)
+    if (!collection) return res.status(404).json({ error: 'Collection not found' })
+
+    const requestedPricing = req.body?.pricingType
+    if (requestedPricing !== undefined && String(requestedPricing) !== collection.pricingType) {
+      return res.status(400).json({ error: 'A collection\'s pricing type is fixed when it is created' })
+    }
+    if ('isSystem' in (req.body ?? {}) && Boolean(req.body.isSystem) !== collection.isSystem) {
+      return res.status(400).json({ error: 'The system flag cannot be changed' })
+    }
+    if (collection.isSystem) {
+      return res.status(400).json({
+        error: 'The Silver Jewels collection is fixed — its name and pricing behaviour cannot be changed',
+      })
+    }
+    if (req.body?.name === undefined) return res.status(400).json({ error: 'Nothing to update' })
+
+    const name = normalizeCollectionName(req.body.name)
+    const invalid = collectionNameError(name)
+    if (invalid) return res.status(400).json({ error: invalid })
+
+    const [clash] = await db!
+      .select({ id: s.collections.id })
+      .from(s.collections)
+      .where(sql`lower(${s.collections.name}) = lower(${name}) and ${s.collections.id} <> ${id}`)
+      .limit(1)
+    if (clash) return res.status(400).json({ error: `A collection called "${name}" already exists` })
+
+    const [row] = await db!
+      .update(s.collections)
+      .set({ name, updatedAt: new Date().toISOString() })
+      .where(eq(s.collections.id, id))
+      .returning()
+
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Renamed collection',
+      module: 'inventory',
+      entity: `${collection.name} → ${row.name}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json(row)
+  } catch (err) {
+    logger.error({ err }, 'collection rename failed')
+    res.status(400).json({ error: 'Could not rename the collection' })
+  }
+})
+
+dbRouter.get('/inventory/categories', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const collectionId = String(req.query.collectionId ?? '').trim()
+    const rows = await db!
+      .select({
+        id: s.productCategories.id,
+        collectionId: s.productCategories.collectionId,
+        name: s.productCategories.name,
+        prefix: s.productCategories.prefix,
+        createdAt: s.productCategories.createdAt,
+        updatedAt: s.productCategories.updatedAt,
+        productCount: sql<number>`count(${s.products.id})::int`,
+      })
+      .from(s.productCategories)
+      .leftJoin(s.products, eq(s.products.category, s.productCategories.name))
+      .where(collectionId ? eq(s.productCategories.collectionId, collectionId) : undefined)
+      .groupBy(s.productCategories.id)
+      .orderBy(s.productCategories.name)
+    res.json({ data: rows })
+  } catch (err) {
+    logger.error({ err }, 'categories list failed')
+    res.status(500).json({ error: 'Could not load categories' })
+  }
+})
+
+dbRouter.post('/inventory/categories', requirePermission('inventory', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const collectionId = String(req.body?.collectionId ?? '').trim()
+    const name = normalizeCategoryName(req.body?.name)
+    const prefix = normalizeCategoryPrefix(req.body?.prefix)
+    if (!collectionId) return res.status(400).json({ error: 'Choose the collection this category belongs to' })
+    const nameInvalid = categoryNameError(name)
+    if (nameInvalid) return res.status(400).json({ error: nameInvalid })
+    const prefixInvalid = categoryPrefixError(prefix)
+    if (prefixInvalid) return res.status(400).json({ error: prefixInvalid })
+
+    const [collection] = await db!.select({ id: s.collections.id, name: s.collections.name }).from(s.collections).where(eq(s.collections.id, collectionId)).limit(1)
+    if (!collection) return res.status(400).json({ error: 'Unknown collection' })
+
+    const [clash] = await db!
+      .select({ id: s.productCategories.id, name: s.productCategories.name, prefix: s.productCategories.prefix })
+      .from(s.productCategories)
+      .where(or(sql`lower(${s.productCategories.name}) = lower(${name})`, eq(s.productCategories.prefix, prefix)))
+      .limit(1)
+    if (clash) {
+      return res.status(400).json({
+        error: clash.prefix === prefix
+          ? `SKU prefix ${prefix} is already used by "${clash.name}"`
+          : `A category called "${name}" already exists`,
+      })
+    }
+
+    const now = new Date().toISOString()
+    const [row] = await db!
+      .insert(s.productCategories)
+      .values({ id: randomUUID(), collectionId, name, prefix, createdAt: now, updatedAt: now })
+      .returning()
+
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Created category',
+      module: 'inventory',
+      entity: `${row.name} (${row.prefix}) in ${collection.name}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.status(201).json({ ...row, productCount: 0 })
+  } catch (err) {
+    logger.error({ err }, 'category create failed')
+    res.status(400).json({ error: 'Could not create the category' })
+  }
+})
+
+/**
+ * Edit a category or move it to another collection. Renaming propagates to the
+ * products that carry the old name (products.category is text), so no product
+ * is left pointing at a category that no longer exists. SKUs, prices and stock
+ * are never touched.
+ */
+dbRouter.patch('/inventory/categories/:id', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const id = routeParam(req.params.id)
+    const [category] = await db!.select().from(s.productCategories).where(eq(s.productCategories.id, id)).limit(1)
+    if (!category) return res.status(404).json({ error: 'Category not found' })
+
+    const name = req.body?.name === undefined ? category.name : normalizeCategoryName(req.body.name)
+    const prefix = req.body?.prefix === undefined ? category.prefix : normalizeCategoryPrefix(req.body.prefix)
+    const collectionId = req.body?.collectionId === undefined
+      ? category.collectionId
+      : String(req.body.collectionId).trim()
+    if (!collectionId) return res.status(400).json({ error: 'Choose the collection this category belongs to' })
+
+    const nameInvalid = categoryNameError(name)
+    if (nameInvalid) return res.status(400).json({ error: nameInvalid })
+    const prefixInvalid = categoryPrefixError(prefix)
+    if (prefixInvalid) return res.status(400).json({ error: prefixInvalid })
+
+    const [collection] = await db!.select({ id: s.collections.id }).from(s.collections).where(eq(s.collections.id, collectionId)).limit(1)
+    if (!collection) return res.status(400).json({ error: 'Unknown collection' })
+
+    const [clash] = await db!
+      .select({ name: s.productCategories.name, prefix: s.productCategories.prefix })
+      .from(s.productCategories)
+      .where(and(
+        ne(s.productCategories.id, id),
+        or(sql`lower(${s.productCategories.name}) = lower(${name})`, eq(s.productCategories.prefix, prefix)),
+      ))
+      .limit(1)
+    if (clash) {
+      return res.status(400).json({
+        error: clash.prefix === prefix
+          ? `SKU prefix ${prefix} is already used by "${clash.name}"`
+          : `A category called "${name}" already exists`,
+      })
+    }
+
+    const result = await db!.transaction(async (tx) => {
+      const renamed = name !== category.name
+      let productsUpdated = 0
+      if (renamed) {
+        const [counted] = await tx
+          .select({ n: sql<number>`count(*)::int` })
+          .from(s.products)
+          .where(sql`lower(${s.products.category}) = lower(${category.name})`)
+        productsUpdated = Number(counted?.n ?? 0)
+        if (productsUpdated > 0) {
+          await tx
+            .update(s.products)
+            .set({ category: name })
+            .where(sql`lower(${s.products.category}) = lower(${category.name})`)
+        }
+      }
+      const [row] = await tx
+        .update(s.productCategories)
+        .set({ name, prefix, collectionId, updatedAt: new Date().toISOString() })
+        .where(eq(s.productCategories.id, id))
+        .returning()
+      return { row, productsUpdated }
+    })
+
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Updated category',
+      module: 'inventory',
+      entity: `${category.name} → ${result.row.name} (${result.row.prefix})`,
+      details: result.productsUpdated > 0 ? `${result.productsUpdated} product(s) relabelled` : undefined,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json({ ...result.row, productsUpdated: result.productsUpdated })
+  } catch (err) {
+    logger.error({ err }, 'category update failed')
+    res.status(400).json({ error: 'Could not update the category' })
+  }
+})
+
 dbRouter.get('/inventory/transfers', listOf(s.stockTransfers, s.stockTransfers.date))
 dbRouter.get('/inventory/transfers/:id', oneOf(s.stockTransfers, s.stockTransfers.id))
 
@@ -3681,13 +4047,14 @@ dbRouter.get('/inventory/levels', requirePermission('inventory', 'view'), async 
 // Create a transfer. This is what makes a transfer actually move stock: the
 // record and the paired ledger movements are written together, so the document
 // and the balances can never disagree.
-/** Resolves a location given its id or its display name (the UI sends names). */
-async function resolveLocation(input: string): Promise<string | null> {
+/** Resolves a location by canonical ID, with display-name fallback for legacy transfers. */
+async function resolveLocation(input: string, tx?: Tx): Promise<string | null> {
   const value = String(input ?? '').trim()
-  if (!value) return null
-  const [byId] = await db!.select({ id: s.inventoryLocations.id }).from(s.inventoryLocations).where(eq(s.inventoryLocations.id, value)).limit(1)
+  const client = tx ?? db
+  if (!value || !client) return null
+  const [byId] = await client.select({ id: s.inventoryLocations.id }).from(s.inventoryLocations).where(eq(s.inventoryLocations.id, value)).limit(1)
   if (byId) return byId.id
-  const [byName] = await db!.select({ id: s.inventoryLocations.id }).from(s.inventoryLocations).where(eq(s.inventoryLocations.name, value)).limit(1)
+  const [byName] = await client.select({ id: s.inventoryLocations.id }).from(s.inventoryLocations).where(eq(s.inventoryLocations.name, value)).limit(1)
   return byName?.id ?? null
 }
 
@@ -3695,42 +4062,48 @@ dbRouter.post('/inventory/transfers', requirePermission('inventory', 'edit'), as
   if (!requireDb(res)) return
   try {
     const sku = String(req.body?.sku ?? '').trim()
-    const qty = Math.floor(Number(req.body?.qty ?? 0))
+    const qty = Number(req.body?.qty)
     const fromRaw = String(req.body?.from ?? '').trim()
     const toRaw = String(req.body?.to ?? '').trim()
-    if (!sku || qty <= 0 || !fromRaw || !toRaw) {
-      return res.status(400).json({ error: 'sku, qty, from and to are required' })
+    if (!sku || !Number.isSafeInteger(qty) || qty <= 0 || !fromRaw || !toRaw) {
+      return res.status(400).json({ error: 'sku, positive whole-number qty, from and to are required' })
     }
 
-    const from = await resolveLocation(fromRaw)
-    const to = await resolveLocation(toRaw)
-    if (!from) return res.status(400).json({ error: `Unknown source location "${fromRaw}"` })
-    if (!to) return res.status(400).json({ error: `Unknown destination location "${toRaw}"` })
-    if (from === to) return res.status(400).json({ error: 'Source and destination must differ' })
+    const created = await db!.transaction(async (tx) => {
+      const from = await resolveLocation(fromRaw, tx)
+      const to = await resolveLocation(toRaw, tx)
+      if (!from) throw Object.assign(new Error(`Unknown source location "${fromRaw}"`), { status: 400 })
+      if (!to) throw Object.assign(new Error(`Unknown destination location "${toRaw}"`), { status: 400 })
+      if (from === to) throw Object.assign(new Error('Source and destination must differ'), { status: 400 })
 
-    const [product] = await db!.select({ id: s.products.id, name: s.products.name }).from(s.products).where(eq(s.products.sku, sku)).limit(1)
-    if (!product) return res.status(404).json({ error: `Unknown SKU ${sku}` })
+      const [product] = await tx.select({ id: s.products.id, name: s.products.name }).from(s.products).where(eq(s.products.sku, sku)).limit(1)
+      if (!product) throw Object.assign(new Error(`Unknown SKU ${sku}`), { status: 404 })
 
-    // Available at the source must cover it now, or dispatch will fail later
-    // and the transfer would be a promise nobody can keep.
-    const [fromLevel] = await db!
-      .select({ qty: s.stockLevels.qty })
-      .from(s.stockLevels)
-      .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, from)))
-      .limit(1)
-    const available = Number(fromLevel?.qty ?? 0)
-    if (available < qty) {
-      return res.status(400).json({ error: `Only ${available} in stock at ${fromRaw}, tried to move ${qty}` })
-    }
+      // Lock the product before checking source stock. Concurrent transfers and
+      // sales then serialize on the same row instead of both trusting a stale balance.
+      await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.id, product.id)).for('update')
+      const [fromLevel] = await tx.select({ qty: s.stockLevels.qty })
+        .from(s.stockLevels)
+        .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, from)))
+        .limit(1)
+      const available = Number(fromLevel?.qty ?? 0)
+      if (available < qty) {
+        throw Object.assign(new Error(`Only ${available} in stock at ${fromRaw}, tried to move ${qty}`), { status: 400 })
+      }
 
-    const number = String(req.body?.number ?? '').trim() || `ST-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`
-    const [created] = await db!
-      .insert(s.stockTransfers)
-      .values({
+      // Generate identifiers on the server. Client-side list counts are stale
+      // under multi-computer use and can produce duplicate transfer numbers.
+      // The 8-hex suffix is random, not sequential: two concurrent creates cannot
+      // race for a shared counter, and the unique index is the final backstop.
+      const number = `ST-${new Date().getFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`
+      // from/to store the canonical location IDs — the id, not a display name
+      // that breaks the moment a location is renamed. The bootstrap upgrade
+      // migrates legacy name-valued rows to their IDs.
+      const [row] = await tx.insert(s.stockTransfers).values({
         id: randomUUID(),
         number,
-        from: fromRaw,
-        to: toRaw,
+        from,
+        to,
         product: product.name ?? null,
         sku,
         qty,
@@ -3741,14 +4114,16 @@ dbRouter.post('/inventory/transfers', requirePermission('inventory', 'edit'), as
         // dispatched has already emptied the shelf it was meant to refill.
         status: 'pending',
         date: new Date().toISOString(),
-      })
-      .returning()
+      }).returning()
+      return row
+    })
 
-    recordCrud('stockTransfers', 'Created', req, { number, sku, qty, from: fromRaw, to: toRaw })
+    recordCrud('stockTransfers', 'Created', req, { number: created.number, sku, qty, from: created.from, to: created.to })
     res.status(201).json(created)
   } catch (err) {
-    logger.error({ err }, 'stock transfer create failed')
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Transfer failed' })
+    const status = (err as { status?: number }).status ?? 500
+    if (status === 500) logger.error({ err }, 'stock transfer create failed')
+    res.status(status).json({ error: err instanceof Error ? err.message : 'Transfer failed' })
   }
 })
 
@@ -3757,13 +4132,16 @@ dbRouter.post('/inventory/transfers/:id/dispatch', requirePermission('inventory'
   if (!requireDb(res)) return
   try {
     const updated = await db!.transaction(async (tx) => {
-      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1)
+      // FOR UPDATE serialises concurrent dispatch attempts on the same
+      // transfer: the second arrives after the first committed and hits the
+      // status check, instead of both moving the stock.
+      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1).for('update')
       if (!transfer) throw Object.assign(new Error('Transfer not found'), { status: 404 })
       if (transfer.status !== 'pending') {
         throw Object.assign(new Error(`Cannot dispatch a transfer that is ${transfer.status}`), { status: 400 })
       }
-      const from = await resolveLocation(String(transfer.from ?? ''))
-      const to = await resolveLocation(String(transfer.to ?? ''))
+      const from = await resolveLocation(String(transfer.from ?? ''), tx)
+      const to = await resolveLocation(String(transfer.to ?? ''), tx)
       if (!from || !to) throw Object.assign(new Error('Transfer locations no longer exist'), { status: 400 })
 
       const sku = String(transfer.sku ?? '')
@@ -3780,7 +4158,9 @@ dbRouter.post('/inventory/transfers/:id/dispatch', requirePermission('inventory'
       }
 
       // Stock physically leaves the source. It lands at the destination on
-      // receive, so goods in transit are in neither location's balance.
+      // receive, so goods in transit are in neither location's balance. The
+      // movement rides the caller's transaction: if the status update below
+      // fails, the deduction rolls back with it rather than evaporating stock.
       await applyStockMovement({
         sku,
         qty: -Number(transfer.qty ?? 0),
@@ -3789,6 +4169,7 @@ dbRouter.post('/inventory/transfers/:id/dispatch', requirePermission('inventory'
         refType: 'stock_transfer',
         refId: transfer.id,
         createdBy: actorFromRequest(req).userId ?? 'system',
+        tx,
       })
       const [row] = await tx
         .update(s.stockTransfers)
@@ -3821,12 +4202,12 @@ dbRouter.post('/inventory/transfers/:id/receive', requirePermission('inventory',
   if (!requireDb(res)) return
   try {
     const updated = await db!.transaction(async (tx) => {
-      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1)
+      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1).for('update')
       if (!transfer) throw Object.assign(new Error('Transfer not found'), { status: 404 })
       if (transfer.status !== 'in-transit') {
         throw Object.assign(new Error(`Cannot receive a transfer that is ${transfer.status}`), { status: 400 })
       }
-      const to = await resolveLocation(String(transfer.to ?? ''))
+      const to = await resolveLocation(String(transfer.to ?? ''), tx)
       if (!to) throw Object.assign(new Error('Destination location no longer exists'), { status: 400 })
 
       const dispatched = Math.floor(Number(transfer.qty ?? 0))
@@ -3881,15 +4262,20 @@ dbRouter.post('/inventory/transfers/:id/cancel', requirePermission('inventory', 
   if (!requireDb(res)) return
   try {
     const updated = await db!.transaction(async (tx) => {
-      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1)
+      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1).for('update')
       if (!transfer) throw Object.assign(new Error('Transfer not found'), { status: 404 })
-      if (transfer.status === 'received') {
-        throw Object.assign(new Error('A received transfer cannot be cancelled'), { status: 400 })
+      // Only a pending or in-transit transfer can be cancelled. Repeating a
+      // cancel used to fall through as a silent no-op write; the second
+      // request is refused instead of pretending to transition again.
+      if (transfer.status !== 'pending' && transfer.status !== 'in-transit') {
+        throw Object.assign(new Error(`Cannot cancel a transfer that is ${transfer.status}`), { status: 400 })
       }
       if (transfer.status === 'in-transit') {
-        const from = await resolveLocation(String(transfer.from ?? ''))
+        const from = await resolveLocation(String(transfer.from ?? ''), tx)
         if (!from) throw Object.assign(new Error('Source location no longer exists'), { status: 400 })
-        // It left the source on dispatch, so cancelling returns it there.
+        // It left the source on dispatch, so cancelling returns it there. The
+        // return must commit with the status flip, or a failed cancel would
+        // leave stock duplicated (deducted on dispatch, "restored" here).
         await applyStockMovement({
           sku: String(transfer.sku ?? ''),
           qty: Number(transfer.qty ?? 0),
@@ -3899,6 +4285,7 @@ dbRouter.post('/inventory/transfers/:id/cancel', requirePermission('inventory', 
           refId: transfer.id,
           note: 'transfer cancelled — returned to source',
           createdBy: actorFromRequest(req).userId ?? 'system',
+          tx,
         })
       }
       const [row] = await tx
@@ -4382,7 +4769,61 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
       })
     }
     if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
-    const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, routeParam(req.params.id))).returning()
+
+    const [existing] = await db!
+      .select()
+      .from(s.products)
+      .where(eq(s.products.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!existing) return res.status(404).json({ error: 'Not found' })
+
+    // Collection/category association. Only touched when the request carries
+    // it, so an unrelated edit (status, image, price) never re-links a product.
+    // The ids stay authoritative; the displayed names are refreshed from the
+    // rows so a renamed collection/category reads correctly on the product.
+    let collection: Awaited<ReturnType<typeof findCollection>> = null
+    const touchesAssociation =
+      body.collectionId !== undefined || body.categoryId !== undefined || body.category !== undefined
+    if (touchesAssociation) {
+      const association = await resolveProductAssociation(db!, {
+        collectionId: body.collectionId === undefined ? existing.collectionId : body.collectionId,
+        categoryId: body.categoryId === undefined ? existing.categoryId : body.categoryId,
+        categoryName: body.category === undefined ? existing.category : body.category,
+      })
+      if (!association.ok) return res.status(400).json({ error: association.error })
+      collection = association.collection
+      if (association.category) {
+        body.category = association.category.name
+        body.categoryId = association.category.id
+      } else if (body.categoryId !== undefined) {
+        // Legacy free-text category (or the row was removed): keep the text,
+        // drop the dangling link.
+        body.categoryId = null
+      }
+      if (association.collection) {
+        body.collectionId = association.collection.id
+        body.collection = association.collection.name
+      }
+      if (!String(body.category ?? existing.category ?? '').trim()) {
+        return res.status(400).json({ error: 'A category is required to generate the product SKU' })
+      }
+    }
+
+    // A fixed-price collection prices from the entered selling price alone. The
+    // piece-rate flag is the existing protection that keeps silver-rate changes
+    // and Shopify pulls from overwriting it, so it is set from the collection
+    // rather than left to the caller. Silver-collection edits keep every
+    // existing pricing behaviour (including a product the user marked piece-rate).
+    if (body.sellingPrice !== undefined && collection?.pricingType === 'fixed') {
+      const error = fixedPriceError(body.sellingPrice)
+      if (error) return res.status(400).json({ error })
+      const price = Number(body.sellingPrice)
+      body.sellingPrice = price
+      body.fixedPieceRate = price
+      body.pieceRateProduct = true
+    }
+
+    const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, existing.id)).returning()
     if (!row) return res.status(404).json({ error: 'Not found' })
     if (body.sellingPrice !== undefined) await recordProductPrice(row.id, row.sellingPrice)
     recordCrud('products', 'Updated', req, row)
@@ -4477,8 +4918,56 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     const body = sanitize(req.body ?? {}, s.products)
     const name = String(body.name ?? '').trim()
     const requestedSku = String(body.sku ?? '').trim()
+    // The category is what the SKU prefix is derived from (Chains → OL-CHN): a
+    // product without one would mint a meaningless OL-GEN code, so it is
+    // required here rather than left to the NOT NULL constraint. A categoryId
+    // is enough on its own — its row names the category.
+    const category = String(body.category ?? '').trim()
     if (!name) return res.status(400).json({ error: 'Product name is required' })
+    if (!category && !String(body.categoryId ?? '').trim()) {
+      return res.status(400).json({ error: 'A category is required to generate the product SKU' })
+    }
     body.name = name
+    if (category) body.category = category
+
+    // Collection/category association: the stable ids decide the pricing model
+    // (fixed-price collections price from the entered selling price) and the
+    // SKU prefix (the category's own prefix). No explicit collection keeps the
+    // legacy behaviour — free-text grouping and the silver-rate formula.
+    const association = await resolveProductAssociation(db!, {
+      collectionId: body.collectionId,
+      collectionName: body.collection,
+      categoryId: body.categoryId,
+      categoryName: category,
+    })
+    if (!association.ok) return res.status(400).json({ error: association.error })
+    if (association.category) {
+      body.category = association.category.name
+      body.categoryId = association.category.id
+    } else {
+      body.categoryId = null
+    }
+    if (association.collection) {
+      body.collectionId = association.collection.id
+      body.collection = association.collection.name
+    } else if (body.collectionId === '') {
+      body.collectionId = null
+    }
+    if (!String(body.category ?? '').trim()) {
+      return res.status(400).json({ error: 'A category is required to generate the product SKU' })
+    }
+    // A fixed-price product never runs the silver formula: the entered selling
+    // price is the price, and the piece-rate flag carries the existing
+    // protection (silver-rate changes and Shopify pulls leave it alone).
+    if (association.collection?.pricingType === 'fixed') {
+      const priceError = fixedPriceError(body.sellingPrice)
+      if (priceError) return res.status(400).json({ error: priceError })
+      const price = Number(body.sellingPrice)
+      body.sellingPrice = price
+      body.fixedPieceRate = price
+      body.pieceRateProduct = true
+      body.silverRate = null
+    }
     // Barcodes are gone: never write the legacy column from a create.
     delete body.barcode
     if (requestedSku) body.sku = requestedSku
@@ -4513,7 +5002,16 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
         if (dup) throw new Error(`A product with that SKU already exists`)
         sku = requestedSku
       } else {
-        sku = await generateUniqueSku(tx, String(body.category ?? ''))
+        // Mint under the configured Product codes settings so an API/scripted
+        // create mints exactly what the dialog would have proposed. The
+        // category's own prefix wins when the product belongs to a catalogue
+        // category — the collection's name is never part of a SKU.
+        sku = await generateUniqueSku(
+          tx,
+          String(body.category ?? ''),
+          await productCodeSettings(tx),
+          association.category?.prefix,
+        )
       }
 
       const [created] = await tx.insert(s.products).values({ ...body, sku } as never).returning()

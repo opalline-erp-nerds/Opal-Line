@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildPrintHtml, invoicePrintDoc, mergePrintConfig } from '@/lib/printTemplate'
+import { buildPrintHtml, exportHtmlPdf, invoicePrintDoc, mergePrintConfig, printHtmlToPrinter } from '@/lib/printTemplate'
 import type { Invoice } from '@/types'
 
 // The invoice screen and the printed page must show the SAME persisted values.
@@ -436,4 +436,68 @@ test('header and row cells stay in the same column order, with and without image
   const plainHtml = printInvoice(invoice)
   const plainThs = headerOf(plainHtml)
   assert.equal(colTexts(itemRow(plainHtml, 'Twisted Rope Chain 22 inch'), 'td').length, plainThs.length)
+})
+
+// ── Hand-off to the browser ───────────────────────────────────────────────────
+// Without the desktop bridge, Print and "Save as PDF" both end in
+// window.open(): that popup is where Chrome's print dialog (and its
+// "Save as PDF" destination) opens. A popup the browser refuses must surface
+// as a failure — it used to be swallowed, so a blocked Save reported
+// "Labels saved as PDF" while no file was ever written.
+
+interface StubWindow {
+  written: string[]
+  handle: { opener: unknown; document: { write: (s: string) => void; close: () => void } }
+}
+
+const hadWindow = Object.prototype.hasOwnProperty.call(globalThis, 'window')
+const originalWindow = (globalThis as { window?: unknown }).window
+
+function stubWindow(handle: StubWindow['handle']): void {
+  ;(globalThis as { window?: unknown }).window = { open: () => handle }
+}
+
+function stubBlockedPopup(): void {
+  ;(globalThis as { window?: unknown }).window = { open: () => null }
+}
+
+test.after(() => {
+  if (hadWindow) (globalThis as { window?: unknown }).window = originalWindow
+  else delete (globalThis as { window?: unknown }).window
+})
+
+test('a blocked popup is reported as a failed PDF export, not a fake success', async () => {
+  stubBlockedPopup()
+  const res = await exportHtmlPdf('<!doctype html><html><body>label sheet</body></html>', 'product-labels')
+  assert.equal(res.ok, false, 'a popup Chrome refused must not be reported as a saved PDF')
+  assert.equal(res.cancelled, undefined)
+  assert.match(String(res.error), /pop-ups/i, 'the failure must tell the user how to unblock it')
+})
+
+test('printHtmlToPrinter throws when the print popup is blocked', async () => {
+  stubBlockedPopup()
+  await assert.rejects(
+    () => printHtmlToPrinter('<!doctype html><html><body>label sheet</body></html>', 'Product Labels', 'silent'),
+    /pop-ups/i,
+    'a blocked print must reach the caller so it can toast instead of silently doing nothing',
+  )
+})
+
+test('an allowed popup receives the whole document and the print-on-load script', async () => {
+  const stub: StubWindow = {
+    written: [],
+    handle: {
+      opener: undefined,
+      document: { write: (s: string) => void stub.written.push(s), close: () => {} },
+    },
+  }
+  stubWindow(stub.handle)
+
+  const html = '<!doctype html><html><head><style>@page{size:A4;margin:0;}</style></head><body>labels</body></html>'
+  const res = await exportHtmlPdf(html, 'product-labels')
+  assert.equal(res.ok, true)
+  const out = stub.written.join('')
+  assert.ok(out.includes('labels'), 'the popup must carry the built document')
+  assert.ok(out.includes('@page{size:A4;margin:0;}'), 'the sheet geometry must survive the hand-off')
+  assert.ok(out.includes('window.print()'), 'the popup must print itself on load')
 })

@@ -257,3 +257,67 @@ test('labels survive a long name and a missing SKU', async () => {
   assert.ok(pdf)
   assert.equal(pdf!.subarray(0, 5).toString('latin1'), '%PDF-')
 })
+
+// Preview ↔ PDF parity: the page's content toggles and paper stock -----------
+
+test('the preview name/SKU/category toggles reach the design renderer', () => {
+  const design = LABEL_PRESET_LIST.find((p) => p.key === 'label-50x40')?.design
+  assert.ok(design)
+  const shown = designFieldTexts(product, resolveLabelPreset('label-50x40'), design)
+  assert.deepEqual(
+    shown.map((f) => f.kind),
+    ['brand', 'name', 'rate', 'code', 'attr1', 'attr2'],
+  )
+  assert.equal(shown.find((f) => f.kind === 'attr1')?.text, 'Rings')
+
+  const hidden = designFieldTexts(
+    product,
+    { ...resolveLabelPreset('label-50x40'), showName: false, showSku: false, showCategory: false },
+    design,
+  )
+  const texts = hidden.map((f) => f.text)
+  assert.ok(!texts.includes('DIAMOND RING'), 'the name line hides with its toggle')
+  assert.ok(!texts.some((t) => t.includes('SKU-1')), 'the code line hides with its toggle')
+  assert.ok(!texts.includes('Rings'), 'the category chip hides with its toggle')
+  // The collection chip has no toggle of its own and keeps printing, moving
+  // into the first chip slot once the category chip is hidden.
+  assert.equal(hidden.find((f) => f.kind === 'attr1')?.text, 'Classic')
+  assert.ok(texts.includes('Rate: 1234.50/-'), 'rate is independent of those toggles')
+
+  // Callers that pass no flags keep every line — the defaults never shrink.
+  // (The brand line appears only when the caller supplies the brand string;
+  // the renderer never invents one.)
+  const defaults = designFieldTexts(product, { showPrice: true, showWeight: true }, design)
+  assert.deepEqual(
+    defaults.map((f) => f.kind),
+    ['name', 'rate', 'code', 'attr1', 'attr2'],
+  )
+})
+
+test('computeLabelLines honours the name/SKU/category toggles on legacy sizes', () => {
+  const geo = computeLabelGeometry((50 / 25.4) * 72, (40 / 25.4) * 72, true)
+  const kinds = computeLabelLines(geo, product, {
+    showPrice: true,
+    showWeight: true,
+    showBrand: true,
+    brand: 'OPAL LINE',
+    showName: false,
+    showSku: false,
+    showCategory: false,
+  }).map((l) => l.kind)
+  assert.ok(!kinds.includes('name'), 'name hidden')
+  assert.ok(!kinds.includes('code'), 'code hidden')
+  assert.ok(!kinds.includes('category'), 'category hidden')
+  assert.ok(kinds.includes('brand'), 'brand survives')
+  assert.ok(kinds.includes('price'), 'price survives')
+})
+
+test('the PDF prints on the page stock the preview selected', async () => {
+  const letter = await generateLabelsPDF([product], { page: 'letter' })
+  const a4 = await generateLabelsPDF([product])
+  assert.ok(letter && a4)
+  // US Letter is exactly 612 × 792 pt; A4 never contains that pair.
+  assert.ok(letter!.includes('612 792'), 'Letter MediaBox')
+  assert.ok(!a4!.includes('612 792'), 'default stays A4')
+  assert.ok(a4!.includes('841.89') || a4!.includes('841.9'), 'A4 MediaBox height')
+})

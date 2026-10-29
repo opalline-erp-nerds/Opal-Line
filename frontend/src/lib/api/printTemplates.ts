@@ -1,6 +1,7 @@
 import { request } from './core'
+import type { PrintDocType } from '../printTemplate'
 
-export type PrintDocType = 'invoice' | 'quotation' | 'order' | 'packing-slip' | 'pick-list' | 'barcode-label'
+export type { PrintDocType } from '../printTemplate'
 
 export interface PrintTemplateRow {
   id: string

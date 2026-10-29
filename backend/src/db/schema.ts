@@ -39,6 +39,14 @@ export const products = pgTable('products', {
   huid: text('huid'),
   category: text('category').notNull(),
   collection: text('collection'),
+  /**
+   * Stable link to the pricing collection (collections.id). `collection` above
+   * stays the display name so existing screens keep working; the id is what the
+   * pricing model is derived from and renaming a collection never touches it.
+   */
+  collectionId: text('collection_id'),
+  /** Stable link to the category row (product_categories.id) whose prefix mints new SKUs. */
+  categoryId: text('category_id'),
   metal: text('metal').default('silver'),
   purity: numericNumber('purity'),
   purityLabel: text('purity_label'),
@@ -99,12 +107,60 @@ export const products = pgTable('products', {
   skuIdx: uniqueIndex('products_sku_idx').on(table.sku),
   shopifyIdIdx: index('products_shopify_id_idx').on(table.shopifyId),
   categoryIdx: index('products_category_idx').on(table.category),
+  collectionIdIdx: index('products_collection_id_idx').on(table.collectionId),
+  categoryIdIdx: index('products_category_id_idx').on(table.categoryId),
   statusIdx: index('products_status_idx').on(table.status),
   shopifyStatusIdx: index('products_shopify_status_idx').on(table.shopifyStatus),
   supplierIdIdx: index('products_supplier_id_idx').on(table.supplierId),
   barcodeIdx: index('products_barcode_idx').on(table.barcode).where(sql`${table.barcode} is not null and ${table.barcode} <> ''`),
   barcodeUniqueIdx: uniqueIndex('products_barcode_unique_idx').on(table.barcode).where(sql`${table.barcode} is not null and ${table.barcode} <> ''`),
   nameSearchIdx: index('products_name_search_idx').using('gin', sql`to_tsvector('english', ${table.name})`),
+}))
+
+/**
+ * Pricing collections group product categories by how they are priced.
+ *
+ * `Silver Jewels` (silver-rate pricing) and `Other Products` (fixed-price
+ * pricing) are the two foundation rows; the id is the stable identity and the
+ * name is only a display label, so renaming never rewrites references.
+ * Products link through products.collectionId; the pricing type only decides
+ * how a NEW product is priced (silver-rate formula vs a manually entered
+ * selling price), never how an existing price is recalculated.
+ */
+export const collections = pgTable('collections', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  /** silver | fixed — how products in this collection are priced. */
+  pricingType: text('pricing_type').notNull().default('fixed'),
+  /**
+   * System collections are foundational (Silver Jewels): their name and pricing
+   * type are fixed so the existing silver-rate workflow keeps its meaning.
+   */
+  isSystem: boolean('is_system').notNull().default(false),
+  createdAt: timestamp('created_at', { mode: 'string' }),
+  updatedAt: timestamp('updated_at', { mode: 'string' }),
+}, (table) => ({
+  nameIdx: uniqueIndex('collections_name_unique').on(table.name),
+}))
+
+/**
+ * Categories inside a pricing collection. Products keep their category name as
+ * text so every existing filter and search keeps working, and carry `categoryId`
+ * for the stable link; `prefix` is the globally unique SKU segment (RNG, CHN …)
+ * that new product SKUs are minted from.
+ */
+export const productCategories = pgTable('product_categories', {
+  id: text('id').primaryKey(),
+  collectionId: text('collection_id').notNull().references(() => collections.id),
+  name: text('name').notNull(),
+  /** Uppercase 2–5 letter SKU prefix, unique across every collection. */
+  prefix: text('prefix').notNull(),
+  createdAt: timestamp('created_at', { mode: 'string' }),
+  updatedAt: timestamp('updated_at', { mode: 'string' }),
+}, (table) => ({
+  collectionIdx: index('product_categories_collection_idx').on(table.collectionId),
+  nameIdx: uniqueIndex('product_categories_name_unique').on(table.name),
+  prefixIdx: uniqueIndex('product_categories_prefix_unique').on(table.prefix),
 }))
 
 /** Snapshot of a product's selling price whenever it is written. */
