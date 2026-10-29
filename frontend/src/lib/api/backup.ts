@@ -260,6 +260,7 @@ export const backupApi = {
     if (opts?.page) params.set('page', opts.page)
     if (opts?.copies && opts.copies > 1) params.set('copies', String(opts.copies))
     if (opts?.brandName) params.set('brandName', opts.brandName)
+    if (opts?.page) params.set('page', opts.page)
     if (opts?.width) params.set('w', String(opts.width))
     if (opts?.height) params.set('h', String(opts.height))
     if (opts?.columns) params.set('cols', String(opts.columns))

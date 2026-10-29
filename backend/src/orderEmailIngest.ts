@@ -8,6 +8,7 @@ import { invoiceTotals } from './invoiceTotals'
 import { getLatestSilverRate } from './shopify'
 import { decryptSecret } from './lib/crypto'
 import { recountCustomerStatsBoth } from './customerStats'
+import { upgradeName } from './shopifyCustomerData'
 import { applyStockMovement, resolveMovementLocation } from './stock'
 import { logger } from './logger'
 
@@ -605,7 +606,10 @@ async function ensureCustomerFromEmail(d: OrderEmailData): Promise<void> {
     await db
       .update(schema.customers)
       .set({
-        name: realName,
+        // Same rule as the API sync: a real name replaces a placeholder
+        // ("Shopify Customer #<id>") / Guest / blank, but never a real name
+        // — an email-parsed pseudo-name must not clobber it.
+        name: realName ? upgradeName(existing.name, realName) : undefined,
         ...(email ? { email } : {}),
         ...(phone ? { phone } : {}),
         ...(city ? { city } : {}),
@@ -970,8 +974,11 @@ export async function createInvoiceForOrderRow(
         number,
         shopifyOrder: order.shopifyId ?? null,
         customer: order.customer,
-        customerEmail: customer?.email ?? '',
-        customerPhone: customer?.phone ?? String(addr.phone ?? ''),
+        // Fall back to the order's own contact columns when the customer row
+        // could not be matched (placeholder 'Guest' name on a guest checkout
+        // still left a fillable customer_email / customer_phone on the order).
+        customerEmail: customer?.email || String(order.customerEmail ?? ''),
+        customerPhone: customer?.phone || String(addr.phone ?? '') || String(order.customerPhone ?? ''),
         customerAddress: [address1, address2].filter(Boolean).join(', '),
         customerCity: String(addr.city ?? customer?.city ?? ''),
         customerState: String(addr.province ?? customer?.province ?? ''),

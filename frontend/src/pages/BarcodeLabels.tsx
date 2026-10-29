@@ -1,24 +1,27 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   Printer,
   Tag,
   QrCode,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
   Search,
   FileDown,
   FileCode,
   Eye,
   Settings2,
   SlidersHorizontal,
-  ZoomIn,
-  ZoomOut,
-  Maximize2,
   AlertTriangle,
   Check,
+  ChevronLeft,
+  ChevronRight,
+  FileText,
 } from 'lucide-react'
-import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { PageHeader } from '@/components/ui/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Select } from '@/components/ui/select'
@@ -37,6 +40,7 @@ import {
   MM_TO_PX,
   PAGE_SIZES,
   clamp,
+  tagStem,
   type LabelConfig,
   type LabelProduct,
 } from '@/lib/labelSheet'
@@ -62,7 +66,8 @@ function loadConfig(): LabelConfig {
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<LabelConfig>
       if (parsed && typeof parsed === 'object' && typeof parsed.widthMm === 'number') {
-        return { ...configFromPreset(parsed.presetKey ?? 'label-50x40'), ...parsed }
+        const base = configFromPreset(parsed.presetKey ?? 'label-50x40')
+        return { ...base, ...parsed, labelType: parsed.labelType ?? base.labelType }
       }
     }
   } catch {
@@ -78,6 +83,7 @@ function toLabelProduct(p: Product): LabelProduct {
     sku: p.sku,
     price: p.sellingPrice ?? 0,
     weight: p.netWeight || undefined,
+    purity: p.purity,
     category: p.category,
     collection: p.collection || undefined,
     huid: p.huid || undefined,
@@ -154,6 +160,7 @@ export default function BarcodeLabelsPage() {
   const [loading, setLoading] = useState(true)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [duplicates, setDuplicates] = useState<Set<string>>(new Set())
+  const [printMode, setPrintMode] = useState<'sheet' | 'label'>('label')
   const [cfg, setCfg] = useState<LabelConfig>(loadConfig)
   const [presets, setPresets] = useState<LabelPreset[]>(FALLBACK_LABEL_PRESETS)
   const [generating, setGenerating] = useState(false)
@@ -162,9 +169,10 @@ export default function BarcodeLabelsPage() {
   const [category, setCategory] = useState('all')
   const [stockFilter, setStockFilter] = useState('all')
 
+  const previewRef = useRef<HTMLDivElement>(null)
   const [zoom, setZoom] = useState(1)
   const [fitScale, setFitScale] = useState(1)
-  const previewRef = useRef<HTMLDivElement>(null)
+  const [previewIndex, setPreviewIndex] = useState(0)
   const [searchParams] = useSearchParams()
 
   useEffect(() => {
@@ -178,8 +186,6 @@ export default function BarcodeLabelsPage() {
           }
           return [] as Product[]
         }),
-        // Shopify is optional: a failure or an unconfigured store must never
-        // block the local catalog, so the error is swallowed here.
         shopifyApi.getProducts().then((r) => r.data).catch(() => [] as SyncProduct[]),
       ]).then(([local, shopify]) => {
         if (!active) return
@@ -203,17 +209,21 @@ export default function BarcodeLabelsPage() {
         if (active) {
           setPresets(list)
         }
+      }).catch(() => {
+        if (active) {
+          setPresets(FALLBACK_LABEL_PRESETS)
+        }
+      }),
+      dbApi.getSettings().then((s) => {
+        if (active && s?.businessName) setCfg((prev) => ({ ...prev, companyName: prev.companyName || s.businessName }))
       }).catch((error: unknown) => {
-        if (active) return
-        const message = error instanceof Error ? error.message : 'Could not load label templates'
-        setPresets(FALLBACK_LABEL_PRESETS)
-        toast.error(`${message}; using the bundled reference templates`)
+        if (active) toast.error(error instanceof Error ? error.message : 'Could not load business name')
       }),
     ]).finally(() => {
       if (active) setLoading(false)
     })
     return () => { active = false }
-  }, [])
+  }, [searchParams])
 
   useEffect(() => {
     localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(cfg))
@@ -240,6 +250,7 @@ export default function BarcodeLabelsPage() {
       heightMm: next.heightMm,
       marginMm: next.marginMm,
       gapMm: next.gapMm,
+      labelType: next.labelType,
     }))
   }, [])
 
@@ -266,40 +277,51 @@ export default function BarcodeLabelsPage() {
     return source.map(toLabelProduct)
   }, [products, filtered, selected])
 
+  const isTagLabel = cfg.labelType === 'tag'
   const grid = useMemo(() => computeGrid(cfg), [cfg])
   // Reference sizes render from the approved transcribed artwork, whose field
   // positions and type sizes are fixed — controls the artwork does not carry
   // are disabled rather than silently ignored.
-  const designActive = useMemo(() => labelDesignFor(cfg.widthMm, cfg.heightMm) !== null, [cfg.widthMm, cfg.heightMm])
+  const designActive = useMemo(() => !isTagLabel && labelDesignFor(cfg.widthMm, cfg.heightMm) !== null, [cfg.widthMm, cfg.heightMm, isTagLabel])
   const expandedCount = useMemo(() => expandLabels(labelProducts, cfg).length, [labelProducts, cfg])
-  const sheetCount = Math.max(1, Math.ceil(expandedCount / grid.labelsPerPage))
-  const pageSize = PAGE_SIZES[cfg.page]
 
-  const previewHtml = useMemo(
-    () => buildLabelSheet(labelProducts, cfg, { mode: 'preview' }).html,
-    [labelProducts, cfg],
-  )
+  // The preview frame is sized from the SAME derivation the sheet/printer
+  // HTML uses (labelCellSize), so the iframe can never contradict the paper.
+  const stem = tagStem(cfg)
+  const previewWidthMm = stem ? stem.overallW : cfg.widthMm
+  const previewHeightMm = stem ? stem.overallH : cfg.heightMm
+  const pageSize = { widthMm: previewWidthMm, heightMm: previewHeightMm, label: 'Label' }
+
+  const safePreviewIndex = labelProducts.length === 0 ? 0 : Math.min(previewIndex, labelProducts.length - 1)
+  const previewProduct = labelProducts.length > 0 ? labelProducts[safePreviewIndex] : null
 
   useEffect(() => {
     const el = previewRef.current
-    if (!el) return
+    if (!el || !previewProduct) return
     const update = () => {
-      const available = el.clientWidth - 16
-      const natural = pageSize.widthMm * MM_TO_PX + 12 * MM_TO_PX
-      setFitScale(clamp(available / natural, 0.15, 2))
+      const availableW = el.clientWidth - 8
+      const availableH = el.clientHeight - 8
+      const naturalW = pageSize.widthMm * MM_TO_PX
+      const naturalH = pageSize.heightMm * MM_TO_PX
+      const s = Math.min(availableW / naturalW, availableH / naturalH)
+      setFitScale(clamp(s, 0.1, 4))
     }
     update()
     const ro = new ResizeObserver(update)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [pageSize.widthMm])
+  }, [pageSize.widthMm, pageSize.heightMm, previewProduct, loading])
+
+  const previewHtml = useMemo(() => {
+    if (!previewProduct) return ''
+    return buildLabelSheet([previewProduct], cfg, { mode: 'preview', paper: 'label' }).html
+  }, [previewProduct, cfg])
 
   const scale = fitScale * zoom
-  const previewPageCount = Math.min(2, Math.max(1, Math.ceil(expandedCount / grid.labelsPerPage)))
-  const pageWidthPx = pageSize.widthMm * MM_TO_PX + 12 * MM_TO_PX
-  const pageHeightPx = pageSize.heightMm * MM_TO_PX + 12 * MM_TO_PX
+  const pageWidthPx = pageSize.widthMm * MM_TO_PX
+  const pageHeightPx = pageSize.heightMm * MM_TO_PX
   const scaledWidth = pageWidthPx * scale
-  const scaledHeight = pageHeightPx * previewPageCount * scale
+  const scaledHeight = pageHeightPx * scale
 
   const toggleSelect = (id: string) => {
     setSelected((prev) => {
@@ -328,8 +350,17 @@ export default function BarcodeLabelsPage() {
       toast.info('No labels to preview')
       return
     }
-    const { html } = buildLabelSheet(labelProducts, cfg, { mode: 'print' })
-    void openHtmlPreview(html, 'Label Preview')
+    const { html } = buildLabelSheet(labelProducts, cfg, { mode: 'preview', paper: printMode })
+    void openHtmlPreview(html, 'Product Labels Preview')
+  }
+
+  const testPrint = () => {
+    if (expandedCount === 0) {
+      toast.info('No labels to print')
+      return
+    }
+    const { html } = buildLabelSheet(labelProducts, cfg, { mode: 'print', paper: printMode })
+    void openHtmlPreview(html, 'Test Print')
   }
 
   const downloadPdf = () => {
@@ -337,24 +368,10 @@ export default function BarcodeLabelsPage() {
       toast.info('No labels to download')
       return
     }
-    backupApi.downloadAllLabels({
-      preset: cfg.presetKey === 'custom' ? undefined : cfg.presetKey,
-      showName: cfg.showName,
-      showSku: cfg.showSku,
-      showPrice: cfg.showPrice,
-      showWeight: cfg.showWeight,
-      showCategory: cfg.showCategory,
-      showQR: cfg.showQr,
-      page: cfg.page,
-      copies: cfg.copies,
-      brandName: labelBrandText(cfg),
-      width: cfg.widthMm,
-      height: cfg.heightMm,
-      columns: grid.columns,
-      rows: grid.rows,
-      margin: cfg.marginMm,
-      gap: cfg.gapMm,
-      ...(selected.size > 0 ? { ids: [...selected] } : {}),
+    const { html } = buildLabelSheet(labelProducts, cfg, { mode: 'print', paper: printMode })
+    void exportHtmlPdf(html, 'product-labels').then((res) => {
+      if (!res.ok && !res.cancelled) toast.error(res.error || 'PDF export failed')
+      else if (res.ok) toast.success('Labels saved as PDF')
     })
   }
 
@@ -394,12 +411,12 @@ export default function BarcodeLabelsPage() {
       return
     }
     if (grid.overflow) {
-      toast.error('Label size does not fit the page — reduce size or margins')
+      toast.error('Label size does not fit the page ... reduce size or margins')
       return
     }
     setGenerating(true)
     const pick = choosePrintMode()
-    const sheet = buildLabelSheet(labelProducts, cfg, { mode: 'print' })
+    const sheet = buildLabelSheet(labelProducts, cfg, { mode: 'print', paper: printMode })
     void (async () => {
       try {
         const mode = await pick
@@ -419,14 +436,29 @@ export default function BarcodeLabelsPage() {
     })()
   }
 
+  const setPrinterMode = (mode: 'thermal' | 'jewellery' | 'sheet') => {
+    if (mode === 'thermal') {
+      setPrintMode('label')
+      patch({ labelType: 'label' })
+    } else if (mode === 'jewellery') {
+      setPrintMode('label')
+      patch({ labelType: 'tag' })
+    } else {
+      setPrintMode('sheet')
+    }
+  }
+
+  const activePrinterMode =
+    printMode === 'sheet' ? 'sheet' : cfg.labelType === 'tag' ? 'jewellery' : 'thermal'
+
   if (loading) {
     return (
-      <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+      <div className="flex h-full flex-col gap-4 p-4 lg:p-6">
         <Skeleton className="h-10 w-64" />
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-          <Skeleton className="h-[520px] lg:col-span-3" />
-          <Skeleton className="h-[520px] lg:col-span-5" />
-          <Skeleton className="h-[520px] lg:col-span-4" />
+        <div className="grid flex-1 grid-cols-3 gap-4">
+          <Skeleton className="h-full" />
+          <Skeleton className="h-full" />
+          <Skeleton className="h-full" />
         </div>
       </div>
     )
@@ -466,13 +498,47 @@ export default function BarcodeLabelsPage() {
         }
       />
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-        {/* ΓöÇΓöÇ Settings ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
-        <div className="space-y-4 lg:col-span-3">
+      <div className="grid shrink-0 grid-cols-1 gap-3 md:grid-cols-3">
+        {[
+          { key: 'thermal', title: 'Thermal Label', desc: 'Direct thermal / label printer', icon: Printer },
+          { key: 'jewellery', title: 'Jewellery Tag', desc: 'Tag-style jewellery labels', icon: Tag },
+          { key: 'sheet', title: 'A4 Sheet', desc: 'A4 / Letter sheet printing', icon: FileText },
+        ].map((m) => {
+          const active = activePrinterMode === m.key
+          const Icon = m.icon
+          return (
+            <button
+              key={m.key}
+              type="button"
+              onClick={() => setPrinterMode(m.key as 'thermal' | 'jewellery' | 'sheet')}
+              className={`flex items-center gap-3 rounded-xl border p-4 text-left transition-all ${
+                active
+                  ? 'border-primary bg-primary-50 shadow-sm ring-1 ring-primary/30 dark:bg-primary-50/60'
+                  : 'border-border bg-card hover:border-primary/40 hover:bg-muted/40'
+              }`}
+            >
+              <div
+                className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+                  active ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'
+                }`}
+              >
+                <Icon className="h-5 w-5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-foreground">{m.title}</p>
+                <p className="truncate text-xs text-muted-foreground">{m.desc}</p>
+              </div>
+            </button>
+          )
+        })}
+      </div>
+
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[320px_minmax(0,1fr)_360px]">
+        <div className="min-h-0 space-y-4 overflow-y-auto pr-1">
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-sm">
-                <Settings2 className="h-4 w-4" /> Label Size
+                <Settings2 className="h-4 w-4" /> Label Settings
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -483,6 +549,18 @@ export default function BarcodeLabelsPage() {
                   options={(presets.length ? presets : FALLBACK_LABEL_PRESETS).map((p) => ({ value: p.key, label: p.label }))}
                   value={cfg.presetKey}
                   onValueChange={applyPreset}
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">Label type</label>
+                <Select
+                  className="mt-1"
+                  options={[
+                    { value: 'label', label: 'Normal label' },
+                    { value: 'tag', label: 'Jewellery tag' },
+                  ]}
+                  value={cfg.labelType}
+                  onValueChange={(v) => patch({ labelType: v as 'label' | 'tag' })}
                 />
               </div>
 
@@ -538,7 +616,7 @@ export default function BarcodeLabelsPage() {
               <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground space-y-1">
                 <div className="flex justify-between">
                   <span>Grid</span>
-                  <span className="font-medium text-foreground">{grid.columns} ├ù {grid.rows} / page</span>
+                  <span className="font-medium text-foreground">{grid.columns} x {grid.rows} / page</span>
                 </div>
                 <div className="flex justify-between">
                   <span>Labels / page</span>
@@ -546,14 +624,14 @@ export default function BarcodeLabelsPage() {
                 </div>
                 <div className="flex justify-between">
                   <span>Label size</span>
-                  <span className="font-medium text-foreground">{cfg.widthMm} ├ù {cfg.heightMm} mm</span>
+                  <span className="font-medium text-foreground">{cfg.widthMm} x {cfg.heightMm} mm</span>
                 </div>
               </div>
 
               {grid.overflow && (
                 <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  Label + margins exceed the page — reduce size or margins.
+                  Label + margins exceed the page ... reduce size or margins.
                 </div>
               )}
             </CardContent>
@@ -568,7 +646,7 @@ export default function BarcodeLabelsPage() {
             <CardContent className="space-y-3">
               <ToggleRow label="Product name" checked={cfg.showName} onCheckedChange={(v) => patch({ showName: v })} />
               <ToggleRow label="SKU" checked={cfg.showSku} onCheckedChange={(v) => patch({ showSku: v })} />
-              <ToggleRow label="Price (₹)" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
+              <ToggleRow label="Price" checked={cfg.showPrice} onCheckedChange={(v) => patch({ showPrice: v })} />
               <ToggleRow label="Net weight" checked={cfg.showWeight} onCheckedChange={(v) => patch({ showWeight: v })} />
               <ToggleRow
                 label="HUID"
@@ -610,209 +688,229 @@ export default function BarcodeLabelsPage() {
           </Card>
         </div>
 
-        {/* ΓöÇΓöÇ Preview ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
-        <div className="lg:col-span-5">
-          <Card className="h-full">
-            <CardHeader className="flex-row items-center justify-between space-y-0">
+        <Card className="flex min-h-0 flex-col">
+          <CardHeader className="flex-row items-center justify-between space-y-0 border-b">
+            <div>
               <CardTitle className="flex items-center gap-2 text-sm">
                 <Eye className="h-4 w-4" /> Preview
-                <Badge variant="muted" className="ml-1 text-[10px]">
-                  {cfg.widthMm} ├ù {cfg.heightMm} mm
-                </Badge>
-                <Badge variant="muted" className="text-[10px]">
-                  {pageSize.label}
-                </Badge>
               </CardTitle>
-              <div className="flex items-center gap-1">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7"
-                  title="Zoom out"
-                  onClick={() => setZoom((z) => clamp(z - 0.15, 0.3, 3))}
-                >
-                  <ZoomOut className="h-3.5 w-3.5" />
-                </Button>
-                <span className="w-11 text-center text-xs text-muted-foreground">
-                  {Math.round(scale * 100)}%
-                </span>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7"
-                  title="Zoom in"
-                  onClick={() => setZoom((z) => clamp(z + 0.15, 0.3, 3))}
-                >
-                  <ZoomIn className="h-3.5 w-3.5" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7"
-                  title="Fit to width"
-                  onClick={() => setZoom(1)}
-                >
-                  <Maximize2 className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="p-0">
-              <div
-                ref={previewRef}
-                className="h-[560px] overflow-auto rounded-b-lg bg-muted/40 p-2"
+              <p className="text-xs text-muted-foreground">{cfg.widthMm} x {cfg.heightMm} mm</p>
+            </div>
+            <div className="flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                title="Previous product"
+                disabled={labelProducts.length <= 1 || safePreviewIndex <= 0}
+                onClick={() => setPreviewIndex((i) => Math.max(0, i - 1))}
               >
-                {labelProducts.length === 0 ? (
-                  <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
-                    <Tag className="h-8 w-8 opacity-40" />
-                    <p>No products match the current filters.</p>
-                  </div>
-                ) : (
-                  <div
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </Button>
+              <span className="w-12 text-center text-xs text-muted-foreground">
+                {labelProducts.length > 0 ? `${safePreviewIndex + 1}/${labelProducts.length}` : '0/0'}
+              </span>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                title="Next product"
+                disabled={labelProducts.length <= 1 || safePreviewIndex >= labelProducts.length - 1}
+                onClick={() => setPreviewIndex((i) => Math.min(labelProducts.length - 1, i + 1))}
+              >
+                <ChevronRight className="h-3.5 w-3.5" />
+              </Button>
+              <div className="mx-1 h-4 w-px bg-border" />
+              <Button variant="ghost" size="icon" className="h-7 w-7" title="Zoom out" onClick={() => setZoom((z) => clamp(z - 0.15, 0.3, 3))}>
+                <ZoomOut className="h-3.5 w-3.5" />
+              </Button>
+              <span className="w-11 text-center text-xs text-muted-foreground">{Math.round(scale * 100)}%</span>
+              <Button variant="ghost" size="icon" className="h-7 w-7" title="Zoom in" onClick={() => setZoom((z) => clamp(z + 0.15, 0.3, 3))}>
+                <ZoomIn className="h-3.5 w-3.5" />
+              </Button>
+              <Button variant="ghost" size="icon" className="h-7 w-7" title="Fit" onClick={() => setZoom(1)}>
+                <Maximize2 className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="flex min-h-0 flex-1 flex-col p-0">
+            <div
+              ref={previewRef}
+              className="flex min-h-0 flex-1 items-center justify-center overflow-auto bg-background p-2"
+            >
+              {previewProduct ? (
+                <div
+                  style={{
+                    width: scaledWidth,
+                    height: scaledHeight,
+                  }}
+                >
+                  <iframe
+                    title="Label preview"
+                    // Remount on every content change: guarantees the iframe
+                    // never keeps showing a stale document, no matter how the
+                    // browser handles srcdoc re-navigation.
+                    key={previewHtml}
+                    srcDoc={previewHtml}
+                    scrolling="no"
                     style={{
-                      width: scaledWidth,
-                      height: scaledHeight,
-                      margin: '0 auto',
+                      width: pageWidthPx,
+                      height: pageHeightPx,
+                      transform: `scale(${scale})`,
+                      transformOrigin: 'top left',
+                      border: 'none',
+                      background: 'transparent',
+                      display: 'block',
                     }}
-                  >
-                    <iframe
-                      title="Label preview"
-                      srcDoc={previewHtml}
-                      scrolling="no"
-                      style={{
-                        width: pageWidthPx,
-                        height: pageHeightPx * previewPageCount,
-                        transform: `scale(${scale})`,
-                        transformOrigin: 'top left',
-                        border: 'none',
-                        background: 'transparent',
-                        display: 'block',
-                      }}
-                    />
-                  </div>
-                )}
-              </div>
-              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-4 py-2.5 text-xs text-muted-foreground">
-                <span>
-                  <span className="font-medium text-foreground">{labelProducts.length}</span> product
-                  {labelProducts.length === 1 ? '' : 's'} ├ù {cfg.copies} cop
-                  {cfg.copies === 1 ? 'y' : 'ies'} ={' '}
-                  <span className="font-medium text-foreground">{expandedCount}</span> labels
-                </span>
-                <span>
-                  <span className="font-medium text-foreground">{sheetCount}</span> page
-                  {sheetCount === 1 ? '' : 's'} ({grid.columns} ├ù {grid.rows} grid)
-                </span>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* ΓöÇΓöÇ Products ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
-        <div className="lg:col-span-4">
-          <Card className="h-full">
-            <CardHeader className="space-y-3">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-sm">Products</CardTitle>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">
-                    {selected.size > 0 ? `${selected.size} selected` : `${filtered.length} shown`}
-                  </span>
-                  <Button variant="outline" size="sm" className="h-7 text-xs" onClick={selectAllFiltered}>
-                    {filtered.length > 0 && filtered.every((p) => selected.has(p.id))
-                      ? 'Deselect all'
-                      : 'Select shown'}
-                  </Button>
+                  />
                 </div>
-              </div>
-              <div className="relative">
-                <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search name or SKU..."
-                  className="h-8 pl-8 text-sm"
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <Select
-                  options={[
-                    { value: 'all', label: 'All categories' },
-                    ...categories.map((c) => ({ value: c, label: c })),
-                  ]}
-                  value={category}
-                  onValueChange={setCategory}
-                  className="h-8 text-sm"
-                />
-                <Select
-                  options={[
-                    { value: 'all', label: 'Any stock' },
-                    { value: 'in', label: 'In stock' },
-                    { value: 'low', label: 'Low stock' },
-                    { value: 'out', label: 'Out of stock' },
-                  ]}
-                  value={stockFilter}
-                  onValueChange={setStockFilter}
-                  className="h-8 text-sm"
-                />
-              </div>
-            </CardHeader>
-            <CardContent className="max-h-[560px] space-y-0 overflow-y-auto p-0">
-              {filtered.length === 0 ? (
-                <div className="px-4 py-10 text-center text-sm text-muted-foreground">No products found.</div>
               ) : (
-                <div className="divide-y divide-border">
-                  {filtered.map((product) => {
-                    const isSelected = selected.has(product.id)
-                    return (
-                      <div
-                        key={product.id}
-                        className={`flex cursor-pointer items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/50 ${
-                          isSelected ? 'bg-primary-50 dark:bg-primary-500/20' : ''
-                        }`}
-                        onClick={() => toggleSelect(product.id)}
-                      >
-                        <div
-                          className="flex shrink-0 items-center justify-center rounded border"
-                          style={{
-                            width: 18,
-                            height: 18,
-                            borderColor: isSelected ? 'var(--primary)' : undefined,
-                            background: isSelected ? 'var(--primary)' : undefined,
-                            color: isSelected ? '#fff' : undefined,
-                          }}
-                        >
-                          {isSelected && <Check className="h-3 w-3" />}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm font-medium text-foreground">{product.name}</p>
-                          <p className="truncate text-xs text-muted-foreground">
-                            {product.sku}
-                            {product.sku && duplicates.has(product.sku.toLowerCase()) && (
-                              <Badge variant="warning" className="ml-1.5 text-[10px]">
-                                Dup SKU
-                              </Badge>
-                            )}
-                          </p>
-                        </div>
-                        <div className="shrink-0 text-right">
-                          <p className="text-sm font-semibold text-primary-700">
-                            ₹{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
-                          </p>
-                          <p className="text-[11px] text-muted-foreground">
-                            {product.netWeight ? `${product.netWeight}g` : ''}
-                            {product.stock !== undefined ? ` · ${product.stock} pcs` : ''}
-                          </p>
-                        </div>
-                      </div>
-                    )
-                  })}
+                <div className="flex flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
+                  <Tag className="h-8 w-8 opacity-40" />
+                  <p>No products match the current filters.</p>
                 </div>
               )}
-            </CardContent>
-          </Card>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-4 py-2.5 text-xs text-muted-foreground">
+              <span className="truncate">
+                {previewProduct ? (
+                  <>
+                    <span className="font-medium text-foreground">{previewProduct.name}</span>
+                    <span className="ml-2">{previewProduct.sku}</span>
+                  </>
+                ) : (
+                  'No product selected'
+                )}
+              </span>
+              <span>
+                Body: {cfg.widthMm} x {cfg.heightMm} mm
+                {isTagLabel ? ` · Overall: ${previewWidthMm} x ${previewHeightMm} mm` : ''}
+              </span>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="flex min-h-0 flex-col">
+          <CardHeader className="space-y-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-sm">Products</CardTitle>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">
+                  {selected.size > 0 ? `${selected.size} selected` : `${filtered.length} shown`}
+                </span>
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={selectAllFiltered}>
+                  {filtered.length > 0 && filtered.every((p) => selected.has(p.id)) ? 'Deselect all' : 'Select shown'}
+                </Button>
+              </div>
+            </div>
+            <div className="relative">
+              <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search name or SKU..."
+                className="h-8 pl-8 text-sm"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <Select
+                options={[
+                  { value: 'all', label: 'All categories' },
+                  ...categories.map((c) => ({ value: c, label: c })),
+                ]}
+                value={category}
+                onValueChange={setCategory}
+                className="h-8 text-sm"
+              />
+              <Select
+                options={[
+                  { value: 'all', label: 'Any stock' },
+                  { value: 'in', label: 'In stock' },
+                  { value: 'low', label: 'Low stock' },
+                  { value: 'out', label: 'Out of stock' },
+                ]}
+                value={stockFilter}
+                onValueChange={setStockFilter}
+                className="h-8 text-sm"
+              />
+            </div>
+          </CardHeader>
+          <CardContent className="min-h-0 flex-1 overflow-y-auto p-0">
+            {filtered.length === 0 ? (
+              <div className="px-4 py-10 text-center text-sm text-muted-foreground">No products found.</div>
+            ) : (
+              <div className="divide-y divide-border">
+                {filtered.map((product) => {
+                  const isSelected = selected.has(product.id)
+                  return (
+                    <div
+                      key={product.id}
+                      className={`flex cursor-pointer items-center gap-3 border-l-2 px-4 py-2.5 transition-colors hover:bg-muted/50 ${
+                        isSelected ? 'border-primary bg-primary-100 font-medium text-primary-900 dark:bg-primary-500/30 dark:text-primary-100' : 'border-transparent'
+                      }`}
+                      onClick={() => toggleSelect(product.id)}
+                    >
+                      <div
+                        className={`flex shrink-0 items-center justify-center rounded border transition-colors ${
+                          isSelected ? 'border-primary bg-primary text-primary-foreground shadow-sm ring-1 ring-primary/30' : 'border-border bg-background text-transparent'
+                        }`}
+                        style={{ width: 20, height: 20 }}
+                      >
+                        {isSelected && <Check className="h-3.5 w-3.5" strokeWidth={3} />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-foreground">{product.name}</p>
+                        <p className="truncate text-xs text-muted-foreground">
+                          {product.sku}
+                          {product.sku && duplicates.has(product.sku.toLowerCase()) && (
+                            <Badge variant="warning" className="ml-1.5 text-[10px]">
+                              Dup SKU
+                            </Badge>
+                          )}
+                        </p>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <p className="text-sm font-semibold text-primary-700">
+                          ?{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
+                        </p>
+                        <p className="text-[11px] text-muted-foreground">
+                          {product.netWeight ? `${product.netWeight}g` : ''}
+                          {product.stock !== undefined ? ` ... ${product.stock} pcs` : ''}
+                        </p>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="flex shrink-0 flex-col gap-3 rounded-xl border bg-card px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="text-sm text-muted-foreground">
+          <span className="font-medium text-foreground">{labelProducts.length}</span> product
+          {labelProducts.length === 1 ? '' : 's'} ·{' '}
+          <span className="font-medium text-foreground">{cfg.copies}</span> cop
+          {cfg.copies === 1 ? 'y' : 'ies'} / product ·{' '}
+          <span className="font-medium text-foreground">{expandedCount}</span> label
+          {expandedCount === 1 ? '' : 's'} total
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" onClick={testPrint} disabled={expandedCount === 0}>
+            <Printer className="h-4 w-4" />
+            Test Print
+          </Button>
+          <Button variant="outline" onClick={downloadPdf} disabled={expandedCount === 0}>
+            <FileDown className="h-4 w-4" />
+            Export PDF
+          </Button>
+          <Button onClick={printLabels} disabled={generating || expandedCount === 0}>
+            <Printer className="h-4 w-4" />
+            {generating ? 'Preparing...' : `Print Selected (${expandedCount})`}
+          </Button>
         </div>
       </div>
     </div>
   )
-  
 }

@@ -12,6 +12,7 @@ import {
 import { findProductsBySku, generateUniqueSku, productCodeSettings } from '../lib/skuIdentity'
 import { isGenericSku, migrationWarnings, planSkuMigration, type SkuReferences } from '../lib/skuMigration'
 import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, resolveMovementLocation, type Tx } from '../stock'
+import { applyInvoiceReturn, aggregateReturnedBySku, nextInvoiceStatus, summarizeReturnLines } from '../invoiceReturn'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
   validate,
@@ -27,6 +28,7 @@ import { recordProductPrice } from '../lib/productPriceHistory'
 import { encrypt, decrypt,  encryptSecret } from '../lib/crypto'
 import { isConfigured as isShopifyConfigured, config as shopifyConfig, normalizeShopDomain } from '../config'
 import { upsertEnvVar } from '../lib/envfile'
+import { DispatchError, dispatchOrder, confirmShipmentDelivered } from '../dispatch'
 import { logger } from '../logger'
 import {
   AGING_BUCKETS,
@@ -42,7 +44,6 @@ import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockC
 import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
 import { escapeHtml } from '../htmlEscape'
 import { routeParam } from '../lib/routeParams'
-import { planSalesReturn } from '../salesReturns'
 import {
   categoryNameError,
   categoryPrefixError,
@@ -434,8 +435,8 @@ async function labelRequestOptions(source: Record<string, unknown>) {
     showName: source.name !== 'false' && source.showName !== false,
     showSku: source.sku !== 'false' && source.showSku !== false,
     showCategory: source.category !== 'false' && source.showCategory !== false,
-    page: source.page === 'letter' ? 'letter' : 'a4',
     copies: copiesRaw == null ? 1 : Number(copiesRaw),
+    page: source.page === 'letter' || source.pageSize === 'letter' ? 'letter' : (source.page === 'a4' ? 'a4' : undefined),
   })
   const brand = source.brandName
   if (typeof brand === 'string' && brand.trim()) opts.brand = brand.trim()
@@ -2065,7 +2066,7 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
  * undo the status move the user just asked for, so errors are logged and
  * swallowed. Returns the invoice number when one exists after the call.
  */
-async function autoInvoiceFulfilledOrder(
+export async function autoInvoiceFulfilledOrder(
   order: typeof s.salesOrders.$inferSelect,
   actor: { userId?: string | null; ip?: string | null },
 ): Promise<string | null> {
@@ -2120,113 +2121,107 @@ dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), a
 })
 
 // ─── Returns & credit notes: return invoice items, restock, credit note ─────
+// Quantity-aware: a return only consumes the returnable quantity of the SKUs
+// in its payload (sold minus previously returned), and the invoice status is
+// derived from the cumulative quantities — 'partially_returned' /
+// 'fully_returned' — instead of the blanket 'refunded' the old handler left
+// to a whole-invoice status flip.
 dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    // Return spec: explicit items list (partial) or whole invoice
-    const requested: Array<{ sku?: string; qty: number }> = Array.isArray(req.body?.items) && req.body.items.length > 0
-      ? req.body.items
-      : []
-    const restock = req.body?.restock !== false
+    const [invoice] = await db!.select({ id: s.salesInvoices.id, customer: s.salesInvoices.customer, number: s.salesInvoices.number })
+      .from(s.salesInvoices)
+      .where(eq(s.salesInvoices.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found' })
 
-    // Everything that moves stock or money runs in one transaction with the
-    // invoice row locked, so two returns against the same invoice serialise:
-    // both can never read the same "already returned" totals and credit the
-    // customer (and restock the shelf) twice.
+    // Lock the invoice before applying the idempotent return transaction.
     const outcome = await db!.transaction(async (tx) => {
-      const [invoice] = await tx
-        .select()
+      await tx.select({ id: s.salesInvoices.id })
         .from(s.salesInvoices)
         .where(eq(s.salesInvoices.id, routeParam(req.params.id)))
         .limit(1)
         .for('update')
-      if (!invoice) return { ok: false as const, status: 404, error: 'Invoice not found' }
-      const invItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, invoice.id))
-      if (invItems.length === 0) return { ok: false as const, status: 400, error: 'Invoice has no line items to return' }
-
-      // What earlier credit notes against this invoice already took back.
-      const prior = await tx
-        .select({ returnItems: s.salesReturns.returnItems })
-        .from(s.salesReturns)
-        .where(eq(s.salesReturns.invoiceId, invoice.id))
-
-      const planned = planSalesReturn({ invoiceItems: invItems, requested, priorReturns: prior })
-      if (!planned.ok) return { ok: false as const, status: 400, error: planned.error }
-
-      const now = new Date()
-      const ym = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`
-      let number = `CR${ym}-${Math.floor(100000 + Math.random() * 900000)}`
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const [dup] = await tx.select({ id: s.salesReturns.id }).from(s.salesReturns).where(eq(s.salesReturns.number, number)).limit(1)
-        if (!dup) break
-        number = `CR${ym}-${Math.floor(100000 + Math.random() * 900000)}`
-      }
-
-      // Restock inside the same transaction as the credit note: the goods and
-      // the paperwork can never disagree if one of the writes fails.
-      if (restock) {
-        for (const it of planned.items) {
-          const [prod] = await tx
-            .select({ id: s.products.id, stock: s.products.stock })
-            .from(s.products)
-            .where(eq(s.products.sku, it.sku))
-            .limit(1)
-            .for('update')
-          if (prod) {
-            await tx.update(s.products).set({ stock: (prod.stock ?? 0) + it.qty }).where(eq(s.products.id, prod.id))
-          }
-        }
-      }
-
-      const [ret] = await tx.insert(s.salesReturns).values({
-        id: randomUUID(),
-        number,
-        invoiceId: invoice.id,
-        creditNoteNumber: number,
-        restocked: restock,
-        returnItems: planned.items,
-        order: invoice.shopifyOrder,
-        customer: invoice.customer,
-        items: planned.items.reduce((a, it) => a + it.qty, 0),
-        amount: planned.amount,
-        status: 'processed',
-        date: now.toISOString(),
-      }).returning()
-
-      // Accounting trail: negative payment against the invoice
-      await tx.insert(s.payments).values({
-        id: randomUUID(), ref: number, invoice: invoice.number, customer: invoice.customer,
-        amount: -planned.amount, method: 'Credit Note', gateway: 'return', status: 'refunded', date: now.toISOString(),
+      return applyInvoiceReturn(tx, routeParam(req.params.id), {
+        items: req.body?.items,
+        restock: req.body?.restock,
+        // The client generates one key per intended return; a retry with the
+        // same key replays that credit note instead of double-restocking.
+        idempotencyKey: typeof req.body?.idempotencyKey === 'string' ? req.body.idempotencyKey : undefined,
       })
-
-      return { ok: true as const, invoice, ret, number, amount: planned.amount, itemCount: planned.items.length }
     })
 
     if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error })
-    const { invoice, ret, number, amount, itemCount } = outcome
-
-    recordCrud('sales-returns', 'Created', req, ret)
+    const { result } = outcome
+    recordCrud('sales-returns', 'Created', req, { id: result.returnId, number: result.creditNoteNumber, invoiceId: routeParam(req.params.id), amount: result.amount, quantity: result.quantity })
     // Give back the points earned on the value being returned.
     void import('../loyalty')
       .then(({ reverseEarnedForInvoice }) =>
         reverseEarnedForInvoice({
           id: invoice.id,
-          number: invoice.number,
+          number: result.invoiceNumber,
           customer: String(invoice.customer ?? ''),
-          value: amount,
-          reason: `Reversed on return — credit note ${number} (₹${amount.toLocaleString('en-IN')})`,
+          value: result.amount,
+          reason: `Reversed on return — credit note ${result.creditNoteNumber} (₹${result.amount.toLocaleString('en-IN')})`,
         }),
       )
       .catch(() => undefined)
-    if (invoice.id) await insertOrderEvent(invoice.id, 'Return Processed', `Credit note ${number} — ${itemCount} item(s), ₹${amount.toLocaleString('en-IN')}${restock ? ', restocked' : ''}`, actorFromRequest(req).userId ?? 'system')
-    void import('../statusNotifications').then((m) => m.notifyReturnProcessed({ customer: invoice.customer, invoiceNumber: invoice.number, amount, restocked: restock, creditNoteNumber: number })).catch(() => undefined)
-    res.json({ return: ret, creditNoteNumber: number, amount, restocked: restock })
+    await insertOrderEvent(invoice.id, 'Return Processed', `Credit note ${result.creditNoteNumber} — ${result.quantity} item(s), ₹${result.amount.toLocaleString('en-IN')}${result.restocked ? ', restocked' : ''}`, actorFromRequest(req).userId ?? 'system')
+    void import('../statusNotifications').then((m) => m.notifyReturnProcessed({ customer: invoice.customer, invoiceNumber: result.invoiceNumber, amount: result.amount, restocked: result.restocked, creditNoteNumber: result.creditNoteNumber })).catch(() => undefined)
+
+    res.json({
+      returnId: result.returnId,
+      creditNoteNumber: result.creditNoteNumber,
+      invoiceNumber: result.invoiceNumber,
+      amount: result.amount,
+      restocked: result.restocked,
+      returnStatus: result.status,
+      lines: result.lines,
+    })
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     const cause = (err as { cause?: unknown })?.cause instanceof Error ? (err as Error & { cause: Error }).cause.message : ''
     logger.error({ err }, 'invoice return failed')
     const isDuplicate = /unique|duplicate key/i.test(`${msg} ${cause}`)
     res.status(isDuplicate ? 400 : 500).json({ error: isDuplicate ? 'That credit note number already exists — retry the return' : 'Failed to process return' })
+  }
+})
+
+// The return dialog's per-line truth: sold / previously returned / remaining |
+// returnable quantities per SKU plus the cumulative amount credited so far.
+// The UI reads this on open, so a partially returned invoice shows only what
+// is actually returnable and the Return action stays available until the
+// eligible quantity is exhausted.
+dbRouter.get('/invoices/:id/return-status', requirePermission('sales', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [invoice] = await db!.select({ id: s.salesInvoices.id, number: s.salesInvoices.number, status: s.salesInvoices.status })
+      .from(s.salesInvoices)
+      .where(eq(s.salesInvoices.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found' })
+    const invItems = await db!.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, invoice.id))
+    const priorRows = await db!.select({ status: s.salesReturns.status, returnItems: s.salesReturns.returnItems, amount: s.salesReturns.amount })
+      .from(s.salesReturns)
+      .where(eq(s.salesReturns.invoiceId, invoice.id))
+    const returned = aggregateReturnedBySku(priorRows)
+    const lines = summarizeReturnLines(invItems, returned)
+    // Amount credited so far = sum of every non-cancelled credit note's payload.
+    const totalReturnedAmount = Math.round(priorRows
+      .filter((r) => String(r.status ?? '').toLowerCase() !== 'cancelled')
+      .reduce((a, r) => a + Number(r.amount ?? 0), 0) * 100) / 100
+    res.json({
+      invoiceId: invoice.id,
+      number: invoice.number,
+      status: invoice.status,
+      returnStatus: nextInvoiceStatus(lines),
+      anyReturnable: lines.some((l) => l.remaining > 0),
+      totalReturnedAmount,
+      lines,
+    })
+  } catch (err) {
+    logger.error({ err }, 'invoice return-status failed')
+    res.status(500).json({ error: 'Failed to load return status' })
   }
 })
 
@@ -2545,43 +2540,14 @@ dbRouter.get('/shipments', requirePermission('sales', 'view'), async (_req, res)
 dbRouter.post('/shipments/dispatch', requirePermission('sales', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const orderId = String(req.body?.orderId ?? '').trim()
-    if (!orderId) return res.status(400).json({ error: 'orderId is required' })
-    const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, orderId)).limit(1)
-    if (!order) return res.status(404).json({ error: 'Order not found' })
-    const courier = String(req.body?.courier ?? '').trim() || null
-    const trackingNumber = String(req.body?.trackingNumber ?? '').trim() || null
-    const expected = req.body?.expectedDelivery ? String(req.body.expectedDelivery).slice(0, 10) : null
-    const notes = String(req.body?.notes ?? '').trim() || null
-    const [existing] = await db!.select().from(s.shipments).where(eq(s.shipments.orderId, orderId)).limit(1)
-    const values = {
-      orderRef: order.internalId ?? order.shopifyId ?? orderId,
-      customer: order.customer,
-      courier,
-      trackingNumber,
-      status: 'dispatched',
-      dispatchedAt: new Date().toISOString(),
-      expectedDelivery: expected,
-      notes,
-    }
-    if (existing) {
-      await db!.update(s.shipments).set(values).where(eq(s.shipments.id, existing.id))
-    } else {
-      await db!.insert(s.shipments).values({ id: randomUUID(), orderId, ...values })
-    }
-    // Keep order fulfillment in sync
-    if (order.status !== 'cancelled') {
-      const [updated] = await db!.update(s.salesOrders).set({ fulfillment: 'fulfilled', status: order.status === 'imported' ? 'processing' : order.status }).where(eq(s.salesOrders.id, orderId)).returning()
-      // Dispatch means the goods went out — raise the sales invoice
-      // automatically (idempotent, same pipeline as the manual button).
-      if (updated) await autoInvoiceFulfilledOrder(updated, actorFromRequest(req))
-    }
-    await insertOrderEvent(orderId, 'Dispatched', `Dispatched via ${courier ?? 'courier'}${trackingNumber ? ` — tracking ${trackingNumber}` : ''}`, actorFromRequest(req).userId ?? 'system')
-    // Customer notification with tracking details
-    void import('../statusNotifications').then((m) => m.notifyOrderFulfilled({ ...order, trackingId: trackingNumber, carrier: courier })).catch(() => undefined)
-    recordCrud('sales-orders', 'Updated', req, { id: orderId, dispatched: true })
-    res.json({ ok: true })
+    // All eligibility (cancelled orders, delivered shipments), the upsert
+    // duplicate protection, the transaction and the auto-invoice live in
+    // dispatchOrder (src/dispatch.ts) — the same rules the tests assert.
+    const result = await dispatchOrder(req.body?.orderId, req.body ?? {}, actorFromRequest(req))
+    recordCrud('sales-orders', 'Updated', req, { id: String(req.body?.orderId ?? ''), dispatched: true })
+    res.json({ ok: true, ...result })
   } catch (err) {
+    if (err instanceof DispatchError) return res.status(err.status).json({ error: err.message })
     logger.error({ err }, 'dispatch failed')
     res.status(500).json({ error: 'Dispatch failed' })
   }
@@ -2590,18 +2556,10 @@ dbRouter.post('/shipments/dispatch', requirePermission('sales', 'edit'), async (
 dbRouter.post('/shipments/:id/delivered', requirePermission('sales', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const [ship] = await db!.update(s.shipments).set({ status: 'delivered', deliveredAt: new Date().toISOString() }).where(eq(s.shipments.id, routeParam(req.params.id))).returning()
-    if (!ship) return res.status(404).json({ error: 'Shipment not found' })
-    await insertOrderEvent(ship.orderId, 'Delivered', `Delivery confirmed${ship.trackingNumber ? ` (tracking ${ship.trackingNumber})` : ''}`, actorFromRequest(req).userId ?? 'system')
-    // Customer notification (fire-and-forget)
-    void import('../statusNotifications').then((m) => m.notifyOrderDelivered({
-      internalId: ship.orderRef,
-      customer: ship.customer,
-      trackingId: ship.trackingNumber,
-      courier: ship.courier,
-    })).catch(() => undefined)
-    res.json({ ok: true })
+    const { shipment, alreadyDelivered } = await confirmShipmentDelivered(routeParam(req.params.id), actorFromRequest(req))
+    res.json({ ok: true, alreadyDelivered, shipmentId: shipment.id })
   } catch (err) {
+    if (err instanceof DispatchError) return res.status(err.status).json({ error: err.message })
     logger.error({ err }, 'delivery confirm failed')
     res.status(500).json({ error: 'Failed to confirm delivery' })
   }

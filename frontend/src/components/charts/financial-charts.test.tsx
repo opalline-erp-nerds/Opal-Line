@@ -167,7 +167,7 @@ test('receivable card ages the open balance across the bands', () => {
   assert.ok(html.includes('2 invoices'), 'plural invoice count')
   assert.ok(html.includes('&gt;30 Days') && html.includes('Current'), 'aging band labels are listed')
   assert.ok(html.includes('₹2,000') && html.includes('₹1,000'), 'per-band amounts')
-  assert.ok(html.includes('—'), 'empty bands render a dash')
+  assert.ok(html.includes('₹0'), 'empty bands still show an amount, never a blank row')
   assert.ok(html.includes('· 1'), 'bands with invoices show their count')
 })
 

@@ -283,7 +283,7 @@ export function ReceivableBody({ data }: { data: FinancialSummary }) {
                   <span className="truncate">{band.label}</span>
                 </span>
                 <span className="shrink-0 font-medium tabular-nums text-foreground">
-                  {band.value > 0 ? inr(band.value) : '—'}
+                  {inr(band.value)}
                   {band.count > 0 ? <span className="ml-1 text-muted-foreground">· {band.count}</span> : null}
                 </span>
               </div>

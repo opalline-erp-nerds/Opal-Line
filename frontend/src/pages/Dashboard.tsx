@@ -214,8 +214,12 @@ export default function DashboardPage() {
       // Low Stock
       const lowStock = lowStockResult.status === 'fulfilled' ? lowStockResult.value : []
 
-      // Activities
-      const activities = activitiesResult.status === 'fulfilled' ? activitiesResult.value : []
+      // Activities — the endpoint answers { items, total, nextCursor }, so the
+      // payload has to be unwrapped (the header notification bell does the same).
+      const activitiesRes = activitiesResult.status === 'fulfilled' ? activitiesResult.value : []
+      const activities: Activity[] = Array.isArray(activitiesRes)
+        ? activitiesRes
+        : activitiesRes?.items ?? []
 
       // Analytics
       const analytics = analyticsResult.status === 'fulfilled' ? analyticsResult.value : []
@@ -234,7 +238,7 @@ export default function DashboardPage() {
       setPaymentStatus(paymentStatus)
       setPaymentStatusError(paymentStatusError ?? null)
       setLowStock(lowStock)
-      setActivities(Array.isArray(activities) ? activities : [])
+      setActivities(activities)
       setAnalytics(analytics)
       setShopifyStatus(shopifyStatus)
       // If critical widgets (KPIs or summary) had errors, mark DB as unreachable
@@ -353,7 +357,13 @@ export default function DashboardPage() {
               </Card>
             ))}
 
-          {summary ? <OperationalStrip summary={summary} analytics={analytics} /> : null}
+          {summary ? (
+            <OperationalStrip
+              summary={summary}
+              analytics={analytics}
+              rangeText={resolveClientRange(period, customRange).rangeText}
+            />
+          ) : null}
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
             <Card className="lg:col-span-2">
@@ -1048,9 +1058,12 @@ function QuickActions() {
 function OperationalStrip({
   summary,
   analytics,
+  rangeText,
 }: {
   summary: Record<string, string | number | null>
   analytics: AnalyticsStat[]
+  /** The selected period, so the expenses tile follows the page-wide date filter. */
+  rangeText: string
 }) {
   const statValue = (label: string) => analytics.find((s) => s.label === label)?.value ?? '—'
   const items: { label: string; value: string; icon: LucideIcon; tint: string }[] = [
@@ -1059,7 +1072,14 @@ function OperationalStrip({
     { label: 'Total Suppliers', value: `${summary.totalSuppliers}`, icon: BuildingIcon, tint: 'bg-warning-50 text-warning-700' },
     { label: 'Total Stock (Qty)', value: `${formatNumber(Number(summary.totalStockQty))} pcs`, icon: Boxes, tint: 'bg-success-50 text-success-700' },
     { label: 'Total Stock (Wt)', value: formatWeight(Number(summary.totalStockWeight)), icon: ScaleIcon, tint: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300' },
-    { label: "Today's Expenses", value: compactCurrency(Number(summary.todayExpenses)), icon: Wallet, tint: 'bg-warning-50 text-warning-700' },
+    {
+      // Follows the page-wide range: `rangeExpenses` covers the selected
+      // window, while `todayExpenses` is always the current day only.
+      label: `Expenses · ${rangeText}`,
+      value: compactCurrency(Number(summary.rangeExpenses ?? summary.todayExpenses ?? 0)),
+      icon: Wallet,
+      tint: 'bg-warning-50 text-warning-700',
+    },
     { label: 'Pending Payments', value: compactCurrency(Number(summary.pendingPayments)), icon: Clock, tint: 'bg-red-50 text-red-600 dark:text-red-400' },
     { label: 'Avg Order Value', value: statValue('Average Order Value'), icon: IndianRupee, tint: 'bg-success-50 text-success-700' },
     { label: 'Return Rate', value: statValue('Return Rate'), icon: Repeat, tint: 'bg-info-50 text-info-700' },

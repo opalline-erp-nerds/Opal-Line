@@ -481,10 +481,15 @@ export const salesReturns = pgTable('sales_returns', {
   amount: numericNumber('amount'),
   status: text('status'),
   date: ts('date'),
+  // Optional client idempotency key: a retried submission with the same key
+  // replays the original credit note instead of restocking the units again.
+  idempotencyKey: text('idempotency_key'),
 }, (table) => ({
   numberIdx: uniqueIndex('sales_returns_number_idx').on(table.number),
   customerIdx: index('sales_returns_customer_idx').on(table.customer),
   dateIdx: index('sales_returns_date_idx').on(table.date),
+  // Unique only over non-null keys — NULLs never block new returns.
+  idempotencyIdx: uniqueIndex('sales_returns_idempotency_key_idx').on(table.idempotencyKey),
 }))
 
 export const orderEvents = pgTable('order_events', {
@@ -753,6 +758,33 @@ export const syncLogs = pgTable('sync_logs', {
   shopifyIdIdx: index('sync_logs_shopify_id_idx').on(table.shopifyId),
 }))
 
+/** One step of a silver-rate apply run, stored with the rate row (step_log). */
+export interface SilverRateStepRecord {
+  key: 'sync' | 'rate' | 'reprice' | 'match' | 'push'
+  label: string
+  status: 'done' | 'failed' | 'skipped'
+  /** When the step started/finished (ISO-8601) — the View modal shows both. */
+  startedAt: string
+  finishedAt: string
+  detail?: string
+  /** Failure text for a failed step ("Shopify sync failed: …"). */
+  error?: string
+}
+
+/**
+ * Full record of one rate update: which steps ran, when, and with what
+ * outcome. Persisted on the silver_rates row so the history log can show
+ * per-step status long after the in-memory apply result is gone.
+ */
+export interface SilverRateStepLog {
+  startedAt: string
+  finishedAt: string
+  ok: boolean
+  /** Products recomputed / matched / pushed / skipped by this run. */
+  counts: { repriced: number; matched: number; pushed: number; skipped: number }
+  steps: SilverRateStepRecord[]
+}
+
 export const silverRates = pgTable('silver_rates', {
   id: text('id').primaryKey(),
   purity: numericNumber('purity'),
@@ -770,6 +802,8 @@ export const silverRates = pgTable('silver_rates', {
   syncStatus: text('sync_status'),
   /** Admin/superadmin who approved a staff request (approval source only). */
   approvedBy: text('approved_by'),
+  /** Per-step record of this update: timestamps, counts, error text. */
+  stepLog: jsonb('step_log').$type<SilverRateStepLog>(),
 }, (table) => ({
   updatedAtIdx: index('silver_rates_updated_at_idx').on(table.updatedAt),
 }))

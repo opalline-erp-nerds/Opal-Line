@@ -34,6 +34,16 @@ const PURCHASE_TABLES = [
 
 const STOCK_TABLES = ['stock_levels', 'stock_movements']
 
+const VARIANT_COLUMNS = [
+  'title',
+  'option_values',
+  'selling_price',
+  'compare_at_price',
+  'cost_price',
+  'gross_weight',
+  'reorder_level',
+]
+
 const KEY_COLUMNS = [
   'products.cost_price',
   'purchase_invoices.order_id',
@@ -93,6 +103,31 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
       // Emulate an install whose products.created_at is still a DATE
       // (predates the timestamp upgrade): the upgrade must widen it back.
       await sql.unsafe('alter table products alter column created_at type date using created_at::date')
+      // Emulate an install with the old colour-only variant table. The
+      // Shopify-style columns must be ALTERed in, and the colour/price values
+      // carried forward so existing variants still render.
+      await sql.unsafe('drop table if exists product_variants cascade')
+      await sql.unsafe(`
+        create table product_variants (
+          id text primary key,
+          product_id text not null,
+          colour_name text,
+          colour_hex text,
+          sku text not null,
+          barcode text,
+          price numeric,
+          stock integer not null default 0,
+          shopify_variant_id text,
+          shopify_inventory_item_id text,
+          status text not null default 'active',
+          is_primary boolean not null default false,
+          created_at timestamp,
+          shopify_status text
+        )`)
+      await sql.unsafe(`
+        insert into product_variants
+          (id, product_id, colour_name, sku, price, stock, status, is_primary)
+        values ('VAR-LEGACY', 'PROD-LEGACY', 'Red', 'SKU-LEGACY-RED', 100, 2, 'active', false)`)
 
       // Emulate legacy transfer data: rows created before canonical location
       // IDs became the stored reference carry display names. One resolves to
@@ -152,6 +187,23 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
         )
         assert.equal(rows.length, 1, `upgrade must produce ${col}`)
       }
+
+      // …and the Shopify-style variant columns, with legacy colour/price data
+      // migrated into them.
+      for (const column of VARIANT_COLUMNS) {
+        const rows = await sql.unsafe(
+          `select 1 from information_schema.columns
+           where table_schema = 'public' and table_name = 'product_variants' and column_name = $1`,
+          [column],
+        )
+        assert.equal(rows.length, 1, `upgrade must produce product_variants.${column}`)
+      }
+      const [legacyVariant] = await sql.unsafe(
+        `select title, option_values, selling_price from product_variants where id = 'VAR-LEGACY'`,
+      )
+      assert.equal(legacyVariant?.title, 'Red')
+      assert.deepEqual(legacyVariant?.option_values, ['Red'])
+      assert.equal(Number(legacyVariant?.selling_price), 100)
 
       // …and products.created_at must be widened back to a full timestamp:
       // day granularity tied every same-day product, so "newest first" was

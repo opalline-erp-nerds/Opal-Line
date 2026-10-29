@@ -243,7 +243,8 @@ test('generateLabelsPDF returns null for an empty product list', async () => {
 
 test('the label preview/export QR encoder returns a real PNG symbol', async () => {
   const png = await generateLabelQrBuffer('OLABC12345', 7.875)
-  assert.ok(png.length > 100)
+  assert.ok(png)
+  assert.ok(png!.length > 100)
   assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a')
 })
 

@@ -3,6 +3,18 @@ import path from 'node:path'
 import { desc, eq, inArray, isNotNull, isNull, like, or, sql } from 'drizzle-orm'
 import { config, isConfigured, normalizeShopDomain } from './config'
 import { db, schema } from './db/client'
+import {
+  fillOrKeep,
+  mergeAddress,
+  normalizeEmail,
+  normalizePhone,
+  orderCustomerPiiRedacted,
+  parseOrderAddress,
+  upgradeName,
+  usableText,
+  type OrderAddress,
+} from './shopifyCustomerData'
+import type { SilverRateStepLog, SilverRateStepRecord } from './db/schema'
 import type { SyncCustomer, SyncLogEntry, SyncOrder, SyncPrice, SyncProduct, SyncResource, SyncStore } from './types'
 import { CONSTANTS } from './constants'
 import { logger } from './logger'
@@ -2771,10 +2783,42 @@ export async function applySilverRate(
   const previous = await getLatestSilverRate()
   const previousRate = previous?.rate ?? 92.8
 
+  // Per-step record of this run, persisted on the rate row (silver_rates.step_log)
+  // so the history log can still show timestamps, counts and error text after
+  // the in-memory result is gone. Only exists once a rate row does — a failure
+  // in the optional catalog sync below leaves no history entry at all, which
+  // matches what the history table has always recorded.
+  const stepLog: SilverRateStepLog = {
+    startedAt: new Date().toISOString(),
+    finishedAt: '',
+    ok: false,
+    counts: { repriced: 0, matched: 0, pushed: 0, skipped: 0 },
+    steps: [],
+  }
+  const recordStep = (
+    step: Omit<SilverRateStepRecord, 'startedAt' | 'finishedAt'> & { startedAt?: string },
+  ): void => {
+    stepLog.steps.push({
+      startedAt: step.startedAt ?? new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      ...step,
+    })
+  }
+  // History annotation is best-effort: a failed write must never mask the
+  // result of the rate change itself.
+  const persistStepLog = async (rateRowId: string): Promise<void> => {
+    if (!db) return
+    try {
+      await db.update(schema.silverRates).set({ stepLog }).where(eq(schema.silverRates.id, rateRowId))
+    } catch { /* best-effort */ }
+  }
+
   if (options?.syncFirst) {
-    const synced = await syncProductsToDb()
-    if (!synced.ok) {
-      setSilverRateProgress({ running: false, phase: 'done', label: 'Product sync failed before repricing', error: synced.errors.join('; ') })
+    const syncStartedAt = new Date().toISOString()
+    // A throw here used to escape applySilverRate, leaving progress running
+    // forever — report it exactly like a sync that returned ok:false.
+    const syncFailed = (message: string): SilverUpdateResult => {
+      setSilverRateProgress({ running: false, phase: 'done', label: 'Product sync failed before repricing', error: message })
       return {
         ok: false,
         rate,
@@ -2783,10 +2827,24 @@ export async function applySilverRate(
         matched: 0,
         updated: 0,
         skipped: 0,
-        errors: [`Product sync failed before silver rate update: ${synced.errors.join('; ')}`],
+        errors: [`Product sync failed before silver rate update: ${message}`],
         message: 'Product sync failed before silver rate update',
       }
     }
+    let synced: ProductsDbSyncResult
+    try {
+      synced = await syncProductsToDb()
+    } catch (err) {
+      return syncFailed(err instanceof Error ? err.message : 'Product sync failed')
+    }
+    if (!synced.ok) return syncFailed(synced.errors.join('; '))
+    recordStep({
+      key: 'sync',
+      label: 'Sync catalog from Shopify',
+      status: 'done',
+      startedAt: syncStartedAt,
+      detail: `${synced.synced} synced (${synced.created} created, ${synced.updated} updated, ${synced.removed} removed)`,
+    })
   }
 
   if (!db) {
@@ -2801,9 +2859,13 @@ export async function applySilverRate(
   const actorName = options?.actorName?.trim() || 'Admin'
   const source = options?.source ?? 'manual'
 
+  // The row id is captured so the step log and sync status land on THIS run's
+  // row — the old code re-queried "the latest row", which races a second apply.
+  const rateRowId = randomUUID()
+  const rateStartedAt = new Date().toISOString()
   try {
     await db.insert(schema.silverRates).values({
-      id: randomUUID(),
+      id: rateRowId,
       purity: 92.5,
       rate,
       previousRate,
@@ -2821,107 +2883,158 @@ export async function applySilverRate(
     return { ok: false, rate, previousRate, affected: 0, matched: 0, updated: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Failed to save silver rate'] }
   }
 
-  const rows = await db
-    .select({
-      id: schema.products.id,
-      netWeight: schema.products.netWeight,
-      makingCharge: schema.products.makingCharge,
-      sellingPrice: schema.products.sellingPrice,
-      pieceRateProduct: schema.products.pieceRateProduct,
-    })
-    .from(schema.products)
+  // Step 1 of the run: the rate row itself. The pre-reprice price snapshot and
+  // the reprice loop live in the try below (chandru1's step reporting), so
+  // master's separately-hoisted snapshot is deliberately NOT duplicated here —
+  // two snapshot loops would write two history rows per product.
+  const rateDetail = `₹${previousRate.toFixed(2)} → ₹${rate.toFixed(2)}/gm`
+  const steps: NonNullable<SilverUpdateResult['steps']> = [
+    { key: 'rate', label: 'Save new rate', status: 'done', detail: rateDetail },
+  ]
+  recordStep({ key: 'rate', label: 'Save new rate', status: 'done', startedAt: rateStartedAt, detail: rateDetail })
 
-  const snapshotAt = previous?.updatedAt ?? now
-  for (const row of rows) {
-    if (row.sellingPrice == null) continue
-    try {
-      await db.insert(schema.productPriceHistory).values({
-        id: randomUUID(),
-        productId: row.id,
-        sellingPrice: Number(row.sellingPrice),
-        recordedAt: snapshotAt,
-      })
-    } catch { /* history must not block a rate change */ }
-  }
-
+  const repriceStartedAt = new Date().toISOString()
   let recomputed = 0
-  setSilverRateProgress({ phase: 'repricing', label: `Repricing ${rows.length} product(s) from the new rate`, done: 0, total: rows.length })
-  for (const row of rows) {
-    // Piece Rate Products carry a fixed price per piece — a silver-rate change
-    // must never recompute (and thereby overwrite) their selling price.
-    if (row.pieceRateProduct) continue
-    const netWeight = Number(row.netWeight)
-    const makingCharge = Number(row.makingCharge)
-    if (!netWeight || netWeight <= 0) continue
-    const sellingPrice = computeSellingPrice(rate, netWeight, makingCharge)
-    await db.update(schema.products).set({ sellingPrice, silverRate: rate }).where(eq(schema.products.id, row.id))
-    try {
-      await db.insert(schema.productPriceHistory).values({
-        id: randomUUID(),
-        productId: row.id,
-        sellingPrice,
-        recordedAt: now,
-      })
-    } catch { /* history must not block a rate change */ }
-    recomputed++
-    setSilverRateProgress({ done: recomputed })
+  try {
+    const rows = await db
+      .select({ id: schema.products.id, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge, sellingPrice: schema.products.sellingPrice, pieceRateProduct: schema.products.pieceRateProduct })
+      .from(schema.products)
+
+    const snapshotAt = previous?.updatedAt ?? now
+    for (const row of rows) {
+      if (row.sellingPrice == null) continue
+      try {
+        await db.insert(schema.productPriceHistory).values({
+          id: randomUUID(),
+          productId: row.id,
+          sellingPrice: Number(row.sellingPrice),
+          recordedAt: snapshotAt,
+        })
+      } catch { /* history must not block a rate change */ }
+    }
+
+    setSilverRateProgress({ phase: 'repricing', label: `Repricing ${rows.length} product(s) from the new rate`, done: 0, total: rows.length })
+    for (const row of rows) {
+      // Piece Rate Products carry a fixed price per piece — a silver-rate change
+      // must never recompute (and thereby overwrite) their selling price.
+      if (row.pieceRateProduct) continue
+      const netWeight = Number(row.netWeight)
+      const makingCharge = Number(row.makingCharge)
+      if (!netWeight || netWeight <= 0) continue
+      const sellingPrice = computeSellingPrice(rate, netWeight, makingCharge)
+      await db.update(schema.products).set({ sellingPrice, silverRate: rate }).where(eq(schema.products.id, row.id))
+      try {
+        await db.insert(schema.productPriceHistory).values({
+          id: randomUUID(),
+          productId: row.id,
+          sellingPrice,
+          recordedAt: now,
+        })
+      } catch { /* history must not block a rate change */ }
+      recomputed++
+      setSilverRateProgress({ done: recomputed })
+    }
+  } catch (err) {
+    // The rate row exists but the catalogue is only partly repriced: name the
+    // step that failed, stop (never continue to the Shopify steps) and release
+    // the progress flag — it used to stay running forever and spin the UI.
+    const message = err instanceof Error ? err.message : 'Failed to reprice products'
+    const detail = `${recomputed} product(s) updated before the failure`
+    steps.push({ key: 'reprice', label: 'Reprice products', status: 'failed', detail })
+    recordStep({ key: 'reprice', label: 'Reprice products', status: 'failed', startedAt: repriceStartedAt, detail, error: message })
+    stepLog.finishedAt = new Date().toISOString()
+    stepLog.ok = false
+    stepLog.counts.repriced = recomputed
+    await persistStepLog(rateRowId)
+    setSilverRateProgress({ running: false, phase: 'done', label: 'Repricing failed', error: message })
+    return { ok: false, rate, previousRate, affected: recomputed, matched: 0, updated: 0, skipped: 0, errors: [message], steps }
   }
 
-  await recordAudit({
-    timestamp: now,
-    user: actorName,
-    action: `Silver rate updated to ₹${rate.toFixed(2)}/gm`,
-    module: 'Silver',
-    entity: 'silver_rates',
-    changes: `previous=${previousRate}, rate=${rate}, source=${source}`,
-    ip: null,
-  })
+  const repriceDetail = `${recomputed} product(s) recomputed from the new rate`
+  steps.push({ key: 'reprice', label: 'Reprice products', status: 'done', detail: repriceDetail })
+  recordStep({ key: 'reprice', label: 'Reprice products', status: 'done', startedAt: repriceStartedAt, detail: repriceDetail })
+
+  // The audit trail must never block (or look like a hang on) a rate change.
+  try {
+    await recordAudit({
+      timestamp: now,
+      user: actorName,
+      action: `Silver rate updated to ₹${rate.toFixed(2)}/gm`,
+      module: 'Silver',
+      entity: 'silver_rates',
+      changes: `previous=${previousRate}, rate=${rate}, source=${source}`,
+      ip: null,
+    })
+  } catch { /* audit is best-effort */ }
 
   let matched = 0
   let updated = 0
   let skipped = 0
   const errors: string[] = []
-  const steps: NonNullable<SilverUpdateResult['steps']> = [
-    { key: 'rate', label: 'Save new rate', status: 'done', detail: `₹${previousRate.toFixed(2)} → ₹${rate.toFixed(2)}/gm` },
-    { key: 'reprice', label: 'Reprice products', status: 'done', detail: `${recomputed} product(s) recomputed from the new rate` },
-  ]
 
   if (isConfigured()) {
+    const matchStartedAt = new Date().toISOString()
     try {
       setSilverRateProgress({ phase: 'matching', label: 'Matching local products to the Shopify catalog', done: 0, total: 0 })
       await syncPrices()
       const pending = store.price.filter((p) => p.status === 'update')
+      const unmatched = store.price.filter((p) => p.status === 'no-match').length
       matched = store.price.filter((p) => p.status !== 'no-match').length
-      steps.push({ key: 'match', label: 'Match products to Shopify', status: 'done', detail: `${matched} matched, ${store.price.filter((p) => p.status === 'no-match').length} without a Shopify match` })
+      const matchDetail = `${matched} matched, ${unmatched} without a Shopify match`
+      steps.push({ key: 'match', label: 'Match products to Shopify', status: 'done', detail: matchDetail })
+      recordStep({ key: 'match', label: 'Match products to Shopify', status: 'done', startedAt: matchStartedAt, detail: matchDetail })
       if (pending.length > 0) {
+        const pushStartedAt = new Date().toISOString()
         setSilverRateProgress({ phase: 'pushing', label: 'Pushing the new prices to Shopify', done: 0, total: pending.length })
         const result = await applyPriceSync((done) => setSilverRateProgress({ done }))
         updated = result.updated ?? 0
         skipped = result.skipped ?? 0
         errors.push(...(result.errors ?? []))
+        const pushDetail = `${updated} pushed, ${skipped} skipped${errors.length ? `, ${errors.length} error(s)` : ''}`
         steps.push({
           key: 'push',
           label: 'Push prices to Shopify',
           status: errors.length === 0 ? 'done' : 'failed',
-          detail: `${updated} pushed, ${skipped} skipped${errors.length ? `, ${errors.length} error(s)` : ''}`,
+          detail: pushDetail,
+        })
+        recordStep({
+          key: 'push',
+          label: 'Push prices to Shopify',
+          status: errors.length === 0 ? 'done' : 'failed',
+          startedAt: pushStartedAt,
+          detail: pushDetail,
+          ...(errors.length > 0 ? { error: errors.join('; ') } : {}),
         })
       } else {
-        steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: 'All Shopify prices already match the new rate' })
+        const pushDetail = 'All Shopify prices already match the new rate'
+        steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: pushDetail })
+        recordStep({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: pushDetail })
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error'
       store.lastError = message
       errors.push(message)
-      steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'failed', detail: message })
+      // The try block spans matching + pushing: blame the step that actually
+      // failed instead of always reporting the push.
+      const failedKey = steps.some((s) => s.key === 'match') ? 'push' : 'match'
+      const failedLabel = failedKey === 'match' ? 'Match products to Shopify' : 'Push prices to Shopify'
+      steps.push({ key: failedKey, label: failedLabel, status: 'failed', detail: message })
+      recordStep({ key: failedKey, label: failedLabel, status: 'failed', startedAt: matchStartedAt, detail: message, error: message })
       await persistLog({ entity: 'Price', direction: 'out', action: 'Silver Rate Update', status: 'failed', error: message, retry: true })
     }
   } else {
-    steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: 'Shopify is not configured — prices updated locally only' })
+    const pushDetail = 'Shopify is not configured — prices updated locally only'
+    steps.push({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: pushDetail })
+    recordStep({ key: 'push', label: 'Push prices to Shopify', status: 'skipped', detail: pushDetail })
     await persistLog({ entity: 'Silver', direction: 'in', action: 'Rate Update (Shopify not configured)', status: 'success' })
   }
 
-  // Record the Shopify push outcome on the rate row for the history table.
+  // Record the Shopify push outcome AND the full step log on this run's rate
+  // row for the history table (best-effort, never masks the result).
   const syncStatus = !isConfigured() ? 'skipped' : errors.length === 0 ? 'synced' : 'failed'
+  stepLog.finishedAt = new Date().toISOString()
+  stepLog.ok = errors.length === 0
+  stepLog.counts = { repriced: recomputed, matched, pushed: updated, skipped }
   setSilverRateProgress({
     running: false,
     phase: 'done',
@@ -2932,12 +3045,7 @@ export async function applySilverRate(
   })
   if (db) {
     try {
-      const [latestRow] = await db
-        .select({ id: schema.silverRates.id })
-        .from(schema.silverRates)
-        .orderBy(desc(schema.silverRates.updatedAt))
-        .limit(1)
-      if (latestRow) await db.update(schema.silverRates).set({ syncStatus }).where(eq(schema.silverRates.id, latestRow.id))
+      await db.update(schema.silverRates).set({ syncStatus, stepLog }).where(eq(schema.silverRates.id, rateRowId))
     } catch {
       // History annotation is best-effort.
     }
@@ -2963,6 +3071,42 @@ export interface DraftOrderLineInput {
   sku?: string
   /** Shopify ProductVariant id (numeric or gid:// form) when the line was billed against a specific variant. */
   variantId?: string | number
+}
+
+/**
+ * Stored/local order lines → DraftOrderLineInput[]. ERP `sales_orders.line_items`
+ * prices are PER-UNIT and GST-inclusive, which is exactly what a draft line's
+ * `originalUnitPrice` is:
+ *
+ *   Shopify line total = originalUnitPrice × quantity
+ *
+ * Feeding it a full line's GST-inclusive total (amount × 1.03) instead made
+ * Shopify bill that total PER UNIT, so a manual order with a qty-3 line was
+ * created on Shopify at ~3× its real value.
+ */
+export function draftOrderInputLines(
+  lines: ReadonlyArray<unknown> | null | undefined,
+): DraftOrderLineInput[] {
+  if (!Array.isArray(lines)) return []
+  return lines
+    .map((raw): DraftOrderLineInput | null => {
+      const li = (raw ?? null) as Record<string, unknown> | null
+      if (!li) return null
+      const title = String(li.title ?? '').trim()
+      const quantity = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
+      if (!title || quantity <= 0) return null
+      const price = Number(li.price)
+      return {
+        title,
+        quantity,
+        price: Number.isFinite(price) ? Math.round(price * 100) / 100 : null,
+        ...(li.sku != null && String(li.sku).trim() !== '' ? { sku: String(li.sku).trim() } : {}),
+        ...(li.variantId != null && String(li.variantId).trim() !== ''
+          ? { variantId: li.variantId as string | number }
+          : {}),
+      }
+    })
+    .filter((li): li is DraftOrderLineInput => li !== null)
 }
 
 /** Shopify's GraphQL API wants variant ids in gid form. */
@@ -3434,6 +3578,8 @@ export interface ShopifyOrdersImportResult {
   updated: number
   errors: string[]
   message?: string
+  /** Present when Shopify redacted customer PII on the REST payloads (plan-gated). */
+  piiRedacted?: { count: number; example: string; message: string } | null
 }
 
 function mapImportedPayment(status: string | null | undefined): string {
@@ -3502,6 +3648,10 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
     const errors: string[] = []
     // Orders whose auto-invoice failed this run (reported in Sync Logs).
     const invoiceFailures: string[] = []
+    // Orders whose customer payload was mass-redacted by Shopify's
+    // plan-gated Protected Customer Data (HTTP 200, fields stripped). They
+    // import as temporary "Guest" rows — surfaced so the sync explains WHY.
+    const redactedOrders: string[] = []
 
     for (const o of raw) {
       const orderNumber = String(o.name ?? '').replace(/^#/, '')
@@ -3512,6 +3662,7 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
       seenInBatch.add(shopifyId)
 
       const customerId = o.customer?.id ? String(o.customer.id) : undefined
+      if (orderCustomerPiiRedacted(o)) redactedOrders.push(shopifyId)
       // Shopify order REST API often has minimal customer object {id, email} without first_name/last_name.
       // The actual customer name is on billing_address. Fall back through: customer → billing_address → email → 'Guest'.
       // Some dev stores return literal "undefined" strings — treat those as empty.
@@ -3542,34 +3693,23 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
       const discount = Math.round(Number(o.total_discounts ?? 0) * 100) / 100
 
       const billingAddress = o.billing_address ? (() => {
-        const addr = {
-          name: `${safeStr(o.billing_address.first_name)} ${safeStr(o.billing_address.last_name)}`.trim(),
-          address1: safeStr(o.billing_address.address1),
-          address2: safeStr(o.billing_address.address2),
-          city: safeStr(o.billing_address.city),
-          province: safeStr(o.billing_address.province),
-          zip: safeStr(o.billing_address.zip),
-          country: safeStr(o.billing_address.country),
-          phone: safeStr(o.billing_address.phone),
-        }
-        // Only return if at least one field has actual data
-        return (addr.name || addr.address1 || addr.city || addr.phone) ? addr : null
+        // parseOrderAddress keeps region-only redacted stubs (province/country);
+        // the old name/address1/city/phone guard threw them away.
+        return parseOrderAddress(o.billing_address)
       })() : null
       const shippingAddress = o.shipping_address ? (() => {
-        const addr = {
-          name: `${safeStr(o.shipping_address.first_name)} ${safeStr(o.shipping_address.last_name)}`.trim(),
-          address1: safeStr(o.shipping_address.address1),
-          address2: safeStr(o.shipping_address.address2),
-          city: safeStr(o.shipping_address.city),
-          province: safeStr(o.shipping_address.province),
-          zip: safeStr(o.shipping_address.zip),
-          country: safeStr(o.shipping_address.country),
-          phone: safeStr(o.shipping_address.phone),
-        }
-        return (addr.name || addr.address1 || addr.city || addr.phone) ? addr : null
+        return parseOrderAddress(o.shipping_address)
       })() : null
 
       if (knownShopifyIds.has(shopifyId)) {
+        // Merge against the stored row: locally recovered addresses (repair /
+        // webhook) must survive a redacted or partial payload — a whole-address
+        // write of null or of a half-redacted object used to blank them out.
+        const [cur] = await db
+          .select({ billingAddress: schema.salesOrders.billingAddress, shippingAddress: schema.salesOrders.shippingAddress })
+          .from(schema.salesOrders)
+          .where(eq(schema.salesOrders.shopifyId, shopifyId))
+          .limit(1)
         await db
           .update(schema.salesOrders)
           .set({
@@ -3584,10 +3724,10 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             currency,
             discount,
             lineItems: lineItems.length > 0 ? lineItems : undefined,
-            // Locally recovered addresses (repair / webhook) win over a
-            // redacted empty payload — never blank them back out.
-            billingAddress: billingAddress ?? undefined,
-            shippingAddress: shippingAddress ?? undefined,
+            // undefined from mergeAddress = nothing worth writing → drizzle
+            // omits the column and the stored address is untouched.
+            billingAddress: mergeAddress(cur?.billingAddress as OrderAddress | undefined, billingAddress),
+            shippingAddress: mergeAddress(cur?.shippingAddress as OrderAddress | undefined, shippingAddress),
           })
           .where(eq(schema.salesOrders.shopifyId, shopifyId))
         updated++
@@ -3662,26 +3802,33 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           // Match the local customer by Shopify id FIRST — two distinct
           // Shopify identities can share an email inbox (or a phone), and
           // email-first matching would merge their stats into one row.
-          let existingCustomer = null
-          const [byShopifyId] = await db
-            .select()
-            .from(schema.customers)
-            .where(eq(schema.customers.shopifyId, customerId))
-            .limit(1)
-          if (byShopifyId) existingCustomer = byShopifyId
-          if (!existingCustomer && customerEmail) {
+          // Email/phone then fall back through case/format-normalized lookups
+          // ("Foo@Bar.COM" vs "foo@bar.com", "+91 98.." vs "98..") so a
+          // re-sync finds its row instead of creating a duplicate customer.
+          let existingCustomer: typeof schema.customers.$inferSelect | null = null
+          {
+            const [byShopifyId] = await db
+              .select()
+              .from(schema.customers)
+              .where(eq(schema.customers.shopifyId, customerId))
+              .limit(1)
+            if (byShopifyId) existingCustomer = byShopifyId
+          }
+          const emailLc = normalizeEmail(customerEmail)
+          if (!existingCustomer && emailLc) {
             const [byEmail] = await db
               .select()
               .from(schema.customers)
-              .where(eq(schema.customers.email, customerEmail))
+              .where(sql`lower(coalesce(${schema.customers.email}, '')) = ${emailLc}`)
               .limit(1)
             if (byEmail) existingCustomer = byEmail
           }
-          if (!existingCustomer && customerPhone) {
+          const phoneDigits = normalizePhone(customerPhone)
+          if (!existingCustomer && phoneDigits) {
             const [byPhone] = await db
               .select()
               .from(schema.customers)
-              .where(eq(schema.customers.phone, customerPhone))
+              .where(sql`regexp_replace(coalesce(${schema.customers.phone}, ''), '[^0-9]', '', 'g') = ${phoneDigits}`)
               .limit(1)
             if (byPhone) existingCustomer = byPhone
           }
@@ -3690,11 +3837,16 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             await db
               .update(schema.customers)
               .set({
-                name: existingCustomer.name || label,
-                email: customerEmail ?? existingCustomer.email,
-                phone: customerPhone ?? existingCustomer.phone,
-                province: province ?? existingCustomer.province,
-                city: city ?? existingCustomer.city,
+                // A real Shopify name replaces a placeholder ("Shopify
+                // Customer #<id>"), a Guest stand-in or an email; a
+                // placeholder/blank/email never clobbers a real name.
+                name: upgradeName(existingCustomer.name, label),
+                // Redaction-safe: null, "" or redacted Shopify values keep the
+                // stored data instead of blanking it out.
+                email: fillOrKeep(existingCustomer.email, customerEmail ?? null),
+                phone: fillOrKeep(existingCustomer.phone, customerPhone ?? null),
+                province: fillOrKeep(existingCustomer.province, province ?? null),
+                city: fillOrKeep(existingCustomer.city, city ?? null),
                 emailVerified: verifiedEmail ?? existingCustomer.emailVerified,
                 shopifyId: existingCustomer.shopifyId ?? customerId,
                 // Platform-reported stats are authoritative — never accumulate on top of them.
@@ -3770,13 +3922,34 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
       })
     }
 
+    let piiRedacted: ShopifyOrdersImportResult['piiRedacted'] = null
+    if (redactedOrders.length > 0) {
+      piiRedacted = {
+        count: redactedOrders.length,
+        example: redactedOrders[0],
+        message:
+          `Shopify stripped customer name/email/phone/addresses from ${redactedOrders.length} order(s) ` +
+          '(plan-gated Protected Customer Data — e.g. ' + redactedOrders.slice(0, 3).join(', ') + '). ' +
+          'They import as "Guest" until access is approved in the Shopify admin ' +
+          '(Settings → Apps and sales channels → app → Protected customer data) or recovered via the customers CSV export / order-confirmation emails.',
+      }
+      await persistLog({
+        entity: 'Customer',
+        direction: 'in',
+        action: 'Customer PII Redacted',
+        status: 'failed',
+        error: `${redactedOrders.length} order(s) arrived with customer details stripped by Shopify's plan-gated Protected Customer Data (${redactedOrders.slice(0, 5).join(', ')}). Approve access in the Shopify admin or recover via the customers CSV export / email ingestion.`,
+        retry: true,
+      })
+    }
+
     await persistLog({
       entity: 'Order',
       direction: 'in',
       action: 'Orders Synced',
       status: 'success',
     })
-    return { ok: true, imported, updated, errors }
+    return { ok: true, imported, updated, errors, piiRedacted }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     await persistLog({ entity: 'Order', direction: 'in', action: 'Orders Synced', status: 'failed', error: msg })
@@ -3806,6 +3979,16 @@ export async function importShopifyCustomers(): Promise<ShopifyCustomersImportRe
     const knownByShopifyId = new Map(existing.filter((r) => r.shopifyId).map((r) => [r.shopifyId!, r]))
     const knownByEmail = new Map(existing.filter((r) => r.email).map((r) => [r.email!, r]))
     const knownByPhone = new Map(existing.filter((r) => r.phone).map((r) => [r.phone!, r]))
+    // Normalized fallbacks — a case/format difference ("Foo@BAR.com",
+    // "+91 98.." vs "98..") must find the same row, not create a duplicate.
+    const knownByEmailLc = new Map<string, (typeof existing)[number]>()
+    const knownByPhoneDigits = new Map<string, (typeof existing)[number]>()
+    for (const r of existing) {
+      const eK = normalizeEmail(r.email)
+      if (eK && !knownByEmailLc.has(eK)) knownByEmailLc.set(eK, r)
+      const pK = normalizePhone(r.phone)
+      if (pK && !knownByPhoneDigits.has(pK)) knownByPhoneDigits.set(pK, r)
+    }
 
     let imported = 0
     let updated = 0
@@ -3825,21 +4008,26 @@ export async function importShopifyCustomers(): Promise<ShopifyCustomersImportRe
       const joined = c.created_at ? new Date(c.created_at).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10)
       const verifiedEmail = c.verified_email != null ? Boolean(c.verified_email) : null
 
-      // Match existing customer by shopifyId, email, or phone
+      // Match existing customer by shopifyId, email, or phone (+ normalized
+      // fallbacks for case/format differences).
       let existingCustomer = knownByShopifyId.get(shopifyId)
-      if (!existingCustomer && email) existingCustomer = knownByEmail.get(email)
-      if (!existingCustomer && phone) existingCustomer = knownByPhone.get(phone)
+      if (!existingCustomer && email) existingCustomer = knownByEmail.get(email) ?? (knownByEmailLc.get(normalizeEmail(email) ?? '') ?? undefined)
+      if (!existingCustomer && phone) existingCustomer = knownByPhone.get(phone) ?? (knownByPhoneDigits.get(normalizePhone(phone) ?? '') ?? undefined)
 
       try {
         if (existingCustomer) {
+          // The real name replaces a placeholder / blankish name; a real
+          // local name is never downgraded to the placeholder.
+          const realName = firstName && lastName ? name : null
           await db
             .update(schema.customers)
             .set({
-              name: existingCustomer.name || name,
-              email: email ?? existingCustomer.email,
-              phone: phone ?? existingCustomer.phone,
-              city: city ?? undefined,
-              province: province ?? undefined,
+              name: upgradeName(existingCustomer.name, realName),
+              // A redacted (null/\"\") API value keeps the stored PII.
+              email: fillOrKeep(existingCustomer.email, email ?? null),
+              phone: fillOrKeep(existingCustomer.phone, phone ?? null),
+              city: usableText(city ?? null) ?? undefined,
+              province: usableText(province ?? null) ?? undefined,
               shopifyId: existingCustomer.shopifyId ?? shopifyId,
               emailVerified: verifiedEmail ?? undefined,
               orders: ordersCount,
@@ -3931,33 +4119,23 @@ export async function refreshShopifyOrder(localOrderId: string): Promise<{ ok: b
   const payment = mapImportedPayment(o.financial_status)
   const fulfillment = mapImportedFulfillment(o.fulfillment_status)
 
-  const addrFrom = (src: any) => {
-    if (!src) return null
-    const addr = {
-      name: `${safeStr(src.first_name)} ${safeStr(src.last_name)}`.trim(),
-      address1: safeStr(src.address1),
-      address2: safeStr(src.address2),
-      city: safeStr(src.city),
-      province: safeStr(src.province),
-      zip: safeStr(src.zip),
-      country: safeStr(src.country),
-      phone: safeStr(src.phone),
-    }
-    return (addr.name || addr.address1 || addr.city || addr.phone) ? addr : null
-  }
+  const addrFrom = (src: any) => parseOrderAddress(src)
   const billingAddress = addrFrom(o.billing_address)
   const shippingAddress = addrFrom(o.shipping_address)
 
   await db
     .update(schema.salesOrders)
     .set({
-      ...(customerName && customerName !== 'Guest' ? { customer: customerName } : {}),
+      // A real fetched name wins over the placeholder/Guest/none, never the
+      // other way round (same rule as the order sync's customer upsert).
+      ...(customerName && customerName !== 'Guest' ? { customer: upgradeName(local.customer, customerName) } : {}),
       value,
       payment,
       fulfillment,
       items,
-      billingAddress: billingAddress ?? undefined,
-      shippingAddress: shippingAddress ?? undefined,
+      // Locally recovered addresses survive a redacted or partial payload.
+      billingAddress: mergeAddress(local.billingAddress as OrderAddress | undefined, billingAddress),
+      shippingAddress: mergeAddress(local.shippingAddress as OrderAddress | undefined, shippingAddress),
     })
     .where(eq(schema.salesOrders.id, localOrderId))
 

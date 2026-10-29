@@ -65,7 +65,7 @@ function tempHtmlFile(): string {
 /** Paper geometry a job must print on. */
 type PrintJobOptions = {
   margins?: { marginType: 'default' | 'none' | 'printableArea' | 'custom' }
-  pageSize?: 'A3' | 'A4' | 'A5' | 'Legal' | 'Letter' | 'Tabloid'
+  pageSize?: 'A3' | 'A4' | 'A5' | 'Legal' | 'Letter' | 'Tabloid' | { width: number; height: number }
 }
 
 /**
@@ -89,10 +89,17 @@ function declaredPage(html: string): { size?: PrintJobOptions['pageSize']; margi
     letter: 'Letter',
     legal: 'Legal',
   }
-  const size = /(?:^|[;\s])size\s*:\s*(a3|a4|a5|letter|legal)\b/i.exec(rule)
+  const rawSize = /(?:^|[;\s])size\s*:\s*([^;]+)/i.exec(rule)?.[1]?.trim() ?? ''
+  const namedSize = /^(a3|a4|a5|letter|legal|tabloid)\b/i.exec(rawSize)
+  const mmSize = /^([\d.]+)\s*mm\s+([\d.]+)\s*mm$/i.exec(rawSize)
+  const size = namedSize
+    ? sizes[namedSize[1].toLowerCase()] ?? 'Tabloid'
+    : mmSize
+      ? { width: Math.round(Number(mmSize[1]) * 1000), height: Math.round(Number(mmSize[2]) * 1000) }
+      : undefined
   const marginZero = /(?:^|[;\s])margin\s*:\s*0(?:\.0+)?(?:px)?\s*(?:;|$)/i.test(rule)
   return {
-    size: size ? sizes[size[1].toLowerCase()] : undefined,
+    size,
     marginZero,
   }
 }
