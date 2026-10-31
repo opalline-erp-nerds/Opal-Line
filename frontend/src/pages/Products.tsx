@@ -589,6 +589,16 @@ export default function ProductsPage() {
         footer={
           <DialogFooter>
             <Button variant="outline" onClick={() => setViewProduct(null)}>Close</Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                const p = viewProduct
+                setViewProduct(null)
+                if (p) setEditTarget(p)
+              }}
+            >
+              <Pencil className="h-4 w-4" /> Edit
+            </Button>
             <Button onClick={() => { setReorderFor(viewProduct); setReorderQty(String(Math.max(10, (viewProduct?.reorderLevel ?? 5) - (viewProduct?.stock ?? 0)))); setViewProduct(null) }}>
               <PackagePlus className="h-4 w-4" /> Quick Reorder
             </Button>

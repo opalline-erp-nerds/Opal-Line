@@ -563,6 +563,16 @@ export default function CustomersPage() {
                 <Mail className="h-4 w-4" /> Email
               </Button>
             ) : null}
+            <Button
+              variant="outline"
+              onClick={() => {
+                const c = viewCustomer
+                setViewCustomer(null)
+                if (c) openEdit(c)
+              }}
+            >
+              <Pencil className="h-4 w-4" /> Edit
+            </Button>
             <Button onClick={() => { setViewCustomer(null); navigate('/sales/invoices') }}>
               <ShoppingBag className="h-4 w-4" /> Order History
             </Button>
