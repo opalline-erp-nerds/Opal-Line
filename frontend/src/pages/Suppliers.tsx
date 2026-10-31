@@ -2,7 +2,7 @@ import { toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { Building2, CheckCircle2, History, MapPin, Phone, Plus, Search, ShoppingCart, User, UserRoundPen, Wallet, XCircle } from 'lucide-react'
+import { Building2, CheckCircle2, History, MapPin, Pencil, Phone, Plus, Search, ShoppingCart, User, UserRoundPen, Wallet, XCircle } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -120,9 +120,24 @@ export default function SuppliersPage() {
         ),
       },
       {
+        accessorKey: 'contact',
+        header: 'Contact Person',
+        cell: ({ row }) => <span className="text-muted-foreground">{row.original.contact || '—'}</span>,
+      },
+      {
         accessorKey: 'phone',
         header: 'Phone',
         cell: ({ row }) => <span className="text-muted-foreground">{row.original.phone}</span>,
+      },
+      {
+        accessorKey: 'alternatePhone',
+        header: 'Alt Number',
+        cell: ({ row }) => <span className="text-muted-foreground">{row.original.alternatePhone || '—'}</span>,
+      },
+      {
+        accessorKey: 'gstin',
+        header: 'GST No.',
+        cell: ({ row }) => <span className="text-muted-foreground uppercase">{row.original.gstin || '—'}</span>,
       },
       {
         accessorKey: 'city',
@@ -132,6 +147,12 @@ export default function SuppliersPage() {
             <MapPin className="h-3 w-3" /> {row.original.city}
           </span>
         ),
+      },
+      {
+        accessorKey: 'address',
+        header: 'Address',
+        meta: { headerClassName: 'min-w-[200px]' },
+        cell: ({ row }) => <span className="text-muted-foreground">{row.original.address || '—'}</span>,
       },
       {
         accessorKey: 'outstanding',
@@ -289,15 +310,31 @@ export default function SuppliersPage() {
                 <Phone className="h-4 w-4" /> Call
               </Button>
             ) : null}
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (!viewSupplier) return
+                setEditing(viewSupplier)
+                setError('')
+                setViewSupplier(null)
+                setDialogOpen(true)
+              }}
+            >
+              <Pencil className="h-4 w-4" /> Edit
+            </Button>
             <Button onClick={() => setViewSupplier(null)}>Close</Button>
           </DialogFooter>
         }
       >
         {viewSupplier ? (
           <div className="space-y-0.5 text-sm">
-            <DetailRow label="Contact" value={viewSupplier.contact || '—'} />
+            <DetailRow label="Contact Person" value={viewSupplier.contact || '—'} />
             <DetailRow label="Phone" value={viewSupplier.phone || '—'} />
+            <DetailRow label="Alternate Number" value={viewSupplier.alternatePhone || '—'} />
+            <DetailRow label="Email" value={viewSupplier.email || '—'} />
+            <DetailRow label="GST No." value={viewSupplier.gstin || '—'} />
             <DetailRow label="City" value={viewSupplier.city || '—'} />
+            <DetailRow label="Address" value={viewSupplier.address || '—'} />
             <DetailRow label="Outstanding" value={formatCurrency(viewSupplier.outstanding)} />
             <DetailRow label="Status" value={viewSupplier.status === 'active' ? 'Active' : 'Inactive'} />
           </div>

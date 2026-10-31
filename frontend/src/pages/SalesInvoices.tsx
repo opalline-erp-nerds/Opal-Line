@@ -498,6 +498,9 @@ export default function SalesInvoicesPage() {
         footer={
           <DialogFooter className="flex-wrap gap-2">
             <Button variant="outline" onClick={() => setViewInvoice(null)}>Close</Button>
+            <Button variant="outline" onClick={() => viewInvoice && openEdit(viewInvoice)}>
+              <Pencil className="h-4 w-4" /> Edit
+            </Button>
             <Button variant="outline" onClick={() => void printCurrentPage()}>
               <Printer className="h-4 w-4" /> Print / PDF
             </Button>

@@ -1693,6 +1693,16 @@ export default function SalesOrdersPage() {
         footer={
           <DialogFooter className="flex-wrap gap-2">
             <Button variant="outline" onClick={() => setViewOrder(null)}>Close</Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                const o = viewOrder
+                setViewOrder(null)
+                if (o) startEdit(o)
+              }}
+            >
+              <Pencil className="h-4 w-4" /> Edit
+            </Button>
             <Button variant="outline" onClick={() => viewOrder && printOrder(viewOrder)}>
               <Printer className="h-4 w-4" /> Print / PDF
             </Button>

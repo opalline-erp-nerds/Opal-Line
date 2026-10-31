@@ -859,6 +859,9 @@ export default function QuotationsPage() {
               <Button variant="outline" className="flex-1" size="sm" onClick={() => backupApi.downloadQuotationPDF(viewQuote.id)}>
                 <Download className="h-4 w-4" /> Download PDF
               </Button>
+              <Button variant="outline" className="flex-1" size="sm" onClick={() => openEdit(viewQuote)}>
+                <Pencil className="h-4 w-4" /> Edit
+              </Button>
               <Button className="flex-1" size="sm" disabled={convertingId === viewQuote.id} onClick={() => { const q = viewQuote; setViewQuote(null); void convert(q) }}>
                 <Wallet className="h-4 w-4" /> Convert to Invoice
               </Button>
