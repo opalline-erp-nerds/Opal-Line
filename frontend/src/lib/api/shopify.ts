@@ -14,6 +14,23 @@ import type {
 } from '@/types/shopify'
 import { request } from './core'
 
+/** One order line as sent by the order dialog (weight & pricing included). */
+interface OrderItemPayload {
+  title: string
+  sku?: string
+  productSku?: string
+  quantity: number
+  /** Per-unit, GST-inclusive. */
+  price: number
+  variantId?: string
+  /** Weight per piece (g) — product value, or a manual entry when the product has none. */
+  netWeight?: number
+  /** Total line weight (g) = quantity × weight per piece (or a manual override). */
+  weight?: number
+  /** Making charge per gram. */
+  makingCharge?: number
+}
+
 export const shopifyApi = {
   getHealth: () => request<{ ok: boolean; shopifyConfigured: boolean }>('/health'),
   getStatus: () => request<ShopifyStatus>('/shopify/status'),
@@ -39,7 +56,7 @@ export const shopifyApi = {
     status?: string
     date?: string
     note?: string
-    items: Array<{ title: string; sku?: string; quantity: number; price: number; variantId?: string }>
+    items: OrderItemPayload[]
     billingAddress?: {
       name?: string
       phone?: string
@@ -75,7 +92,7 @@ export const shopifyApi = {
     status?: string
     date?: string
     note?: string
-    items?: Array<{ title: string; sku?: string; quantity: number; price: number; variantId?: string }>
+    items?: OrderItemPayload[]
     billingAddress?: {
       name?: string
       phone?: string

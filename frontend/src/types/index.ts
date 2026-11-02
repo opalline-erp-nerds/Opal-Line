@@ -794,6 +794,16 @@ export interface SalesOrderLineItem {
   sku?: string
   quantity: number
   price: number
+  /** Weight per piece (g) snapshotted on the line. */
+  netWeight?: number | null
+  /** Total line weight (g) = quantity × weight per piece (or a manual override). */
+  weight?: number | null
+  /** Making charge per gram snapshotted on the line. */
+  makingCharge?: number | null
+  silverRate?: number | null
+  silverValue?: number | null
+  makingValue?: number | null
+  amount?: number | null
 }
 
 export interface SalesOrder {

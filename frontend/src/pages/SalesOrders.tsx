@@ -1,6 +1,5 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { ProductDialog } from '@/components/product-dialog'
-import { ManualInvoiceDialog } from '@/components/manual-invoice-dialog'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
@@ -116,8 +115,15 @@ interface OrderLineItem {
   qty: number
   price: number
   // Product fields needed for price recalculation
+  /** Weight per piece (g) — the product's value, or a manual entry when it has none. */
   netWeight?: number
   makingCharge?: number
+  /**
+   * Total line weight (g): qty × weight per piece, unless manually overridden.
+   * Editing qty or the weight per piece re-applies the formula; editing this
+   * field keeps the typed value until one of them changes next.
+   */
+  totalWeight?: number | null
 }
 
 interface CreateResult {
@@ -168,6 +174,37 @@ let lineSeq = 0
 
 function emptyLine(): OrderLineItem {
   return { key: `li-${++lineSeq}`, productId: '', title: '', sku: '', qty: 1, price: 0 }
+}
+
+/** Grams round to 3 dp — silver jewellery is billed to milligram precision. */
+const roundWeight = (g: number) => Math.round(g * 1000) / 1000
+
+/** A typed weight/charge: empty or unusable input clears the field (undefined). */
+const parseNumberInput = (raw: string): number | undefined => {
+  if (raw.trim() === '') return undefined
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : undefined
+}
+
+/**
+ * The total-weight rule: Total Weight = Quantity × Weight Per Piece.
+ * Returns null while no weight per piece is known, so the field stays empty
+ * for the manual entry a product without a configured weight needs.
+ */
+function derivedTotalWeight(qty: number, weightPerPiece?: number | null): number | null {
+  if (weightPerPiece == null || !(weightPerPiece > 0)) return null
+  const q = Number.isFinite(qty) ? qty : 0
+  return roundWeight(q * weightPerPiece)
+}
+
+/** A stored numeric that actually holds a usable number, else null. */
+const finiteOrNull = (v: number | null | undefined): number | null =>
+  typeof v === 'number' && Number.isFinite(v) ? v : null
+
+/** As above, but 0 counts as "not configured" for weights. */
+const positiveOrNull = (v: number | null | undefined): number | null => {
+  const n = finiteOrNull(v)
+  return n !== null && n > 0 ? n : null
 }
 
 export default function SalesOrdersPage() {
@@ -242,6 +279,22 @@ export default function SalesOrdersPage() {
   const [payment, setPayment] = useState('paid')
   const [fulfillment, setFulfillment] = useState('unfulfilled')
   const [orderStatus, setOrderStatus] = useState('confirmed')
+
+  // ── Edit Customer Details ────────────────────────────────────────────
+  // Saves land on the SAME customer row (PATCH by id — never an insert), so
+  // no duplicate customer is created and existing orders keep their record.
+  const [custEditOpen, setCustEditOpen] = useState(false)
+  const [custSaving, setCustSaving] = useState(false)
+  const [custErrors, setCustErrors] = useState<Record<string, string>>({})
+  const [custBaseline, setCustBaseline] = useState('')
+  const [custForm, setCustForm] = useState({
+    name: '',
+    email: '',
+    phone: '',
+    billing: emptyAddress(),
+    shipping: emptyAddress(),
+    sameAsBilling: true,
+  })
   // Which shop this document belongs to. Stock movements follow it, so picking
   // the wrong one puts the goods on the wrong shelf.
   const [locations, setLocations] = useState<InventoryLocation[]>([])
@@ -283,17 +336,6 @@ export default function SalesOrdersPage() {
   const [invoiceSavingId, setInvoiceSavingId] = useState<string | null>(null)
   const [syncingOrders, setSyncingOrders] = useState(false)
   const [syncMsg, setSyncMsg] = useState<{ ok: boolean; text: string } | null>(null)
-
-  // Manual invoice creation — the same dialog the Sales Invoices page uses, so
-  // a walk-in / phone sale can be billed from either screen. The row action
-  // seeds the buyer from the order it was opened on.
-  const [manualInvoiceOpen, setManualInvoiceOpen] = useState(false)
-  const [manualInvoiceOrder, setManualInvoiceOrder] = useState<SalesOrder | null>(null)
-
-  const openManualInvoice = useCallback((order: SalesOrder | null) => {
-    setManualInvoiceOrder(order)
-    setManualInvoiceOpen(true)
-  }, [])
 
   const reload = useCallback(() => {
     dbApi.getSalesOrders().then(setOrders).catch(() => {})
@@ -558,6 +600,38 @@ export default function SalesOrdersPage() {
     })
   }, [orders, query, status])
 
+  /**
+   * Saved line items → editable rows. The weight snapshotted on the line wins;
+   * older lines fall back to the catalogue (SKU match, variant SKUs included)
+   * so their weight per piece and making charge still show. productId stays
+   * empty exactly as before — re-selecting a product remains an explicit act.
+   */
+  const mapSavedLines = useCallback(
+    (o: SalesOrder): OrderLineItem[] => {
+      if (!o.lineItems || o.lineItems.length === 0) return [emptyLine()]
+      return o.lineItems.map((li) => {
+        const sku = li.sku ?? ''
+        const product =
+          products.find((p) => p.sku === sku) ??
+          products.find((p) => productVariants(p).some((v) => v.sku === sku))
+        const weightPerPiece = positiveOrNull(li.netWeight) ?? positiveOrNull(product?.netWeight)
+        const makingCharge = finiteOrNull(li.makingCharge) ?? finiteOrNull(product?.makingCharge)
+        return {
+          key: crypto.randomUUID(),
+          productId: '',
+          title: li.title,
+          sku,
+          qty: li.quantity,
+          price: li.price,
+          netWeight: weightPerPiece ?? undefined,
+          makingCharge: makingCharge ?? undefined,
+          totalWeight: positiveOrNull(li.weight) ?? derivedTotalWeight(li.quantity, weightPerPiece),
+        }
+      })
+    },
+    [products],
+  )
+
   const startEdit = useCallback((o: SalesOrder) => {
     setEditing(o)
     setFormError('')
@@ -577,11 +651,7 @@ export default function SalesOrdersPage() {
     setOrderStatus(o.status)
     setNote('')
     setSyncToShopify(Boolean(o.shopifyId && o.shopifyId.startsWith('#')))
-    setLineItems(
-      o.lineItems && o.lineItems.length > 0
-        ? o.lineItems.map((li) => ({ key: crypto.randomUUID(), productId: '', title: li.title, sku: li.sku ?? '', qty: li.quantity, price: li.price }))
-        : [emptyLine()],
-    )
+    setLineItems(mapSavedLines(o))
     setSilverRate(null)
     setDialogOpen(true)
     // Fetch the current applied silver rate
@@ -594,7 +664,7 @@ export default function SalesOrdersPage() {
       .catch(() => {
         setSilverRateLoading(false)
       })
-  }, [customers])
+  }, [customers, mapSavedLines])
 
   /** Clone a past order into a fresh draft — same customer/items, today's date, nothing synced. */
   const duplicateOrder = useCallback((o: SalesOrder) => {
@@ -616,11 +686,7 @@ export default function SalesOrdersPage() {
     setOrderStatus(o.status)
     setNote('')
     setSyncToShopify(false)
-    setLineItems(
-      o.lineItems && o.lineItems.length > 0
-        ? o.lineItems.map((li) => ({ key: crypto.randomUUID(), productId: '', title: li.title, sku: li.sku ?? '', qty: li.quantity, price: li.price }))
-        : [emptyLine()],
-    )
+    setLineItems(mapSavedLines(o))
     setSilverRate(null)
     setDialogOpen(true)
     // Fetch the current applied silver rate
@@ -633,7 +699,7 @@ export default function SalesOrdersPage() {
       .catch(() => {
         setSilverRateLoading(false)
       })
-  }, [customers])
+  }, [customers, mapSavedLines])
 
   const columns = useMemo<ColumnDef<SalesOrder>[]>(
     () => [
@@ -801,9 +867,6 @@ export default function SalesOrdersPage() {
                 </DropdownMenuItem>
               )}
               <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => openManualInvoice(row.original)}>
-                <FileText className="h-3.5 w-3.5" /> New invoice for this customer
-              </DropdownMenuItem>
               <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => cancelOrder(row.original)}>Cancel Order</DropdownMenuItem>
             </DropdownMenuContent>
             </DropdownMenu>
@@ -812,7 +875,7 @@ export default function SalesOrdersPage() {
         ),
       },
     ],
-    [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder, openManualInvoice],
+    [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder],
   )
 
   const snapshotForm = () =>
@@ -874,6 +937,12 @@ export default function SalesOrdersPage() {
   }
 
   const totalValue = useMemo(() => orderLinesTotal(lineItems), [lineItems])
+
+  // Weight & Pricing summary: every line's total weight (g), summed.
+  const totalWeight = useMemo(
+    () => lineItems.reduce((sum, li) => sum + (li.totalWeight ?? 0), 0),
+    [lineItems],
+  )
 
   // Live stock check per line: mirrors the order endpoints' per-line
   // validation against the catalog already loaded, so an over-quantity shows
@@ -944,6 +1013,8 @@ export default function SalesOrdersPage() {
           price: price ?? li.price,
           netWeight: p.netWeight,
           makingCharge: p.makingCharge,
+          // Picking a product re-applies Total = qty × weight per piece.
+          totalWeight: derivedTotalWeight(li.qty, p.netWeight),
         }
       }),
     )
@@ -973,6 +1044,8 @@ export default function SalesOrdersPage() {
               }) ?? row.price,
               netWeight: p.netWeight,
               makingCharge: p.makingCharge,
+              // Same rule as product selection: the total follows the new line weight.
+              totalWeight: derivedTotalWeight(row.qty, p.netWeight),
             }
           : row,
       ),
@@ -1015,7 +1088,17 @@ export default function SalesOrdersPage() {
             makingCharge: existing.makingCharge,
             fallback: existing.price,
           }) ?? existing.price
-        return prev.map((li) => (li.key === existing.key ? { ...li, qty: newQty, price: newPrice } : li))
+        return prev.map((li) =>
+          li.key === existing.key
+            ? {
+                ...li,
+                qty: newQty,
+                price: newPrice,
+                // The bumped quantity scales the total weight with it.
+                totalWeight: derivedTotalWeight(newQty, existing.netWeight),
+              }
+            : li,
+        )
       }
       const fresh = {
         productId: p.id,
@@ -1026,6 +1109,7 @@ export default function SalesOrdersPage() {
         qty: 1,
         netWeight: p.netWeight,
         makingCharge: p.makingCharge,
+        totalWeight: derivedTotalWeight(1, p.netWeight),
       }
       // Fill the empty first line if it's untouched, otherwise append
       const firstEmpty = prev.length === 1 && !prev[0].productId && !prev[0].title
@@ -1036,20 +1120,47 @@ export default function SalesOrdersPage() {
     })
   }
 
+  /**
+   * Per-unit price for a line at the current silver rate. A manually
+   * overridden total weight enters as its per-unit equivalent (total ÷ qty),
+   * so the price can never disagree with the weight on the same line.
+   */
+  const lineUnitPrice = (li: OrderLineItem): number | undefined =>
+    perUnitLinePrice({
+      silverRate,
+      netWeight:
+        li.qty > 0 && li.totalWeight != null && li.totalWeight > 0
+          ? li.totalWeight / li.qty
+          : li.netWeight,
+      makingCharge: li.makingCharge,
+      fallback: null,
+    })
+
   const updateLineItem = (key: string, patch: Partial<OrderLineItem>) => {
     setLineItems((prev) =>
       prev.map((li) => {
         if (li.key !== key) return li
         const updated = { ...li, ...patch }
-        if (patch.qty !== undefined && patch.qty !== li.qty) {
-          // Refresh the PER-UNIT price at the current rate; the quantity must
-          // never scale it — the subtotal multiplies price × qty once.
-          const unit = perUnitLinePrice({
-            silverRate,
-            netWeight: li.netWeight,
-            makingCharge: li.makingCharge,
-            fallback: null,
-          })
+        const qtyChanged = 'qty' in patch && patch.qty !== li.qty
+        const weightPerPieceChanged = 'netWeight' in patch && patch.netWeight !== li.netWeight
+        // Quantity and weight-per-piece are the two inputs the total weight is
+        // derived from — touching either re-applies
+        // Total = Qty × Weight Per Piece (which is also how a manual total is
+        // cleared). Editing the total itself keeps the typed value until one of
+        // them changes next.
+        if (qtyChanged || weightPerPieceChanged) {
+          updated.totalWeight = derivedTotalWeight(updated.qty, updated.netWeight)
+        }
+        // Keep the PER-UNIT price in step with the weight/making inputs at the
+        // current rate; quantity never scales it — the subtotal multiplies
+        // price × qty once.
+        const priceInputsChanged =
+          qtyChanged ||
+          weightPerPieceChanged ||
+          ('totalWeight' in patch && patch.totalWeight !== li.totalWeight) ||
+          ('makingCharge' in patch && patch.makingCharge !== li.makingCharge)
+        if (priceInputsChanged) {
+          const unit = lineUnitPrice(updated)
           if (unit !== undefined) updated.price = unit
         }
         return updated
@@ -1072,6 +1183,13 @@ export default function SalesOrdersPage() {
         sku: li.sku,
         quantity: Math.max(0, Math.floor(li.qty) || 0),
         price: Number(li.price) || 0,
+        // Weight & pricing per line: the weight per piece (product value or
+        // manual entry), the total weight (qty × weight per piece, or the
+        // manual override) and the making charge. Omitted when unknown so the
+        // backend falls back to the catalogue.
+        ...(li.netWeight != null && li.netWeight > 0 ? { netWeight: li.netWeight } : {}),
+        ...(li.totalWeight != null && li.totalWeight > 0 ? { weight: li.totalWeight } : {}),
+        ...(li.makingCharge != null ? { makingCharge: li.makingCharge } : {}),
         // Shopify sync targets the exact variant; the local invoice keeps
         // billing the variant's SKU, which the line already carries.
         ...(li.variantId
@@ -1098,16 +1216,33 @@ export default function SalesOrdersPage() {
         : originalItems.length !== items.length ||
           originalItems.some((oi, i) => {
             const cur = items[i]
-            return !cur || String(oi.title ?? '') !== cur.title || String(oi.sku ?? '') !== cur.sku || Number(oi.quantity ?? 0) !== cur.quantity || Number(oi.price ?? 0) !== cur.price
+            return (
+              !cur ||
+              String(oi.title ?? '') !== cur.title ||
+              String(oi.sku ?? '') !== cur.sku ||
+              Number(oi.quantity ?? 0) !== cur.quantity ||
+              Number(oi.price ?? 0) !== cur.price ||
+              // A weight-only edit must reach the API too — the stored line
+              // keeps its own weight/making snapshot fields.
+              Number(oi.netWeight ?? 0) !== Number(cur.netWeight ?? 0) ||
+              Number(oi.weight ?? 0) !== Number(cur.weight ?? 0) ||
+              Number(oi.makingCharge ?? 0) !== Number(cur.makingCharge ?? 0)
+            )
           })
     setSaving(true)
     setFormError('')
     setServerStockErrors({})
     try {
       const shared = hasAddress(billingAddr) ? billingAddr : shippingAddr
-      const billing = customerSel === '__new__' ? toAddressPayload(shared, customerName) : undefined
-      const shipping =
-        customerSel === '__new__' ? (sameAsBilling ? billing : toAddressPayload(shippingAddr, customerName)) : undefined
+      // Addresses follow the form for existing customers too (the Edit
+      // Customer Details modal writes into these same fields); an order whose
+      // addresses were never filled still saves none, exactly as before.
+      const billing = hasAddress(shared) ? toAddressPayload(shared, customer) : undefined
+      const shipping = sameAsBilling
+        ? billing
+        : hasAddress(shippingAddr)
+          ? toAddressPayload(shippingAddr, customer)
+          : undefined
       const common = {
         customer,
         email: customerEmail.trim() || undefined,
@@ -1143,12 +1278,86 @@ export default function SalesOrdersPage() {
     }
   }
 
-  const customerOptions = customers.map((c) => ({
-    value: c.name,
-    label: c.name,
-    keywords: `${c.email ?? ''} ${c.phone ?? ''}`.trim(),
-    subtitle: [c.email, c.phone].filter(Boolean).join(' · ') || undefined,
-  }))
+  // Options for the customer dropdown. Customers without a name are skipped:
+  // their value '' collides with the "nothing chosen" state, so the row would
+  // never be selectable and just stacks as blank rows at the top of the list.
+  const customerOptions = customers
+    .filter((c) => c.name.trim() !== '')
+    .map((c) => ({
+      value: c.name,
+      label: c.name,
+      keywords: `${c.email ?? ''} ${c.phone ?? ''}`.trim(),
+      subtitle: [c.email, c.phone].filter(Boolean).join(' · ') || undefined,
+    }))
+
+  const custSnapshot = () => JSON.stringify(custForm)
+
+  /** Seed the modal from the customer record + whatever the form already holds. */
+  const openCustomerEditor = () => {
+    const c = customers.find((x) => x.name === customerSel)
+    const billing = hasAddress(billingAddr)
+      ? billingAddr
+      : { ...emptyAddress(), name: customerSel, city: c?.city ?? '', province: c?.province ?? '' }
+    const form = {
+      name: customerName || customerSel,
+      email: customerEmail || c?.email || '',
+      phone: customerPhone || c?.phone || '',
+      billing,
+      shipping: hasAddress(shippingAddr) ? shippingAddr : billing,
+      sameAsBilling: sameAsBilling || !hasAddress(shippingAddr),
+    }
+    setCustForm(form)
+    setCustBaseline(JSON.stringify(form))
+    setCustErrors({})
+    setCustEditOpen(true)
+  }
+
+  const saveCustomerDetails = async () => {
+    const name = custForm.name.trim()
+    const email = custForm.email.trim()
+    const phone = custForm.phone.trim()
+    const errors: Record<string, string> = {}
+    if (!name) errors.name = 'Customer name is required'
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.email = 'Enter a valid email address'
+    if (phone && !/^\+?[0-9][0-9\s\-().]{6,19}$/.test(phone)) errors.phone = 'Enter a valid phone number'
+    setCustErrors(errors)
+    if (Object.keys(errors).length > 0) return
+
+    const billing = custForm.billing
+    const shipping = custForm.sameAsBilling ? billing : custForm.shipping
+    setCustSaving(true)
+    try {
+      const target = customers.find((x) => x.name === customerSel)
+      if (target) {
+        // Update the existing row in place — same id, same record, so the
+        // customer's other orders and invoices keep pointing at them and no
+        // duplicate customer is ever inserted.
+        const patch = {
+          name,
+          email,
+          phone,
+          city: billing.city.trim(),
+          province: billing.province.trim(),
+        }
+        await dbApi.update('customers', target.id, patch)
+        setCustomers((prev) => prev.map((x) => (x.id === target.id ? { ...x, ...patch } : x)))
+      }
+      // The order form follows the edited details.
+      setCustomerSel(name)
+      setCustomerName(name)
+      setCustomerEmail(email)
+      setCustomerPhone(phone)
+      setBillingAddr(billing)
+      setShippingAddr(shipping)
+      setSameAsBilling(custForm.sameAsBilling)
+      setCustEditOpen(false)
+      toast.success('Customer details updated')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not update customer details')
+    } finally {
+      setCustSaving(false)
+    }
+  }
 
   return (
     <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-6 lg:px-6">
@@ -1169,9 +1378,6 @@ export default function SalesOrdersPage() {
             </Button>
             <Button size="sm" className="gap-1.5" onClick={openDialog}>
               <Plus className="h-4 w-4" /> Manual Order
-            </Button>
-            <Button size="sm" className="gap-1.5" onClick={() => openManualInvoice(null)}>
-              <FileText className="h-4 w-4" /> New Invoice
             </Button>
           </>
         }
@@ -1361,14 +1567,23 @@ export default function SalesOrdersPage() {
               <div className="space-y-5">
                 <div>
                   <div className="mb-2 flex items-center justify-between">
-                    <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Customer</Label>
-                    <span className="text-[11px] text-muted-foreground">Pick an existing customer or add a new one</span>
+                    <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Customer Details</Label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] text-muted-foreground">Pick an existing customer or add a new one</span>
+                      {customerSel && customerSel !== '__new__' ? (
+                        <Button variant="outline" size="sm" onClick={openCustomerEditor} disabled={custSaving}>
+                          <Pencil className="h-3.5 w-3.5" /> Edit Customer Details
+                        </Button>
+                      ) : null}
+                    </div>
                   </div>
                   <SearchableSelect
                     placeholder="Select customer"
                     searchPlaceholder="Search customers..."
                     options={[...customerOptions, { value: '__new__', label: 'New customer…' }]}
                     value={customerSel}
+                    compact
+                    contentClassName="min-w-[16rem] max-w-sm rounded-xl z-[60] shadow-lg"
                     onValueChange={(v) => {
                       setCustomerSel(v)
                       if (v !== '__new__') {
@@ -1430,7 +1645,7 @@ export default function SalesOrdersPage() {
 
               <div>
                 <div className="mb-2 flex items-center justify-between">
-                  <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Line Items</Label>
+                  <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Product Details</Label>
                   <Button variant="outline" size="sm" onClick={() => setLineItems((prev) => [...prev, emptyLine()])}>
                     <Plus className="h-3.5 w-3.5" /> Add Item
                   </Button>
@@ -1488,12 +1703,11 @@ export default function SalesOrdersPage() {
                 ) : null}
                   {editing ? (
                     <p className="mb-2 text-[11px] text-muted-foreground">
-                      Existing line items are not stored in the ERP. Add items below to change the total, or leave them blank to keep the current value.
+                      Saved line items load below with their original weight and price. Change a quantity or weight to recalculate, or leave them untouched to keep the current value.
                     </p>
                   ) : null}
                   <div className="space-y-2">
                     {lineItems.map((li) => {
-                      const stockError = lineStockErrors[li.key]
                       const rowProduct = products.find((p) => p.id === li.productId)
                       const rowVariants = rowProduct ? variantOptions(rowProduct) : []
                       return (
@@ -1538,46 +1752,6 @@ export default function SalesOrdersPage() {
                             />
                           </div>
                         ) : null}
-                        <div className="w-20">
-                          <Label className="text-xs text-muted-foreground">Qty</Label>
-                          <Input
-                            type="number"
-                            min="1"
-                            value={li.qty}
-                            onChange={(e) => updateLineItem(li.key, { qty: Math.max(1, Number(e.target.value)) })}
-                            className={cn(
-                              stockError &&
-                                'border-red-500 focus-visible:border-red-500 focus-visible:ring-red-500/40',
-                            )}
-                            aria-invalid={stockError ? true : undefined}
-                          />
-                          {stockError ? (
-                            <p className="mt-1 text-[11px] leading-snug text-red-600 dark:text-red-400">{stockError}</p>
-                          ) : null}
-                        </div>
-                        <div className="w-28">
-                          <Label className="text-xs text-muted-foreground">Price (?)</Label>
-                          <Input
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            value={li.price}
-                            onChange={(e) => updateLineItem(li.key, { price: Number(e.target.value) })}
-                          />
-                          {/* Show price breakdown when calculated from silver rate */}
-                          {li.netWeight && li.netWeight > 0 && li.makingCharge && li.makingCharge > 0 && silverRate && (
-                            <div className="mt-1 text-[10px] text-muted-foreground space-y-0.5">
-                              <div>Silver: {silverRate.toFixed(2)} × {li.netWeight} × {li.qty} = ₹{(silverRate * li.netWeight * li.qty).toFixed(2)}</div>
-                              <div>Making: {li.makingCharge.toFixed(2)} × {li.netWeight} × {li.qty} = ₹{(li.makingCharge * li.netWeight * li.qty).toFixed(2)}</div>
-                              <div>Subtotal: ₹{(silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty).toFixed(2)}</div>
-                              <div>GST (3%): ₹{((silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty) * 0.03).toFixed(2)}</div>
-                              <div className="font-medium">Total: ₹{(silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty + (silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty) * 0.03).toFixed(2)}</div>
-                            </div>
-                          )}
-                        </div>
-                        <div className="w-28 pb-0.5 text-right text-sm font-semibold tabular-nums text-foreground">
-                          {formatCurrency((Number.isFinite(li.price) ? li.price : 0) * (Number.isFinite(li.qty) ? li.qty : 0))}
-                        </div>
                         <Button
                           variant="ghost"
                           size="icon-sm"
@@ -1591,12 +1765,141 @@ export default function SalesOrdersPage() {
                       )
                     })}
                   </div>
-                  <div className="mt-2 flex items-center justify-between rounded-md bg-muted/50 px-3 py-2 text-sm">
-                    <span className="text-muted-foreground">{editing && totalValue === 0 ? 'Order value (unchanged)' : 'Total order value'}</span>
-                    <span className="font-bold tabular-nums text-foreground">
-                      {formatCurrency(totalValue > 0 ? totalValue : (editing?.value ?? 0))}
+                </div>
+
+                <div>
+                  <div className="mb-2 flex items-center justify-between">
+                    <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Weight & Pricing</Label>
+                    <span className="text-[11px] text-muted-foreground">Total Weight = Quantity × Weight Per Piece</span>
+                  </div>
+                  <div className="space-y-2">
+                    {lineItems.map((li, idx) => {
+                      const stockError = lineStockErrors[li.key]
+                      // A manually overridden total enters pricing as its per-unit
+                      // equivalent, so the breakdown always matches the line total.
+                      const effWeightPerPiece =
+                        li.qty > 0 && li.totalWeight != null && li.totalWeight > 0
+                          ? li.totalWeight / li.qty
+                          : li.netWeight ?? 0
+                      const makingCharge = li.makingCharge ?? 0
+                      const billableGrams =
+                        li.qty > 0 && li.totalWeight != null && li.totalWeight > 0
+                          ? li.totalWeight
+                          : effWeightPerPiece * li.qty
+                      const showBreakdown = Boolean(effWeightPerPiece > 0 && makingCharge > 0 && silverRate)
+                      return (
+                        <div key={li.key} className="rounded-lg border bg-muted/30 p-2.5">
+                          <p className="mb-2 truncate text-[11px] font-medium text-muted-foreground">
+                            {li.title || li.sku || 'Untitled line'}
+                          </p>
+                          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+                            <div>
+                              <Label className="text-xs text-muted-foreground">Quantity</Label>
+                              <Input
+                                type="number"
+                                min="1"
+                                step="1"
+                                aria-label={`Qty for line ${idx + 1}`}
+                                value={li.qty}
+                                onChange={(e) =>
+                                  updateLineItem(li.key, { qty: Math.max(1, Math.floor(Number(e.target.value) || 1)) })
+                                }
+                                className={cn(
+                                  stockError &&
+                                    'border-red-500 focus-visible:border-red-500 focus-visible:ring-red-500/40',
+                                )}
+                                aria-invalid={stockError ? true : undefined}
+                              />
+                              {stockError ? (
+                                <p className="mt-1 text-[11px] leading-snug text-red-600 dark:text-red-400">{stockError}</p>
+                              ) : null}
+                            </div>
+                            <div>
+                              <Label className="text-xs text-muted-foreground">Weight Per Piece (g)</Label>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.001"
+                                aria-label={`Weight per piece for line ${idx + 1} (g)`}
+                                placeholder="e.g. 10"
+                                value={li.netWeight ?? ''}
+                                onChange={(e) => updateLineItem(li.key, { netWeight: parseNumberInput(e.target.value) })}
+                              />
+                            </div>
+                            <div>
+                              <Label className="text-xs text-muted-foreground">Total Weight (g)</Label>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.001"
+                                aria-label={`Total weight for line ${idx + 1} (g)`}
+                                placeholder="Calculated"
+                                value={li.totalWeight ?? ''}
+                                onChange={(e) => updateLineItem(li.key, { totalWeight: parseNumberInput(e.target.value) })}
+                              />
+                            </div>
+                            <div>
+                              <Label className="text-xs text-muted-foreground">Making Charges (₹/g)</Label>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.01"
+                                aria-label={`Making charge for line ${idx + 1} (₹/g)`}
+                                placeholder="0"
+                                value={li.makingCharge ?? ''}
+                                onChange={(e) => updateLineItem(li.key, { makingCharge: parseNumberInput(e.target.value) })}
+                              />
+                            </div>
+                            <div>
+                              <Label className="text-xs text-muted-foreground">Unit Price (₹)</Label>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.01"
+                                aria-label={`Unit price for line ${idx + 1} (₹)`}
+                                value={li.price}
+                                onChange={(e) => updateLineItem(li.key, { price: Number(e.target.value) })}
+                              />
+                              {/* Price breakdown when the rate-based calculation applies */}
+                              {showBreakdown ? (
+                                <div className="mt-1 space-y-0.5 text-[10px] text-muted-foreground">
+                                  <div>Silver: {silverRate!.toFixed(2)} × {effWeightPerPiece} × {li.qty} = ₹{(silverRate! * billableGrams).toFixed(2)}</div>
+                                  <div>Making: {makingCharge.toFixed(2)} × {effWeightPerPiece} × {li.qty} = ₹{(makingCharge * billableGrams).toFixed(2)}</div>
+                                  <div>Subtotal: ₹{(silverRate! * billableGrams + makingCharge * billableGrams).toFixed(2)}</div>
+                                  <div>GST (3%): ₹{((silverRate! * billableGrams + makingCharge * billableGrams) * 0.03).toFixed(2)}</div>
+                                  <div className="font-medium">Total: ₹{((silverRate! * billableGrams + makingCharge * billableGrams) * 1.03).toFixed(2)}</div>
+                                </div>
+                              ) : null}
+                            </div>
+                            <div>
+                              <Label className="text-xs text-muted-foreground">Total Amount</Label>
+                              <div className="flex h-9 items-center text-sm font-semibold tabular-nums text-foreground">
+                                {formatCurrency(
+                                  (Number.isFinite(li.price) ? li.price : 0) * (Number.isFinite(li.qty) ? li.qty : 0),
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div className="mt-2 flex items-center justify-between rounded-md bg-muted/50 px-3 py-2 text-xs">
+                    <span className="text-muted-foreground">
+                      Total weight: <b className="tabular-nums text-foreground">{roundWeight(totalWeight)} g</b>
+                    </span>
+                    <span className="text-muted-foreground">
+                      {editing && totalValue === 0 ? 'Order value (unchanged)' : 'Total amount'}:{' '}
+                      <b className="tabular-nums text-foreground">
+                        {formatCurrency(totalValue > 0 ? totalValue : (editing?.value ?? 0))}
+                      </b>
                     </span>
                   </div>
+                  <p className="mt-1.5 text-[11px] text-muted-foreground">
+                    Changing Quantity or Weight Per Piece recalculates Total Weight as Qty × Weight Per Piece. Editing
+                    Total Weight directly keeps your value until either changes. Products without a configured weight
+                    need the weight entered here.
+                  </p>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -1682,6 +1985,108 @@ export default function SalesOrdersPage() {
               </div>
             </>
           )}
+      </AppDialog>
+
+      {/* Edit Customer Details: updates the existing customer record in place
+          (PATCH by id — never an insert) and mirrors the changes onto this
+          order's form fields. */}
+      <AppDialog
+        open={custEditOpen}
+        onOpenChange={(open) => { if (!open) setCustEditOpen(false) }}
+        size="lg"
+        isDirty={custEditOpen && custSnapshot() !== custBaseline}
+        title="Edit Customer Details"
+        description={`Changes update ${customerSel || 'this customer'}\u2019s existing record — no duplicate customer is created.`}
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCustEditOpen(false)} disabled={custSaving}>Cancel</Button>
+            <Button onClick={saveCustomerDetails} disabled={custSaving}>
+              {custSaving ? (
+                <>
+                  <RefreshCw className="h-4 w-4 animate-spin" /> Saving...
+                </>
+              ) : (
+                'Save Changes'
+              )}
+            </Button>
+          </DialogFooter>
+        }
+      >
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div>
+              <Label className="text-xs text-muted-foreground">Customer Name *</Label>
+              <Input
+                aria-label="Customer name"
+                value={custForm.name}
+                onChange={(e) => setCustForm((f) => ({ ...f, name: e.target.value }))}
+                placeholder="Customer name"
+              />
+              {custErrors.name ? (
+                <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">{custErrors.name}</p>
+              ) : null}
+            </div>
+            <div>
+              <Label className="text-xs text-muted-foreground">Email</Label>
+              <Input
+                type="email"
+                aria-label="Email"
+                value={custForm.email}
+                onChange={(e) => setCustForm((f) => ({ ...f, email: e.target.value }))}
+                placeholder="name@example.com"
+              />
+              {custErrors.email ? (
+                <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">{custErrors.email}</p>
+              ) : null}
+            </div>
+            <div>
+              <Label className="text-xs text-muted-foreground">Phone</Label>
+              <Input
+                aria-label="Phone"
+                value={custForm.phone}
+                onChange={(e) => setCustForm((f) => ({ ...f, phone: e.target.value }))}
+                placeholder="+91 …"
+              />
+              {custErrors.phone ? (
+                <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">{custErrors.phone}</p>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between rounded-lg border bg-muted/30 px-3 py-2.5">
+            <div>
+              <p className="text-sm font-medium text-foreground">Billing & shipping address are the same</p>
+              <p className="text-[11px] text-muted-foreground">Ship to the billing address</p>
+            </div>
+            <Switch
+              checked={custForm.sameAsBilling}
+              onCheckedChange={(on) =>
+                setCustForm((f) => ({ ...f, sameAsBilling: on, shipping: on ? f.billing : f.shipping }))
+              }
+            />
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <AddressFields
+              title="Billing Address"
+              addr={custForm.billing}
+              onChange={(a) => setCustForm((f) => ({ ...f, billing: a }))}
+              fallbackName={custForm.name}
+            />
+            {custForm.sameAsBilling ? (
+              <div className="flex min-h-[160px] items-center justify-center rounded-md border border-dashed bg-muted/20 px-3 py-4 text-center text-xs text-muted-foreground">
+                Shipping address will match the billing address.
+              </div>
+            ) : (
+              <AddressFields
+                title="Shipping Address"
+                addr={custForm.shipping}
+                onChange={(a) => setCustForm((f) => ({ ...f, shipping: a }))}
+                fallbackName={custForm.name}
+              />
+            )}
+          </div>
+        </div>
       </AppDialog>
 
       <AppDialog
@@ -1828,13 +2233,6 @@ export default function SalesOrdersPage() {
           ) : null}
       </AppDialog>
 
-      <ManualInvoiceDialog
-        open={manualInvoiceOpen}
-        onOpenChange={setManualInvoiceOpen}
-        initialCustomer={manualInvoiceOrder?.customer ?? ''}
-        initialCustomerPhone={manualInvoiceOrder?.customerPhone ?? ''}
-      />
-
       <AppDialog
         open={viewDialogOpen}
         onOpenChange={setViewDialogOpen}
@@ -1871,7 +2269,25 @@ export default function SalesOrdersPage() {
           setLineItems((prev) =>
             prev.map((li) =>
               li.key === key
-                ? { ...li, productId: product.id, title: product.name, sku: product.sku ?? li.sku, price: product.sellingPrice ?? li.price }
+                ? {
+                    ...li,
+                    productId: product.id,
+                    title: product.name,
+                    sku: product.sku ?? li.sku,
+                    // Same wiring as picking from the list: rate-based price
+                    // (selling price as the fallback) plus the product's own
+                    // weight per piece and making charge.
+                    price:
+                      perUnitLinePrice({
+                        silverRate,
+                        netWeight: product.netWeight,
+                        makingCharge: product.makingCharge,
+                        fallback: product.sellingPrice,
+                      }) ?? li.price,
+                    netWeight: product.netWeight,
+                    makingCharge: product.makingCharge,
+                    totalWeight: derivedTotalWeight(li.qty, product.netWeight),
+                  }
                 : li,
             ),
           )
@@ -1926,6 +2342,10 @@ function AddressFields({
         <div>
           <Label className="text-xs text-muted-foreground">PIN / Zip</Label>
           <Input value={addr.zip} onChange={(e) => set({ zip: e.target.value })} placeholder="PIN code" />
+        </div>
+        <div>
+          <Label className="text-xs text-muted-foreground">Country</Label>
+          <Input value={addr.country} onChange={(e) => set({ country: e.target.value })} placeholder="Country" />
         </div>
         <div>
           <Label className="text-xs text-muted-foreground">Phone</Label>

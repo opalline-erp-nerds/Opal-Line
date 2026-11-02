@@ -214,21 +214,13 @@ test.describe('invoice mutations round-trip', () => {
       const dialog = page.getByRole('dialog')
       await expect(dialog).toBeVisible({ timeout: 10000 })
       await dialog.getByPlaceholder('e.g. Silver Classic Ring').fill(name)
-      await dialog.getByPlaceholder('e.g. SLV-RNG-00001').fill(sku)
+      await dialog.getByLabel('Product SKU').fill(sku)
       // The dialog refuses to save without a priceable product: a valid silver
       // rate is mandatory and net weight drives the auto-computed selling price.
-      // Both inputs carry no placeholder, so address them by their field label.
-      // These pricing inputs have no placeholder or accessible name (the Field
-      // label isn't associated), so address them structurally: each field is a
-      // wrapper div whose second child is the input. Tailwind's `space-y-1.5`
-      // class can't be used in a CSS selector without escaping, so target divs
-      // generically and disambiguate by the label text inside the wrapper.
-      const field = (label: string) =>
-        dialog
-          .locator('div:has(> label)', { hasText: label })
-          .locator('input')
-      await field('Net weight (g)').fill('5')
-      await field('Silver rate (₹/g) *').fill('90')
+      // Both price inputs expose an aria-label (the Field label isn't
+      // associated), so address them by that.
+      await dialog.getByLabel('Net weight').fill('5')
+      await dialog.getByLabel('Silver rate').fill('90')
       // Add mode defaults "Push to Shopify" ON, so the label is either
       // "Create & Push to Shopify" or "Create Product" depending on the toggle.
       await dialog.getByRole('button', { name: /Create (Product|& Push to Shopify)/ }).click()
@@ -371,14 +363,25 @@ test.describe('invoice mutations round-trip', () => {
       await expect(dialog).toBeVisible({ timeout: 10000 })
       await expect(dialog.getByText('New Sales Invoice')).toBeVisible()
 
-      // Header — customer is the only required field.
-      await dialog.getByPlaceholder('Walk-in customer').fill(customer)
+      // The customer field sits inside a <label>, and a wrapping label
+      // overrides a button's accessible name — so address the picker trigger
+      // through the label, then type the walk-in name (every keystroke also
+      // writes it into the form) and close the menu with Escape.
+      await dialog.locator('label', { hasText: 'Customer *' }).getByRole('button').click()
+      // Radix portals the picker's menu to <body>, so its search box lives
+      // OUTSIDE the dialog element — address it from the page scope.
+      await page.getByRole('textbox', { name: 'Search customers' }).fill(customer)
+      await page.keyboard.press('Escape')
 
       // First line, typed by hand (no SKU): stock is left alone without one.
+      // Columns: Product / SKU · Qty · Net wt / pc · Rate / gm (locked to the
+      // managed silver rate, no input) · Making / gm · Amount · actions. The
+      // amount line = weight × (rate + making), so driving making/gram alone
+      // guarantees a positive total whatever the environment's silver rate.
       const line = dialog.locator('table tbody tr').first()
-      await line.getByPlaceholder('Item name / SKU').fill(itemName)
-      await line.locator('td').nth(2).locator('input').fill('10') // weight (gm)
-      await line.locator('td').nth(3).locator('input').fill('90') // rate (₹/gm)
+      await line.getByPlaceholder('Search name or SKU…').fill(itemName)
+      await line.locator('td').nth(2).locator('input').fill('10') // net wt / pc (gm)
+      await line.locator('td').nth(4).locator('input').fill('90') // making / gm (₹)
 
       await dialog.getByRole('button', { name: /Create invoice/ }).click()
 
@@ -414,12 +417,12 @@ test.describe('invoice mutations round-trip', () => {
     }
   })
 
-  test('Sales Orders offers manual invoicing from the header and the row menu', async ({ page }) => {
+  test('Sales Orders no longer offers manual invoicing from the header or row menu', async ({ page }) => {
     const stamp = Date.now()
     const customer = `E2E Order Cust ${stamp}`
 
     const apiClient = await api()
-    // Fixture: one order, so the row action has a buyer to pre-fill from.
+    // Fixture: one order, so the row menu can be opened and inspected.
     const orderResp = await apiClient.post('/api/v1/db/sales-orders', {
       shopifyId: `#E2E-MANINV-${stamp}`,
       customer,
@@ -437,37 +440,21 @@ test.describe('invoice mutations round-trip', () => {
       await page.goto('/sales/orders')
       await expect(page.getByRole('heading', { level: 1 }).first()).toBeVisible({ timeout: 20000 })
 
-      // Header: opens the same dialog in place and starts blank.
-      await page.getByRole('button', { name: 'New Invoice' }).click()
-      await expect(page).toHaveURL(/\/sales\/orders/, { timeout: 5000 })
-      const dialog = page.getByRole('dialog')
-      await expect(dialog.getByText('New Sales Invoice')).toBeVisible({ timeout: 10000 })
-      await expect(dialog.getByPlaceholder('Walk-in customer')).toHaveValue('')
-      await dialog.getByRole('button', { name: /^Cancel$/ }).click()
-      await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 5000 })
+      // The manual-invoice entry points were removed from this page: no
+      // header "New Invoice" button…
+      await expect(page.getByRole('button', { name: 'New Invoice' })).toHaveCount(0)
+      // …and the order workflow itself is otherwise intact — Manual Order
+      // still creates orders, and invoicing an order (row action / view
+      // dialog) plus manual invoicing on Sales Invoices still exist.
+      await expect(page.getByRole('button', { name: 'Manual Order' })).toBeVisible({ timeout: 10000 })
 
-      // Row menu: opens the same dialog with the order's buyer pre-filled.
       const row = page.locator('table tbody tr', { hasText: customer })
       await expect(row).toHaveCount(1, { timeout: 20000 })
       // The trigger is a bare icon button with no accessible name.
       await row.first().locator('button:has(svg.lucide-more-horizontal)').click()
-      await page.getByRole('menuitem', { name: /New invoice for this customer/ }).click()
-
-      await expect(dialog.getByPlaceholder('Walk-in customer')).toHaveValue(customer, { timeout: 10000 })
-      const line = dialog.locator('table tbody tr').first()
-      await line.getByPlaceholder('Item name / SKU').fill(`E2E Order Ring ${stamp}`)
-      await line.locator('td').nth(2).locator('input').fill('5')
-      await line.locator('td').nth(3).locator('input').fill('90')
-      await dialog.getByRole('button', { name: /Create invoice/ }).click()
-      await expect(page.getByText('New Sales Invoice')).toHaveCount(0, { timeout: 20000 })
-
-      // The invoice landed, billed to the order's customer.
-      const list = await (await apiClient.get('/api/v1/db/invoices?limit=200')).json()
-      const saved = ((list.data ?? []) as Array<{ number: string; customer: string; grandTotal: number }>).find(
-        (r) => r.customer === customer,
-      )
-      expect(saved, 'invoice created from the orders page must exist in the API').toBeTruthy()
-      expect(saved!.grandTotal, 'totals are computed from the line').toBeGreaterThan(0)
+      // No "New invoice for this customer" menu item either.
+      await expect(page.getByRole('menuitem', { name: /New invoice for this customer/ })).toHaveCount(0)
+      await page.keyboard.press('Escape')
     } finally {
       try {
         const list = await (await apiClient.get('/api/v1/db/invoices?limit=200')).json()

@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
 import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
-import { buildPricedOrder, type ValidatedOrderItem } from './orderPricing'
+import { buildPricedOrder, ORDER_GST_RATE, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
 import { deductOrderLineStock, resolveMovementLocation, restoreOrderLineStock } from './stock'
@@ -1981,7 +1981,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       .limit(1)
     if (!existing) return res.status(404).json({ error: 'Order not found' })
 
-    const { customer, email, phone, payment: rawPayment, fulfillment: rawFulfillment, status, date, note, items, shippingAddress, syncToShopify } = req.body
+    const { customer, email, phone, payment: rawPayment, fulfillment: rawFulfillment, status, date, note, items, billingAddress, shippingAddress, syncToShopify } = req.body
 
     // Normalize payment and fulfillment values
     const payment = rawPayment === 'Online' || rawPayment === 'online' ? 'paid' : rawPayment
@@ -1989,19 +1989,84 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
 
     let value = Number(existing.value ?? 0)
     let itemCount = Number(existing.items ?? 0)
-    let mappedLineItems: Array<{ title: string; sku: string; quantity: number; price: number }> | null = null
+    let mappedLineItems: Array<Record<string, unknown>> | null = null
     if (items) {
+      // Lines carry their weight & pricing snapshot — the order→invoice
+      // generator reads weight/silverValue/makingValue/amount straight off
+      // manual orders, so an edit must keep that snapshot coherent instead of
+      // stripping it to {title, sku, qty, price} and invoicing ₹0 later.
+      const productSkus: string[] = Array.from(
+        new Set<string>(
+          items
+            .map((li: any) => String(li.productSku ?? li.sku ?? '').trim())
+            .filter(Boolean),
+        ),
+      )
+      const productRows = productSkus.length
+        ? await db
+            .select({ sku: schema.products.sku, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge })
+            .from(schema.products)
+            .where(inArray(schema.products.sku, productSkus))
+        : []
+      const productMap = new Map(
+        productRows.map((p) => [
+          String(p.sku ?? '').trim(),
+          { netWeight: Number(p.netWeight ?? 0), makingCharge: Number(p.makingCharge ?? 0) },
+        ]),
+      )
+      const latestRate = await getLatestSilverRate()
+      const currentRate = latestRate && latestRate.rate && latestRate.rate > 0 ? latestRate.rate : 0
+
       const mapped = items
-        .map((li: any) => ({
-          title: String(li.title ?? li.name ?? '').trim(),
-          sku: String(li.sku ?? ''),
-          quantity: Math.max(0, Math.floor(Number(li.quantity ?? li.qty ?? 0)) || 0),
-          price: Number(li.price ?? 0),
-        }))
+        .map((li: any) => {
+          const title = String(li.title ?? li.name ?? '').trim()
+          const sku = String(li.sku ?? '')
+          const quantity = Math.max(0, Math.floor(Number(li.quantity ?? li.qty ?? 0)) || 0)
+          const price = Number(li.price ?? 0)
+          // Same weight rules as create: the form's value wins, the catalogue
+          // fills in when the form sent none, total = qty × weight per piece.
+          const product = productMap.get(String(li.productSku ?? sku).trim()) ?? { netWeight: 0, makingCharge: 0 }
+          const formWeightPerPiece = Number(li.netWeight ?? 0)
+          const netWeight = formWeightPerPiece > 0 ? formWeightPerPiece : product.netWeight
+          const makingCharge =
+            li.makingCharge === undefined || li.makingCharge === null ? product.makingCharge : Number(li.makingCharge)
+          const formTotalWeight = Number(li.weight ?? 0)
+          const weight =
+            formTotalWeight > 0
+              ? Math.round(formTotalWeight * 1000) / 1000
+              : netWeight > 0
+                ? Math.round(netWeight * quantity * 1000) / 1000
+                : 0
+          // Snapshot derived from the stored per-unit price so invoicing an
+          // edited order reproduces its order value exactly (amount is the
+          // ex-GST half of price × qty; the silver/making split follows the
+          // current rate — identical to create's split while the rate holds).
+          const lineTotal = Math.round(price * quantity * 100) / 100
+          const amount = Math.round((lineTotal / (1 + ORDER_GST_RATE / 100)) * 100) / 100
+          const splitBase = currentRate + Math.max(makingCharge, 0)
+          const silverValue =
+            weight > 0 && currentRate > 0 && splitBase > 0
+              ? Math.round(amount * (currentRate / splitBase) * 100) / 100
+              : amount
+          const makingValue = Math.round((amount - silverValue) * 100) / 100
+          return {
+            title,
+            sku,
+            quantity,
+            price,
+            makingCharge,
+            ...(netWeight > 0 ? { netWeight } : {}),
+            ...(weight > 0 ? { weight, silverRate: currentRate } : { silverRate: 0 }),
+            ...(weight > 0 ? { silverValue, makingValue } : { silverValue: amount, makingValue: 0 }),
+            amount,
+            ...(li.variantId !== undefined && li.variantId !== null ? { variantId: li.variantId } : {}),
+            ...(li.productSku ? { productSku: String(li.productSku) } : {}),
+          }
+        })
         .filter((li: any) => li.title && li.quantity > 0)
       if (mapped.length > 0) {
-        value = Math.round(mapped.reduce((s: number, li: { price: number; quantity: number }) => s + li.price * li.quantity, 0) * 100) / 100
-        itemCount = mapped.reduce((s: number, li: { quantity: number }) => s + li.quantity, 0)
+        value = Math.round(mapped.reduce((s: number, li: any) => s + li.price * li.quantity, 0) * 100) / 100
+        itemCount = mapped.reduce((s: number, li: any) => s + li.quantity, 0)
         mappedLineItems = mapped
       }
     }
@@ -2016,6 +2081,12 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       ...(mappedLineItems ? { lineItems: mappedLineItems } : {}),
     }
     if (date) updates.date = new Date(String(date)).toISOString()
+    // Contact & address edits made in the order dialog must survive the save
+    // (they previously only fed the Shopify sync and were dropped from the row).
+    if (billingAddress !== undefined) updates.billingAddress = billingAddress
+    if (shippingAddress !== undefined) updates.shippingAddress = shippingAddress
+    if (email !== undefined) updates.customerEmail = String(email).trim() || null
+    if (phone !== undefined) updates.customerPhone = String(phone).trim() || null
 
     // If line items changed, rebalance product stock: restore the previous
     // items' stock, then deduct stock for the new items (mirroring the create

@@ -80,6 +80,14 @@ export const createOrderSchema = z.object({
     // billed against a specific variant. Optional so flat products and every
     // existing client keep working unchanged.
     variantId: z.union([z.string().max(120), z.number()]).optional(),
+    // Weight & pricing snapshot from the order form. The catalogue stays the
+    // source of truth (a supplied value only fills a product with no
+    // configured weight), so these are optional — clients that don't send
+    // them keep the exact product-derived behaviour they have today.
+    // Decimal grams are supported: silver jewellery is billed to 3 dp.
+    netWeight: z.number().min(0).max(100000).optional(),
+    weight: z.number().min(0).max(1000000).optional(),
+    makingCharge: z.number().min(0).max(1000000).optional(),
   })).min(1, 'At least one item is required'),
   billingAddress: z.object({
     name: z.string().max(255).optional(),
