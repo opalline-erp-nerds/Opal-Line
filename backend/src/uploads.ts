@@ -4,10 +4,20 @@ import { join, basename, resolve } from 'node:path'
 import type { Request, Response } from 'express'
 import { logger } from './logger'
 
+/** Supabase Storage. Absent on the desktop, which keeps writing local files. */
+export function supabaseStorageConfig(env: NodeJS.ProcessEnv = process.env): { url: string; key: string; bucket: string } | null {
+  const url = (env.SUPABASE_URL ?? '').trim().replace(/\/+$/, '')
+  const key = (env.SUPABASE_SERVICE_ROLE_KEY ?? '').trim()
+  const bucket = (env.SUPABASE_STORAGE_BUCKET ?? '').trim() || 'product-images'
+  if (!url || !key) return null
+  return { url, key, bucket }
+}
+
 // Uploads live under the backend package root (same logic as backups), so the
 // folder stays stable regardless of how the server process is launched.
 let _uploadsDir: string | null = null
 export function UPLOADS_DIR(): string {
+  if (process.env.UPLOADS_DIR) return resolve(process.env.UPLOADS_DIR)
   if (_uploadsDir) return _uploadsDir
   let dir = __dirname
   for (let i = 0; i < 8; i++) {
@@ -70,26 +80,43 @@ export function ensureUploadsDir(): string {
 }
 
 /**
- * Save one uploaded image. Accepts either:
- *  - a data URL ("data:image/png;base64,....")
- *  - raw base64 with an explicit mime type
- * Returns the web path ("/uploads/<file>") to store in the DB.
+ * Save one uploaded image. Accepts a data URL ("data:image/png;base64,...").
+ * Desktop (no Supabase env) returns a local web path ("/uploads/<file>").
+ * Hosted mode, when SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set,
+ * stores the bytes in that Storage bucket and returns the public object URL.
+ * The bucket must be public so the browser and Shopify can fetch it.
  */
-export function saveUploadedImage(dataUrl: string): string | null {
+export async function saveUploadedImage(dataUrl: string): Promise<string | null> {
   const match = /^data:(image\/[a-z+]+);base64,(.+)$/i.exec(dataUrl.trim())
   if (!match) return null
   const mime = match[1].toLowerCase()
-  const base64 = match[2]
   const ext = ALLOWED_MIME[mime]
   if (!ext) return null
-  const buf = Buffer.from(base64, 'base64')
+  const buf = Buffer.from(match[2], 'base64')
   if (buf.length === 0 || buf.length > MAX_UPLOAD_BYTES) return null
-  // Reject payloads whose bytes don't match the declared mime type.
   if (!matchesImageMagic(buf, mime)) return null
-  ensureUploadsDir()
-  // Content-addressed name: same image uploaded twice stores once.
   const hash = createHash('sha1').update(buf).digest('hex').slice(0, 16)
   const fileName = `${hash}-${randomUUID().slice(0, 8)}.${ext}`
+  const storage = supabaseStorageConfig()
+  if (storage) {
+    const objectPath = `products/${fileName}`
+    const res = await fetch(`${storage.url}/storage/v1/object/${encodeURIComponent(storage.bucket)}/${objectPath}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${storage.key}`,
+        apikey: storage.key,
+        'Content-Type': mime,
+        'x-upsert': 'true',
+      },
+      body: buf,
+    })
+    if (!res.ok) {
+      logger.error({ status: res.status }, 'Supabase storage upload failed')
+      return null
+    }
+    return `${storage.url}/storage/v1/object/public/${storage.bucket}/${objectPath}`
+  }
+  ensureUploadsDir()
   const filePath = join(UPLOADS_DIR(), fileName)
   if (!existsSync(filePath)) {
     require('node:fs').writeFileSync(filePath, buf)
@@ -121,7 +148,7 @@ export async function uploadImageHandler(req: Request, res: Response): Promise<v
     const paths: string[] = []
     const errors: string[] = []
     for (const [i, dataUrl] of inputs.entries()) {
-      const saved = saveUploadedImage(dataUrl)
+      const saved = await saveUploadedImage(dataUrl)
       if (saved) paths.push(saved)
       else errors.push(`Image ${i + 1}: unsupported format or too large (max 8 MB, jpeg/png/webp/gif/avif)`)
     }

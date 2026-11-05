@@ -52,3 +52,22 @@ projects:
                 sync: false
               - key: SHOPIFY_WEBHOOK_SECRET
                 sync: false
+              # Optional. Product images. Bucket must be public. Leave empty to keep local disk.
+              - key: SUPABASE_URL
+                sync: false
+              - key: SUPABASE_SERVICE_ROLE_KEY
+                sync: false
+              - key: SUPABASE_STORAGE_BUCKET
+                sync: false
+              # Optional. Supabase Storage S3 keys, from Storage → S3 Access Keys.
+              # Daily backups are pushed only when all four are set.
+              - key: BACKUP_OFFSITE_ENDPOINT
+                sync: false
+              - key: BACKUP_OFFSITE_BUCKET
+                sync: false
+              - key: BACKUP_OFFSITE_KEY_ID
+                sync: false
+              - key: BACKUP_OFFSITE_SECRET
+                sync: false
+              - key: BACKUP_OFFSITE_REGION
+                sync: false

@@ -2196,6 +2196,10 @@ async function startServer() {
         'FRONTEND_ORIGIN is still the desktop dev default. Leave it unset while this server serves the UI, and set it when the pages move to another site.',
       )
     }
+    const { supabaseStorageConfig } = await import('./uploads')
+    if (isPublicHost() && !supabaseStorageConfig()) {
+      logger.warn('Product images are still stored on local disk. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY so uploads survive a restart.')
+    }
     await loadSecretsFromDb()
     // Schedule the daily automated backup (7:00 PM local time).
     startAutoBackup()

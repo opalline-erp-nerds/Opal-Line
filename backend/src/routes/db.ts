@@ -1807,7 +1807,7 @@ dbRouter.post('/products/bulk-images', requirePermission('inventory', 'edit'), e
       const sku = base.replace(/\.[^.]+$/, '').trim().toLowerCase()
       const productId = bySku.get(sku)
       if (!productId) { unmatched.push(filename); continue }
-      const path = saveUploadedImage(dataUrl)
+      const path = await saveUploadedImage(dataUrl)
       if (!path) { errors.push(`${filename}: invalid image data (must be a data:image/... URL)`); continue }
       const [prod] = await db!.select({ images: s.products.images, image: s.products.image }).from(s.products).where(eq(s.products.id, productId)).limit(1)
       const gallery = Array.isArray(prod?.images) ? (prod!.images as string[]) : []
