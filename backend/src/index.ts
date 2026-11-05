@@ -43,6 +43,8 @@ import {
   updateScheduledRateChange,
 } from './scheduledRateApplier'
 import { ensureUploadsDir, UPLOADS_DIR, uploadImageHandler } from './uploads'
+import { mountFrontend, resolveFrontendDist } from './frontendStatic'
+import { HostedConfigError, isPublicHost, publicHostStartupError } from './hostedMode'
 import { routeParam } from './lib/routeParams'
 
 const app = express()
@@ -100,6 +102,11 @@ app.use((req, res, next) => {
 
 const CSRF_FILE = '.csrf-secret'
 function getCsrfSecret(): string {
+  const hostedError = publicHostStartupError()
+  if (hostedError) {
+    logger.error(hostedError)
+    process.exit(1)
+  }
   if (process.env.CSRF_SECRET) return process.env.CSRF_SECRET
   if (existsSync(CSRF_FILE)) {
     try { return readFileSync(CSRF_FILE, 'utf8').trim() } catch { /* regenerate */ }
@@ -2148,20 +2155,12 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 // must be registered BEFORE the catch-all 404 handler below, otherwise every
 // request would be swallowed by the 404 handler before reaching express.static.
 const _resourcesPath = (process as any).resourcesPath
-const frontendDist = (() => {
-  const candidates: Array<string | null | undefined> = [
-    process.env.FRONTEND_DIST,
-    typeof _resourcesPath === 'string' ? join(_resourcesPath, 'app', 'frontend', 'dist') : null,
-    typeof _resourcesPath === 'string' ? join(_resourcesPath, 'frontend', 'dist') : null,
-    join(__dirname, '..', '..', 'frontend', 'dist'),
-  ]
-  for (const c of candidates) {
-    // Guard against the spawn env serializing an `undefined` value to the
-    // string "undefined", and only accept a candidate that actually renders.
-    if (c && c !== 'undefined' && existsSync(join(c, 'index.html'))) return c
-  }
-  return join(__dirname, '..', '..', 'frontend', 'dist')
-})()
+const frontendDist = resolveFrontendDist([
+  process.env.FRONTEND_DIST,
+  typeof _resourcesPath === 'string' ? join(_resourcesPath, 'app', 'frontend', 'dist') : null,
+  typeof _resourcesPath === 'string' ? join(_resourcesPath, 'frontend', 'dist') : null,
+  join(__dirname, '..', '..', 'frontend', 'dist'),
+])
 // Serve uploaded product images (public, read-only).
 try {
   app.use('/uploads', express.static(UPLOADS_DIR(), { fallthrough: false, maxAge: '30d' }))
@@ -2170,24 +2169,18 @@ try {
   logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Could not mount /uploads static handler')
 }
 
-if (existsSync(frontendDist)) {
-  app.use(express.static(frontendDist))
-  // SPA fallback: serve index.html for any non-API route.
-  // Express 5 uses path-to-regexp v8, which removed the bare '*' wildcard - a
-  // wildcard must now be NAMED. The name is arbitrary and unused; only the
-  // shape of the match matters.
-  //
-  // The braces matter, and the exact form was verified against express 5.2.1
-  // rather than assumed: v8 wildcards match ONE OR MORE segments, so a plain
-  // '/*splat' 404s on '/' - the app's own root. Wrapping as '/{*splat}' makes
-  // the leading slash part of the optional group and matches '/', '/products'
-  // and '/a/b/c' alike. ('/{/*splat}' compiles but only matches '/', so it is
-  // NOT equivalent.)
-  app.get('/{*splat}', (req, res, next) => {
-    if (req.path.startsWith('/api/')) return next()
-    res.sendFile(join(frontendDist, 'index.html'))
-  })
-}
+// SPA fallback: serve index.html for any non-API route.
+// Express 5 uses path-to-regexp v8, which removed the bare '*' wildcard - a
+// wildcard must now be NAMED. The name is arbitrary and unused; only the
+// shape of the match matters.
+//
+// The braces matter, and the exact form was verified against express 5.2.1
+// rather than assumed: v8 wildcards match ONE OR MORE segments, so a plain
+// '/*splat' 404s on '/' - the app's own root. Wrapping as '/{*splat}' makes
+// the leading slash part of the optional group and matches '/', '/products'
+// and '/a/b/c' alike. ('/{/*splat}' compiles but only matches '/', so it is
+// NOT equivalent.)
+mountFrontend(app, frontendDist)
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' })
@@ -2221,11 +2214,25 @@ async function startServer() {
     const boot = await bootstrapDatabase()
     if (boot.ran) logger.info({ tablesCreated: boot.tablesCreated }, 'Database bootstrap complete')
   } catch (err) {
+    if (err instanceof HostedConfigError) {
+      logger.error(err.message)
+      process.exit(1)
+    }
     logger.error({ err }, 'Database bootstrap failed — continuing with startup')
   }
 
   const server = app.listen(config.port, config.host, async () => {
     logger.info({ port: config.port, host: config.host, shopifyConfigured: isConfigured(), frontendOrigin: FRONTEND_ORIGIN }, 'Server started')
+    if (isPublicHost() && FRONTEND_ORIGIN === 'http://localhost:47195') {
+      logger.warn(
+        { frontendOrigin: FRONTEND_ORIGIN },
+        'FRONTEND_ORIGIN is still the desktop dev default. Leave it unset while this server serves the UI, and set it when the pages move to another site.',
+      )
+    }
+    const { supabaseStorageConfig } = await import('./uploads')
+    if (isPublicHost() && !supabaseStorageConfig()) {
+      logger.warn('Product images are still stored on local disk. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY so uploads survive a restart.')
+    }
     await loadSecretsFromDb()
     // Schedule the daily automated backup (7:00 PM local time).
     startAutoBackup()

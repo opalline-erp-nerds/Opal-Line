@@ -120,27 +120,27 @@ export async function destroyUserSessions(userId: string): Promise<void> {
   }
 }
 
+/** Desktop leaves both unset: Secure stays off (http://localhost drops a Secure
+ * cookie) and SameSite stays Strict. Hosted mode opts in with COOKIE_SECURE=true. */
+export function sessionCookieOptions(maxAge: number): {
+  httpOnly: true
+  secure: boolean
+  sameSite: 'strict' | 'lax' | 'none'
+  maxAge: number
+  path: '/'
+} {
+  const secure = /^(1|true|yes)$/i.test((process.env.COOKIE_SECURE ?? '').trim())
+  const raw = (process.env.COOKIE_SAMESITE ?? '').trim().toLowerCase()
+  const sameSite = raw === 'lax' || raw === 'none' || raw === 'strict' ? raw : 'strict'
+  return { httpOnly: true, secure, sameSite, maxAge, path: '/' }
+}
+
 export function setSessionCookie(res: Response, token: string): void {
-  res.cookie(COOKIE_NAME, token, {
-    httpOnly: true,
-    // Desktop app runs on http://localhost — Secure flag must be false or the
-    // browser will silently drop the cookie (it only sends Secure cookies
-    // over HTTPS).
-    secure: false,
-    sameSite: 'strict',
-    maxAge: TTL_MS,
-    path: '/',
-  })
+  res.cookie(COOKIE_NAME, token, sessionCookieOptions(TTL_MS))
 }
 
 export function clearSessionCookie(res: Response): void {
-  res.cookie(COOKIE_NAME, '', {
-    httpOnly: true,
-    secure: false,
-    sameSite: 'strict',
-    maxAge: 0,
-    path: '/',
-  })
+  res.cookie(COOKIE_NAME, '', sessionCookieOptions(0))
 }
 
 export function tokenFromRequest(req: Request): string | undefined {

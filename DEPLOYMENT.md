@@ -6,9 +6,71 @@
 > for the user-facing install guide, and the reserved **47191–47198 port map**
 > in [README → Ports](README.md#ports).
 
+## Hosted mode (Render + Supabase)
+
+Staging is one Render web service (`render.yaml`, environment `staging`). The API serves the built UI, so the browser stays on one origin. PostgreSQL is an external Supabase project. Do not point this at a database that has real orders — use a scratch project. Do not run `npm run db:seed` there; that script loads demo users. A fresh database gets username `admin` from bootstrap, with `SEED_ADMIN_PASSWORD`, and forces a password change at first login. When `HOST` is not loopback the process refuses to start without a 64-hex `ENCRYPTION_KEY` and a `CSRF_SECRET`, and it refuses to create that admin without `SEED_ADMIN_PASSWORD`. The password is not printed. The desktop app leaves `HOST` unset, so it still binds to `127.0.0.1`, still uses its default first password, and still prints that password once.
+
+Product images stay on local disk unless `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set. Then new images go to the public Storage bucket `SUPABASE_STORAGE_BUCKET` (default `product-images`). Daily backups already upload to any S3-compatible bucket when `BACKUP_OFFSITE_ENDPOINT`, `BACKUP_OFFSITE_BUCKET`, `BACKUP_OFFSITE_KEY_ID`, and `BACKUP_OFFSITE_SECRET` are set. Supabase shows that S3 endpoint and those keys under Storage → S3 Access Keys. Leave both groups empty until the buckets exist.
+
+Leave hosted variables unset on a desktop machine. The desktop app keeps binding to `127.0.0.1` and using its own data folder.
+
+### Build and start
+
+From the repo root, with Node 20:
+
+```bash
+npm ci --include=dev
+npm run build -w frontend
+```
+
+`tsx` is a backend devDependency, so the install must include devDependencies. Do not set `VITE_API_BASE` for this one-origin layout. The client then calls relative `/api/v1` on the same host.
+
+```bash
+# Render sets PORT. HOST must be public; the desktop default is loopback.
+# cwd of `npm run start -w backend` is backend/, so the UI path is one level up.
+HOST=0.0.0.0 \
+TRUST_PROXY=1 \
+NODE_ENV=production \
+FRONTEND_DIST=../frontend/dist \
+DATABASE_URL='postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres?sslmode=require' \
+npm run start:server
+```
+
+Health check: `GET /api/v1/health`.
+
+The same image is `Dockerfile` (context = repo root, container port **4000**). Local Docker still publishes that as host port **47196** via `docker-compose.yml`. Render’s blueprint uses the Node build above, not the Dockerfile.
+
+### One origin
+
+`backend/src/index.ts` serves `FRONTEND_DIST` when that folder contains `index.html`, then falls back to `frontend/dist` next to the repo root (`join(__dirname, '..', '..', 'frontend', 'dist')` while running `tsx src/index.ts`). Non-API routes get `index.html`. `/api/` and `/uploads` stay on that same host. Set `FRONTEND_ORIGIN` only when the UI moves to a different origin.
+
+### Supabase connection
+
+Use the **session pooler** (host `*.pooler.supabase.com`, port **5432**) or the **direct** host (`db.<ref>.supabase.co`, port **5432**), with `sslmode=require`. Both keep a session, which this process needs: `postgres.js` prepares statements by default, and `backend/src/db/client.ts` calls `client.listen('drizzle')`.
+
+Do **not** use the transaction pooler (port **6543**). Prepared statements and `LISTEN` fail there. The direct host is often IPv6-only; Render’s IPv4-only instances need the session pooler or Supabase’s IPv4 add-on. That network limit was not tested from this repo.
+
+Run **one** instance. The process starts backup, sync, mail, and rate timers in memory; a second instance runs them twice.
+
+### Ports to leave alone
+
+| Port | Keep it for |
+|---|---|
+| **47191** | Dev API |
+| **47192** | Installed desktop API |
+| **47193** | Desktop bundled Postgres |
+| **47194** | Dev bundled Postgres |
+| **47195** | Vite |
+| **47196 / 47197 / 47198** | Local Docker host mappings (API, nginx, Postgres) |
+
+Render assigns `PORT` (often 10000). Do not set `PORT` to anything in 47191–47198 on the hosted service. Shopify webhooks go to `https://<PUBLIC_BASE_URL>/api/v1/webhooks/shopify` (one route, topic in the header). API version **2025-10**.
+
+Copy `backend/.env.example.hosted` into the Render environment. It has placeholders only.
+
 ## Prerequisites
 
-- **Node.js** 18+ (recommended: 20 LTS)
+- **Node.js** 20 LTS
+
 - **PostgreSQL** 14+ (tested with 17)
 - **npm** 9+ (or pnpm/yarn)
 - **Shopify** store with Admin API access token
@@ -32,7 +94,7 @@ ENCRYPTION_KEY=
 # Shopify
 SHOPIFY_STORE_URL=https://your-store.myshopify.com
 SHOPIFY_ACCESS_TOKEN=shpat_xxxxxxxxxxxxx
-SHOPIFY_API_VERSION=2024-10
+SHOPIFY_API_VERSION=2025-10
 
 # Backup
 BACKUP_DIR=./backups
@@ -59,17 +121,12 @@ VITE_API_BASE=http://localhost:47196/api/v1
 # Create database
 createdb opal_line
 
-# Run migrations
+# Optional schema push. Server boot also runs the idempotent bootstrap.
 cd backend
 npx drizzle-kit push
-
-# Seed initial data (creates admin user + sample data)
-npx tsx src/db/seed.ts
 ```
 
-**First login credentials** (from seed output — check console):
-- Username: `arjun`
-- Password: printed in console on first seed, or set via `SEED_ADMIN_PASSWORD=yourpass npx tsx src/db/seed.ts`
+A fresh database creates username `admin` on boot (`SEED_ADMIN_PASSWORD`, or the desktop default) and requires a password change. `npm run db:seed` is demo data (user `arjun`) for a local scratch database only — do not run it on the hosted database.
 
 ## 3. Start Development
 
@@ -154,14 +211,9 @@ sudo certbot --nginx -d yourdomain.com
 
 ## 7. Shopify Webhook Setup
 
-1. Go to **Shopify Admin → Settings → Notifications → Webhooks**
-2. Create webhooks for:
-   - `orders/create` → `https://yourdomain.com/api/v1/webhooks/orders/create`
-   - `orders/updated` → `https://yourdomain.com/api/v1/webhooks/orders/updated`
-   - `orders/cancelled` → `https://yourdomain.com/api/v1/webhooks/orders/cancelled`
-   - `products/create` → `https://yourdomain.com/api/v1/webhooks/products/create`
-   - `products/update` → `https://yourdomain.com/api/v1/webhooks/products/update`
-3. Set the webhook secret in `.env` as `SHOPIFY_WEBHOOK_SECRET`
+1. Set `PUBLIC_BASE_URL` to the public https origin (no trailing slash) and `SHOPIFY_WEBHOOK_SECRET`.
+2. On startup the server registers topics at `https://<PUBLIC_BASE_URL>/api/v1/webhooks/shopify`. The topic arrives in the `X-Shopify-Topic` header. There is no per-topic path.
+3. API version is `SHOPIFY_API_VERSION` (default **2025-10**).
 
 ## 8. Backups
 
