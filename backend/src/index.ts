@@ -44,6 +44,7 @@ import {
   updateScheduledRateChange,
 } from './scheduledRateApplier'
 import { ensureUploadsDir, UPLOADS_DIR, uploadImageHandler } from './uploads'
+import { mountFrontend, resolveFrontendDist } from './frontendStatic'
 import { routeParam } from './lib/routeParams'
 
 const app = express()
@@ -2115,20 +2116,12 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 // must be registered BEFORE the catch-all 404 handler below, otherwise every
 // request would be swallowed by the 404 handler before reaching express.static.
 const _resourcesPath = (process as any).resourcesPath
-const frontendDist = (() => {
-  const candidates: Array<string | null | undefined> = [
-    process.env.FRONTEND_DIST,
-    typeof _resourcesPath === 'string' ? join(_resourcesPath, 'app', 'frontend', 'dist') : null,
-    typeof _resourcesPath === 'string' ? join(_resourcesPath, 'frontend', 'dist') : null,
-    join(__dirname, '..', '..', 'frontend', 'dist'),
-  ]
-  for (const c of candidates) {
-    // Guard against the spawn env serializing an `undefined` value to the
-    // string "undefined", and only accept a candidate that actually renders.
-    if (c && c !== 'undefined' && existsSync(join(c, 'index.html'))) return c
-  }
-  return join(__dirname, '..', '..', 'frontend', 'dist')
-})()
+const frontendDist = resolveFrontendDist([
+  process.env.FRONTEND_DIST,
+  typeof _resourcesPath === 'string' ? join(_resourcesPath, 'app', 'frontend', 'dist') : null,
+  typeof _resourcesPath === 'string' ? join(_resourcesPath, 'frontend', 'dist') : null,
+  join(__dirname, '..', '..', 'frontend', 'dist'),
+])
 // Serve uploaded product images (public, read-only).
 try {
   app.use('/uploads', express.static(UPLOADS_DIR(), { fallthrough: false, maxAge: '30d' }))
@@ -2137,24 +2130,18 @@ try {
   logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Could not mount /uploads static handler')
 }
 
-if (existsSync(frontendDist)) {
-  app.use(express.static(frontendDist))
-  // SPA fallback: serve index.html for any non-API route.
-  // Express 5 uses path-to-regexp v8, which removed the bare '*' wildcard - a
-  // wildcard must now be NAMED. The name is arbitrary and unused; only the
-  // shape of the match matters.
-  //
-  // The braces matter, and the exact form was verified against express 5.2.1
-  // rather than assumed: v8 wildcards match ONE OR MORE segments, so a plain
-  // '/*splat' 404s on '/' - the app's own root. Wrapping as '/{*splat}' makes
-  // the leading slash part of the optional group and matches '/', '/products'
-  // and '/a/b/c' alike. ('/{/*splat}' compiles but only matches '/', so it is
-  // NOT equivalent.)
-  app.get('/{*splat}', (req, res, next) => {
-    if (req.path.startsWith('/api/')) return next()
-    res.sendFile(join(frontendDist, 'index.html'))
-  })
-}
+// SPA fallback: serve index.html for any non-API route.
+// Express 5 uses path-to-regexp v8, which removed the bare '*' wildcard - a
+// wildcard must now be NAMED. The name is arbitrary and unused; only the
+// shape of the match matters.
+//
+// The braces matter, and the exact form was verified against express 5.2.1
+// rather than assumed: v8 wildcards match ONE OR MORE segments, so a plain
+// '/*splat' 404s on '/' - the app's own root. Wrapping as '/{*splat}' makes
+// the leading slash part of the optional group and matches '/', '/products'
+// and '/a/b/c' alike. ('/{/*splat}' compiles but only matches '/', so it is
+// NOT equivalent.)
+mountFrontend(app, frontendDist)
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' })
