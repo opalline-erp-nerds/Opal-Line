@@ -8,7 +8,7 @@
 
 ## Hosted mode (Render + Supabase)
 
-Staging is one Render web service (`render.yaml`, environment `staging`). The API serves the built UI, so the browser stays on one origin. PostgreSQL is an external Supabase project. Do not point this at a database that has real orders — use a scratch project. Do not run `npm run db:seed` there; that script loads demo users. A fresh database gets username `admin` from bootstrap, with `SEED_ADMIN_PASSWORD`, and forces a password change at first login.
+Staging is one Render web service (`render.yaml`, environment `staging`). The API serves the built UI, so the browser stays on one origin. PostgreSQL is an external Supabase project. Do not point this at a database that has real orders — use a scratch project. Do not run `npm run db:seed` there; that script loads demo users. A fresh database gets username `admin` from bootstrap, with `SEED_ADMIN_PASSWORD`, and forces a password change at first login. When `HOST` is not loopback the process refuses to start without a 64-hex `ENCRYPTION_KEY` and a `CSRF_SECRET`, and it refuses to create that admin without `SEED_ADMIN_PASSWORD`. The password is not printed. The desktop app leaves `HOST` unset, so it still binds to `127.0.0.1`, still uses its default first password, and still prints that password once.
 
 Leave hosted variables unset on a desktop machine. The desktop app keeps binding to `127.0.0.1` and using its own data folder.
 

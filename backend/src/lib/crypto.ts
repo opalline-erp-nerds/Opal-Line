@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { logger } from '../logger'
+import { publicHostStartupError } from '../hostedMode'
 
 const ALGORITHM = 'aes-256-gcm'
 const KEY_LENGTH = 32
@@ -20,6 +21,12 @@ let masterKey: Buffer | null = null
 
 function loadOrGenerateKey(): Buffer {
   if (masterKey) return masterKey
+
+  const hostedError = publicHostStartupError()
+  if (hostedError) {
+    logger.error(hostedError)
+    process.exit(1)
+  }
 
   const envKey = process.env.ENCRYPTION_KEY?.trim()
   if (envKey) {

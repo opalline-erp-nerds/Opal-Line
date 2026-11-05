@@ -11,6 +11,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import argon2 from 'argon2'
 import { logger } from '../logger'
+import { isPublicHost, seedAdminPassword } from '../hostedMode'
 
 /**
  * First-run database bootstrap.
@@ -1049,7 +1050,7 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
     // exposure: the server binds to 127.0.0.1 only, and requirePasswordChange
     // below forces a new password at the first sign-in — the default never
     // survives the initial setup screen.
-    const tempPassword = process.env.SEED_ADMIN_PASSWORD?.trim() || 'Opal@2026'
+    const tempPassword = seedAdminPassword()
     generatedAdminPassword = tempPassword
     const passwordHash = await argon2.hash(tempPassword)
     await db.insert(schema.users).values({
@@ -1066,12 +1067,16 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
       permissions: null,
     })
     logger.info('Bootstrap: created initial admin user')
-    console.log('\n══════════════════════════════════════════════════════')
-    console.log('  Initial admin account created:')
-    console.log('    Username: admin')
-    console.log(`    Password: ${tempPassword}`)
-    console.log('  You will be asked to set a new password at first login.')
-    console.log('══════════════════════════════════════════════════════\n')
+    if (!isPublicHost()) {
+      console.log('\n══════════════════════════════════════════════════════')
+      console.log('  Initial admin account created:')
+      console.log('    Username: admin')
+      console.log(`    Password: ${tempPassword}`)
+      console.log('  You will be asked to set a new password at first login.')
+      console.log('══════════════════════════════════════════════════════\n')
+    } else {
+      logger.info('Bootstrap: admin password was not written to the log')
+    }
     // Hand the one-time credential to the desktop app so it can show the real
     // password in its first-run dialog instead of a hardcoded placeholder.
     // The desktop shell deletes this file as soon as it has displayed it.
@@ -1313,6 +1318,7 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
   try {
     const hasUsers = await tableExists(sql, 'users')
     if (!hasUsers) {
+      if (isPublicHost()) seedAdminPassword()
       logger.info('Bootstrap: fresh database detected — creating schema')
       await createSchema(sql)
       // Bring the fresh schema fully up to date BEFORE seeding defaults —

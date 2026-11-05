@@ -45,6 +45,7 @@ import {
 } from './scheduledRateApplier'
 import { ensureUploadsDir, UPLOADS_DIR, uploadImageHandler } from './uploads'
 import { mountFrontend, resolveFrontendDist } from './frontendStatic'
+import { HostedConfigError, isPublicHost, publicHostStartupError } from './hostedMode'
 import { routeParam } from './lib/routeParams'
 
 const app = express()
@@ -102,6 +103,11 @@ app.use((req, res, next) => {
 
 const CSRF_FILE = '.csrf-secret'
 function getCsrfSecret(): string {
+  const hostedError = publicHostStartupError()
+  if (hostedError) {
+    logger.error(hostedError)
+    process.exit(1)
+  }
   if (process.env.CSRF_SECRET) return process.env.CSRF_SECRET
   if (existsSync(CSRF_FILE)) {
     try { return readFileSync(CSRF_FILE, 'utf8').trim() } catch { /* regenerate */ }
@@ -2175,11 +2181,21 @@ async function startServer() {
     const boot = await bootstrapDatabase()
     if (boot.ran) logger.info({ tablesCreated: boot.tablesCreated }, 'Database bootstrap complete')
   } catch (err) {
+    if (err instanceof HostedConfigError) {
+      logger.error(err.message)
+      process.exit(1)
+    }
     logger.error({ err }, 'Database bootstrap failed — continuing with startup')
   }
 
   const server = app.listen(config.port, config.host, async () => {
     logger.info({ port: config.port, host: config.host, shopifyConfigured: isConfigured(), frontendOrigin: FRONTEND_ORIGIN }, 'Server started')
+    if (isPublicHost() && FRONTEND_ORIGIN === 'http://localhost:47195') {
+      logger.warn(
+        { frontendOrigin: FRONTEND_ORIGIN },
+        'FRONTEND_ORIGIN is still the desktop dev default. Leave it unset while this server serves the UI, and set it when the pages move to another site.',
+      )
+    }
     await loadSecretsFromDb()
     // Schedule the daily automated backup (7:00 PM local time).
     startAutoBackup()
