@@ -73,7 +73,24 @@ test.describe('product codes & variants', () => {
     await expect(dialog).toBeVisible({ timeout: 10000 })
     await dialog.getByLabel('Product title').fill(PRODUCT_NAME)
 
-    // SKU minted under the saved format (category "Silver jewels" → SIL).
+    // No collection yet → no SKU: the field stays empty until the grouping
+    // that determines the prefix is selected.
+    await expect(dialog.getByLabel('Product SKU')).toHaveValue('')
+    await dialog.getByLabel('Category').selectOption('Silver Jewels')
+    await expect(dialog.getByLabel('Product SKU')).toHaveValue('')
+    await dialog.getByRole('button', { name: 'Select a collection…' }).click()
+    await page.getByRole('button', { name: 'Silver jewels', exact: true }).click()
+
+    // SKU minted under the saved format (collection "Silver jewels" → SIL).
+    await expect(dialog.getByLabel('Product SKU')).toHaveValue(/^TST-SIL-\d{4}$/)
+
+    // Switching the collection BEFORE saving re-proposes the SKU for that
+    // grouping's prefix, and switching back restores the original proposal.
+    await dialog.getByRole('button', { name: 'Silver jewels', exact: true }).click()
+    await page.getByRole('button', { name: 'Rings', exact: true }).click()
+    await expect(dialog.getByLabel('Product SKU')).toHaveValue(/^TST-RNG-\d{4}$/)
+    await dialog.getByRole('button', { name: 'Rings', exact: true }).click()
+    await page.getByRole('button', { name: 'Silver jewels', exact: true }).click()
     await expect(dialog.getByLabel('Product SKU')).toHaveValue(/^TST-SIL-\d{4}$/)
 
     // Pricing inputs drive the auto price: (105 + 20) × 10g × 1.03 = 1287.5,
@@ -138,6 +155,9 @@ test.describe('product codes & variants', () => {
     await expect(editDialog.getByLabel('Values for Size')).toBeVisible()
     await expect(editDialog.getByText('2 variants')).toBeVisible({ timeout: 10000 })
     await expect(editDialog.getByLabel(`SKU for S`)).toHaveValue(new RegExp(`^${parentSku}-S$`))
+    // A saved product's SKU is read-only: an edit never rewrites it.
+    await expect(editDialog.getByLabel('Product SKU')).toHaveValue(parentSku)
+    await expect(editDialog.getByLabel('Product SKU')).toHaveAttribute('readonly', '')
     await editDialog.getByRole('button', { name: 'Cancel' }).click()
     await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 5000 })
 

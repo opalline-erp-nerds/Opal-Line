@@ -73,6 +73,16 @@ export default function StockTransfersPage() {
     [transfers],
   )
 
+  /**
+   * Transfers store the location ID; rows created before that keep the display
+   * name. Resolving through the locations list keeps both readable — and keeps
+   * search working over whatever the row actually holds.
+   */
+  const locationLabel = useCallback((value: string | null | undefined) => {
+    if (!value) return '—'
+    return locations.find((l) => l.id === value || l.name === value)?.name ?? value
+  }, [locations])
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
     return transfers.filter((t) => {
@@ -81,11 +91,12 @@ export default function StockTransfersPage() {
         t.number.toLowerCase().includes(q) ||
         t.product.toLowerCase().includes(q) ||
         t.sku.toLowerCase().includes(q) ||
-        (t.from ?? '').toLowerCase().includes(q)
+        locationLabel(t.from).toLowerCase().includes(q) ||
+        locationLabel(t.to).toLowerCase().includes(q)
       const matchStatus = !statusFilter || t.status === statusFilter
       return matchQ && matchStatus
     })
-  }, [transfers, query, statusFilter])
+  }, [transfers, query, statusFilter, locationLabel])
 
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -112,23 +123,24 @@ export default function StockTransfersPage() {
 
   const availableAtSource = useMemo(() => {
     if (!selectedProduct || !form.from) return null
-    const loc = locations.find((l) => l.name === form.from)
-    return levels.find((x) => x.locationId === loc?.id || x.locationId === form.from)?.qty ?? 0
-  }, [selectedProduct, form.from, levels, locations])
+    // form.from is the location's ID, the same key the stock-levels API uses.
+    return levels.find((x) => x.locationId === form.from)?.qty ?? 0
+  }, [selectedProduct, form.from, levels])
 
   const handleCreate = async () => {
     const product = products.find((p) => p.id === form.product)
     if (!product || !form.from || !form.to || !form.qty || form.from === form.to) return
     const qty = Number(form.qty)
-    if (Number.isNaN(qty) || qty <= 0) {
-      setError('Enter a valid quantity')
+    if (!Number.isSafeInteger(qty) || qty <= 0) {
+      setError('Enter a positive whole-number quantity')
       return
     }
     setSaving(true)
     setError('')
     try {
+      // No number is sent: the backend mints it. A number derived from the
+      // loaded list collides the moment two computers create transfers.
       await dbApi.createStockTransfer({
-        number: `ST-${new Date().getFullYear()}-${String(transfers.length + 1).padStart(4, '0')}`,
         from: form.from,
         to: form.to,
         sku: product.sku,
@@ -230,9 +242,9 @@ export default function StockTransfersPage() {
         meta: { headerClassName: 'min-w-[240px]' },
         cell: ({ row }) => (
           <div className="flex items-center gap-1.5 text-[12.5px]">
-            <span className="max-w-[130px] truncate text-muted-foreground">{row.original.from}</span>
+            <span className="max-w-[130px] truncate text-muted-foreground">{locationLabel(row.original.from)}</span>
             <ArrowRightIcon />
-            <span className="max-w-[130px] truncate font-medium text-foreground">{row.original.to}</span>
+            <span className="max-w-[130px] truncate font-medium text-foreground">{locationLabel(row.original.to)}</span>
           </div>
         ),
       },
@@ -290,7 +302,7 @@ export default function StockTransfersPage() {
                       <Truck className="h-3.5 w-3.5 text-info-700" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>Dispatch — stock leaves {row.original.from}</TooltipContent>
+                  <TooltipContent>Dispatch — stock leaves {locationLabel(row.original.from)}</TooltipContent>
                 </Tooltip>
               )}
               {row.original.status === 'in-transit' && (
@@ -300,7 +312,7 @@ export default function StockTransfersPage() {
                       <ArrowDownToLine className="h-3.5 w-3.5 text-success-600" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>Receive — stock arrives at {row.original.to}</TooltipContent>
+                  <TooltipContent>Receive — stock arrives at {locationLabel(row.original.to)}</TooltipContent>
                 </Tooltip>
               )}
               {(row.original.status === 'pending' || row.original.status === 'in-transit') && (
@@ -372,7 +384,7 @@ export default function StockTransfersPage() {
                           <div className="flex items-center justify-between gap-3">
                             <div className="min-w-0">
                               <p className="font-medium text-foreground">{t.number}</p>
-                              <p className="truncate text-xs text-muted-foreground">{t.product} · dispatched {t.qty} pcs · {t.from} → {t.to}</p>
+                              <p className="truncate text-xs text-muted-foreground">{t.product} · dispatched {t.qty} pcs · {locationLabel(t.from)} → {locationLabel(t.to)}</p>
                             </div>
                             <Button size="sm" disabled={invalid} onClick={() => receive(t)}>
                               <CheckCircle2 className="h-3.5 w-3.5" /> Receive
@@ -438,9 +450,9 @@ export default function StockTransfersPage() {
                       <Select
                         id="transfer-from"
                         options={locations.map((l) => {
-                          const held = levels.find((x) => x.locationId === l.id || x.locationId === l.name)?.qty
+                          const held = levels.find((x) => x.locationId === l.id)?.qty
                           return {
-                            value: l.name,
+                            value: l.id,
                             label: selectedProduct ? `${l.name} (${held ?? 0} pcs)` : l.name,
                           }
                         })}
@@ -453,7 +465,7 @@ export default function StockTransfersPage() {
                       <Label htmlFor="transfer-to">To</Label>
                       <Select
                         id="transfer-to"
-                        options={locations.map((l) => ({ value: l.name, label: l.name }))}
+                        options={locations.map((l) => ({ value: l.id, label: l.name }))}
                         value={form.to}
                         onValueChange={(v) => setForm((f) => ({ ...f, to: v }))}
                         placeholder="To location"

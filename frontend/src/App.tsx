@@ -30,6 +30,7 @@ const PurchaseInvoicesPage = lazy(() => import('@/pages/PurchaseInvoices'))
 const SuppliersPage = lazy(() => import('@/pages/Suppliers'))
 const PurchaseReturnsPage = lazy(() => import('@/pages/PurchaseReturns'))
 const ProductsPage = lazy(() => import('@/pages/Products'))
+const InventoryCollectionsPage = lazy(() => import('@/pages/InventoryCollections'))
 const ProductDetailPage = lazy(() => import('@/pages/ProductDetail'))
 const StockOverviewPage = lazy(() => import('@/pages/StockOverview'))
 const StockTransfersPage = lazy(() => import('@/pages/StockTransfers'))
@@ -134,6 +135,7 @@ function App() {
             <Route path="/purchase/returns" element={guarded('purchase', <PurchaseReturnsPage />)} />
 
             <Route path="/inventory/products" element={guarded('inventory', <ProductsPage />)} />
+            <Route path="/inventory/collections" element={guarded('inventory', <InventoryCollectionsPage />)} />
             <Route path="/inventory/products/:id" element={guarded('inventory', <ProductDetailPage />)} />
             <Route path="/inventory/stock" element={guarded('inventory', <StockOverviewPage />)} />
             <Route path="/inventory/transfers" element={guarded('inventory', <StockTransfersPage />)} />

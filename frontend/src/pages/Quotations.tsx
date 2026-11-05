@@ -1,5 +1,5 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ColumnDef } from '@/lib/table'
 import {
   CheckCircle2,
@@ -32,7 +32,17 @@ import { AppDialog } from '@/components/ui/app-dialog'
 import { DialogFooter } from '@/components/ui/dialog'
 import { dbApi, backupApi, formatApiError } from '@/lib/api'
 import { SalesFollowUpsCard } from '@/components/sales-follow-ups-card'
-import type { AppSettings, Quotation } from '@/types'
+import { useSilverRate } from '@/lib/silver-rate-context'
+import { productHasVariants, productVariants, variantLabel } from '@/lib/productVariants'
+import {
+  parseQuotationQty,
+  quotationLineAmount,
+  quotationLineIssues,
+  quotationLineWeight,
+  type QuotationLineInput,
+} from '@/lib/quotationPricing'
+import { round2 } from '@/lib/utils'
+import type { AppSettings, Product, ProductVariant, Quotation } from '@/types'
 import { formatCurrency, formatDate } from '@/lib/format'
 import { printDocument, mergePrintConfig } from '@/lib/printTemplate'
 
@@ -75,16 +85,40 @@ const isLive = (status: string) => !isClosed(status)
 /** Order the status filter follows the lifecycle. */
 const statusOptions: Array<Quotation['status']> = ['draft', 'sent', 'approved', 'converted', 'expired', 'cancelled']
 
+/**
+ * One edit line in the quotation dialog. Weight and making charge are
+ * PER-PIECE / PER-GRAM values seeded from the catalogue (same conventions the
+ * manual invoice dialog uses); pieceRate is only set for fixed-price Piece
+ * Rate Products, where the rate components are priced out by the server.
+ */
 interface ItemForm {
   product: string
   sku: string
   qty: string
-  weight: string
+  netWeight: string
   silverRate: string
   makingCharge: string
+  pieceRate: string
+  /** Chosen explicitly via the "custom line" option — no catalogue SKU. */
+  custom: boolean
 }
 
-const emptyItem: ItemForm = { product: '', sku: '', qty: '1', weight: '', silverRate: '', makingCharge: '' }
+const emptyItem: ItemForm = { product: '', sku: '', qty: '1', netWeight: '', silverRate: '', makingCharge: '', pieceRate: '', custom: false }
+
+const isPieceRateForm = (it: ItemForm) => !it.custom && Number(it.pieceRate) > 0
+
+function toLineInput(it: ItemForm, qtyOverride?: number): QuotationLineInput {
+  const qty = qtyOverride ?? (Number(it.qty) || 0)
+  return {
+    qty,
+    netWeight: Number(it.netWeight) || 0,
+    silverRatePerGram: Number(it.silverRate) || 0,
+    makingChargePerGram: Number(it.makingCharge) || 0,
+    fixedPieceRate: isPieceRateForm(it) ? Number(it.pieceRate) : 0,
+  }
+}
+
+
 
 export default function QuotationsPage() {
   const [quotes, setQuotes] = useState<Quotation[]>([])
@@ -104,7 +138,117 @@ export default function QuotationsPage() {
   const [convertingId, setConvertingId] = useState<string | null>(null)
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
   const [settings, setSettings] = useState<AppSettings | null>(null)
+  // ─── Product search / selection ───────────────────────────────────────────
   const [printConfig, setPrintConfig] = useState<unknown>(null)
+  // Catalogue for the line-item dropdown, debounced remote search with a
+  // stale-guard, SKU lookup names (incl. variants) for validation, and the per
+  // edited line's live dropdown state. Query/hits live in separate states so a
+  // results write never re-triggers the search effect.
+  const { rate: managedSilverRate } = useSilverRate()
+  /** Managed rate per gram; 0 until Silver Rate Management loads. */
+  const ratePerGram = managedSilverRate?.rate ?? 0
+  const [products, setProducts] = useState<Product[]>([])
+  const [extraSkus, setExtraSkus] = useState<Set<string>>(new Set())
+  const [productSearch, setProductSearch] = useState<{ line: number; query: string }>({ line: -1, query: '' })
+  const [productHits, setProductHits] = useState<Product[]>([])
+  const [resolvedProductQuery, setResolvedProductQuery] = useState('')
+  const searchToken = useRef(0)
+
+  const allSkus = useMemo(() => {
+    const set = new Set(extraSkus)
+    for (const p of products) {
+      if (p.sku) set.add(p.sku.trim().toLowerCase())
+      for (const v of productVariants(p)) if (v.sku) set.add(v.sku.trim().toLowerCase())
+    }
+    return set
+  }, [products, extraSkus])
+
+  // Load the catalogue when a dialog first opens so the dropdown is browsable
+  // before typing anything.
+  useEffect(() => {
+    if (!dialogOpen || products.length > 0) return
+    dbApi.getProducts().then((all) => setProducts(all)).catch(() => setProducts([]))
+  }, [dialogOpen, products.length])
+
+  // Dropdown results: filter the loaded catalogue first; only reach to the
+  // /products/search endpoint when the local list doesn't contain the term.
+  useEffect(() => {
+    if (productSearch.line === -1) return
+    const q = productSearch.query.trim()
+    const lower = q.toLowerCase()
+    if (q === '') {
+      setProductHits(products.slice(0, 20))
+      setResolvedProductQuery('')
+      return
+    }
+    const local = products.filter(
+      (p) =>
+        p.name.toLowerCase().includes(lower) ||
+        p.sku.toLowerCase().includes(lower) ||
+        productVariants(p).some((v) => (v.sku ?? '').toLowerCase().includes(lower)),
+    )
+    if (local.length > 0) {
+      setProductHits(local.slice(0, 20))
+      setResolvedProductQuery(q)
+      return
+    }
+    const t = window.setTimeout(() => {
+      const token = ++searchToken.current
+      dbApi.searchProducts(q).then((rows) => {
+        if (token !== searchToken.current) return // stale — a newer query won
+        setProductHits(rows)
+        setResolvedProductQuery(q)
+        setExtraSkus((prev) => {
+          const next = new Set(prev)
+          for (const r of rows) if (r.sku) next.add(r.sku.trim().toLowerCase())
+          return next
+        })
+      }).catch(() => {
+        if (token !== searchToken.current) return
+        setProductHits([])
+        setResolvedProductQuery(q)
+      })
+    }, 250)
+    return () => window.clearTimeout(t)
+  }, [productSearch, products])
+
+  // Editing an older quotation: reconcile lines against the loaded catalogue.
+  // Stored piece-rate lines arrive with all rate components zeroed — swap the
+  // fixed rate back in so the preview prices them; a stored SKU the catalogue
+  // no longer knows stays editable as a custom line instead of blocking the
+  // edit.
+  useEffect(() => {
+    if (products.length === 0 || !editingId) return
+    setItems((prev) =>
+      prev.map((it) => {
+        if (it.custom) return it
+        const sku = it.sku.trim().toLowerCase()
+        const p = products.find((x) => x.sku.trim().toLowerCase() === sku)
+        if (p && !isPieceRateForm(it)) {
+          if (p.pieceRateProduct === true && Number(p.fixedPieceRate) > 0) {
+            return { ...it, pieceRate: String(p.fixedPieceRate), custom: false }
+          }
+          return it
+        }
+        if (p || Number(it.pieceRate) > 0) return it
+        // SKU no longer in the catalogue — keep historical numbers writable.
+        return { ...it, custom: true }
+      }),
+    )
+  }, [products, editingId])
+
+  // Seed the managed silver rate into any new line as soon as the rate loads;
+  // product picks also carry it at pick time.
+  useEffect(() => {
+    if (ratePerGram <= 0) return
+    setItems((prev) =>
+      prev.map((it) =>
+        !it.custom && !isPieceRateForm(it) && !(Number(it.silverRate) > 0)
+          ? { ...it, silverRate: String(ratePerGram) }
+          : it,
+      ),
+    )
+  }, [ratePerGram])
 
   useEffect(() => {
     dbApi.getSettings().then((s) => setSettings(s ?? null)).catch(() => {})
@@ -182,26 +326,27 @@ export default function QuotationsPage() {
     })
   }, [quotes, query, statusFilter])
 
-  const itemAmount = (it: ItemForm) => {
-    const weight = parseFloat(it.weight) || 0
-    const rate = parseFloat(it.silverRate) || 0
-    const making = parseFloat(it.makingCharge) || 0
-    if (weight > 0 && rate > 0) return Math.round((weight * rate + making) * 100) / 100
-    return 0
-  }
+  const totalWeightOf = (it: ItemForm, qty?: number) => quotationLineWeight(toLineInput(it, qty))
 
-  const itemsTotal = items.reduce((a, it) => a + itemAmount(it), 0)
-  const gstRate = parseFloat(form.gst) || 0
-  const discount = parseFloat(form.discount) || 0
-  const gstAmount = Math.round(((itemsTotal * gstRate) / 100) * 100) / 100
-  const grandTotal = Math.round((itemsTotal + gstAmount - discount) * 100) / 100
+  const validLines = items.filter((it) => it.product.trim() || it.sku.trim())
+  const pricedLines = validLines.map((it) => ({ it, qty: parseQuotationQty(it.qty) ?? 0 }))
+  const itemsTotal = round2(pricedLines.reduce((a, { it, qty }) => a + quotationLineAmount(toLineInput(it, qty)), 0))
+  const gstRate = Number(form.gst) || 0
+  const discount = Number(form.discount) || 0
+  // Same formulas the backend's computeTotals applies: GST on the subtotal,
+  // discount off the grand total — the dialog preview matches stored data.
+  const gstAmount = round2((itemsTotal * gstRate) / 100)
+  const grandTotal = round2(itemsTotal + gstAmount - discount)
 
   const openDialog = () => {
     const nextForm = { customer: '', phone: '', email: '', city: '', notes: '', gst: '3', discount: '0', validUntil: '' }
-    const nextItems = [{ ...emptyItem }]
+    // Seed the managed rate at open so the unsaved-changes baseline matches
+    // what the rate-seed effect would otherwise write right after opening.
+    const nextItems = [{ ...emptyItem, silverRate: ratePerGram > 0 ? String(ratePerGram) : '' }]
     setEditingId(null)
     setForm(nextForm)
     setItems(nextItems)
+    closeSearch()
     setBaseline(JSON.stringify({ form: nextForm, items: nextItems }))
     setError('')
     setDialogOpen(true)
@@ -222,22 +367,39 @@ export default function QuotationsPage() {
       validUntil: q.validUntil ? q.validUntil.slice(0, 10) : '',
     }
     const existingItems = q.items ?? []
-    const nextItems =
+    const nextItems: ItemForm[] =
       existingItems.length > 0
-        ? existingItems.map((it) => ({
-            product: it.product ?? '',
-            sku: it.sku ?? '',
-            qty: String(it.qty ?? 1),
-            weight: it.weight ? String(it.weight) : '',
-            silverRate: it.silverRate ? String(it.silverRate) : '',
-            makingCharge: it.makingCharge ? String(it.makingCharge) : '',
-          }))
+        ? existingItems.map((it) => {
+            const qty = Math.max(1, Number(it.qty ?? 1) || 1)
+            // Stored weight is the line TOTAL (net wt × qty) — split it back
+            // into the per-piece value this form edits.
+            const weightTotal = Number(it.weight ?? 0)
+            const perPiece = qty > 0 ? Math.round((weightTotal / qty) * 1000) / 1000 : 0
+            // Piece-rate lines are stored with every rate component zeroed and
+            // amount = fixed × qty (applyPieceRateItems) — recover the fixed
+            // rate so the preview prices the line the way the server did.
+            const pieceShaped =
+              !weightTotal && !Number(it.silverRate ?? 0) && !Number(it.makingCharge ?? 0) && Number(it.amount ?? 0) > 0
+            const rateSeed = (v: number | null | undefined) =>
+              Number(v) > 0 ? String(v) : ratePerGram > 0 ? String(ratePerGram) : ''
+            return {
+              product: it.product ?? '',
+              sku: it.sku ?? '',
+              qty: String(qty),
+              netWeight: perPiece ? String(perPiece) : '',
+              silverRate: pieceShaped ? '' : rateSeed(it.silverRate),
+              makingCharge: pieceShaped ? '' : rateSeed(it.makingCharge),
+              pieceRate: pieceShaped ? String(round2(Number(it.amount) / qty)) : '',
+              custom: false,
+            }
+          })
         : [{ ...emptyItem }]
     setEditingId(q.id)
     setForm(nextForm)
     setItems(nextItems)
     setBaseline(JSON.stringify({ form: nextForm, items: nextItems }))
     setError('')
+    closeSearch()
     setViewQuote(null)
     setDialogOpen(true)
   }
@@ -246,10 +408,108 @@ export default function QuotationsPage() {
     setItems((prev) => prev.map((it, i) => (i === idx ? { ...it, ...patch } : it)))
   }
 
+  // ─── Product pick / custom line ───────────────────────────────────────────
+  const closeSearch = () => {
+    searchToken.current++ // invalidate any in-flight request
+    setProductSearch({ line: -1, query: '' })
+    setProductHits([])
+    setResolvedProductQuery('')
+  }
+
+  /** Picking from the dropdown fills the pricing fields from the catalogue. */
+  const pickProduct = (idx: number, product: Product, variant: ProductVariant | null) => {
+    const isPieceRate = product.pieceRateProduct === true && Number(product.fixedPieceRate) > 0
+    setItem(idx, {
+      product: variant ? `${product.name} — ${variantLabel(variant)}` : product.name,
+      sku: variant ? (variant.sku || product.sku) : product.sku,
+      custom: false,
+      netWeight: isPieceRate ? '' : product.netWeight ? String(Math.round(product.netWeight * 1000) / 1000) : '',
+      makingCharge: isPieceRate ? '' : Number(product.makingCharge) > 0 ? String(Math.round(product.makingCharge * 100) / 100) : '',
+      silverRate: isPieceRate ? '' : ratePerGram > 0 ? String(ratePerGram) : '',
+      pieceRate: isPieceRate ? String(product.fixedPieceRate) : '',
+    })
+    closeSearch()
+  }
+
+  /** Explicit "keep the typed name, no catalogue SKU" option.
+   * Nothing invalid is ever silently accepted — this is the user's choice. */
+  const pickCustomLine = (idx: number) => {
+    setItem(idx, { product: productSearch.query.trim(), sku: '', custom: true, pieceRate: '' })
+    closeSearch()
+  }
+
+  /** User typed in the product field: reset the price fields and search. */
+  const typeProduct = (idx: number, value: string) => {
+    setItem(idx, {
+      product: value,
+      ...(items[idx]?.sku ? { sku: '', custom: false, pieceRate: '' } : {}),
+    })
+    setProductSearch({ line: idx, query: value })
+  }
+
+  const openLineSearch = (idx: number) => {
+    setProductSearch((prev) =>
+      prev.line === idx ? prev : { line: idx, query: '' },
+    )
+  }
+
   const submit = async () => {
-    const validItems = items.filter((it) => it.product.trim() || it.sku.trim())
+    if (saving) return // no double submission while a create is in flight
     if (!form.customer.trim()) { setError('Customer name is required'); return }
-    if (validItems.length === 0) { setError('Add at least one product line'); return }
+    const lines = items.filter((it) => it.product.trim() || it.sku.trim())
+    if (lines.length === 0) { setError('Add at least one product line'); return }
+
+    // Validate everything before touching the API — bad numbers, unpicked
+    // typed product names, catalog SKU mismatches, zero-weight rate lines.
+    const problems: string[] = []
+    const submitItems: Array<{
+      product: string
+      sku: string
+      qty: number
+      weight: number
+      silverRate: number
+      makingCharge: number
+      amount: number
+    }> = []
+    items.forEach((it, i) => {
+      if (!it.product.trim() && !it.sku.trim()) return // untouched empty line
+      const lineNo = i + 1
+      const qty = parseQuotationQty(it.qty)
+      if (qty === null) {
+        problems.push(`Line ${lineNo}: quantity must be a whole number of at least 1`)
+        return
+      }
+      if (!it.custom) {
+        if (!it.sku.trim()) {
+          problems.push(`Line ${lineNo}: pick "${it.product.trim()}" from the product search, or explicitly choose "use as custom line"`)
+          return
+        }
+        if (!allSkus.has(it.sku.trim().toLowerCase())) {
+          problems.push(`Line ${lineNo}: SKU "${it.sku.trim()}" is not in the catalogue — search it by name/SKU or mark the line as custom`)
+          return
+        }
+      }
+      const issues = quotationLineIssues(toLineInput(it, qty))
+      if (issues.length > 0) {
+        problems.push(`Line ${lineNo}: ${issues[0]}`)
+        return
+      }
+      const piece = isPieceRateForm(it)
+      submitItems.push({
+        product: it.product.trim(),
+        sku: it.sku.trim(),
+        qty,
+        // Piece-rate lines carry no weight/rates — the server bills the fixed
+        // rate × qty and zeroes the components the same way.
+        weight: piece ? 0 : quotationLineWeight(toLineInput(it, qty)),
+        silverRate: piece ? 0 : Number(it.silverRate) || 0,
+        makingCharge: piece ? 0 : Number(it.makingCharge) || 0,
+        amount: quotationLineAmount(toLineInput(it, qty)),
+      })
+    })
+    if (problems.length > 0) { setError(problems.join('\n')); return }
+    if (submitItems.length === 0) { setError('Add at least one priced product line'); return }
+
     setSaving(true)
     setError('')
     const payload = {
@@ -261,21 +521,15 @@ export default function QuotationsPage() {
       validUntil: form.validUntil || null,
       gst: gstRate,
       discount,
-      items: validItems.map((it) => ({
-        product: it.product.trim(),
-        sku: it.sku.trim(),
-        qty: Math.max(1, parseInt(it.qty, 10) || 1),
-        weight: parseFloat(it.weight) || 0,
-        silverRate: parseFloat(it.silverRate) || 0,
-        makingCharge: parseFloat(it.makingCharge) || 0,
-      })),
+      items: submitItems,
     }
     try {
       if (editingId) {
         await dbApi.updateQuotation(editingId, payload)
         toast.success('Quotation updated')
       } else {
-        await dbApi.createQuotation(payload)
+        const created = await dbApi.createQuotation(payload)
+        toast.success(`Quotation ${created?.number ?? ''} created`)
       }
       setDialogOpen(false)
       load()
@@ -759,70 +1013,171 @@ export default function QuotationsPage() {
           <div className="grid gap-3">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field label="Customer name *">
-                <Input value={form.customer} onChange={(e) => setForm((f) => ({ ...f, customer: e.target.value }))} placeholder="Walk-in customer" />
+                <Input aria-label="Customer name *" value={form.customer} onChange={(e) => setForm((f) => ({ ...f, customer: e.target.value }))} placeholder="Walk-in customer" />
               </Field>
               <Field label="Phone">
-                <Input value={form.phone} onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))} placeholder="+91..." />
+                <Input aria-label="Phone" value={form.phone} onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))} placeholder="+91..." />
               </Field>
               <Field label="Email">
-                <Input type="email" value={form.email} onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))} />
+                <Input aria-label="Email" type="email" value={form.email} onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))} />
               </Field>
               <Field label="City">
-                <Input value={form.city} onChange={(e) => setForm((f) => ({ ...f, city: e.target.value }))} />
+                <Input aria-label="City" value={form.city} onChange={(e) => setForm((f) => ({ ...f, city: e.target.value }))} />
               </Field>
             </div>
 
             <div className="space-y-2 border-t pt-3">
               <div className="flex items-center justify-between">
                 <Label className="text-xs uppercase tracking-wide text-muted-foreground">Line items</Label>
-                <Button variant="outline" size="sm" onClick={() => setItems((prev) => [...prev, { ...emptyItem }])}>
+                <Button variant="outline" size="sm" onClick={() => setItems((prev) => [...prev, { ...emptyItem, silverRate: ratePerGram > 0 ? String(ratePerGram) : '' }])}>
                   <Plus className="h-3.5 w-3.5" /> Add line
                 </Button>
               </div>
-              {items.map((it, idx) => (
-                <div key={idx} className="grid grid-cols-2 items-end gap-2 rounded-lg border p-2.5 sm:grid-cols-6">
-                  <div className="col-span-2 sm:col-span-2">
-                    <Label className="text-[10px] text-muted-foreground">Product</Label>
-                    <Input className="h-8 text-xs" value={it.product} onChange={(e) => setItem(idx, { product: e.target.value })} placeholder="Item name" />
-                  </div>
-                  <div>
-                    <Label className="text-[10px] text-muted-foreground">SKU</Label>
-                    <Input className="h-8 text-xs" value={it.sku} onChange={(e) => setItem(idx, { sku: e.target.value })} />
-                  </div>
-                  <div>
-                    <Label className="text-[10px] text-muted-foreground">Qty</Label>
-                    <Input className="h-8 text-xs" type="number" min="1" value={it.qty} onChange={(e) => setItem(idx, { qty: e.target.value })} />
-                  </div>
-                  <div>
-                    <Label className="text-[10px] text-muted-foreground">Weight (g)</Label>
-                    <Input className="h-8 text-xs" type="number" value={it.weight} onChange={(e) => setItem(idx, { weight: e.target.value })} />
-                  </div>
-                  <div>
-                    <Label className="text-[10px] text-muted-foreground">Making ₹</Label>
-                    <Input className="h-8 text-xs" type="number" value={it.makingCharge} onChange={(e) => setItem(idx, { makingCharge: e.target.value })} />
-                  </div>
-                  <div className="col-span-2 flex items-center justify-between sm:col-span-6">
-                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                      <span>Silver rate ₹/g</span>
-                      <Input className="h-7 w-24 text-xs" type="number" value={it.silverRate} onChange={(e) => setItem(idx, { silverRate: e.target.value })} />
-                      <span className="font-semibold text-foreground">Line: {formatCurrency(itemAmount(it))}</span>
+              {items.map((it, idx) => {
+                const piece = isPieceRateForm(it)
+                const lineTotal = quotationLineAmount(toLineInput(it, parseQuotationQty(it.qty) ?? 0))
+                const searching = productSearch.line === idx
+                // Keep the line's search panel open while that line is being
+                // searched: it shows the live hits, the "Searching…" spinner,
+                // the browsable catalogue for an empty query, and — once a
+                // query resolves with nothing — the "No matching products"
+                // empty state. Only a pick, the custom-line choice, or closing
+                // the dialog (closeSearch) takes it down.
+                const showDropdown = searching
+                return (
+                  <div key={idx} className="grid grid-cols-2 items-end gap-2 rounded-lg border p-2.5 sm:grid-cols-12">
+                    <div className="col-span-2 relative sm:col-span-5">
+                      <Label className="text-[10px] text-muted-foreground">Product</Label>
+                      <Input
+                        className="h-8 text-xs"
+                        aria-label="Product search"
+                        value={it.sku && !it.custom ? `${it.product} · ${it.sku}` : it.product}
+                        onChange={(e) => typeProduct(idx, e.target.value)}
+                        onFocus={() => openLineSearch(idx)}
+                        placeholder="Search name or SKU…"
+                        autoComplete="off"
+                      />
+                      {showDropdown && (
+                        <div className="absolute z-20 mt-1 max-h-44 w-full overflow-auto rounded-md border border-border/60 bg-card p-1 shadow-md">
+                          {productSearch.query.trim() !== '' && productSearch.query.trim() !== resolvedProductQuery ? (
+                            <p className="flex items-center gap-2 px-2 py-1 text-[11px] text-muted-foreground">
+                              <Loader2 className="h-3 w-3 animate-spin" /> Searching…
+                            </p>
+                          ) : productHits.length === 0 ? (
+                            <p className="px-2 py-1 text-[11px] text-muted-foreground">No matching products</p>
+                          ) : (
+                            productHits.map((p) => (
+                              <div key={p.sku || p.id}>
+                                <button
+                                  type="button"
+                                  onClick={() => pickProduct(idx, p, null)}
+                                  className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left text-[11px] transition-colors hover:bg-muted"
+                                >
+                                  <span className="truncate">
+                                    {p.name}
+                                    {p.pieceRateProduct === true && Number(p.fixedPieceRate) > 0 ? (
+                                      <span className="ml-1.5 rounded bg-emerald-100 px-1 text-[9px] font-semibold text-emerald-700">fixed ₹{Number(p.fixedPieceRate)}/pc</span>
+                                    ) : null}
+                                  </span>
+                                  <span className="shrink-0 text-muted-foreground">{p.sku}</span>
+                                </button>
+                                {productHasVariants(p) && productVariants(p).map((v) => (
+                                  <button
+                                    key={`${p.sku || p.id}:${v.sku || v.id}`}
+                                    type="button"
+                                    onClick={() => pickProduct(idx, p, v)}
+                                    className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 pl-5 text-left text-[11px] text-muted-foreground transition-colors hover:bg-muted"
+                                  >
+                                    <span className="truncate">↳ {variantLabel(v)}</span>
+                                    <span className="shrink-0">{v.sku}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            ))
+                          )}
+                          {productSearch.query.trim() !== '' && (
+                            <button
+                              type="button"
+                              onClick={() => pickCustomLine(idx)}
+                              className="mt-1 flex w-full items-center justify-between gap-2 rounded border-t px-2 py-1 text-left text-[11px] transition-colors hover:bg-muted"
+                            >
+                              <span>Use “{productSearch.query.trim()}” as a custom line (no SKU)</span>
+                            </button>
+                          )}
+                        </div>
+                      )}
                     </div>
-                    {items.length > 1 && (
-                      <Button variant="ghost" size="icon-sm" onClick={() => setItems((prev) => prev.filter((_, i) => i !== idx))}>
-                        <Trash2 className="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
-                      </Button>
-                    )}
+                    <div className="sm:col-span-1">
+                      <Label className="text-[10px] text-muted-foreground">Qty</Label>
+                      <Input
+                        className="h-8 text-xs"
+                        aria-label={`Qty for line ${idx + 1}`}
+                        type="number" min="1" step="1"
+                        value={it.qty}
+                        onChange={(e) => setItem(idx, { qty: e.target.value })}
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <Label className="text-[10px] text-muted-foreground">Net wt / pc (g)</Label>
+                      <Input
+                        className="h-8 text-xs"
+                        aria-label={`Net wt pc for line ${idx + 1}`}
+                        type="number" min="0" step="0.001"
+                        value={piece ? '' : it.netWeight}
+                        disabled={piece}
+                        onChange={(e) => setItem(idx, { netWeight: e.target.value })}
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <Label className="text-[10px] text-muted-foreground">Making ₹/g</Label>
+                      <Input
+                        className="h-8 text-xs"
+                        aria-label={`Making charge for line ${idx + 1}`}
+                        type="number" min="0" step="0.01"
+                        value={piece ? '' : it.makingCharge}
+                        disabled={piece}
+                        onChange={(e) => setItem(idx, { makingCharge: e.target.value })}
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <Label className="text-[10px] text-muted-foreground">
+                        {piece ? `Fixed ₹${Number(it.pieceRate)}/pc` : 'Rate ₹/g'}
+                      </Label>
+                      <Input
+                        className="h-8 text-xs"
+                        aria-label={`Silver rate for line ${idx + 1}`}
+                        type="number" min="0" step="0.01"
+                        value={piece ? String(Number(it.pieceRate)) : it.silverRate}
+                        disabled={piece}
+                        onChange={(e) => setItem(idx, piece ? { pieceRate: e.target.value } : { silverRate: e.target.value })}
+                      />
+                    </div>
+                    <div className="col-span-2 flex items-center justify-between sm:col-span-12">
+                      <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                        <span className="font-semibold text-foreground">
+                          Line ({piece ? `₹${Number(it.pieceRate)} × ${parseQuotationQty(it.qty) ?? 0}` : `${totalWeightOf(it, parseQuotationQty(it.qty) ?? 0)}g × (rate + making)`}): {formatCurrency(lineTotal)}
+                        </span>
+                      </div>
+                      {items.length > 1 && (
+                        <Button variant="ghost" size="icon-sm" onClick={() => setItems((prev) => prev.filter((_, i) => i !== idx))} aria-label={`Remove line ${idx + 1}`}>
+                          <Trash2 className="h-3.5 w-3.5 text-red-600 dark:text-red-400" />
+                        </Button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
+              <p className="text-[11px] text-muted-foreground">
+                Amount = net wt × qty × (rate ₹/g + making ₹/g). Fixed-price (Piece Rate) products bill their fixed rate × qty. {ratePerGram > 0 ? `Managed silver rate: ₹${ratePerGram}/g.` : 'Silver rate not loaded yet — set it in Silver Rate Management.'}
+              </p>
             </div>
 
             <div className="grid grid-cols-2 gap-3 border-t pt-3 sm:grid-cols-4">
               <Field label="GST %">
-                <Input type="number" value={form.gst} onChange={(e) => setForm((f) => ({ ...f, gst: e.target.value }))} />
+                <Input aria-label="GST percent" type="number" value={form.gst} onChange={(e) => setForm((f) => ({ ...f, gst: e.target.value }))} />
               </Field>
               <Field label="Discount ₹">
-                <Input type="number" value={form.discount} onChange={(e) => setForm((f) => ({ ...f, discount: e.target.value }))} />
+                <Input aria-label="Discount rupees" type="number" value={form.discount} onChange={(e) => setForm((f) => ({ ...f, discount: e.target.value }))} />
               </Field>
               <Field label="Valid until">
                 <Input type="date" value={form.validUntil} onChange={(e) => setForm((f) => ({ ...f, validUntil: e.target.value }))} />

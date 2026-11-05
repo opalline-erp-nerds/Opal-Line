@@ -18,6 +18,7 @@ export interface ProductLabel {
 interface LabelOptions {
   width: number       // mm
   height: number      // mm
+  page?: 'a4' | 'letter'
   columns: number
   rows: number
   /** Outer page margin in mm (A4/Letter stock). */
@@ -28,6 +29,10 @@ interface LabelOptions {
   showWeight: boolean
   showQR: boolean
   showBrand: boolean
+  /** Content toggles shared with the preview, so the two never disagree. */
+  showName?: boolean
+  showSku?: boolean
+  showCategory?: boolean
   brand: string
   copies: number
   codeLength?: number
@@ -44,8 +49,12 @@ const DEFAULT_OPTIONS: LabelOptions = {
   showWeight: true,
   showQR: true,
   showBrand: true,
+  showName: true,
+  showSku: true,
+  showCategory: true,
   brand: 'OPAL LINE',
   copies: 1,
+  page: 'a4',
 }
 
 // ─── Reference designs ───────────────────────────────────────────
@@ -286,7 +295,7 @@ export function textEmWidth(text: string): number {
  */
 export function labelAttributes(product: LabelLineInput, opts: LabelLineOptions): string[] {
   const out: string[] = []
-  if (product.category) out.push(String(product.category))
+  if (opts.showCategory !== false && product.category) out.push(String(product.category))
   if (product.collection) out.push(String(product.collection))
   else if (opts.showWeight !== false && product.weight) out.push(`${product.weight}g`)
   return out
@@ -314,9 +323,12 @@ export function designFieldTexts(
       }
       case 'name': {
         // Every reference size prints a name line; a product without one still
-        // gets the placeholder rather than an empty field.
-        const name = (String(product.name ?? '').trim() || 'Product').toLocaleUpperCase()
-        out.push({ kind: 'name', text: name })
+        // gets the placeholder rather than an empty field. The preview's name
+        // toggle maps to `showName` so PDF and preview hide it together.
+        if (opts.showName !== false) {
+          const name = (String(product.name ?? '').trim() || 'Product').toLocaleUpperCase()
+          out.push({ kind: 'name', text: name })
+        }
         break
       }
       case 'rate':
@@ -329,8 +341,9 @@ export function designFieldTexts(
         const rawCode = labelCode(product)
         const code = opts.codeLength ? rawCode.slice(0, opts.codeLength) : rawCode
         // The slim 50×10 reference prints the bare identifier; every other size
-        // prefixes it with "Code:" exactly like the samples.
-        if (code) out.push({ kind: 'code', text: design.height <= 12 ? code : `Code: ${code}` })
+        // prefixes it with "Code:" exactly like the samples. The SKU toggle only
+        // hides the printed line — the QR payload never changes when present.
+        if (code && opts.showSku !== false) out.push({ kind: 'code', text: design.height <= 12 ? code : `Code: ${code}` })
         break
       }
       case 'attr1':
@@ -468,7 +481,10 @@ export async function fetchProductLabels(productIds: string[]): Promise<ProductL
   if (!client || productIds.length === 0) return []
   try {
     const products = await client.unsafe(
-      `SELECT name, sku, selling_price, net_weight, category, collection, hsn, huid FROM products WHERE id = ANY($1)`,
+      // `id` must come back: the rows are re-keyed by it below to keep the
+      // caller's order, and without it every lookup misses and the export
+      // reports "Products not found" for products that ARE in the catalogue.
+      `SELECT id, name, sku, selling_price, net_weight, category, collection, hsn, huid FROM products WHERE id = ANY($1)`,
       [productIds]
     )
     // Preserve the caller's order — the printed sheet should match the order the
@@ -520,16 +536,18 @@ export function labelCode(product: Pick<ProductLabel, 'sku'>): string {
  * (`^FDLA,<data>` means "level L, auto data type"), and keeping the module count
  * whole is what stops a tiny label's code from being blurred by resampling.
  */
-export async function generateLabelQrBuffer(data: string, sizeMm: number): Promise<Buffer> {
-  const qr = await QRCode.create(data, { errorCorrectionLevel: 'L' })
+export async function generateLabelQrBuffer(data: string, sizeMm: number): Promise<Buffer | null> {
+  const code = (data ?? '').trim()
+  if (!code || code.length < 2) return null
+  const qr = await QRCode.create(code, { errorCorrectionLevel: 'M' })
   const modules = qr.modules.size
   // ~12 device pixels per point keeps the symbol crisp on a high-res print.
   const targetPx = mmToPt(sizeMm) * 12
   const px = Math.max(modules, Math.round(targetPx / modules) * modules)
-  return QRCode.toBuffer(data, {
+  return QRCode.toBuffer(code, {
     width: px,
-    margin: 0,
-    errorCorrectionLevel: 'L',
+    margin: 2,
+    errorCorrectionLevel: 'M',
     color: { dark: '#000000', light: '#ffffff' },
   })
 }
@@ -599,6 +617,9 @@ export interface LabelLineOptions {
   showWeight: boolean
   showBrand?: boolean
   brand?: string
+  showName?: boolean
+  showSku?: boolean
+  showCategory?: boolean
   /** On very short labels the "Code:" prefix wastes room — drop it. */
   compact?: boolean
   codeLength?: number
@@ -648,11 +669,11 @@ export function computeLabelLines(
   // until the block fits, so a tiny label keeps brand + name + price.
   const stack: Array<{ kind: LabelLineKind; text: string; size: number }> = []
   if (showBrand) stack.push({ kind: 'brand', text: opts.brand as string, size: brandSize })
-  if (product.name) stack.push({ kind: 'name', text: product.name, size: nameSize })
-  if (code) {
+  if (product.name && opts.showName !== false) stack.push({ kind: 'name', text: product.name, size: nameSize })
+  if (code && opts.showSku !== false) {
     stack.push({ kind: 'code', text: opts.compact ? code : `Code: ${code}`, size: metaSize })
   }
-  if (product.category && !opts.compact) {
+  if (product.category && !opts.compact && opts.showCategory !== false) {
     stack.push({ kind: 'category', text: product.category, size: categorySize })
   }
 
@@ -758,6 +779,9 @@ function drawLabel(
       showWeight: opts.showWeight,
       showBrand: opts.showBrand,
       brand: opts.brand,
+      showName: opts.showName,
+      showSku: opts.showSku,
+      showCategory: opts.showCategory,
       compact: opts.height <= 12,
     },
   )
@@ -930,12 +954,27 @@ export async function generateLabelsPDF(
 
   const resolved = resolveLabelPreset(options.preset, options)
 
+  const pageFormat = resolved.page === 'letter' ? 'letter' : 'a4'
+  const pageDimsMm = pageFormat === 'letter' ? { width: 215.9, height: 279.4 } : { width: 210, height: 297 }
+  const pageSizeName = pageFormat === 'letter' ? 'Letter' : 'A4'
+
   const labelW = mmToPt(resolved.width)
   const labelH = mmToPt(resolved.height)
   // The four supplied sizes print from their transcribed reference design; any
   // other (legacy) size keeps the adaptive layout it has always used.
   const design = labelDesignFor(resolved.width, resolved.height)
   const geometry = computeLabelGeometry(labelW, labelH, resolved.showQR)
+
+  let columns = Math.floor(Number(resolved.columns))
+  let rows = Math.floor(Number(resolved.rows))
+  if (!Number.isFinite(columns) || columns < 1 || !Number.isFinite(rows) || rows < 1) {
+    const margin = clamp(resolved.margin, 0, 40)
+    const gap = clamp(resolved.gap, 0, 20)
+    const usableW = pageDimsMm.width - margin * 2
+    const usableH = pageDimsMm.height - margin * 2
+    columns = Math.max(1, Math.floor((usableW + gap) / (resolved.width + gap)))
+    rows = Math.max(1, Math.floor((usableH + gap) / (resolved.height + gap)))
+  }
 
   const copies = Math.min(Math.max(Math.floor(resolved.copies) || 1, 1), 999)
   const expanded: ProductLabel[] = []
@@ -954,8 +993,8 @@ export async function generateLabelsPDF(
 
   return new Promise((resolve) => {
     const doc = new PDFDocument({
-      size: 'A4',
-      margins: { top: 20, bottom: 20, left: 20, right: 20 },
+      size: pageSizeName,
+      margins: { top: 0, bottom: 0, left: 0, right: 0 },
     })
     const chunks: Buffer[] = []
     doc.on('data', (chunk: Buffer) => chunks.push(chunk))
@@ -966,17 +1005,16 @@ export async function generateLabelsPDF(
     const gapPt = mmToPt(clamp(resolved.gap, 0, 20))
     const stepX = labelW + gapPt
     const stepY = labelH + gapPt
-    const columns = Math.max(1, Math.floor(resolved.columns))
-    const rows = Math.max(1, Math.floor(resolved.rows))
+    const columnsCount = Math.max(1, columns)
+    const rowsCount = Math.max(1, rows)
     let col = 0
     let row = 0
 
     for (let i = 0; i < expanded.length; i++) {
       const product = expanded[i]
 
-      // Check if we need a new page
-      if (row >= rows) {
-        doc.addPage()
+      if (row >= rowsCount) {
+        doc.addPage({ size: pageSizeName })
         col = 0
         row = 0
       }
@@ -992,7 +1030,7 @@ export async function generateLabelsPDF(
 
       // Advance position
       col++
-      if (col >= columns) {
+      if (col >= columnsCount) {
         col = 0
         row++
       }

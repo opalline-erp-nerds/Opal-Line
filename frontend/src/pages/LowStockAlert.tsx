@@ -92,16 +92,16 @@ export default function LowStockAlertPage() {
     [rows],
   )
 
-  const handleOrder = useCallback(() => {
+  // Hand off to the purchase order screen with the confirmed quantity — the
+  // PO page opens its new-PO dialog prefilled with this product + qty.
+  const handleCreatePo = useCallback(() => {
     if (!orderTarget) return
-    const product = rows.find((r) => r.id === orderTarget.id)
-    if (!product) return
-    setRows((prev) =>
-      prev.map((r) => (r.id === product.id ? { ...r, stock: r.stock + Number(orderQty || 0), status: r.stock + Number(orderQty || 0) === 0 ? 'out' : r.status } : r)),
-    )
+    const target = rows.find((r) => r.id === orderTarget.id) ?? orderTarget
+    const qty = Math.max(1, Math.floor(Number(orderQty) || 0))
+    navigate(`/purchase/orders?product=${encodeURIComponent(target.sku)}&qty=${qty}`)
     setOrderTarget(null)
     setOrderQty('')
-  }, [orderTarget, orderQty, rows])
+  }, [orderTarget, orderQty, rows, navigate])
 
   const columns = useMemo<ColumnDef<Row>[]>(
     () => [
@@ -293,7 +293,7 @@ export default function LowStockAlertPage() {
         footer={
           <DialogFooter>
             <Button variant="outline" onClick={() => setOrderTarget(null)}>Cancel</Button>
-            <Button onClick={handleOrder} disabled={!orderQty || Number(orderQty) < 1}>
+            <Button onClick={handleCreatePo} disabled={!orderQty || Number(orderQty) < 1}>
               <ShoppingBag className="h-4 w-4" /> Create Purchase Order
             </Button>
           </DialogFooter>

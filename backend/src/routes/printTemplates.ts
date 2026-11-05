@@ -17,7 +17,16 @@ import { routeParam } from '../lib/routeParams'
 
 export const printTemplatesRouter = Router()
 
-export const PRINT_DOC_TYPES = ['invoice', 'quotation', 'order', 'packing-slip', 'pick-list', 'barcode-label'] as const
+export const PRINT_DOC_TYPES = [
+  'invoice',
+  'quotation',
+  'order',
+  'packing-slip',
+  'pick-list',
+  'purchase-order',
+  'purchase-invoice',
+  'barcode-label',
+] as const
 export type PrintDocType = (typeof PRINT_DOC_TYPES)[number]
 
 const MAX_CONFIG_BYTES = 128 * 1024
@@ -285,6 +294,88 @@ export function sampleDocument(docType: PrintDocType): Record<string, unknown> {
       { product: 'Temple Jhumka Earrings', sku: 'OL-TE-014', hsn: '7113', qty: 2, weight: 18.75, silverRate: 92, makingCharge: 2200, tax: 3, amount: 3865 },
       { product: 'Oxidised Anklet Pair', sku: 'OA-AK-022', hsn: '7113', qty: 1, weight: 26.4, silverRate: 92, makingCharge: 1800, tax: 3, amount: 4228.8 },
     ],
+  }
+  if (docType === 'purchase-order' || docType === 'purchase-invoice') {
+    // Purchase documents bill the supplier, so the supplier fields use the
+    // same customer slots the shared builder already renders (billToLabel is
+    // overridden to "Supplier" by the purchase print flows).
+    const supplier = {
+      customer: 'Sunrise Bullion Traders',
+      customerEmail: 'accounts@sunrisebullion.example',
+      customerPhone: '+91 98200 44556',
+      customerAddress: '14 Zaveri Bazaar',
+      customerCity: 'Mumbai',
+      customerState: 'Maharashtra',
+      customerPincode: '400002',
+      customerGstin: '27AACCS1234F1Z6',
+    }
+    const business = {
+      businessName: 'OPAL LINE JEWELS LLP',
+      businessGstin: '27AAACO1234F1Z5',
+      businessAddress: '2nd Floor, 18 Opera House, Mumbai',
+      businessPhone: '+91 22 4000 1234',
+      businessEmail: 'hello@opalline.example',
+    }
+    const items = [
+      { product: '925 Silver Casting Grain', sku: 'OL-RAW-GRAIN', qty: 2, weight: 100, rate: 92, cost: 9200, tax: 276, amount: 9476 },
+      { product: 'Silver Wire 1.2 mm', sku: 'OL-RAW-WIRE', qty: 3, weight: 180, rate: 91.72, cost: 16509.6, tax: 495.29, amount: 17004.89 },
+    ]
+    if (docType === 'purchase-order') {
+      return {
+        ...supplier,
+        ...business,
+        number: 'PO-2026-00456',
+        gst: 3,
+        gstAmount: 771.29,
+        discount: 0,
+        subtotal: 25709.6,
+        grandTotal: 26480.89,
+        date: new Date().toISOString(),
+        expectedDate: new Date(Date.now() + 7 * 86400000).toISOString(),
+        status: 'open',
+        paymentStatus: 'open',
+        items: items.map((line) => ({
+          product: line.product,
+          sku: line.sku,
+          qty: line.qty,
+          weight: line.weight,
+          rate: line.rate,
+          amount: line.cost,
+          tax: 0,
+        })),
+      }
+    }
+    return {
+      ...supplier,
+      ...business,
+      number: 'PI-2026-00078',
+      gst: 3,
+      gstAmount: 771.29,
+      discount: 0,
+      subtotal: 25709.6,
+      cost: 25709.6,
+      tax: 771.29,
+      total: 26480.89,
+      grandTotal: 26506.6,
+      cgst: 385.65,
+      sgst: 385.64,
+      igst: 0,
+      tcsRate: 0.1,
+      tcsAmount: 25.71,
+      status: 'pending',
+      paymentStatus: 'pending',
+      date: new Date().toISOString(),
+      items: items.map((line) => ({
+        product: line.product,
+        sku: line.sku,
+        qty: line.qty,
+        weight: line.weight,
+        rate: line.rate,
+        cost: line.cost,
+        tax: line.tax,
+        amount: line.cost + line.tax,
+      })),
+    }
   }
   if (docType === 'quotation') {
     return { ...base, number: 'QT-2026-00045', validUntil: new Date(Date.now() + 15 * 86400000).toISOString(), status: 'sent', notes: 'Prices valid for 15 days. Silver rate as on date.' }

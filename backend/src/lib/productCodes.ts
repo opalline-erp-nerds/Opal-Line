@@ -34,8 +34,14 @@ export interface ProductCodeSettings {
   skuSeqLength?: number | null
 }
 
-/** Category → the middle segment of auto-generated SKUs. */
-const CATEGORY_PREFIX: Record<string, string> = {
+/**
+ * Category → the middle segment of auto-generated SKUs.
+ *
+ * Exported for the Collections & Categories foundation (src/lib/collections.ts),
+ * which seeds one category row per entry so the catalogue and the SKU
+ * convention never drift apart.
+ */
+export const CATEGORY_PREFIX: Record<string, string> = {
   // The business default category still gets a real category code — generic
   // `OL-GEN-*` codes are reserved for rows with no usable category at all, so
   // no new generic SKUs are minted.
@@ -65,6 +71,18 @@ export function categoryCode(category: string): string {
   if (known) return known
   const letters = String(category ?? '').replace(/[^a-zA-Z]/g, '').slice(0, 3).toUpperCase()
   return letters || 'GEN'
+}
+
+/**
+ * The middle segment a SKU is minted with. An explicit prefix wins: catalogue
+ * categories store their own (product_categories.prefix, 2–5 letters), so a
+ * category created in Inventory → Collections & Categories mints exactly its
+ * stated code instead of one derived from its name. Without a prefix the
+ * built-in mapping / name derivation applies, exactly as before.
+ */
+export function skuCode(category: string, prefix?: string | null): string {
+  const explicit = String(prefix ?? '').replace(/[^a-zA-Z]/g, '').slice(0, 5).toUpperCase()
+  return explicit || categoryCode(category)
 }
 
 /** The settings slice with the shipped defaults filled in — never null. */
@@ -97,11 +115,12 @@ export function renderSku(
   settings: ProductCodeSettings | null | undefined,
   category: string,
   seq: number,
+  prefix?: string | null,
 ): string {
   const cfg = normalizedCodeSettings(settings)
   return cfg.skuFormat
     .replaceAll('{PREFIX}', cfg.skuPrefix)
-    .replaceAll('{CATEGORY}', categoryCode(category))
+    .replaceAll('{CATEGORY}', skuCode(category, prefix))
     .replaceAll('{SEQ}', String(Math.max(0, Math.floor(seq))).padStart(Math.max(MIN_SKU_SEQ_LENGTH, cfg.skuSeqLength), '0'))
     .replaceAll('{SUFFIX}', cfg.skuSuffix)
     .trim()
@@ -122,10 +141,11 @@ export function maxSequence(
   skus: Array<string | null | undefined>,
   settings?: ProductCodeSettings | null,
   category?: string,
+  prefix?: string | null,
 ): number {
   const cfg = normalizedCodeSettings(settings)
   const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const code = category !== undefined ? escape(categoryCode(category)) : '[A-Z]{2,5}'
+  const code = category !== undefined ? escape(skuCode(category, prefix)) : '[A-Z]{2,5}'
   const pattern = cfg.skuFormat
     .split('{PREFIX}').join(escape(cfg.skuPrefix))
     .split('{CATEGORY}').join(code)
@@ -157,14 +177,15 @@ export function generateSku(
   existing: Array<string | null | undefined>,
   category: string,
   settings?: ProductCodeSettings | null,
+  prefix?: string | null,
 ): string {
   const cfg = normalizedCodeSettings(settings)
   const taken = new Set(existing.map((s) => (s ?? '').trim().toUpperCase()).filter(Boolean))
-  let n = maxSequence([...taken], cfg, category) + 1
-  let sku = renderSku(cfg, category, n)
+  let n = maxSequence([...taken], cfg, category, prefix) + 1
+  let sku = renderSku(cfg, category, n, prefix)
   while (taken.has(sku.toUpperCase())) {
     n += 1
-    sku = renderSku(cfg, category, n)
+    sku = renderSku(cfg, category, n, prefix)
   }
   return sku
 }

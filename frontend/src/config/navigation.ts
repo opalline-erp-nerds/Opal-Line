@@ -16,6 +16,7 @@ import {
   HandCoins,
   KanbanSquare,
   Landmark,
+  Layers,
   LayoutDashboard,
   ListOrdered,
   Package,
@@ -90,6 +91,7 @@ export const navSections: NavSection[] = [
     label: 'Inventory',
     items: [
       { title: 'Products', path: '/inventory/products', icon: Gem },
+      { title: 'Collections & Categories', path: '/inventory/collections', icon: Layers },
       { title: 'Stock Overview', path: '/inventory/stock', icon: Boxes },
       { title: 'Stock Transfer', path: '/inventory/transfers', icon: ArrowLeftRight },
       { title: 'Stock Locations', path: '/inventory/locations', icon: Warehouse },

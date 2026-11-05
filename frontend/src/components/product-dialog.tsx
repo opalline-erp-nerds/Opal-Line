@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ImagePlus, Loader2, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { CreatableSelect } from '@/components/ui/creatable-select'
+import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { toast } from '@/components/ui/confirm'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
 import {
+  CATEGORY_PREFIX,
   combineOptions,
   findDuplicateProduct,
   generateSku,
@@ -16,7 +18,7 @@ import {
   type DuplicateMatch,
   type ProductCodeSettings,
 } from '@/lib/productCodes'
-import type { Product, ProductOption, Supplier } from '@/types'
+import type { Product, ProductCategory, ProductOption, Supplier } from '@/types'
 import { cn, safeImageUrl } from '@/lib/utils'
 import { SupplierPicker } from '@/components/ui/supplier-picker'
 
@@ -43,6 +45,10 @@ interface ProductForm {
   huid: string
   category: string
   collection: string
+  /** Stable collection id (collections.id); '' when nothing is linked yet. */
+  collectionId: string
+  /** Stable category id (product_categories.id); '' for free-text categories. */
+  categoryId: string
   purity: string
   supplier: string
   stoneWeight: string
@@ -67,48 +73,34 @@ interface ProductForm {
   pushToShopify: boolean
 }
 
-const CATEGORIES = [
-  // Business default: most of the catalogue is silver jewellery, so a new
-  // product starts here instead of the previous 'Rings' default.
-  'Silver jewels',
-  'Rings',
-  'Chains',
-  'Bracelets',
-  'Earrings',
-  'Pendants',
-  'Mangalsutra',
-  'Anklets',
-  'Toe Rings',
-  'Nose Pins',
-  'Necklaces',
-  'Bangles',
-  'Accessories',
-]
+/**
+ * The two top-level categories that determine how a product is priced.
+ * 'Silver Jewels' → silver-rate pricing; 'Other Product' → fixed price.
+ * They are never mixed with the product groupings (Rings, Chains, …): those
+ * are Collection options and are filtered by the category chosen here.
+ */
+export const TOP_LEVEL_CATEGORIES = ['Silver Jewels', 'Other Product'] as const
+
+/** The Category picker lists exactly these two rows — nothing else. */
+const CATEGORY_SELECT_OPTIONS = TOP_LEVEL_CATEGORIES.map((value) => ({ value, label: value }))
+
+/** Stable ids of the two seeded pricing collections (their names can change). */
+const SILVER_COLLECTION_ID = 'COL-SILVER-JEWELS'
+const OTHER_COLLECTION_ID = 'COL-OTHER-PRODUCTS'
 
 const DEFAULT_CATEGORY = 'Silver jewels'
-
-// The catalogue ships with one curated category; new ones can be added inline
-// from the category picker and are remembered in this browser for next time.
-const CATEGORY_OPTIONS = [DEFAULT_CATEGORY]
-const CUSTOM_CATEGORIES_KEY = 'opal.customCategories'
-
-function loadCustomCategories(): string[] {
-  try {
-    const raw = localStorage.getItem(CUSTOM_CATEGORIES_KEY)
-    const arr = raw ? (JSON.parse(raw) as unknown) : []
-    return Array.isArray(arr) ? arr.filter((c): c is string => typeof c === 'string' && c.trim() !== '') : []
-  } catch {
-    return []
-  }
-}
 
 const EMPTY_FORM: ProductForm = {
   name: '',
   description: '',
   sku: '',
   huid: '',
-  category: DEFAULT_CATEGORY,
+  // Silver Jewels is the business default; the SKU still stays empty until a
+  // collection (the product grouping it is minted from) is chosen.
+  category: 'Silver Jewels',
   collection: '',
+  collectionId: '',
+  categoryId: '',
   purity: '92.5',
   supplier: '',
   stoneWeight: '',
@@ -140,6 +132,8 @@ function fromProduct(p: Product): ProductForm {
     huid: p.huid ?? '',
     category: p.category ?? DEFAULT_CATEGORY,
     collection: p.collection ?? '',
+    collectionId: p.collectionId ?? '',
+    categoryId: p.categoryId ?? '',
     purity: p.purity != null ? String(p.purity) : '92.5',
     supplier: p.supplier ?? '',
     stoneWeight: p.stoneWeight != null ? String(p.stoneWeight) : '',
@@ -174,7 +168,13 @@ function computePrice(form: ProductForm): number {
   return Math.round((rate + making) * net * (1 + gst / 100) * 100) / 100
 }
 
-function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, supplierIdVal?: string) {
+function buildBody(
+  form: ProductForm,
+  silverRate: number,
+  sellingPrice: number,
+  supplierIdVal?: string,
+  fixedCollection = false,
+) {
   return {
     name: form.name.trim(),
     description: form.description.trim() || null,
@@ -182,6 +182,10 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, 
     huid: form.huid.trim() || null,
     category: form.category,
     collection: form.collection.trim() || null,
+    // Stable links: the backend validates them (a category must belong to the
+    // collection) and derives the pricing model and SKU prefix from them.
+    collectionId: form.collectionId.trim() || null,
+    categoryId: form.categoryId.trim() || null,
     purity: parseFloat(form.purity) || null,
     supplier: form.supplier.trim() || null,
     supplierId: supplierIdVal || null,
@@ -191,8 +195,10 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, 
     gst: parseFloat(form.gst) || null,
     silverRate,
     sellingPrice,
-    pieceRateProduct: form.pieceRateProduct,
-    fixedPieceRate: parseFloat(form.fixedPieceRate) || null,
+    // A fixed-price collection stores the entered price as the product's fixed
+    // price (the existing piece-rate protection), never as a silver formula.
+    pieceRateProduct: fixedCollection ? true : form.pieceRateProduct,
+    fixedPieceRate: fixedCollection ? sellingPrice : parseFloat(form.fixedPieceRate) || null,
     compareAtPrice: parseFloat(form.compareAtPrice) || null,
     stock: parseInt(form.stock, 10) || 0,
     reorderLevel: parseInt(form.reorderLevel, 10) || 0,
@@ -313,12 +319,11 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   const [supplierId, setSupplierId] = useState<string>('')
   // Active duplicate (same SKU) — resolved inline before saving.
   const [duplicate, setDuplicate] = useState<DuplicateMatch | null>(null)
-  // Categories added inline by this user (persisted per browser).
-  const [customCategories, setCustomCategories] = useState<string[]>(loadCustomCategories)
-  // Collection names already used by products (loaded once per mount) so the
-  // collection picker can offer them alongside the built-in categories.
-  const [collectionChoices, setCollectionChoices] = useState<string[]>([])
-  const collectionsLoaded = useRef(false)
+  // Collection categories (loaded once per mount): the Collection picker only
+  // offers the rows of the selected category's own collection, and each row
+  // carries the prefix new SKUs mint with.
+  const [categories, setCategories] = useState<ProductCategory[]>([])
+  const categoriesRef = useRef<ProductCategory[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
   // Latest catalogue for code generation + duplicate checks without turning
   // `products` into a dependency of the open effect.
@@ -327,15 +332,19 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   // only the cross-location rollup, so the per-location truth comes from the
   // ledger when the dialog opens.
   const [levelDraft, setLevelDraft] = useState<StockRow[]>([])
-  // Settings → Product codes (SKU format) — loaded once per mount and
-  // applied when minting codes; null until loaded (the shipped defaults).
-  const [codeSettings, setCodeSettings] = useState<ProductCodeSettings | null>(null)
+  // Settings → Product codes (SKU format) — loaded once per mount and used by
+  // the offline fallback / variant minting; null until loaded (defaults).
   const codeSettingsRef = useRef<ProductCodeSettings | null>(null)
   // Shopify-style options + the editable variant table derived from them.
   const [options, setOptions] = useState<ProductOption[]>([])
   const [variants, setVariants] = useState<VariantDraft[]>([])
-  /** SKU last auto-minted for an untouched add-mode form (see the effect). */
-  const lastGenerated = useRef<{ sku: string } | null>(null)
+  // Latest SKU proposal request: a response that lands after the category
+  // changed again must never overwrite the newer proposal.
+  const skuRequest = useRef(0)
+  // The parent SKU this dialog last proposed (add mode), so variant codes that
+  // were derived from it are re-derived when the category changes.
+  const autoParent = useRef('')
+  const [skuLoading, setSkuLoading] = useState(false)
 
   const set = <K extends keyof ProductForm>(key: K, value: ProductForm[K]) => setForm((f) => ({ ...f, [key]: value }))
 
@@ -343,26 +352,26 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     if (products) productsRef.current = products
   }, [products])
 
+  // Keep the latest catalogue rows readable from callbacks without turning
+  // them into effect dependencies.
+  useEffect(() => {
+    categoriesRef.current = categories
+  }, [categories])
+
   // Suppliers + code settings load once per mount — never on the open path —
   // so opening the dialog is a pure render with zero network waits.
   useEffect(() => {
     dbApi.getSuppliers().then(setSuppliers).catch(() => setSuppliers([]))
     dbApi.getSettings().then((s) => {
       codeSettingsRef.current = s
-      setCodeSettings(s)
-    }).catch(() => setCodeSettings(null))
-    // Collection fallback (pages that don't pass `products`): fetch lazily
-    // after first paint so it never competes with the dialog opening.
-    const t = window.setTimeout(() => {
-      if (collectionsLoaded.current || products) return
-      collectionsLoaded.current = true
-      dbApi.getProducts().then((ps) => {
-        const cols = Array.from(new Set(ps.map((p) => p.collection).filter((c): c is string => Boolean(c))))
-        setCollectionChoices(cols)
-      }).catch(() => setCollectionChoices([]))
-    }, 250)
-    return () => window.clearTimeout(t)
-  }, [products])
+    }).catch(() => {
+      codeSettingsRef.current = null
+    })
+    // Collection categories: the Collection picker's options and the SKU
+    // prefixes come from these, so they load once per mount alongside the
+    // other reference data (never on the open path).
+    dbApi.getProductCategories().then(setCategories).catch(() => setCategories([]))
+  }, [])
 
   useEffect(() => {
     if (!open) return
@@ -372,13 +381,12 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
         ? {
             ...fromProduct(duplicateOf),
             name: `${duplicateOf.name} (Copy)`,
-            sku: generateSku(productsRef.current, duplicateOf.category ?? EMPTY_FORM.category, codeSettingsRef.current),
+            // The copy gets a fresh SKU for its own category; its collection
+            // and category are carried over unchanged.
+            sku: '',
             pushToShopify: false,
           }
-        : {
-            ...EMPTY_FORM,
-            sku: generateSku(productsRef.current, EMPTY_FORM.category, codeSettingsRef.current),
-          }
+        : { ...EMPTY_FORM }
     const fixedInitial = parseFloat(initial.fixedPieceRate)
     if (initial.pieceRateProduct && Number.isFinite(fixedInitial) && fixedInitial > 0) {
       initial.sellingPrice = String(fixedInitial)
@@ -386,7 +394,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       const p = computePrice(initial)
       if (Number.isFinite(p)) initial.sellingPrice = String(Math.round(p * 100) / 100)
     }
-    lastGenerated.current = mode === 'add' ? { sku: initial.sku } : null
     // Defer the reset out of the effect body (react/set-state-in-effect).
     queueMicrotask(() => {
       setForm(initial)
@@ -396,6 +403,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       setDuplicate(null)
       setOptions([])
       setVariants([])
+      autoParent.current = ''
     })
   }, [open, mode, product, duplicateOf])
 
@@ -430,40 +438,88 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     }
   }, [open, mode, product])
 
-  // Code settings arrive after mount; if the form is still exactly what we
-  // auto-minted (the user has not touched the SKU), re-mint under the
-  // saved format so an Add dialog opened instantly still honours Settings.
-  useEffect(() => {
-    if (!open || mode !== 'add' || !codeSettings) return
-    const gen = lastGenerated.current
-    if (!gen) return
-    queueMicrotask(() => {
-      setForm((f) => {
-        if (f.sku !== gen.sku) return f
-        const sku = generateSku(productsRef.current, f.category, codeSettings)
-        lastGenerated.current = { sku }
-        return { ...f, sku }
+  // Install a proposed parent SKU and keep the derived variant codes in step:
+  // a variant minted from the previous parent (or before any parent existed)
+  // is re-derived, while a code the user edited is left alone.
+  const applyProposal = useCallback((wanted: string, sku: string) => {
+    const previousUpper = autoParent.current.toUpperCase()
+    autoParent.current = sku
+    setForm((f) => (f.category.trim() === wanted ? { ...f, sku } : f))
+    setVariants((prev) => {
+      if (prev.length === 0) return prev
+      const derived = (value: string) =>
+        !value || (previousUpper !== '' && value.toUpperCase().startsWith(`${previousUpper}-`))
+      if (!prev.some((v) => derived(v.sku.trim()))) return prev
+      const taken = new Set(
+        prev.map((v) => v.sku.trim().toUpperCase()).filter((value) => value && !derived(value)),
+      )
+      return prev.map((v) => {
+        if (!derived(v.sku.trim())) return v
+        const fresh = generateVariantSku(sku, v.optionValues, taken)
+        taken.add(fresh.toUpperCase())
+        return { ...v, sku: fresh }
       })
     })
-  }, [codeSettings, open, mode])
+  }, [])
 
-  // The SKU's middle segment IS the category (OL-RNG-001): re-mint an
-  // untouched add-mode SKU whenever the category changes, so a product never
-  // keeps the generic code minted for the previous category. Edit mode is
-  // guarded — an existing SKU is never regenerated.
+  // Ask the backend for the next free SKU for this category — live product +
+  // variant codes under the create path's advisory lock, honouring Settings →
+  // Product codes and the category's own prefix when it has a category row.
+  // The mirrored client rules are only a fallback when the request itself
+  // fails; the server still mints and validates on save.
+  const proposeSku = useCallback(
+    async (category: string, categoryId?: string): Promise<void> => {
+      const wanted = category.trim()
+      const id = (categoryId ?? '').trim()
+      const requestId = ++skuRequest.current
+      if (!wanted) {
+        setSkuLoading(false)
+        autoParent.current = ''
+        setForm((f) => (f.sku ? { ...f, sku: '' } : f))
+        return
+      }
+      const prefix = categoriesRef.current.find((c) => c.id === id)?.prefix
+      setSkuLoading(true)
+      try {
+        const res = await dbApi.getNextSku(wanted, id || undefined)
+        if (skuRequest.current !== requestId) return
+        applyProposal(wanted, res.sku)
+      } catch {
+        if (skuRequest.current !== requestId) return
+        applyProposal(wanted, generateSku(productsRef.current, wanted, codeSettingsRef.current, prefix))
+      } finally {
+        if (skuRequest.current === requestId) setSkuLoading(false)
+      }
+    },
+    [applyProposal],
+  )
+
+  // Add mode only: the SKU stays empty until a category is selected, then
+  // follows that category (OL-RNG, OL-CHN …) — including when the category
+  // changes again before saving. A saved product's SKU is never regenerated:
+  // its field is read-only and the backend ignores SKU writes on edit.
   useEffect(() => {
     if (!open || mode !== 'add') return
-    const gen = lastGenerated.current
-    if (!gen) return
-    queueMicrotask(() => {
-      setForm((f) => {
-        if (f.sku !== gen.sku) return f
-        const sku = generateSku(productsRef.current, f.category, codeSettingsRef.current)
-        lastGenerated.current = { sku }
-        return { ...f, sku }
-      })
-    })
-  }, [form.category, open, mode])
+    const category = form.category.trim()
+    const collection = form.collection.trim()
+    if (!category) {
+      queueMicrotask(() => setForm((f) => (f.sku ? { ...f, sku: '' } : f)))
+      return
+    }
+    // Only propose the SKU when both a top-level category and a product-grouping
+    // collection have been selected. This ensures the SKU uses the correct prefix
+    // (e.g. RNG for Rings) rather than a top-level category prefix (e.g. SIL for
+    // Silver Jewels), per the requirement: "Do not generate SKUs from the collection
+    // display name or use SLV-GEN."
+    if (!collection) {
+      // Category selected but collection not yet — clear SKU pending collection
+      // selection, but keep the form category so the proposal can resume.
+      queueMicrotask(() => setForm((f) => ({ ...f, sku: '' })))
+      return
+    }
+    // Deferred out of the effect body (react/set-state-in-effect).
+    queueMicrotask(() => { void proposeSku(category, form.categoryId) })
+  }, [open, mode, form.category, form.collection, form.categoryId, proposeSku])
 
   // Stock levels behind the edit dialog: clear first (deferred — sync setState
   // in an effect is linted), then load this product's per-location balances.
@@ -507,11 +563,31 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     }
   }, [open, mode, product])
 
+  // ── Category → pricing model ──────────────────────────────────────────
+  // The Category picker selects the pricing group. Rows saved before this
+  // picker existed carry no top-level value, so their stable links decide it;
+  // an unlinked legacy row stays on the silver-rate catalogue (the business
+  // default) and its stored text is only rewritten when the user picks.
+  const topLevelCategory = useMemo(() => {
+    if (form.category === 'Other Product' || form.category === 'Silver Jewels') return form.category
+    if (!form.category) return ''
+    const linked = categories.find((c) => c.id === form.categoryId)
+    const collectionId = linked?.collectionId ?? form.collectionId
+    return collectionId === OTHER_COLLECTION_ID ? 'Other Product' : 'Silver Jewels'
+  }, [form.category, form.categoryId, form.collectionId, categories])
+
+  // The pricing collection follows the category: Silver Jewels prices from the
+  // silver rate, Other Product is fixed-price. Until a category is chosen the
+  // silver catalogue is what its Collection picker offers.
+  const pricingCollectionId = topLevelCategory === 'Other Product' ? OTHER_COLLECTION_ID : SILVER_COLLECTION_ID
+  const isFixed = topLevelCategory === 'Other Product'
+
   const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
     setForm((f) => {
       const next = { ...f, [key]: value }
-      // Piece-rate prices are fixed — the silver formula must never overwrite them.
-      if (next.pieceRateProduct) return next
+      // Piece-rate and fixed-price-collection prices are fixed — the silver
+      // formula must never overwrite them.
+      if (next.pieceRateProduct || isFixed) return next
       const p = computePrice(next)
       if (Number.isFinite(p)) {
         const rounded = String(Math.round(p * 100) / 100)
@@ -550,48 +626,63 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       return next
     })
 
-  const categorySelectOptions = useMemo(() => {
-    // One curated default for now; categories the user added inline join the
-    // list (remembered per browser), plus the current value while editing.
-    const labels = new Set<string>([...CATEGORY_OPTIONS, ...customCategories])
-    if (form.category) labels.add(form.category)
-    // Keep the default first, alphabetical after it.
-    return Array.from(labels)
-      .sort((a, b) => (a === DEFAULT_CATEGORY ? -1 : b === DEFAULT_CATEGORY ? 1 : a.localeCompare(b)))
-      .map((c) => ({ value: c, label: c }))
-  }, [customCategories, form.category])
-
   const commitCategory = (value: string) => {
-    set('category', value)
-    setCustomCategories((prev) => {
-      const known = [...CATEGORY_OPTIONS, ...prev].some((c) => c.toLowerCase() === value.toLowerCase())
-      if (known) return prev
-      const next = [...prev, value]
-      try {
-        localStorage.setItem(CUSTOM_CATEGORIES_KEY, JSON.stringify(next))
-      } catch {
-        // Private mode / quota — the category still applies to this product.
-      }
-      return next
-    })
+    if (value === form.category) return
+    setForm((f) => ({
+      ...f,
+      category: value,
+      // The grouping belongs to one collection only, so switching category
+      // drops the old grouping (and its link) instead of carrying it across.
+      collection: '',
+      collectionId: '',
+      categoryId: '',
+    }))
+  }
+
+  // Picking a collection records the grouping the product belongs to. The
+  // grouping's category row is the stable link (and the SKU prefix), while the
+  // category stays the pricing group chosen above.
+  const commitCollection = (value: string) => {
+    const key = value.trim().toLowerCase()
+    const row = categories.find(
+      (c) => c.collectionId === pricingCollectionId && c.name.trim().toLowerCase() === key,
+    )
+    setForm((f) => ({
+      ...f,
+      category: topLevelCategory || 'Silver Jewels',
+      collection: value,
+      collectionId: pricingCollectionId,
+      categoryId: row?.id ?? '',
+    }))
   }
 
   const collectionSelectOptions = useMemo(() => {
-    const labels = new Set<string>([...collectionChoices, ...CATEGORIES])
-    if (form.collection) labels.add(form.collection)
-    return Array.from(labels)
+    // Only the groupings of the selected category's own collection: Silver
+    // Jewels offers its product groupings (Rings, Chains, …) and Other Product
+    // offers the collections managed for it in Inventory → Collections &
+    // Categories. The two lists never mix.
+    const labels = categories
+      .filter((c) => c.collectionId === pricingCollectionId)
+      .map((c) => c.name)
+    // First paint / failed request: fall back to the well-known Silver Jewels
+    // groupings rather than showing an empty picker on an Add form.
+    if (labels.length === 0 && pricingCollectionId === SILVER_COLLECTION_ID) {
+      labels.push(...Object.keys(CATEGORY_PREFIX))
+    }
+    return Array.from(new Set(labels))
       .sort((a, b) => a.localeCompare(b))
       .map((c) => ({ value: c, label: c }))
-  }, [collectionChoices, form.collection])
+  }, [categories, pricingCollectionId])
 
   const pieceRateNum = parseFloat(form.fixedPieceRate)
   const isPieceRate = form.pieceRateProduct
   const pieceRateValid = Number.isFinite(pieceRateNum) && pieceRateNum > 0
   const computed = computePrice(form)
-  // A piece-rate product prices from its fixed rate; everything else keeps
-  // the silver-rate formula exactly as before.
-  const hasAutoPrice = isPieceRate ? pieceRateValid : Number.isFinite(computed)
-  const sellingLocked = hasAutoPrice
+  // A fixed-price collection prices from the entered selling price; a
+  // piece-rate product from its fixed rate; everything else keeps the
+  // silver-rate formula exactly as before.
+  const hasAutoPrice = isFixed ? false : isPieceRate ? pieceRateValid : Number.isFinite(computed)
+  const sellingLocked = !isFixed && hasAutoPrice
 
   // ── Shopify-style options → variants ────────────────────────────────────
   // The variant table is derived from the option definitions (cartesian
@@ -607,13 +698,16 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       ...productsRef.current.map((p) => (p.sku ?? '').trim().toUpperCase()),
       ...prev.map((v) => v.sku.trim().toUpperCase()),
     ])
-    const parentSku = form.sku.trim() || generateSku(productsRef.current, form.category, codeSettingsRef.current)
+    // A parent SKU only exists once a category is chosen — never mint a
+    // generic OL-GEN code for variants waiting on one. They are filled in as
+    // soon as the category's proposal lands (see applyProposal).
+    const parentSku = form.sku.trim()
     const defaultPrice = form.sellingPrice.trim()
     const next: VariantDraft[] = combos.map((combo) => {
       const kept = byTitle.get(combo.title)
       if (kept) return { ...kept, optionValues: combo.optionValues }
-      const sku = generateVariantSku(parentSku, combo.optionValues, takenSku)
-      takenSku.add(sku.toUpperCase())
+      const sku = parentSku ? generateVariantSku(parentSku, combo.optionValues, takenSku) : ''
+      if (sku) takenSku.add(sku.toUpperCase())
       return {
         title: combo.title,
         optionValues: combo.optionValues,
@@ -737,15 +831,47 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
 
   const submit = async () => {
     const name = form.name.trim()
-    const sku = form.sku.trim()
-    if (!name || !sku) {
-      setError('Title and SKU are required')
+    if (!name) {
+      setError('Title is required')
+      return
+    }
+    // The category is what the SKU is derived from. With one selected the
+    // field is already filled; if a proposal is still in flight the backend
+    // mints the code inside its advisory lock on save.
+    if (!form.category.trim()) {
+      setError('Select a category — it determines the auto-generated SKU')
+      return
+    }
+    // A new product is grouped by its collection, and that grouping (not the
+    // top-level category label) is what the SKU is minted from — so it must be
+    // chosen. Existing products are never forced to re-link on an edit.
+    if (mode === 'add' && !form.collectionId.trim()) {
+      setError('Choose a collection — it determines the SKU prefix')
       return
     }
     const parsedRate = parseFloat(form.silverRate)
     let sellingPrice: number
     let silverRate: number
-    if (form.pieceRateProduct) {
+    if (isFixed) {
+      // Other Products (fixed price): the category must reference a row in the
+      // Other Products collection so the SKU prefix is derived from a valid
+      // collection category. The user creates categories in
+      // Inventory → Collections & Categories.
+      const ownCategory = categories.find(
+        (c) => c.id === form.categoryId && c.collectionId === pricingCollectionId,
+      )
+      if (!ownCategory) {
+        setError('Choose a collection for this product — it determines the SKU prefix')
+        return
+      }
+      const manual = parseFloat(form.sellingPrice)
+      if (!Number.isFinite(manual) || manual <= 0) {
+        setError('A selling price is required — fixed-price products are never calculated from the silver rate')
+        return
+      }
+      sellingPrice = manual
+      silverRate = Number.isFinite(parsedRate) && parsedRate > 0 ? parsedRate : Number(product?.silverRate) || 0
+    } else if (form.pieceRateProduct) {
       // Piece-rate product: the fixed rate IS the price. Silver rate and the
       // weight formula are not part of its pricing (rate kept for display).
       const fixed = parseFloat(form.fixedPieceRate)
@@ -770,7 +896,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     setSaving(true)
     setError('')
     try {
-      const body = buildBody(form, silverRate, sellingPrice, supplierId)
+      const body = buildBody(form, silverRate, sellingPrice, supplierId, isFixed)
       if (hasVariants) {
         const variantError = validateVariants()
         if (variantError) {
@@ -899,6 +1025,14 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           setDuplicate(dup)
           return
         }
+        // A concurrent create claimed the auto-proposed code. Mint the next
+        // free one for the category so the user reviews a live SKU instead of
+        // retrying a dead one.
+        if (mode === 'add' && form.sku.trim().toUpperCase() === autoParent.current.toUpperCase()) {
+          void proposeSku(form.category)
+          setError('That SKU was just taken by another product — a fresh one has been generated. Review it and save again.')
+          return
+        }
       }
       setError(msg)
     } finally {
@@ -907,12 +1041,11 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   }
 
   const regenerateCodes = () => {
-    setForm((f) => ({
-      ...f,
-      sku: generateSku(productsRef.current, f.category, codeSettingsRef.current),
-    }))
     setDuplicate(null)
     setError('')
+    // Same database-derived proposal the category picker uses — a code that is
+    // already taken is skipped, so the panel's clash is resolved.
+    void proposeSku(form.category)
   }
 
   // Validation + duplicate panels live in the footer so they are always
@@ -1004,29 +1137,57 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                 <p className="text-[11px] text-muted-foreground">Synced to Shopify body_html when the product is pushed.</p>
               </Field>
               <Field label="SKU *">
-                <Input aria-label="Product SKU" value={form.sku} onChange={(e) => set('sku', e.target.value)} placeholder="e.g. OL-RNG-001" />
-                <p className="text-[11px] text-muted-foreground">Auto-generated per category. The printed label's QR code encodes this SKU.</p>
+                {mode === 'edit' ? (
+                  <Input aria-label="Product SKU" value={form.sku} readOnly className="font-mono" />
+                ) : (
+                  <div className="relative">
+                    <Input
+                      aria-label="Product SKU"
+                      value={form.sku}
+                      onChange={(e) => set('sku', e.target.value)}
+                      placeholder={skuLoading ? 'Generating…' : 'Select a category to generate'}
+                      className="pr-8 font-mono"
+                    />
+                    {skuLoading ? (
+                      <Loader2 className="absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />
+                    ) : null}
+                  </div>
+                )}
+                <p className="text-[11px] text-muted-foreground">
+                  {mode === 'edit'
+                    ? 'SKU is fixed once saved — use the SKU regeneration workflow to change an existing code.'
+                    : 'Generated from the category (e.g. Rings → OL-RNG-001). The printed label’s QR code encodes this SKU.'}
+                </p>
               </Field>
               <Field label="HUID (Hallmark)">
                 <Input value={form.huid} onChange={(e) => set('huid', e.target.value)} placeholder="e.g. HUIA07" />
               </Field>
               <Field label="Category">
-                <CreatableSelect
-                  options={categorySelectOptions}
-                  value={form.category}
+                <Select
+                  aria-label="Category"
+                  options={CATEGORY_SELECT_OPTIONS}
+                  value={topLevelCategory}
                   onValueChange={commitCategory}
-                  placeholder="Select or type a category…"
-                  createLabel="Add category"
                 />
+                <p className="text-[11px] text-muted-foreground">
+                  {isFixed
+                    ? 'Other Product is fixed-price — choose one of its collections below and enter the selling price.'
+                    : 'Silver Jewels is priced from the silver rate — choose the product grouping below.'}
+                </p>
               </Field>
               <Field label="Collection">
                 <CreatableSelect
                   options={collectionSelectOptions}
                   value={form.collection}
-                  onValueChange={(v) => set('collection', v)}
-                  placeholder="Select or type a collection…"
+                  onValueChange={commitCollection}
+                  placeholder="Select a collection…"
                   createLabel="Add collection"
                 />
+                <p className="text-[11px] text-muted-foreground">
+                  {isFixed
+                    ? 'Only Other Product’s own collections are listed — manage them in Inventory → Collections & Categories.'
+                    : 'The product groupings (Rings, Chains, Earrings, …) — the chosen one sets the SKU prefix.'}
+                </p>
               </Field>
               <Field label="Purity %">
                 <Input type="number" step="0.1" value={form.purity} onChange={(e) => set('purity', e.target.value)} />
@@ -1154,22 +1315,24 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           <div className="space-y-3">
             <SectionTitle title="Weight & pricing" />
             <div className="grid grid-cols-3 gap-3">
-              <div className="col-span-3 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2">
-                <input
-                  id="piece-rate-product"
-                  type="checkbox"
-                  checked={form.pieceRateProduct}
-                  onChange={(e) => setPieceRate(e.target.checked)}
-                  className="h-4 w-4 cursor-pointer accent-primary-600"
-                />
-                <Label htmlFor="piece-rate-product" className="cursor-pointer text-sm font-medium">
-                  Piece Rate Product
-                </Label>
-                <span className="text-[11px] text-muted-foreground">
-                  Price at a fixed rate per piece instead of the silver-rate calculation.
-                </span>
-              </div>
-              {form.pieceRateProduct ? (
+              {!isFixed ? (
+                <div className="col-span-3 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2">
+                  <input
+                    id="piece-rate-product"
+                    type="checkbox"
+                    checked={form.pieceRateProduct}
+                    onChange={(e) => setPieceRate(e.target.checked)}
+                    className="h-4 w-4 cursor-pointer accent-primary-600"
+                  />
+                  <Label htmlFor="piece-rate-product" className="cursor-pointer text-sm font-medium">
+                    Piece Rate Product
+                  </Label>
+                  <span className="text-[11px] text-muted-foreground">
+                    Price at a fixed rate per piece instead of the silver-rate calculation.
+                  </span>
+                </div>
+              ) : null}
+              {!isFixed && form.pieceRateProduct ? (
                 <Field label="Fixed Piece Rate (₹)">
                   <Input
                     type="number"
@@ -1187,7 +1350,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
               <Field label="Net weight (g)">
                 <Input aria-label="Net weight" type="number" step="0.01" value={form.netWeight} onChange={(e) => setPricing('netWeight', e.target.value)} />
               </Field>
-              <Field label={isPieceRate ? 'Silver rate (₹/g)' : 'Silver rate (₹/g) *'}>
+              <Field label={isFixed || isPieceRate ? 'Silver rate (₹/g)' : 'Silver rate (₹/g) *'}>
                 <Input aria-label="Silver rate" type="number" step="0.01" value={form.silverRate} onChange={(e) => setPricing('silverRate', e.target.value)} />
               </Field>
               <Field label="Making charge (₹/g)">
@@ -1267,7 +1430,12 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                 </p>
               ) : null}
             </div>
-            {isPieceRate ? (
+            {isFixed ? (
+              <p className="text-[11px] text-muted-foreground">
+                Fixed price — entered manually and saved as-is: silver rate, net weight and making charges never
+                calculate it, and silver-rate changes never overwrite it.
+              </p>
+            ) : isPieceRate ? (
               pieceRateValid ? (
                 <p className="text-[11px] text-muted-foreground">
                   Fixed piece rate{' '}

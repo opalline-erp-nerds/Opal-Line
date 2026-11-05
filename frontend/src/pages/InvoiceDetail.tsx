@@ -19,9 +19,7 @@ import {
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
-import { DialogFooter } from '@/components/ui/dialog'
-import { AppDialog } from '@/components/ui/app-dialog'
-import { Input } from '@/components/ui/input'
+import { InvoiceReturnDialog } from '@/components/invoice-return-dialog'
 import { PrintTemplatePicker } from '@/components/print-template-picker'
 import { printDocument, mergePrintConfig, invoicePrintDoc } from '@/lib/printTemplate'
 import { printTemplatesApi } from '@/lib/api'
@@ -52,12 +50,16 @@ export default function InvoiceDetailPage() {
   const [upiQr, setUpiQr] = useState<string | null>(null)
   const [einvoice, setEinvoice] = useState<EInvoiceStatus | null>(null)
   const [irnBusy, setIrnBusy] = useState(false)
-  // Return-dialog state must live above the early returns (Rules of Hooks)
+  // Return-dialog state must live above the early returns (Rules of Hooks).
+  // The dialog itself is the shared component: it loads per-line sold /
+  // previously returned / remaining quantities and submits an idempotent
+  // request so a retry can never restock twice.
   const [returnOpen, setReturnOpen] = useState(false)
-  const [returnQty, setReturnQty] = useState<Record<string, number>>({})
-  const [restock, setRestock] = useState(true)
-  const [returning, setReturning] = useState(false)
-
+  const returnProcessed = (opts: { returnStatus: Invoice['status'] | null; fullyReturned: boolean }) => {
+    const next = opts.returnStatus
+    if (next !== 'partially_returned' && next !== 'fully_returned') return
+    setInvoice((inv) => (inv ? { ...inv, status: next } : inv))
+  }
   useEffect(() => {
     // Defer out of the effect body: setLoading fires synchronously
     // (react/set-state-in-effect).
@@ -70,7 +72,6 @@ export default function InvoiceDetailPage() {
       setEinvoice(null)
       setUpiQr(null)
       setReturnOpen(false)
-      setReturnQty({})
       dbApi.getInvoiceById(id ?? '').then((inv) => {
         // A slower response for a previously opened invoice must never
         // overwrite the record currently on screen.
@@ -230,33 +231,9 @@ export default function InvoiceDetailPage() {
     }
   }
 
-  // Returns: choose quantities per line item → credit note + optional restock
+  // Returns: choose quantities per line item → per-line credit note + restock
   const openReturnDialog = () => {
-    const initial: Record<string, number> = {}
-    for (const it of invoice.items) if (it.sku) initial[it.sku] = 0
-    setReturnQty(initial)
-    setRestock(true)
     setReturnOpen(true)
-  }
-
-  const submitReturn = async () => {
-    const items = Object.entries(returnQty)
-      .filter(([, qty]) => qty > 0)
-      .map(([sku, qty]) => ({ sku, qty }))
-    if (items.length === 0) { toast.error('Enter a quantity greater than 0 for at least one item.'); return }
-    setReturning(true)
-    try {
-      const r = await dbApi.createReturn(invoice.id, { items, restock })
-      toast.success(
-        `Return processed — credit note ${r.creditNoteNumber}, ₹${r.amount.toLocaleString('en-IN')}${r.restocked ? ', items restocked' : ''}`,
-      )
-      setReturnOpen(false)
-      window.location.reload()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Return failed')
-    } finally {
-      setReturning(false)
-    }
   }
 
   const customerInitial = invoice.customer.split(' ').map((n) => n[0]).join('').slice(0, 2)
@@ -281,6 +258,10 @@ export default function InvoiceDetailPage() {
             <span className="font-mono text-lg font-semibold text-primary-700">{invoice.number}</span>
             {invoice.status === 'refunded' ? (
               <Badge variant="muted" dot>REFUNDED</Badge>
+            ) : invoice.status === 'fully_returned' ? (
+              <Badge variant="muted" dot>FULLY RETURNED</Badge>
+            ) : invoice.status === 'partially_returned' ? (
+              <Badge variant="warning" dot>PARTIALLY RETURNED</Badge>
             ) : (
               <Badge variant="success" dot>PAID</Badge>
             )}
@@ -296,7 +277,9 @@ export default function InvoiceDetailPage() {
             {invoice.customerPhone ? (
               <Button variant="outline" size="sm" onClick={sendWhatsAppInvoice} disabled={waSending}><MessageCircle className="h-3.5 w-3.5" /> {waSending ? 'Sending…' : 'Send WhatsApp'}</Button>
             ) : null}
-            <Button variant="outline" size="sm" onClick={openReturnDialog} disabled={invoice.status === 'refunded' || invoice.status === 'cancelled'}><Undo2 className="h-3.5 w-3.5" /> Return Items</Button>
+            <Button variant="outline" size="sm" onClick={openReturnDialog} disabled={invoice.status === 'refunded' || invoice.status === 'cancelled' || invoice.status === 'fully_returned'}>
+              <Undo2 className="h-3.5 w-3.5" /> Return Items
+            </Button>
             <Button variant="soft-danger" size="sm" onClick={refundInvoice} disabled={refunding || invoice.status === 'refunded'}><Undo2 className="h-3.5 w-3.5" /> Refund</Button>
             <Button variant="outline" size="sm" onClick={editInvoice}><Pencil className="h-3.5 w-3.5" /> Edit</Button>
             <Button variant="soft-danger" size="sm" onClick={() => void deleteInvoice()} disabled={deleting}><Trash2 className="h-3.5 w-3.5" /> {deleting ? 'Deleting…' : 'Delete'}</Button>
@@ -540,45 +523,12 @@ export default function InvoiceDetailPage() {
         </div>
       </div>
 
-      <AppDialog
+      <InvoiceReturnDialog
+        invoice={invoice}
         open={returnOpen}
         onOpenChange={setReturnOpen}
-        size="md"
-        isDirty={returnOpen && (Object.values(returnQty).some((q) => q > 0) || restock)}
-        title={`Return items — ${invoice.number}`}
-        description="Choose quantities to return. A credit note is generated automatically."
-        footer={
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setReturnOpen(false)}>Cancel</Button>
-            <Button size="sm" onClick={submitReturn} disabled={returning}>
-              {returning ? 'Processing…' : 'Process return & credit note'}
-            </Button>
-          </DialogFooter>
-        }
-      >
-          <div className="space-y-2">
-            {invoice.items.filter((it) => it.sku).map((it) => (
-              <div key={it.sku} className="flex items-center justify-between gap-2 rounded-md border p-2">
-                <div className="min-w-0">
-                  <p className="truncate text-xs font-medium">{it.product}</p>
-                  <p className="text-[11px] text-muted-foreground">{it.sku} · invoiced qty {it.qty}</p>
-                </div>
-                <Input
-                  type="number"
-                  min={0}
-                  max={it.qty}
-                  value={returnQty[it.sku] ?? 0}
-                  onChange={(e) => setReturnQty((q) => ({ ...q, [it.sku]: Math.max(0, Math.min(it.qty, Number(e.target.value) || 0)) }))}
-                  className="w-20"
-                />
-              </div>
-            ))}
-            <label className="flex items-center gap-2 pt-1 text-xs">
-              <input type="checkbox" checked={restock} onChange={(e) => setRestock(e.target.checked)} />
-              Restock returned items into inventory
-            </label>
-          </div>
-      </AppDialog>
+        onProcessed={returnProcessed}
+      />
     </div>
   )
 }

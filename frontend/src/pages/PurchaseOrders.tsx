@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
 import { Building2, Check, CheckCircle2, Copy, Download, Eye, Loader2, PackageCheck, Pencil, Plus, Save, Search, ShoppingCart, Trash2, Wallet, Weight, XCircle } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
@@ -78,6 +78,11 @@ export default function PurchaseOrdersPage() {
   const [viewPo, setViewPo] = useState<PurchaseOrder | null>(null)
   const [receipt, setReceipt] = useState<PurchaseOrderReceipt | null>(null)
   const [receiptLoading, setReceiptLoading] = useState(false)
+  const [searchParams] = useSearchParams()
+  // Deep-link prefill: /purchase/orders?product=<sku>&qty=<n> opens the new-PO
+  // dialog with that product + quantity preselected (Low Stock → Reorder).
+  const prefillSku = searchParams.get('product')?.trim() ?? ''
+  const prefillQty = Math.max(1, Math.floor(Number(searchParams.get('qty')) || 1))
 
   const load = useCallback(() => {
     setLoading(true)
@@ -97,6 +102,21 @@ export default function PurchaseOrdersPage() {
     dbApi.getProducts().then(setProducts).catch(() => setProducts([]))
   }, [])
 
+  const prefill = useMemo(() => {
+    if (!prefillSku) return null
+    const product = products.find((x) => x.sku === prefillSku) ?? null
+    return { sku: prefillSku, qty: prefillQty, product }
+  }, [prefillSku, prefillQty, products])
+
+  useEffect(() => {
+    if (prefill && !dialogOpen) {
+      openDialog({ sku: prefill.sku, qty: prefill.qty, product: prefill.product })
+    }
+    // Only fire on a fresh prefill target; openDialog closes over the catalog
+    // state, hence the disable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill])
+
   const openView = useCallback(async (po: PurchaseOrder) => {
     setViewPo(po)
     setReceipt(null)
@@ -110,7 +130,7 @@ export default function PurchaseOrdersPage() {
     }
   }, [])
 
-  const openDialog = () => {
+  const openDialog = (prefill?: { sku?: string; qty?: number; product?: Product | null }) => {
     const nextForm = {
       supplier: '',
       supplierId: '',
@@ -119,6 +139,21 @@ export default function PurchaseOrdersPage() {
       gst: '3',
     }
     const nextLines = [emptyLine()]
+    if (prefill?.sku) {
+      // Preselect the line coming from a reorder hand-off: product + qty (plus
+      // the piece weight / cost basis when the catalog row is known).
+      const p = prefill.product ?? products.find((x) => x.sku === prefill.sku) ?? null
+      nextLines[0] = {
+        sku: prefill.sku,
+        product: p?.name ?? '',
+        custom: false,
+        qty: String(Math.max(1, Math.floor(Number(prefill.qty) || 1))),
+        weight: p ? String(p.netWeight ?? 0) : '0',
+        rate: p?.costPrice != null ? String(p.costPrice) : '0',
+        confirmed: true,
+      }
+      if (p?.supplierId) nextForm.supplierId = p.supplierId ?? ''
+    }
     setEditingId(null)
     setForm(nextForm)
     setLines(nextLines)
@@ -470,7 +505,7 @@ export default function PurchaseOrdersPage() {
             <Button variant="outline" size="sm" onClick={() => exportTable('purchase-orders.csv', columns, filtered)}>
               <Download className="h-3.5 w-3.5" /> Export
             </Button>
-            <Button size="sm" onClick={openDialog}>
+            <Button size="sm" onClick={() => openDialog()}>
               <Plus className="h-4 w-4" /> New Purchase Order
             </Button>
           </>

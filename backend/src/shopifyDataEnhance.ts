@@ -1,5 +1,13 @@
 import { config, isConfigured } from './config'
 import { getRawClient } from './db/client'
+import {
+  isPlaceholderName,
+  mergeAddress,
+  normalizePhone,
+  numericShopifyOrderId,
+  upgradeName,
+  type OrderAddress,
+} from './shopifyCustomerData'
 import { logger } from './logger'
 
 /**
@@ -396,19 +404,44 @@ export async function fetchOrderById(shopifyOrderId: string): Promise<ShopifyOrd
 
 // ─── Enrich local customers with Shopify data ─────────────────────
 
-export async function enrichCustomersFromShopify(): Promise<{ enriched: number; failed: number }> {
+export interface EnrichCustomersResult {
+  enriched: number
+  failed: number
+  /** True when the Admin API refuses Customer PII (plan-gated). */
+  piiAccessDenied: boolean
+  /** Block reasons worth surfacing to the user instead of a silent no-op. */
+  errors: string[]
+}
+
+const PII_DENIED_MESSAGE =
+  'Shopify denies Customer PII over the Admin API (plan-gated) — approve access in the Shopify admin'
+
+export async function enrichCustomersFromShopify(): Promise<EnrichCustomersResult> {
   const client = getRawClient()
-  if (!client) return { enriched: 0, failed: 0 }
+  if (!client) return { enriched: 0, failed: 0, piiAccessDenied: false, errors: ['Database not available'] }
+  if (isPiiAccessDenied()) {
+    logger.debug('Customer enrichment skipped — Shopify PII access not approved yet')
+    return { enriched: 0, failed: 0, piiAccessDenied: true, errors: [PII_DENIED_MESSAGE] }
+  }
 
   let enriched = 0
   let failed = 0
 
   try {
-    // Find customers missing email or phone
+    // Find customers incomplete in ANY enrichable field: missing email or
+    // phone — or still named with the "Shopify Customer #<id>" placeholder,
+    // which is exactly the row that NEEDS a name/address upgrade even when
+    // email and phone already exist (requirement: enrichment works without
+    // email/phone being available).
     const incomplete = await client.unsafe(
       `SELECT id, name, email, phone, shopify_id FROM customers
-       WHERE (email IS NULL OR email = '' OR phone IS NULL OR phone = '')
-       AND shopify_id IS NOT NULL AND shopify_id != ''
+       WHERE shopify_id IS NOT NULL AND shopify_id != ''
+         AND (
+           email IS NULL OR email = ''
+           OR phone IS NULL OR phone = ''
+           OR name IS NULL OR name = ''
+           OR name LIKE 'Shopify Customer #'
+         )
        LIMIT 50`
     )
 
@@ -420,6 +453,15 @@ export async function enrichCustomersFromShopify(): Promise<{ enriched: number; 
         const updates: string[] = []
         const values: any[] = []
 
+        // Name upgrade — the core placeholder fix: a real Shopify name
+        // replaces "Shopify Customer #<id>" / "Guest" / a blank name, while
+        // a real local name is never downgraded.
+        const fullName = `${shopifyData.firstName || ''} ${shopifyData.lastName || ''}`.trim()
+        const nextName = upgradeName(String(cust.name ?? ''), fullName || null)
+        if (nextName && nextName !== String(cust.name ?? '')) {
+          updates.push(`name = $${values.length + 1}`)
+          values.push(nextName)
+        }
         if (!cust.email && shopifyData.email) {
           updates.push(`email = $${values.length + 1}`)
           values.push(shopifyData.email)
@@ -432,7 +474,7 @@ export async function enrichCustomersFromShopify(): Promise<{ enriched: number; 
           updates.push(`city = $${values.length + 1}`)
           values.push(shopifyData.defaultAddress.city)
         }
-        if (shopifyData.defaultAddress?.province) {
+        if (shopifyData.defaultAddress?.province && !cust.province) {
           updates.push(`province = $${values.length + 1}`)
           values.push(shopifyData.defaultAddress.province)
         }
@@ -455,21 +497,23 @@ export async function enrichCustomersFromShopify(): Promise<{ enriched: number; 
     logger.error({ err }, 'Customer enrichment batch failed')
   }
 
-  return { enriched, failed }
+  const errors: string[] = []
+  if (isPiiAccessDenied()) errors.push(PII_DENIED_MESSAGE)
+  return { enriched, failed, piiAccessDenied: isPiiAccessDenied(), errors }
 }
 
 // ─── Enrich orders with full customer data ────────────────────────
 
-export async function enrichOrdersFromShopify(): Promise<{ enriched: number; failed: number }> {
+export async function enrichOrdersFromShopify(): Promise<{ enriched: number; failed: number; piiAccessDenied: boolean; errors: string[] }> {
   const client = getRawClient()
-  if (!client) return { enriched: 0, failed: 0 }
+  if (!client) return { enriched: 0, failed: 0, piiAccessDenied: false, errors: ['Database not available'] }
 
   let enriched = 0
   let failed = 0
 
   if (isPiiAccessDenied()) {
     logger.debug('Order enrichment skipped — Shopify PII access not approved yet')
-    return { enriched, failed }
+    return { enriched, failed, piiAccessDenied: true, errors: [PII_DENIED_MESSAGE] }
   }
 
   try {
@@ -485,42 +529,28 @@ export async function enrichOrdersFromShopify(): Promise<{ enriched: number; fai
       try {
         // The numeric Shopify order id is stored in the row's id column
         // ("shopify-<numericId>"); shopify_id holds the order name ("#1034").
-        const numericId = String(order.id ?? '').match(/^shopify-(\d+)$/)?.[1] ?? ''
+        const numericId = numericShopifyOrderId(order.id)
         if (!numericId) { failed++; continue }
 
         const shopifyData = await fetchOrderById(numericId)
         if (!shopifyData) { failed++; continue }
 
+        // Field-by-field merge: locally recovered address values survive a
+        // redacted/partial payload, and a whole-null write never blanks them.
+        const curBilling = order.billing_address && typeof order.billing_address === 'object' ? order.billing_address as OrderAddress : undefined
+        const curShipping = order.shipping_address && typeof order.shipping_address === 'object' ? order.shipping_address as OrderAddress : undefined
+        const nextBilling = mergeAddress(curBilling, shopifyData.billingAddress ?? undefined)
+        const nextShipping = mergeAddress(curShipping, shopifyData.shippingAddress ?? undefined)
+
         const updates: string[] = []
         const values: any[] = []
-
-        if (shopifyData.billingAddress) {
-          const addr = {
-            name: `${shopifyData.billingAddress.firstName} ${shopifyData.billingAddress.lastName}`.trim(),
-            address1: shopifyData.billingAddress.address1,
-            address2: shopifyData.billingAddress.address2,
-            city: shopifyData.billingAddress.city,
-            province: shopifyData.billingAddress.province,
-            zip: shopifyData.billingAddress.zip,
-            country: shopifyData.billingAddress.country,
-            phone: shopifyData.billingAddress.phone,
-          }
+        if (nextBilling) {
           updates.push(`billing_address = $${values.length + 1}`)
-          values.push(JSON.stringify(addr))
+          values.push(JSON.stringify(nextBilling))
         }
-        if (shopifyData.shippingAddress) {
-          const addr = {
-            name: `${shopifyData.shippingAddress.firstName} ${shopifyData.shippingAddress.lastName}`.trim(),
-            address1: shopifyData.shippingAddress.address1,
-            address2: shopifyData.shippingAddress.address2,
-            city: shopifyData.shippingAddress.city,
-            province: shopifyData.shippingAddress.province,
-            zip: shopifyData.shippingAddress.zip,
-            country: shopifyData.shippingAddress.country,
-            phone: shopifyData.shippingAddress.phone,
-          }
+        if (nextShipping) {
           updates.push(`shipping_address = $${values.length + 1}`)
-          values.push(JSON.stringify(addr))
+          values.push(JSON.stringify(nextShipping))
         }
 
         if (updates.length > 0) {
@@ -541,7 +571,7 @@ export async function enrichOrdersFromShopify(): Promise<{ enriched: number; fai
     logger.error({ err }, 'Order enrichment batch failed')
   }
 
-  return { enriched, failed }
+  return { enriched, failed, piiAccessDenied: isPiiAccessDenied(), errors: isPiiAccessDenied() ? [PII_DENIED_MESSAGE] : [] }
 }
 
 // ─── Enrich all incomplete orders via GraphQL ─────────────────────
@@ -551,13 +581,15 @@ export interface EnrichResult {
   failed: number
   skipped: number
   errors: string[]
+  /** True when the batch was blocked by Shopify's plan-gated Customer PII. */
+  piiAccessDenied?: boolean
 }
 
 export async function enrichAllIncompleteOrders(): Promise<EnrichResult> {
   const client = getRawClient()
   if (!client) return { enriched: 0, failed: 0, skipped: 0, errors: ['Database not available'] }
   if (isPiiAccessDenied()) {
-    return { enriched: 0, failed: 0, skipped: 0, errors: ['Shopify PII access not approved — approve in Shopify admin (Protected customer data)'] }
+    return { enriched: 0, failed: 0, skipped: 0, piiAccessDenied: true, errors: ['Shopify PII access not approved — approve in Shopify admin (Protected customer data)'] }
   }
 
   const result: EnrichResult = { enriched: 0, failed: 0, skipped: 0, errors: [] }
@@ -585,7 +617,12 @@ export async function enrichAllIncompleteOrders(): Promise<EnrichResult> {
 
     for (const order of incomplete as any[]) {
       try {
-        const shopifyIdNum = order.shopify_id?.replace('#', '') || ''
+        // GraphQL node(id:) needs the NUMERIC order id, which the local row
+        // keeps in its id column ("shopify-7660565233727"). shopify_id stores
+        // the order NAME ("#1027"); feeding that name into node() resolved to
+        // no order at all, so every enrichment run reported "0 enriched,
+        // N skipped" and the Guest rows stayed Guest — a silent data loss.
+        const shopifyIdNum = numericShopifyOrderId(order.id)
         if (!shopifyIdNum) { result.skipped++; continue }
 
         // Fetch full order details via GraphQL
@@ -597,56 +634,33 @@ export async function enrichAllIncompleteOrders(): Promise<EnrichResult> {
 
         const updates: Record<string, any> = {}
 
-        // Update customer name if we have a better one
+        // Update customer name if we have a better one. Placeholder rows
+        // ("Shopify Customer #<id>") count as Guest-like: they are the ones
+        // that most need the real name once the API can see it.
         const currentName = order.customer || ''
-        if (gqlOrder.customer && (currentName === 'Guest' || !currentName)) {
-          const gqlName = `${gqlOrder.customer.firstName} ${gqlOrder.customer.lastName}`.trim()
-          if (gqlName) updates.customer = gqlName
+        const candidateName = gqlOrder.customer ? `${gqlOrder.customer.firstName} ${gqlOrder.customer.lastName}`.trim() : ''
+        if (candidateName && (currentName === 'Guest' || !currentName || isPlaceholderName(currentName))) {
+          updates.customer = candidateName
         }
-        if (gqlOrder.email && (!currentName || currentName === 'Guest')) {
-          const gqlName = `${gqlOrder.customer?.firstName || ''} ${gqlOrder.customer?.lastName || ''}`.trim()
+        if (gqlOrder.email && (currentName === 'Guest' || !currentName || isPlaceholderName(currentName))) {
+          const gqlName = candidateName
           if (!gqlName && gqlOrder.email) updates.customer = gqlOrder.email
         }
 
-        // Build billing address
+        // Build billing address — every usable fetched field wins, locally
+        // recovered values survive a redacted field, and nothing is written
+        // when the merge produces no usable value.
         if (gqlOrder.billingAddress) {
-          const addr = gqlOrder.billingAddress
-          const existingBilling = order.billing_address
-          const billingName = `${addr.firstName || ''} ${addr.lastName || ''}`.trim()
-          const existingName = existingBilling?.name || ''
-          // Update if we have new data that's better than what exists
-          if (billingName || addr.address1 || addr.city) {
-            updates.billingAddress = {
-              name: billingName || existingName,
-              address1: addr.address1 || existingBilling?.address1 || '',
-              address2: addr.address2 || existingBilling?.address2 || '',
-              city: addr.city || existingBilling?.city || '',
-              province: addr.province || existingBilling?.province || '',
-              zip: addr.zip || existingBilling?.zip || '',
-              country: addr.country || existingBilling?.country || '',
-              phone: addr.phone || existingBilling?.phone || '',
-            }
-          }
+          const existingBilling = order.billing_address && typeof order.billing_address === 'object' ? order.billing_address as OrderAddress : undefined
+          const merged = mergeAddress(existingBilling, gqlOrder.billingAddress)
+          if (merged) updates.billingAddress = merged
         }
 
         // Build shipping address
         if (gqlOrder.shippingAddress) {
-          const addr = gqlOrder.shippingAddress
-          const existingShipping = order.shipping_address
-          const shipName = `${addr.firstName || ''} ${addr.lastName || ''}`.trim()
-          const existingName = existingShipping?.name || ''
-          if (shipName || addr.address1 || addr.city) {
-            updates.shippingAddress = {
-              name: shipName || existingName,
-              address1: addr.address1 || existingShipping?.address1 || '',
-              address2: addr.address2 || existingShipping?.address2 || '',
-              city: addr.city || existingShipping?.city || '',
-              province: addr.province || existingShipping?.province || '',
-              zip: addr.zip || existingShipping?.zip || '',
-              country: addr.country || existingShipping?.country || '',
-              phone: addr.phone || existingShipping?.phone || '',
-            }
-          }
+          const existingShipping = order.shipping_address && typeof order.shipping_address === 'object' ? order.shipping_address as OrderAddress : undefined
+          const merged = mergeAddress(existingShipping, gqlOrder.shippingAddress)
+          if (merged) updates.shippingAddress = merged
         }
 
         // Update line items if available
@@ -692,23 +706,54 @@ export async function enrichAllIncompleteOrders(): Promise<EnrichResult> {
               const fullName = `${gqlCustomer.firstName} ${gqlCustomer.lastName}`.trim()
 
               if (customerEmail || customerPhone) {
-                await client.unsafe(
-                  `UPDATE customers SET
-                    name = CASE WHEN name = 'Guest' OR name IS NULL OR name = '' THEN COALESCE($1, name) ELSE name END,
-                    email = COALESCE($2, email),
-                    phone = COALESCE($3, phone),
-                    city = COALESCE($4, city),
-                    province = COALESCE($5, province)
-                  WHERE shopify_id = $6 OR email = $2 OR phone = $3`,
-                  [
-                    fullName || null,
-                    customerEmail,
-                    customerPhone,
-                    gqlCustomer.defaultAddress?.city || null,
-                    gqlCustomer.defaultAddress?.province || null,
-                    gqlOrder.customer.id,
-                  ]
+                // Resolve ONE target row, identity-first: shopify_id, then a
+                // case-normalized email, then a digits-normalized phone. The
+                // old `WHERE shopify_id = … OR email = … OR phone = …` update
+                // could also rewrite unrelated customers sharing an inbox.
+                let targetId: string | null = null
+                const byShopifyId = await client.unsafe(
+                  `SELECT id FROM customers WHERE shopify_id = $1 LIMIT 1`,
+                  [gqlOrder.customer.id],
                 )
+                targetId = (byShopifyId[0] as any)?.id ?? null
+                if (!targetId && customerEmail) {
+                  const byEmail = await client.unsafe(
+                    `SELECT id FROM customers WHERE lower(coalesce(email, '')) = $1 LIMIT 1`,
+                    [customerEmail.toLowerCase()],
+                  )
+                  targetId = (byEmail[0] as any)?.id ?? null
+                }
+                if (!targetId && customerPhone) {
+                  const byPhone = await client.unsafe(
+                    `SELECT id FROM customers WHERE regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g') = $1 LIMIT 1`,
+                    [normalizePhone(customerPhone) ?? ''],
+                  )
+                  targetId = (byPhone[0] as any)?.id ?? null
+                }
+
+                if (targetId) {
+                  // Fill-only: COALESCE keeps every stored value the API did
+                  // not deliver (redactions included).
+                  await client.unsafe(
+                    `UPDATE customers SET
+                      name = CASE
+                        WHEN name IS NULL OR name = '' OR name = 'Guest' OR name LIKE 'Shopify Customer #'
+                        THEN COALESCE($1, name) ELSE name END,
+                      email = COALESCE(NULLIF($2, ''), email),
+                      phone = COALESCE(NULLIF($3, ''), phone),
+                      city = COALESCE(NULLIF($4, ''), city),
+                      province = COALESCE(NULLIF($5, ''), province)
+                    WHERE id = $6`,
+                    [
+                      fullName || null,
+                      customerEmail,
+                      customerPhone,
+                      gqlCustomer.defaultAddress?.city || null,
+                      gqlCustomer.defaultAddress?.province || null,
+                      targetId,
+                    ]
+                  )
+                }
               }
             }
           } catch {
@@ -731,6 +776,10 @@ export async function enrichAllIncompleteOrders(): Promise<EnrichResult> {
   }
 
   logger.info({ enriched: result.enriched, failed: result.failed, skipped: result.skipped }, 'Order enrichment complete')
+  if (isPiiAccessDenied()) {
+    result.piiAccessDenied = true
+    if (!result.errors.includes(PII_DENIED_MESSAGE)) result.errors.push(PII_DENIED_MESSAGE)
+  }
   return result
 }
 
@@ -828,10 +877,16 @@ export async function importCustomersFromCSV(rows: Record<string, string>[]): Pr
         existing = await findExisting(`SELECT id, email, phone, name, city, province FROM customers WHERE shopify_id = $1 LIMIT 1`, shopifyId)
       }
       if (!existing && email) {
-        existing = await findExisting(`SELECT id, email, phone, name, city, province FROM customers WHERE email = $1 LIMIT 1`, email)
+        // Case-normalized: "Foo@Bar.com" in the CSV must match "foo@bar.com"
+        // on file, or the import creates a duplicate customer.
+        existing = await findExisting(`SELECT id, email, phone, name, city, province FROM customers WHERE lower(coalesce(email, '')) = lower($1) LIMIT 1`, email)
       }
       if (!existing && phone) {
         existing = await findExisting(`SELECT id, email, phone, name, city, province FROM customers WHERE phone = $1 LIMIT 1`, phone)
+        if (!existing) {
+          // Digits-normalized: "+91 98765 43210" must match "9876543210".
+          existing = await findExisting(`SELECT id, email, phone, name, city, province FROM customers WHERE regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g') = $1 LIMIT 1`, normalizePhone(phone) ?? '')
+        }
       }
       // Placeholder rows are named "Shopify Customer #<id>" and carry the id —
       // match them so the CSV UPGRADES the placeholder instead of duplicating it.
@@ -873,7 +928,9 @@ export async function importCustomersFromCSV(rows: Record<string, string>[]): Pr
         // primary target is the redacted placeholder: empty email/phone/name.
         setIf('email', email, existing.email)
         setIf('phone', phone, existing.phone)
-        setIf('name', name, existing.name?.startsWith('Shopify Customer #') ? null : existing.name)
+        // A placeholder row is upgradeable to ANY usable name (including a
+        // "Name" column-less "First Last" row); a real name never moves.
+        setIf('name', name, isPlaceholderName(existing.name) ? null : existing.name)
         setIf('city', city, existing.city)
         setIf('province', province, existing.province)
         // Only stamp the resolved Shopify id when the row does not have one.

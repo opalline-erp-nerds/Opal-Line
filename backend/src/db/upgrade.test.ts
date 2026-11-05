@@ -129,6 +129,15 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
           (id, product_id, colour_name, sku, price, stock, status, is_primary)
         values ('VAR-LEGACY', 'PROD-LEGACY', 'Red', 'SKU-LEGACY-RED', 100, 2, 'active', false)`)
 
+      // Emulate legacy transfer data: rows created before canonical location
+      // IDs became the stored reference carry display names. One resolves to
+      // the seeded default location; the other names a location that no longer
+      // exists, which the upgrade must preserve exactly as it found it.
+      await sql.unsafe(
+        `insert into stock_transfers (id, number, "from", "to", sku, qty, status, date)
+         values ('upgrade-legacy-trf', 'ST-LEGACY-UPGRADE', 'Main Store', 'Vanished Warehouse', 'UPGRADE-SKU', 1, 'in-transit', now())`,
+      )
+
       assert.deepEqual(
         await purchaseTables(sql),
         [],
@@ -156,6 +165,17 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
       }
       const [defaultLoc] = await sql.unsafe(`select id from inventory_locations where id = 'LOC-DEFAULT'`)
       assert.ok(defaultLoc, 'upgrade must seed the default stock location')
+
+      // The legacy transfer row survived the upgrade…
+      const [legacy] = await sql.unsafe(
+        `select "from", "to" from stock_transfers where id = 'upgrade-legacy-trf'`,
+      )
+      assert.ok(legacy, 'upgrade must not drop existing transfer history')
+      // …its resolvable location name became a canonical ID…
+      assert.equal(legacy.from, 'LOC-DEFAULT', 'resolvable legacy location names migrate to IDs')
+      // …and its unresolvable one is preserved verbatim: a migration that maps
+      // nothing must still not rewrite the row it cannot map.
+      assert.equal(legacy.to, 'Vanished Warehouse', 'unresolvable legacy references are preserved, not destroyed')
 
       // …and the columns added alongside them.
       for (const col of KEY_COLUMNS) {

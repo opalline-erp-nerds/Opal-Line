@@ -12,7 +12,7 @@
 // npm scripts cannot set an environment variable portably (Windows cmd has no
 // `VAR=value cmd` syntax), which is why this is a script instead of a one-liner.
 import { spawnSync } from 'node:child_process'
-import { readdirSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -29,6 +29,10 @@ function collect(dir) {
 }
 
 const files = collect(join(frontend, 'src'))
+// tests/ holds cross-package parity checks (e.g. preview vs backend PDF
+// geometry) that import from ../../backend; they belong to the same suite.
+const crossDir = join(frontend, 'tests')
+if (existsSync(crossDir)) files.push(...collect(crossDir))
 if (files.length === 0) {
   console.error('No test files found under src/.')
   process.exit(1)

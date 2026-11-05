@@ -1493,7 +1493,17 @@ backupRouter.post('/shopify/enrich-customers', requirePermission('system', 'edit
   try {
     const { enrichCustomersFromShopify } = await import('../shopifyDataEnhance')
     const result = await enrichCustomersFromShopify()
-    res.json({ ok: true, ...result })
+    // ACCESS_DENIED is not "success with 0 enriched": surface the block so
+    // the UI explains the plan-gated PII permission instead of a silent no-op.
+    res.json({
+      ...result,
+      ok: !result.piiAccessDenied,
+      piiAccessDenied: result.piiAccessDenied,
+      errors: result.errors,
+      message: result.piiAccessDenied
+        ? 'Shopify denies Customer PII over the Admin API (plan-gated) — approve access in the Shopify admin (Settings → Apps and sales channels → Protected customer data), or use the CSV export.'
+        : undefined,
+    })
   } catch (err) {
     res.status(500).json({ error: 'Customer enrichment failed: ' + (err instanceof Error ? err.message : 'Unknown') })
   }
@@ -1503,7 +1513,7 @@ backupRouter.post('/shopify/enrich-orders', requirePermission('system', 'edit'),
   try {
     const { enrichAllIncompleteOrders } = await import('../shopifyDataEnhance')
     const result = await enrichAllIncompleteOrders()
-    res.json({ ok: true, ...result })
+    res.json({ ok: !result.piiAccessDenied, message: result.piiAccessDenied ? result.errors[0] : undefined, ...result })
   } catch (err) {
     res.status(500).json({ error: 'Order enrichment failed: ' + (err instanceof Error ? err.message : 'Unknown') })
   }

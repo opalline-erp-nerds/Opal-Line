@@ -104,7 +104,7 @@ export const shopifyApi = {
     }>(`/shopify/orders/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   getOrders: () => request<{ syncedAt: string | null; data: SyncOrder[] }>('/shopify/orders'),
   syncOrders: () =>
-    request<{ ok: boolean; imported: number; updated: number; errors: string[]; message?: string }>('/shopify/orders/sync', {
+    request<{ ok: boolean; imported: number; updated: number; errors: string[]; message?: string; piiRedacted?: { count: number; example: string; message: string } | null }>('/shopify/orders/sync', {
       method: 'POST',
     }),
   refreshOrder: (orderId: string) =>
