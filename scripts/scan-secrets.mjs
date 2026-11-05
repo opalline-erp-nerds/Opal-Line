@@ -10,10 +10,11 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 
 // Paths that must never be tracked. Matched against the repo-relative path.
-// `.env.example` is the documented exception - it holds placeholders, not values.
+// `.env.example` and its variants (`.env.example.hosted`, ...) are the
+// documented exception - they hold placeholders, not values.
 const FORBIDDEN_PATHS = [
   /(^|\/)\.env$/,
-  /(^|\/)\.env\.(?!example$)[^/]+$/,
+  /(^|\/)\.env\.(?!example(?:\.|$))[^/]+$/,
   /(^|\/)\.encryption-key$/,
   /(^|\/)\.csrf-secret$/,
   /\.pfx$/i,
