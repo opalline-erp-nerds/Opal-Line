@@ -30,6 +30,9 @@ projects:
                 value: ../frontend/dist
               - key: TRUST_PROXY
                 value: "1"
+              # HTTPS on Render. Unset on the desktop app, which stays Secure=false.
+              - key: COOKIE_SECURE
+                value: "true"
               - key: SHOPIFY_API_VERSION
                 value: "2025-10"
               # Render assigns PORT. Do not set 47191–47198 here.
