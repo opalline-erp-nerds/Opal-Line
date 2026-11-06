@@ -267,8 +267,33 @@ export const salesOrders = pgTable('sales_orders', {
    * of them — land on the same location's balance rather than the default one.
    */
   locationId: text('location_id'),
+  // ── Shopify order state (Order Pipeline) ──────────────────────────────────
+  /**
+   * Shopify's order gid (`gid://shopify/Order/123`). `shopifyId` holds the
+   * display name (`#1027`) and is what refunds/returns key on; every Admin
+   * GraphQL mutation needs the gid, so it is stored alongside.
+   */
+  shopifyGid: text('shopify_gid'),
+  /**
+   * Shopify's own statuses, kept verbatim (PAID, PARTIALLY_REFUNDED,
+   * UNFULFILLED, PARTIALLY_FULFILLED, …). The ERP `status` column stays the
+   * operator's pipeline stage and is never overwritten by these.
+   */
+  shopifyFinancialStatus: text('shopify_financial_status'),
+  shopifyFulfillmentStatus: text('shopify_fulfillment_status'),
+  trackingNumber: text('tracking_number'),
+  trackingCompany: text('tracking_company'),
+  trackingUrl: text('tracking_url'),
+  /** Shopify Fulfillment gids recorded for this order (audit + tracking). */
+  fulfillmentIds: jsonb('fulfillment_ids'),
+  cancelledAt: ts('cancelled_at'),
+  /** Shopify `closed_at`: the order is archived in the Shopify admin. */
+  closedAt: ts('closed_at'),
+  /** Last time the local row was brought level with Shopify. */
+  shopifySyncedAt: ts('shopify_synced_at'),
 }, (table) => ({
   shopifyIdIdx: uniqueIndex('sales_orders_shopify_id_idx').on(table.shopifyId),
+  shopifyGidIdx: index('sales_orders_shopify_gid_idx').on(table.shopifyGid),
   customerShopifyIdIdx: index('sales_orders_customer_shopify_id_idx').on(table.customerShopifyId),
   internalIdIdx: index('sales_orders_internal_id_idx').on(table.internalId),
   customerIdx: index('sales_orders_customer_idx').on(table.customer),
@@ -468,6 +493,24 @@ export const supplierPaymentAllocations = pgTable('supplier_payment_allocations'
   paymentFk: foreignKey({ columns: [table.paymentId], foreignColumns: [supplierPayments.id], name: 'supplier_payment_allocations_payment_id_fk' }).onDelete('cascade'),
 }))
 
+/**
+ * A sales return.
+ *
+ * Two entry points write here and both are kept:
+ *
+ *  - the invoice credit-note flow (src/invoiceReturn.ts) writes a `processed`
+ *    row with a credit note number, a negative payment trail and an optional
+ *    immediate restock — the legacy behaviour the Sales page's Return action has
+ *    always had;
+ *  - the Returns page writes a proper RMA: requested → approved → in transit →
+ *    received → completed, with the goods only restocked at RECEIVED (after
+ *    inspection), never at request time.
+ *
+ * `status` is therefore not one enum: the legacy flow uses pending/approved/
+ * refunded/rejected (its old UI vocabulary) and `processed`, while the RMA flow
+ * uses requested/approved/in_transit/received/rejected/completed. The status
+ * machine that guards transitions lives in src/returns.ts.
+ */
 export const salesReturns = pgTable('sales_returns', {
   id: text('id').primaryKey(),
   number: text('number').notNull().unique(),
@@ -479,17 +522,141 @@ export const salesReturns = pgTable('sales_returns', {
   customer: text('customer'),
   items: integer('items'),
   amount: numericNumber('amount'),
+  /**
+   * ISO code of the money on this return, taken from the ORIGINAL order —
+   * never converted. NULL on rows written before this column existed and on
+   * legacy credit notes; readers fall back to the order's own currency.
+   */
+  currency: text('currency'),
   status: text('status'),
   date: ts('date'),
   // Optional client idempotency key: a retried submission with the same key
   // replays the original credit note instead of restocking the units again.
   idempotencyKey: text('idempotency_key'),
+  // ── RMA fields (Returns page) ────────────────────────────────────────────
+  /** sales_orders.id — the order this return was raised against. */
+  orderId: text('order_id'),
+  customerEmail: text('customer_email'),
+  /** Why the customer is returning the goods (free text or a preset code). */
+  reason: text('reason'),
+  notes: text('notes'),
+  /** 'erp' | 'shopify' — where the return record originated. */
+  source: text('source'),
+  /** Shopify's Return gid/number when the RMA came from Shopify. */
+  shopifyReturnId: text('shopify_return_id'),
+  /** What physically arrived: [{ sku, received, accepted, damaged }]. */
+  receivedItems: jsonb('received_items'),
+  requestedAt: ts('requested_at'),
+  receivedAt: ts('received_at'),
+  completedAt: ts('completed_at'),
+  createdBy: text('created_by'),
+  updatedAt: ts('updated_at'),
 }, (table) => ({
   numberIdx: uniqueIndex('sales_returns_number_idx').on(table.number),
   customerIdx: index('sales_returns_customer_idx').on(table.customer),
   dateIdx: index('sales_returns_date_idx').on(table.date),
   // Unique only over non-null keys — NULLs never block new returns.
   idempotencyIdx: uniqueIndex('sales_returns_idempotency_key_idx').on(table.idempotencyKey),
+  orderIdIdx: index('sales_returns_order_id_idx').on(table.orderId),
+  // One row per Shopify return: a redelivered webhook cannot duplicate the RMA.
+  shopifyReturnIdx: uniqueIndex('sales_returns_shopify_return_id_idx').on(table.shopifyReturnId),
+}))
+
+/**
+ * A money refund against an order — Shopify's or our own record of it.
+ *
+ * Money and goods are deliberately separate: a refund can exist without any
+ * physical return (a goodwill refund, a shipping refund), and goods can come
+ * back without money moving. `shopifyRefundId` is the external unique
+ * reference, so a webhook retry and an ERP-initiated refund for the same
+ * Shopify refund collapse onto one row.
+ *
+ * Amounts are kept apart on purpose: `requestedAmount` is what the operator
+ * asked for, `amount` is the authoritative total Shopify reported, and
+ * `refundedAmount` is what actually settled.
+ */
+export const refunds = pgTable('refunds', {
+  id: text('id').primaryKey(),
+  /** Human reference shown in the UI (RF-… for ERP-created, Shopify's id otherwise). */
+  number: text('number').notNull().unique(),
+  /** Shopify Refund id (numeric legacy id or gid). Unique when present. */
+  shopifyRefundId: text('shopify_refund_id'),
+  /** Normalised Shopify order name, e.g. '#1027' — the ERP's order key. */
+  shopifyOrder: text('shopify_order'),
+  /** sales_orders.id when the order is in this ERP. */
+  orderId: text('order_id'),
+  /** sales_invoices.number when the refund maps to one of our invoices. */
+  invoiceNumber: text('invoice_number'),
+  /** sales_returns.id when this refund settles a return. */
+  returnId: text('return_id'),
+  customer: text('customer'),
+  customerEmail: text('customer_email'),
+  /** 'shopify' | 'erp' */
+  source: text('source').notNull(),
+  /** 'pending' | 'completed' | 'failed' — settled money, not the RMA stage. */
+  status: text('status').notNull(),
+  requestedAmount: numericNumber('requested_amount'),
+  /** Authoritative refund total reported by Shopify (or requested for local-only). */
+  amount: numericNumber('amount'),
+  /** Portion that actually settled (completed transactions only). */
+  refundedAmount: numericNumber('refunded_amount'),
+  currency: text('currency'),
+  /** Gateway / original payment method of the refunded transaction. */
+  paymentMethod: text('payment_method'),
+  gateway: text('gateway'),
+  /** Shopify transaction ids of the refund, comma separated. */
+  transactionIds: text('transaction_ids'),
+  note: text('note'),
+  /** Last synchronisation failure, shown with a retry action. */
+  syncError: text('sync_error'),
+  attempts: integer('attempts').notNull().default(0),
+  createdBy: text('created_by'),
+  /** Client idempotency key for ERP-initiated refunds. */
+  idempotencyKey: text('idempotency_key'),
+  createdAt: ts('created_at'),
+  processedAt: ts('processed_at'),
+  updatedAt: ts('updated_at'),
+}, (table) => ({
+  numberIdx: uniqueIndex('refunds_number_idx').on(table.number),
+  shopifyRefundIdx: uniqueIndex('refunds_shopify_refund_id_idx').on(table.shopifyRefundId),
+  orderIdx: index('refunds_shopify_order_idx').on(table.shopifyOrder),
+  orderIdIdx: index('refunds_order_id_idx').on(table.orderId),
+  createdAtIdx: index('refunds_created_at_idx').on(table.createdAt),
+  statusIdx: index('refunds_status_idx').on(table.status),
+  idempotencyIdx: uniqueIndex('refunds_idempotency_key_idx').on(table.idempotencyKey),
+}))
+
+/** One refunded product inside a refund. */
+export const refundLineItems = pgTable('refund_line_items', {
+  id: text('id').primaryKey(),
+  refundId: text('refund_id').notNull(),
+  /** Shopify LineItem id/gid, so a repeated webhook can be matched. */
+  shopifyLineItemId: text('shopify_line_item_id'),
+  product: text('product'),
+  sku: text('sku'),
+  quantity: integer('quantity'),
+  amount: numericNumber('amount'),
+  /** RefundLineItemRestockType reported by Shopify (NO_RESTOCK/RETURN/CANCEL…). */
+  restockType: text('restock_type'),
+}, (table) => ({
+  refundIdx: index('refund_line_items_refund_id_idx').on(table.refundId),
+  skuIdx: index('refund_line_items_sku_idx').on(table.sku),
+  refundFk: foreignKey({ columns: [table.refundId], foreignColumns: [refunds.id], name: 'refund_line_items_refund_id_fk' }).onDelete('cascade'),
+}))
+
+/** Append-only log of every refund sync attempt (webhook, ERP push, retry). */
+export const refundSyncEvents = pgTable('refund_sync_events', {
+  id: text('id').primaryKey(),
+  refundId: text('refund_id'),
+  /** 'webhook' | 'erp_push' | 'retry' | 'pull' */
+  action: text('action').notNull(),
+  /** 'success' | 'failed' | 'skipped' */
+  status: text('status').notNull(),
+  message: text('message'),
+  createdAt: ts('created_at'),
+}, (table) => ({
+  refundIdx: index('refund_sync_events_refund_id_idx').on(table.refundId),
+  createdIdx: index('refund_sync_events_created_at_idx').on(table.createdAt),
 }))
 
 export const orderEvents = pgTable('order_events', {
@@ -926,6 +1093,25 @@ export const settings = pgTable('settings', {
   skuFormat: text('sku_format'),
   skuSeqLength: integer('sku_seq_length'),
   barcodePrefix: text('barcode_prefix'),
+  /**
+   * Loyalty program (Loyalty page → Settings). NULL everywhere means the
+   * shipped defaults: enabled, 1 point per ₹100 spent, 1 point = ₹1, no
+   * minimum order, points never expire, Shopify push off — see
+   * src/loyalty.ts resolveConfig().
+   */
+  loyaltyEnabled: boolean('loyalty_enabled').default(true),
+  /** Rupees of eligible spend that earn one point. */
+  loyaltyPointsPer: numericNumber('loyalty_points_per'),
+  /** Rupee value of one point when redeemed. */
+  loyaltyPointValue: numericNumber('loyalty_point_value'),
+  /** Orders below this value earn no points (0/NULL = no minimum). */
+  loyaltyMinOrder: numericNumber('loyalty_min_order'),
+  /** Months after which earned points expire (NULL/0 = never). */
+  loyaltyExpiryMonths: integer('loyalty_expiry_months'),
+  /** Push each customer's balance to a Shopify customer metafield. */
+  loyaltyShopifySync: boolean('loyalty_shopify_sync').default(false),
+  loyaltyMetafieldNamespace: text('loyalty_metafield_namespace'),
+  loyaltyMetafieldKey: text('loyalty_metafield_key'),
   updatedAt: ts('updated_at'),
 })
 
@@ -1083,16 +1269,38 @@ export const loyaltyTransactions = pgTable('loyalty_transactions', {
   customerId: text('customer_id').notNull(),
   invoiceId: text('invoice_id'),
   invoiceNumber: text('invoice_number'),
-  type: text('type').notNull(), // 'earn' | 'redeem' | 'adjust'
-  points: numericNumber('points').notNull(), // positive earn, negative redeem
+  /** 'earn' | 'redeem' | 'adjust' | 'refund' | 'expire' */
+  type: text('type').notNull(),
+  /** positive earn, negative redeem / refund / expiry */
+  points: numericNumber('points').notNull(),
   balanceAfter: numericNumber('balance_after'),
   note: text('note'),
   createdBy: text('created_by'),
+  /**
+   * Where the movement came from: invoice | shopify_order | shopify_refund |
+   * return | manual | expiry. NULL on rows written before this column existed
+   * (those were all invoice earns or manual adjustments).
+   */
+  source: text('source'),
+  /**
+   * Idempotency key. One row per business event — `invoice:<id>`,
+   * `order:#1001`, `refund:<shopify id>`, `return:<invoice>:<value>`,
+   * `expire:<earn row id>` — enforced by a partial unique index, so a retried
+   * webhook or a double-submitted return can never post twice.
+   */
+  externalRef: text('external_ref'),
+  /** Monetary value (₹) this movement relates to, used for refund proration. */
+  value: numericNumber('value'),
+  /** When the points earned by this row expire (NULL = never). */
+  expiresAt: ts('expires_at'),
   date: ts('date').notNull().defaultNow(),
 }, (table) => ({
   customerIdx: index('loyalty_transactions_customer_id_idx').on(table.customerId),
   invoiceIdx: index('loyalty_transactions_invoice_id_idx').on(table.invoiceId),
   dateIdx: index('loyalty_transactions_date_idx').on(table.date),
+  externalRefIdx: index('loyalty_transactions_external_ref_idx').on(table.externalRef),
+  typeIdx: index('loyalty_transactions_type_idx').on(table.type),
+  expiresAtIdx: index('loyalty_transactions_expires_at_idx').on(table.expiresAt),
 }))
 
 // ─── Multi-currency support ─────────────────────────────────────────────────

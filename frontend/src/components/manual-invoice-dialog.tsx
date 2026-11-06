@@ -77,7 +77,8 @@ export interface ManualInvoiceDialogProps {
  * what gets stored. Each line carrying a SKU deducts stock; hand-typed lines
  * leave stock alone. The server mints the invoice number.
  *
- * Shared by the Sales Invoices "New Invoice" button and the Sales Orders page.
+ * Opened from the Sales Invoices "New Invoice" button (the Sales Orders page
+ * no longer raises invoices directly — it links to the invoice it raised).
  */
 export function ManualInvoiceDialog({
   open,

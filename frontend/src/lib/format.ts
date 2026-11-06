@@ -1,27 +1,64 @@
-const inr = new Intl.NumberFormat('en-IN', {
-  style: 'currency',
-  currency: 'INR',
-  maximumFractionDigits: 2,
-  minimumFractionDigits: 0,
-})
-
-const inrDecimal = new Intl.NumberFormat('en-IN', {
-  style: 'currency',
-  currency: 'INR',
-  maximumFractionDigits: 2,
-  minimumFractionDigits: 2,
-})
-
 const number = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 })
 
 const IST_TIMEZONE = 'Asia/Kolkata'
 
-export function formatCurrency(value: number | null | undefined, opts?: { decimals?: boolean; compact?: boolean }) {
-  if (value == null || !Number.isFinite(value)) return '—'
-  if (opts?.compact) {
-    return compactCurrency(value)
+/**
+ * Only real 3-letter codes reach Intl (it throws on anything else). An unknown
+ * or missing code means "this ERP's own books", which are rupees.
+ */
+export function currencyCode(value: string | null | undefined): string {
+  const code = String(value ?? '').trim().toUpperCase()
+  return /^[A-Z]{3}$/.test(code) ? code : 'INR'
+}
+
+const currencyFormatters = new Map<string, Intl.NumberFormat>()
+
+function formatterFor(code: string, decimals: boolean): Intl.NumberFormat {
+  const key = `${code}:${decimals ? 'd' : 'n'}`
+  const cached = currencyFormatters.get(key)
+  if (cached) return cached
+  let formatter: Intl.NumberFormat
+  try {
+    formatter = new Intl.NumberFormat(code === 'INR' ? 'en-IN' : 'en-US', {
+      style: 'currency',
+      currency: code,
+      // ₹ for INR and $ for USD; every other currency prints its code (CAD, EUR)
+      // because several share the "$" sign and an ERP figure must be
+      // unambiguous.
+      currencyDisplay: code === 'INR' || code === 'USD' ? 'narrowSymbol' : 'code',
+      maximumFractionDigits: 2,
+      minimumFractionDigits: decimals ? 2 : 0,
+    })
+  } catch {
+    // Not a currency Intl knows — show the code rather than a wrong symbol.
+    formatter = new Intl.NumberFormat(code === 'INR' ? 'en-IN' : 'en-US', {
+      maximumFractionDigits: 2,
+      minimumFractionDigits: decimals ? 2 : 0,
+    })
   }
-  return opts?.decimals ? inrDecimal.format(value) : inr.format(value)
+  currencyFormatters.set(key, formatter)
+  return formatter
+}
+
+/**
+ * Format money in its OWN currency.
+ *
+ * `currency` is the ISO code of the amount as stored (from the Shopify order);
+ * amounts are never converted here. Omitting it keeps the ERP default (INR), so
+ * every existing caller behaves exactly as before.
+ */
+export function formatCurrency(
+  value: number | null | undefined,
+  opts?: { decimals?: boolean; compact?: boolean; currency?: string | null },
+) {
+  if (value == null || !Number.isFinite(value)) return '—'
+  const code = currencyCode(opts?.currency)
+  if (opts?.compact) {
+    // The compact form is rupee-shaped (lakh/crore); other currencies just
+    // print in full so a USD figure is never labelled with ₹.
+    return code === 'INR' ? compactCurrency(value) : formatterFor(code, false).format(value)
+  }
+  return formatterFor(code, Boolean(opts?.decimals)).format(value)
 }
 
 export function formatNumber(value: number | null | undefined) {

@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises'
+import { get } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Server } from 'node:http'
@@ -22,9 +23,22 @@ async function serve(dist: string): Promise<{ server: Server; port: number }> {
   return { server, port: address.port }
 }
 
-async function body(port: number, path: string): Promise<{ status: number; text: string }> {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, { headers: { connection: 'close' } })
-  return { status: res.status, text: await res.text() }
+/**
+ * `node:http` rather than the global `fetch`: on Windows, two fetches against
+ * a just-closed listener leave undici async handles that `--test-force-exit`
+ * closes twice, aborting the whole test process (`UV_HANDLE_CLOSING` in uv
+ * async.c) even though every assertion passed.
+ */
+function body(port: number, path: string): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const req = get({ host: '127.0.0.1', port, path, agent: false }, (res) => {
+      let text = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk) => (text += chunk))
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, text }))
+    })
+    req.on('error', reject)
+  })
 }
 
 test('a deep link serves index.html for a relative and an absolute FRONTEND_DIST', async () => {

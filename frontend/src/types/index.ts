@@ -833,6 +833,83 @@ export interface SalesOrderLineItem {
   sku?: string
   quantity: number
   price: number
+  /** Weight per piece (g) snapshotted on the line. */
+  netWeight?: number | null
+  /** Total line weight (g) = quantity × weight per piece (or a manual override). */
+  weight?: number | null
+  /** Making charge per gram snapshotted on the line. */
+  makingCharge?: number | null
+  silverRate?: number | null
+  silverValue?: number | null
+  makingValue?: number | null
+  amount?: number | null
+}
+
+/** Where an order sits in the ERP pipeline, derived from Shopify + ERP state. */
+export type PipelineStage =
+  | 'open'
+  | 'in_progress'
+  | 'unfulfilled'
+  | 'partially_fulfilled'
+  | 'fulfilled'
+  | 'cancelled'
+  | 'archived'
+
+export interface OrderSyncStatus {
+  configured: boolean
+  lastSyncedAt: string | null
+  syncedRecently: number
+  counts: Record<PipelineStage | 'all', number>
+  lastError: { at: string | null; message: string | null; action: string | null } | null
+  stages: PipelineStage[]
+}
+
+/** One still-fulfillable Shopify fulfillment-order line. */
+export interface FulfillmentPlanLine {
+  fulfillmentOrderId: string
+  fulfillmentOrderLineItemId: string
+  sku: string
+  name: string
+  remaining: number
+  total: number
+}
+
+export interface ShopifyOrderState {
+  ok: boolean
+  error?: string
+  orderGid?: string
+  orderName?: string
+  currency?: string
+  financialStatus?: string | null
+  fulfillmentStatus?: string | null
+  cancelledAt?: string | null
+  closedAt?: string | null
+  tracking?: { number: string | null; company: string | null; url: string | null }
+  fulfillments?: Array<{ id: string; status: string; tracking: { number: string | null; company: string | null; url: string | null } | null }>
+  lines?: FulfillmentPlanLine[]
+}
+
+export interface OrderActionResult {
+  ok: boolean
+  error?: string
+  message?: string
+  changed?: string[]
+  order?: {
+    cancelledAt: string | null
+    closedAt?: string | null
+    financialStatus?: string | null
+    fulfillmentStatus?: string | null
+  }
+}
+
+export interface ReconcileResult {
+  ok: boolean
+  checked: number
+  updated: number
+  unchanged: number
+  missing: number
+  errors: string[]
+  checkedAt: string
 }
 
 export interface SalesOrder {
@@ -857,6 +934,18 @@ export interface SalesOrder {
   shippingAddress?: Record<string, string> | null
   isBooking?: boolean | null
   advancePaid?: number | null
+  /** Authoritative Shopify state, kept separate from the ERP pipeline status. */
+  shopifyGid?: string | null
+  shopifyFinancialStatus?: string | null
+  shopifyFulfillmentStatus?: string | null
+  trackingNumber?: string | null
+  trackingCompany?: string | null
+  trackingUrl?: string | null
+  cancelledAt?: string | null
+  closedAt?: string | null
+  shopifySyncedAt?: string | null
+  /** Server-derived pipeline stage (see deriveStage in shopifyOrderPipeline). */
+  pipelineStage?: PipelineStage
 }
 
 export type OrderStatus =
@@ -1563,5 +1652,115 @@ export interface UpdatePrefsInfo {
   autoDownload: boolean
   autoInstall: boolean
   showBanner: boolean
+}
+
+// ─── Loyalty ───────────────────────────────────────────────────────────────
+
+export type LoyaltyMovementType = 'earn' | 'redeem' | 'adjust' | 'refund' | 'expire'
+
+export interface LoyaltyEntry {
+  id: string
+  customerId?: string
+  invoiceId?: string | null
+  invoiceNumber?: string | null
+  type: string
+  points: number
+  balanceAfter: number | null
+  note: string | null
+  createdBy?: string | null
+  /** invoice | shopify_order | shopify_refund | return | manual | expiry */
+  source?: string | null
+  externalRef?: string | null
+  value?: number | null
+  expiresAt?: string | null
+  date: string
+}
+
+export interface LoyaltyConfig {
+  enabled: boolean
+  pointsPer: number
+  pointValue: number
+  minOrderValue: number
+  expiryMonths: number | null
+  shopifySync: boolean
+  metafieldNamespace: string
+  metafieldKey: string
+}
+
+export interface LoyaltySummary {
+  enrolledCustomers: number
+  pointsIssued: number
+  pointsRedeemed: number
+  pointsRefunded: number
+  pointsAdjusted: number
+  pointsExpired: number
+  pointsOutstanding: number
+  transactions: number
+  lastActivityAt: string | null
+}
+
+export type LoyaltyTier = 'Bronze' | 'Silver' | 'Gold' | 'Platinum'
+
+export interface LoyaltyCustomerRow {
+  id: string
+  name: string
+  phone: string | null
+  email: string | null
+  shopifyId: string | null
+  city: string | null
+  status: string | null
+  balance: number
+  totalEarned: number
+  totalRedeemed: number
+  totalAdjusted: number
+  totalExpired: number
+  transactions: number
+  lastActivityAt: string | null
+  tier: LoyaltyTier
+}
+
+export interface LoyaltyTransactionRow {
+  id: string
+  customerId: string
+  customerName: string
+  customerPhone: string | null
+  shopifyId: string | null
+  type: string
+  points: number
+  balanceAfter: number | null
+  invoiceId: string | null
+  invoiceNumber: string | null
+  source: string | null
+  externalRef: string | null
+  note: string | null
+  createdBy: string | null
+  date: string
+}
+
+export interface LoyaltyCustomerProfile {
+  customer: { id: string; name: string; phone: string | null; email: string | null; shopifyId: string | null }
+  balance: number
+  tier: LoyaltyTier
+  totalEarned: number
+  totalRedeemed: number
+  totalRefunded: number
+  totalAdjusted: number
+  totalExpired: number
+  transactions: number
+  lastActivityAt: string | null
+  entries: LoyaltyEntry[]
+}
+
+export interface LoyaltySyncStatus {
+  enabled: boolean
+  shopifyConfigured: boolean
+  namespace: string
+  key: string
+  lastSyncedAt: string | null
+  lastFailureAt: string | null
+  successes24h: number
+  failures24h: number
+  pendingRetries: number
+  recentErrors: Array<{ time: string | null; shopifyId: string | null; error: string | null }>
 }
 
