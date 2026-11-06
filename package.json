@@ -43,12 +43,12 @@
   "devDependencies": {
     "@playwright/test": "^1.64.1",
     "concurrently": "^10.0.6",
-    "electron": "^44.9.0",
-    "electron-builder": "^26.0.12",
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0",
     "esbuild": "^0.28.2",
     "pino-pretty": "^13.2.0",
     "typescript": "^7.0.2",
-    "tailwindcss": "^4.3.3"
+    "tailwindcss": "^4.3.4"
   },
   "dependencies": {
     "asar": "^3.2.0"
