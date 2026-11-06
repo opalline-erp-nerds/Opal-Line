@@ -1411,7 +1411,18 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     recordCrud('invoices', 'Created', req, row)
     // Loyalty: award points on new invoices (fire-and-forget, never blocks billing)
     void import('../loyalty').then(({ earnForInvoice }) =>
-      earnForInvoice({ id: row.id, number: row.number ?? '', customer: row.customer ?? '', grandTotal: row.grandTotal, status: row.status }),
+      earnForInvoice({
+        id: row.id,
+        number: row.number ?? '',
+        customer: row.customer ?? '',
+        customerEmail: row.customerEmail,
+        customerPhone: row.customerPhone,
+        grandTotal: row.grandTotal,
+        status: row.status,
+        // Shopify-linked invoices earn against their order so a later order-level
+        // award cannot double-count the same purchase.
+        shopifyOrder: row.shopifyOrder,
+      }),
     )
     // E-invoicing: in `automatic` mode every new invoice is pushed to the
     // gateway straight away. Fire-and-forget so billing is never blocked.
@@ -1517,6 +1528,7 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
             id: row.id,
             number: row.number,
             customer: String(row.customer ?? ''),
+            shopifyOrder: row.shopifyOrder,
             reason: `Reversed — invoice ${row.number} marked ${nextStatus}`,
           }),
         )
@@ -1557,6 +1569,7 @@ dbRouter.delete('/invoices/:id', requirePermission('sales', 'delete'), async (re
           id: removed.id,
           number: String(removed.number ?? ''),
           customer: String(removed.customer ?? ''),
+          shopifyOrder: removed.shopifyOrder,
           reason: `Reversed — invoice ${removed.number} deleted`,
         }),
       )
@@ -1567,7 +1580,21 @@ dbRouter.delete('/invoices/:id', requirePermission('sales', 'delete'), async (re
   }
 })
 
-dbRouter.get('/sales-orders', listOf(s.salesOrders, s.salesOrders.date))
+// The Order Pipeline renders one stage tab per Shopify-derived state. Stage
+// derivation lives on the server so the UI cannot drift from webhook/import
+// behaviour; the ERP status stays a separate field the operator owns.
+dbRouter.get('/sales-orders', async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const result = await paginate(s.salesOrders, req.query, s.salesOrders.date, req)
+    const { deriveStage } = await import('../shopifyOrderPipeline')
+    result.data = result.data.map((row: any) => ({ ...stripHash(row), pipelineStage: deriveStage(row) }))
+    res.json(result)
+  } catch (err) {
+    logger.error({ err }, 'sales-orders list failed')
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
 dbRouter.get('/sales-orders/:id', oneOf(s.salesOrders, s.salesOrders.id))
 
 /** Raise an invoice for an order that doesn't have one yet (inline action). */
@@ -1635,6 +1662,7 @@ dbRouter.post('/sales-orders/by-invoice/:invoice/reinvoice', requirePermission('
           id: removed.id,
           number: String(removed.number ?? ''),
           customer: String(removed.customer ?? ''),
+          shopifyOrder: removed.shopifyOrder,
           reason: `Reversed — invoice ${removed.number} cancelled for re-issue`,
         }),
       )
@@ -2014,7 +2042,12 @@ dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), a
 dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const [invoice] = await db!.select({ id: s.salesInvoices.id, customer: s.salesInvoices.customer, number: s.salesInvoices.number })
+    const [invoice] = await db!.select({
+      id: s.salesInvoices.id,
+      customer: s.salesInvoices.customer,
+      number: s.salesInvoices.number,
+      shopifyOrder: s.salesInvoices.shopifyOrder,
+    })
       .from(s.salesInvoices)
       .where(eq(s.salesInvoices.id, routeParam(req.params.id)))
       .limit(1)
@@ -2050,7 +2083,9 @@ dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), asyn
           id: invoice.id,
           number: result.invoiceNumber,
           customer: String(invoice.customer ?? ''),
+          shopifyOrder: invoice.shopifyOrder,
           value: result.amount,
+          reference: `return:${result.returnId}`,
           reason: `Reversed on return — credit note ${result.creditNoteNumber} (₹${result.amount.toLocaleString('en-IN')})`,
         }),
       )

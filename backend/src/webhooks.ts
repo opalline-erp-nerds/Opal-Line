@@ -104,6 +104,33 @@ export function resetWebhookDedupe(): void {
   seenWebhookIds.clear()
 }
 
+/** Forget a delivery id (memory only) — used when processing failed. */
+export function forgetWebhookId(webhookId: string): void {
+  seenWebhookIds.delete(webhookId)
+}
+
+/**
+ * Release a claimed delivery id after a processing failure.
+ *
+ * A delivery is claimed BEFORE its handler runs (that is what makes two
+ * simultaneous copies of the same delivery safe), but Shopify retries a
+ * delivery it believes failed. Without releasing the claim, the retry would be
+ * answered as a duplicate and the refund would never be recorded. Releasing
+ * makes the retry a first delivery again.
+ */
+export async function releaseWebhookId(webhookId: string): Promise<void> {
+  forgetWebhookId(webhookId)
+  const client = getRawClient()
+  if (!client) return
+  try {
+    await client`DELETE FROM webhook_deliveries WHERE webhook_id = ${webhookId}`
+  } catch (err) {
+    // Worst case the retry is skipped until the 3-day window expires; the
+    // refund can still be recovered with the Refunds tab's Sync action.
+    logger.warn({ err, webhookId }, 'Could not release a failed webhook delivery id')
+  }
+}
+
 export async function markWebhookIdSeenDb(webhookId: string): Promise<boolean> {
   const client = getRawClient()
   if (!client) {

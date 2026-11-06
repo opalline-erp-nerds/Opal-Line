@@ -31,11 +31,15 @@ export default function Customer360Page() {
     Promise.all([
       dbApi.customer360(decodeURIComponent(name)).catch(() => null),
       dbApi.getCustomers().catch(() => [] as Customer[]),
-      dbApi.loyaltyBalance(decodeURIComponent(name)).catch(() => ({ found: false, balance: null })),
-    ]).then(([d, cs, lb]) => {
+    ]).then(async ([d, cs]) => {
       if (cancelled) return
+      const match = cs.find((c) => c.name === name) ?? null
       setData(d)
-      setCustomer(cs.find((c) => c.name === name) ?? null)
+      setCustomer(match)
+      // Resolve loyalty by customer id: Shopify-created customers can have a
+      // blank name, which never resolves by name.
+      const lb = await dbApi.loyaltyBalance(match ? match.id : decodeURIComponent(name)).catch(() => ({ found: false, balance: null }))
+      if (cancelled) return
       setLoyalty(lb.found ? (lb.balance ?? 0) : null)
       setLoading(false)
     })
