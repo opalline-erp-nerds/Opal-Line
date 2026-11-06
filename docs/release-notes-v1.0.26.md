@@ -1,4 +1,4 @@
-# Opal Line Billing v1.1.0
+# Opal Line Billing v1.0.26
 
 The largest feature release since the 1.0 line. Shopify orders, returns and
 refunds now live in the ERP instead of being looked up in two places, and
