@@ -74,6 +74,17 @@ import type {
   NotificationLogEntry,
   ProductCategory,
   ProductCollection,
+  LoyaltyEntry,
+  LoyaltySummary,
+  LoyaltyConfig,
+  LoyaltyCustomerRow,
+  LoyaltyTransactionRow,
+  LoyaltyCustomerProfile,
+  LoyaltySyncStatus,
+  OrderSyncStatus,
+  ShopifyOrderState,
+  OrderActionResult,
+  ReconcileResult,
 } from '@/types'
 import { request, list, maybe, withItems, PAGED } from './core'
 import type { SearchResults, SalesInvoiceRow } from './core'
@@ -110,6 +121,18 @@ function filterPath(path: string, filters: Record<string, string | undefined>): 
 }
 
 type WidgetFilters = { q?: string; status?: string }
+
+/** Build a query string from the params that actually have a value. */
+function queryString(params?: Record<string, string | number | boolean | undefined>): string {
+  if (!params) return ''
+  const search = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === '' || value === false) continue
+    search.set(key, String(value))
+  }
+  const query = search.toString()
+  return query ? `?${query}` : ''
+}
 
 export const dbApi = {
   getSilverRate: async (): Promise<SilverRate> => {
@@ -339,10 +362,13 @@ export const dbApi = {
       method: 'POST',
       body: JSON.stringify({ csv }),
     }),
+  // ── Loyalty ──────────────────────────────────────────────────────────────
+  // `customer` may be a customer id, a name, or a phone number — the backend
+  // resolves whichever it recognises (ids are preferred, names can be blank).
   loyaltyBalance: (customer: string) =>
-    request<{ found: boolean; customer?: { id: string; name: string; phone: string | null }; balance?: number; pointValue?: number; enabled?: boolean }>(`/loyalty/balance?customer=${encodeURIComponent(customer)}`),
-  loyaltyHistory: (customer: string) =>
-    request<{ found: boolean; entries: Array<{ id: string; type: string; points: string; balanceAfter: string | null; note: string | null; invoiceNumber: string | null; date: string }> }>(`/loyalty/history?customer=${encodeURIComponent(customer)}`),
+    request<{ found: boolean; customer?: { id: string; name: string; phone: string | null }; balance?: number; tier?: string; pointValue?: number; enabled?: boolean }>(`/loyalty/balance?customer=${encodeURIComponent(customer)}`),
+  loyaltyHistory: (customer: string, limit?: number) =>
+    request<{ found: boolean; entries: LoyaltyEntry[] }>(`/loyalty/history?customer=${encodeURIComponent(customer)}${limit ? `&limit=${limit}` : ''}`),
   loyaltyRedeem: (customer: string, points: number, opts?: { invoiceId?: string; invoiceNumber?: string }) =>
     request<{ ok: boolean; balanceAfter?: number; error?: string }>('/loyalty/redeem', {
       method: 'POST',
@@ -352,6 +378,47 @@ export const dbApi = {
     request<{ ok: boolean; points: number; balanceAfter: number }>('/loyalty/adjust', {
       method: 'POST',
       body: JSON.stringify({ customer, points, note }),
+    }),
+  loyaltySummary: (params?: { from?: string; to?: string }) =>
+    request<{ summary: LoyaltySummary; config: LoyaltyConfig }>(
+      `/loyalty/summary${queryString(params)}`,
+    ),
+  loyaltyCustomers: (params?: { query?: string; limit?: number; offset?: number }) =>
+    request<{ customers: LoyaltyCustomerRow[]; total: number }>(`/loyalty/customers${queryString(params)}`),
+  loyaltyCustomerProfile: (id: string) =>
+    request<LoyaltyCustomerProfile>(`/loyalty/customers/${encodeURIComponent(id)}`),
+  loyaltyTransactions: (params?: {
+    customerId?: string
+    type?: string
+    from?: string
+    to?: string
+    search?: string
+    limit?: number
+    offset?: number
+  }) => request<{ transactions: LoyaltyTransactionRow[]; total: number }>(`/loyalty/transactions${queryString(params)}`),
+  loyaltySettings: () => request<{ config: LoyaltyConfig; stored: boolean }>('/loyalty/settings'),
+  loyaltyUpdateSettings: (patch: Partial<LoyaltyConfig> & { enabled?: boolean; shopifySync?: boolean }) =>
+    request<{ ok: boolean; config: LoyaltyConfig }>('/loyalty/settings', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
+  loyaltyExpire: () =>
+    request<{ ok: boolean; expiredPoints: number; lots: number; customers: number }>('/loyalty/expire', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  loyaltyReconcile: () =>
+    request<{ checked: number; mismatches: Array<{ customerId: string; name: string; ledgerBalance: number; lastBalanceAfter: number }> }>('/loyalty/reconcile'),
+  loyaltySyncStatus: () => request<LoyaltySyncStatus>('/loyalty/sync/status'),
+  loyaltySync: (customerId?: string) =>
+    request<{ ok: boolean; pushed: number; failed: number; errors: Array<{ customerId: string; name: string; shopifyId: string | null; error: string }> }>('/loyalty/sync', {
+      method: 'POST',
+      body: JSON.stringify(customerId ? { customerId } : {}),
+    }),
+  loyaltySyncRetry: () =>
+    request<{ ok: boolean; pushed: number; failed: number; errors: Array<{ customerId: string; name: string; shopifyId: string | null; error: string }> }>('/loyalty/sync/retry', {
+      method: 'POST',
+      body: JSON.stringify({}),
     }),
 
   getProducts: () => list<Product>('/db/products', PAGED),
@@ -395,6 +462,25 @@ export const dbApi = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
+  // ─── Order Pipeline (Shopify state + actions) ─────────────────────────────
+  getOrderPipelineStatus: () => request<OrderSyncStatus>('/orders/pipeline/status'),
+  reconcileOrderPipeline: (payload: { days?: number; limit?: number } = {}) =>
+    request<ReconcileResult>('/orders/pipeline/reconcile', { method: 'POST', body: JSON.stringify(payload) }),
+  getOrderShopifyState: (orderId: string) =>
+    request<{ ok: boolean; error?: string; state?: ShopifyOrderState }>(`/orders/pipeline/${encodeURIComponent(orderId)}/shopify-state`),
+  refreshPipelineOrder: (orderId: string) =>
+    request<{ ok: boolean; error?: string; updated?: boolean; changed?: string[] }>(`/orders/pipeline/${encodeURIComponent(orderId)}/refresh`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  fulfillOrder: (orderId: string, payload: { items: Array<{ sku: string; quantity: number }>; trackingNumber?: string | null; trackingCompany?: string | null; trackingUrl?: string | null; notifyCustomer?: boolean }) =>
+    request<OrderActionResult>(`/orders/pipeline/${encodeURIComponent(orderId)}/fulfill`, { method: 'POST', body: JSON.stringify(payload) }),
+  updateOrderTracking: (orderId: string, payload: { trackingNumber: string; trackingCompany?: string | null; trackingUrl?: string | null; notifyCustomer?: boolean }) =>
+    request<OrderActionResult>(`/orders/pipeline/${encodeURIComponent(orderId)}/tracking`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  cancelPipelineOrder: (orderId: string, payload: { reason?: string; restock?: boolean; refund?: boolean; notifyCustomer?: boolean; note?: string }) =>
+    request<OrderActionResult>(`/orders/pipeline/${encodeURIComponent(orderId)}/cancel`, { method: 'POST', body: JSON.stringify(payload) }),
+  archivePipelineOrder: (orderId: string) =>
+    request<OrderActionResult>(`/orders/pipeline/${encodeURIComponent(orderId)}/archive`, { method: 'POST', body: JSON.stringify({}) }),
   getOrderEvents: (orderId: string) =>
     request<{ data: Array<{ id: string; orderId: string; event: string; details: string | null; actor: string | null; createdAt: string }> }>(`/db/orders/${orderId}/events`),
   getOrderFull: (orderId: string) =>

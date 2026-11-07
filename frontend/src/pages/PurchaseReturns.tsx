@@ -453,6 +453,9 @@ export default function PurchaseReturnsPage() {
         footer={
           <DialogFooter>
             <Button variant="outline" onClick={() => setViewReturn(null)}>Close</Button>
+            <Button variant="outline" onClick={() => viewReturn && openEdit(viewReturn)}>
+              <Pencil className="h-4 w-4" /> Edit
+            </Button>
           </DialogFooter>
         }
       >

@@ -47,11 +47,11 @@ async function main() {
   const dir = UPLOADS_DIR()
   const jpeg = readdirSync(dir).filter((f) => f.endsWith('.jpg')).slice(0, 2)
   if (jpeg.length < 2) { console.log('NEED_2_JPEGS'); process.exit(1) }
-  const urlA = saveUploadedImage(`data:image/jpeg;base64,${readFileSync(join(dir, jpeg[0])).toString('base64')}`)
-  const urlB = saveUploadedImage(`data:image/jpeg;base64,${readFileSync(join(dir, jpeg[1])).toString('base64')}`)
+  const urlA = await saveUploadedImage(`data:image/jpeg;base64,${readFileSync(join(dir, jpeg[0])).toString('base64')}`)
+  const urlB = await saveUploadedImage(`data:image/jpeg;base64,${readFileSync(join(dir, jpeg[1])).toString('base64')}`)
   if (!urlA || !urlB) { console.log('UPLOAD_FAILED'); process.exit(1) }
-  const pathA = `/uploads/${urlA}`
-  const pathB = `/uploads/${urlB}`
+  const pathA = urlA
+  const pathB = urlB
   check('setup: two distinct local images', pathA !== pathB)
 
   const id = randomUUID()

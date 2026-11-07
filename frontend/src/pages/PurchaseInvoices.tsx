@@ -562,6 +562,18 @@ export default function PurchaseInvoicesPage() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setViewInvoice(null)}>Close</Button>
             {viewInvoice && viewInvoice.status !== 'cancelled' ? (
+              <Button
+                variant="outline"
+                onClick={() => {
+                  const inv = viewInvoice
+                  setViewInvoice(null)
+                  if (inv) void openEdit(inv)
+                }}
+              >
+                <Pencil className="h-3.5 w-3.5" /> Edit
+              </Button>
+            ) : null}
+            {viewInvoice && viewInvoice.status !== 'cancelled' ? (
               <Button variant="outline" onClick={() => cancelInvoice(viewInvoice)}>
                 <Ban className="h-3.5 w-3.5" /> Cancel Invoice
               </Button>

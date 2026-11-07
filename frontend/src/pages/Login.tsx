@@ -1,11 +1,18 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, Gem, Loader2, LogIn, ShieldCheck } from 'lucide-react'
+import { Eye, EyeOff, Loader2, LogIn } from 'lucide-react'
 import { useAuth } from '@/auth/auth-context'
+import { ApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { AuthLayout, authInputClass, authLabelClass } from '@/components/layout/auth-layout'
+
+function loginErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) return err.message
+  if (err instanceof TypeError) return 'Cannot reach the server. Check your connection and try again.'
+  return err instanceof Error && err.message ? err.message : 'Invalid username or password'
+}
 
 export default function LoginPage() {
   const navigate = useNavigate()
@@ -21,98 +28,94 @@ export default function LoginPage() {
   }, [currentUser, navigate])
 
   const signIn = async () => {
-    if (!identifier.trim() || !password) return
+    if (!identifier.trim() || !password || signingIn) return
     setSigningIn(true)
     setError('')
     try {
       await login(identifier.trim(), password)
       navigate('/', { replace: true })
-    } catch {
-      setError('Invalid username or password')
+    } catch (err) {
+      setError(loginErrorMessage(err))
       setSigningIn(false)
     }
   }
 
   if (authLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-background">
-        <Loader2 className="h-6 w-6 animate-spin text-primary" />
+      <div className="flex min-h-screen items-center justify-center bg-[#15110d]">
+        <Loader2 className="h-6 w-6 animate-spin text-[#d8b36a]" />
       </div>
     )
   }
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-sidebar px-4 py-8 sm:px-6">
-      <div className="pointer-events-none absolute -left-32 -top-32 h-96 w-96 rounded-full bg-primary-500/20 blur-3xl" />
-      <div className="pointer-events-none absolute -bottom-32 -right-32 h-96 w-96 rounded-full bg-primary-500/10 blur-3xl" />
+    <AuthLayout>
+      <div>
+        <h1 className="text-[28px] font-bold leading-tight tracking-tight text-white sm:text-3xl">Welcome back</h1>
+        <p className="mt-2 text-sm text-[#cdc0ad]">Sign in to your account</p>
+      </div>
 
-      <div className="relative w-full max-w-sm sm:max-w-md">
-        <div className="mb-6 flex items-center justify-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-primary-400 to-primary-700 shadow-lg shadow-primary-950/40 ring-1 ring-white/10 sm:h-12 sm:w-12">
-            <Gem className="h-5 w-5 text-white sm:h-6 sm:w-6" />
-          </div>
-          <div>
-            <p className="text-lg font-bold tracking-tight text-white sm:text-xl">OPAL LINE</p>
-            <p className="text-[10px] font-medium uppercase tracking-widest text-sidebar-muted sm:text-[11px]">Jewellery Billing ERP</p>
+      <form
+        className="mt-7 space-y-4"
+        onSubmit={(e) => {
+          e.preventDefault()
+          void signIn()
+        }}
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="username" className={authLabelClass}>
+            Username or email
+          </Label>
+          <Input
+            id="username"
+            autoComplete="username"
+            value={identifier}
+            onChange={(e) => setIdentifier(e.target.value)}
+            className={authInputClass}
+            autoFocus
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="password" className={authLabelClass}>
+            Password
+          </Label>
+          <div className="relative">
+            <Input
+              id="password"
+              type={showPassword ? 'text' : 'password'}
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className={`${authInputClass} pr-10`}
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword((s) => !s)}
+              className="absolute right-2 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-md text-[#6b5f4f] hover:text-[#231c14] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#b8903f]"
+              aria-label={showPassword ? 'Hide password' : 'Show password'}
+              aria-pressed={showPassword}
+            >
+              {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
           </div>
         </div>
 
-        <Card className="shadow-2xl shadow-primary-950/40">
-          <CardHeader className="p-4 sm:p-6">
-            <CardTitle className="text-lg sm:text-xl">Sign in</CardTitle>
-            <CardDescription className="text-xs sm:text-sm">
-              Enter your Opal Line username or email and password. Permissions for each module are applied based on your role and personal overrides.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4 p-4 pt-0 sm:p-6 sm:pt-0">
-            <div className="space-y-1.5">
-              <Label htmlFor="username" className="text-xs text-muted-foreground">Username or email</Label>
-              <Input
-                id="username"
-                autoComplete="username"
-                placeholder="e.g. arjun or arjun@opalline.in"
-                value={identifier}
-                onChange={(e) => setIdentifier(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && signIn()}
-                autoFocus
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="password" className="text-xs text-muted-foreground">Password</Label>
-              <div className="relative">
-                <Input
-                  id="password"
-                  type={showPassword ? 'text' : 'password'}
-                  autoComplete="current-password"
-                  placeholder="Enter your password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && signIn()}
-                  className="pr-9"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword((s) => !s)}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                >
-                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
-              </div>
-            </div>
+        {error ? (
+          <p role="alert" className="rounded-md border border-[#ffb4a8]/30 bg-[#3a1d18]/60 px-3 py-2 text-sm text-[#ffc3b8]">
+            {error}
+          </p>
+        ) : null}
 
-            {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
-
-            <Button className="w-full" onClick={signIn} disabled={!identifier.trim() || !password || signingIn}>
-              {signingIn ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-              Sign in
-            </Button>
-            <p className="flex items-center justify-center gap-1 text-center text-[11px] text-muted-foreground">
-              <ShieldCheck className="h-3 w-3" /> Passwords are encrypted and never stored in plain text.
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-    </div>
+        <Button
+          type="submit"
+          className="h-11 w-full rounded-lg bg-gold text-[15px] font-semibold text-gold-foreground shadow-lg shadow-black/30 hover:bg-gold/90 focus-visible:ring-2 focus-visible:ring-[#e6c16f] focus-visible:ring-offset-2 focus-visible:ring-offset-[#15110d]"
+          disabled={!identifier.trim() || !password || signingIn}
+        >
+          {signingIn ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+          {signingIn ? 'Signing in…' : 'Sign in'}
+        </Button>
+      </form>
+    </AuthLayout>
   )
 }

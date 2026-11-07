@@ -320,4 +320,22 @@ describe('applyLiveCatalog (variant sync)', () => {
     assert.deepEqual(result, { created: 0, updated: 1 })
     assert.equal(variantCalls.length, 0, 'saveVariants must not fire for a simple product')
   })
+
+  test('claimUniqueVariantSku suffixes a SKU another product already owns', () => {
+    const taken = new Set<string>(['007'])
+    assert.equal(shopify.claimUniqueVariantSku('007', taken), '007-2')
+    assert.equal(shopify.claimUniqueVariantSku('007', taken), '007-3')
+    assert.equal(shopify.claimUniqueVariantSku('008', taken), '008')
+    assert.equal(shopify.claimUniqueVariantSku(' 008 ', taken), '008-2')
+    assert.equal(taken.has('007-2'), true)
+    assert.equal(taken.has('008-2'), true)
+  })
+
+  test('claimUniqueBarcode keeps the first barcode and drops a repeat', () => {
+    const taken = new Set<string>()
+    assert.equal(shopify.claimUniqueBarcode('454545', taken), '454545')
+    assert.equal(shopify.claimUniqueBarcode('454545', taken), null)
+    assert.equal(shopify.claimUniqueBarcode('  ', taken), null)
+    assert.equal(shopify.claimUniqueBarcode('999', taken), '999')
+  })
 })

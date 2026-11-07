@@ -11,7 +11,11 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import argon2 from 'argon2'
 import { logger } from '../logger'
+
+import { isPublicHost, seedAdminPassword } from '../hostedMode'
+
 import { ensureCollectionFoundation } from './collectionsSeed'
+
 
 /**
  * First-run database bootstrap.
@@ -499,10 +503,21 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         is_booking boolean,
         advance_paid numeric,
         note text,
+        shopify_gid text,
+        shopify_financial_status text,
+        shopify_fulfillment_status text,
+        tracking_number text,
+        tracking_company text,
+        tracking_url text,
+        fulfillment_ids jsonb,
+        cancelled_at timestamp,
+        closed_at timestamp,
+        shopify_synced_at timestamp,
         created_at timestamp DEFAULT now(),
         updated_at timestamp
       )`)
     await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS sales_orders_shopify_id_idx ON sales_orders (shopify_id)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS sales_orders_shopify_gid_idx ON sales_orders (shopify_gid)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS sales_orders_customer_idx ON sales_orders (customer)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS sales_orders_date_idx ON sales_orders (date)`)
 
@@ -574,12 +589,94 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         customer text,
         items integer,
         amount numeric,
+        currency text,
         status text,
-        date timestamp
+        date timestamp,
+        order_id text,
+        customer_email text,
+        reason text,
+        notes text,
+        source text,
+        shopify_return_id text,
+        received_items jsonb,
+        requested_at timestamp,
+        received_at timestamp,
+        completed_at timestamp,
+        created_by text,
+        updated_at timestamp
       )`)
     await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS sales_returns_number_idx ON sales_returns (number)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS sales_returns_customer_idx ON sales_returns (customer)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS sales_returns_date_idx ON sales_returns (date)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS sales_returns_order_id_idx ON sales_returns (order_id)`)
+
+    // Money refunds, their line items and the sync log. Kept separate from
+    // sales_returns: goods and money are different events (a refund can exist
+    // with no physical return, and a return can be received with no refund).
+    await tx.unsafe(`
+      CREATE TABLE IF NOT EXISTS refunds (
+        id text PRIMARY KEY,
+        number text NOT NULL,
+        shopify_refund_id text,
+        shopify_order text,
+        order_id text,
+        invoice_number text,
+        return_id text,
+        customer text,
+        customer_email text,
+        source text NOT NULL,
+        status text NOT NULL,
+        requested_amount numeric,
+        amount numeric,
+        refunded_amount numeric,
+        currency text,
+        payment_method text,
+        gateway text,
+        transaction_ids text,
+        note text,
+        sync_error text,
+        attempts integer NOT NULL DEFAULT 0,
+        created_by text,
+        idempotency_key text,
+        created_at timestamp,
+        processed_at timestamp,
+        updated_at timestamp
+      )`)
+    await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS refunds_number_idx ON refunds (number)`)
+    await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS refunds_shopify_refund_id_idx ON refunds (shopify_refund_id)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS refunds_shopify_order_idx ON refunds (shopify_order)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS refunds_order_id_idx ON refunds (order_id)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS refunds_created_at_idx ON refunds (created_at)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS refunds_status_idx ON refunds (status)`)
+    await tx.unsafe(
+      `CREATE UNIQUE INDEX IF NOT EXISTS refunds_idempotency_key_idx ON refunds (idempotency_key) WHERE idempotency_key IS NOT NULL`,
+    )
+
+    await tx.unsafe(`
+      CREATE TABLE IF NOT EXISTS refund_line_items (
+        id text PRIMARY KEY,
+        refund_id text NOT NULL REFERENCES refunds(id) ON DELETE CASCADE,
+        shopify_line_item_id text,
+        product text,
+        sku text,
+        quantity integer,
+        amount numeric,
+        restock_type text
+      )`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS refund_line_items_refund_id_idx ON refund_line_items (refund_id)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS refund_line_items_sku_idx ON refund_line_items (sku)`)
+
+    await tx.unsafe(`
+      CREATE TABLE IF NOT EXISTS refund_sync_events (
+        id text PRIMARY KEY,
+        refund_id text,
+        action text NOT NULL,
+        status text NOT NULL,
+        message text,
+        created_at timestamp
+      )`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS refund_sync_events_refund_id_idx ON refund_sync_events (refund_id)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS refund_sync_events_created_at_idx ON refund_sync_events (created_at)`)
 
     await tx.unsafe(`
       CREATE TABLE IF NOT EXISTS quotations (
@@ -976,6 +1073,10 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         balance_after numeric,
         note text,
         created_by text,
+        source text,
+        external_ref text,
+        value numeric,
+        expires_at timestamp,
         date timestamp NOT NULL DEFAULT now()
       )`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS loyalty_transactions_customer_id_idx ON loyalty_transactions (customer_id)`)
@@ -1103,7 +1204,7 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
     // exposure: the server binds to 127.0.0.1 only, and requirePasswordChange
     // below forces a new password at the first sign-in — the default never
     // survives the initial setup screen.
-    const tempPassword = process.env.SEED_ADMIN_PASSWORD?.trim() || 'Opal@2026'
+    const tempPassword = seedAdminPassword()
     generatedAdminPassword = tempPassword
     const passwordHash = await argon2.hash(tempPassword)
     await db.insert(schema.users).values({
@@ -1120,12 +1221,16 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
       permissions: null,
     })
     logger.info('Bootstrap: created initial admin user')
-    console.log('\n══════════════════════════════════════════════════════')
-    console.log('  Initial admin account created:')
-    console.log('    Username: admin')
-    console.log(`    Password: ${tempPassword}`)
-    console.log('  You will be asked to set a new password at first login.')
-    console.log('══════════════════════════════════════════════════════\n')
+    if (!isPublicHost()) {
+      console.log('\n══════════════════════════════════════════════════════')
+      console.log('  Initial admin account created:')
+      console.log('    Username: admin')
+      console.log(`    Password: ${tempPassword}`)
+      console.log('  You will be asked to set a new password at first login.')
+      console.log('══════════════════════════════════════════════════════\n')
+    } else {
+      logger.info('Bootstrap: admin password was not written to the log')
+    }
     // Hand the one-time credential to the desktop app so it can show the real
     // password in its first-run dialog instead of a hardcoded placeholder.
     // The desktop shell deletes this file as soon as it has displayed it.
@@ -1367,6 +1472,7 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
   try {
     const hasUsers = await tableExists(sql, 'users')
     if (!hasUsers) {
+      if (isPublicHost()) seedAdminPassword()
       logger.info('Bootstrap: fresh database detected — creating schema')
       await createSchema(sql)
       // Bring the fresh schema fully up to date BEFORE seeding defaults —
@@ -1462,6 +1568,10 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
         balance_after numeric,
         note text,
         created_by text,
+        source text,
+        external_ref text,
+        value numeric,
+        expires_at timestamp,
         date timestamp NOT NULL DEFAULT now()
       )`,
       `CREATE TABLE IF NOT EXISTS quotations (
@@ -1522,6 +1632,20 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS customer_email text`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS customer_phone text`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS note text`,
+      // Shopify order state for the Order Pipeline. Nullable by design: a
+      // purely local order (POS walk-in, booking) never has any of it, and the
+      // UI treats "no Shopify status" as a local order rather than unfulfilled.
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS shopify_gid text`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS shopify_financial_status text`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS shopify_fulfillment_status text`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS tracking_number text`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS tracking_company text`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS tracking_url text`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS fulfillment_ids jsonb`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS cancelled_at timestamp`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS closed_at timestamp`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS shopify_synced_at timestamp`,
+      `CREATE INDEX IF NOT EXISTS sales_orders_shopify_gid_idx ON sales_orders (shopify_gid)`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS is_booking boolean`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS advance_paid numeric`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS metal text DEFAULT 'silver'`,
@@ -1901,6 +2025,128 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
        FROM products
        WHERE selling_price IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM product_price_history h WHERE h.id = 'pph-' || products.id)`,
+      // ── Loyalty program ──────────────────────────────────────────────────
+      // Settings (Loyalty page → Settings, src/loyalty.ts). NULL means "use the
+      // shipped defaults" (1 point per ₹100, 1 point = ₹1, no minimum order,
+      // points never expire, Shopify push off), so existing installs keep the
+      // rules they have always run under.
+      `ALTER TABLE settings ADD COLUMN IF NOT EXISTS loyalty_enabled boolean DEFAULT true`,
+      `ALTER TABLE settings ADD COLUMN IF NOT EXISTS loyalty_points_per numeric`,
+      `ALTER TABLE settings ADD COLUMN IF NOT EXISTS loyalty_point_value numeric`,
+      `ALTER TABLE settings ADD COLUMN IF NOT EXISTS loyalty_min_order numeric`,
+      `ALTER TABLE settings ADD COLUMN IF NOT EXISTS loyalty_expiry_months integer`,
+      `ALTER TABLE settings ADD COLUMN IF NOT EXISTS loyalty_shopify_sync boolean DEFAULT false`,
+      `ALTER TABLE settings ADD COLUMN IF NOT EXISTS loyalty_metafield_namespace text`,
+      `ALTER TABLE settings ADD COLUMN IF NOT EXISTS loyalty_metafield_key text`,
+      // Ledger provenance + idempotency. `external_ref` is the business event
+      // key (invoice:<id>, order:#1001, refund:<id>, expire:<row id>) that the
+      // partial unique index below makes unique, so retried webhooks and
+      // double-clicked returns cannot post the same movement twice.
+      `ALTER TABLE loyalty_transactions ADD COLUMN IF NOT EXISTS source text`,
+      `ALTER TABLE loyalty_transactions ADD COLUMN IF NOT EXISTS external_ref text`,
+      `ALTER TABLE loyalty_transactions ADD COLUMN IF NOT EXISTS value numeric`,
+      `ALTER TABLE loyalty_transactions ADD COLUMN IF NOT EXISTS expires_at timestamp`,
+      // Backfill the key for existing invoice earns. If an install already has
+      // duplicate earns for one invoice, only the first keeps the ref so the
+      // unique index can be built; the history itself is never rewritten.
+      `UPDATE loyalty_transactions t SET external_ref = 'invoice:' || t.invoice_id
+         WHERE t.type = 'earn' AND t.external_ref IS NULL AND t.invoice_id IS NOT NULL
+           AND t.id = (SELECT min(x.id) FROM loyalty_transactions x
+                        WHERE x.type = 'earn' AND x.invoice_id = t.invoice_id)`,
+      `UPDATE loyalty_transactions t SET external_ref = NULL
+         WHERE t.external_ref IS NOT NULL
+           AND t.id <> (SELECT min(x.id) FROM loyalty_transactions x
+                         WHERE x.external_ref = t.external_ref)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS loyalty_transactions_external_ref_uidx ON loyalty_transactions (external_ref) WHERE external_ref IS NOT NULL`,
+      `CREATE INDEX IF NOT EXISTS loyalty_transactions_external_ref_idx ON loyalty_transactions (external_ref)`,
+      `CREATE INDEX IF NOT EXISTS loyalty_transactions_type_idx ON loyalty_transactions (type)`,
+      `CREATE INDEX IF NOT EXISTS loyalty_transactions_expires_at_idx ON loyalty_transactions (expires_at)`,
+      // ── Returns & refunds ────────────────────────────────────────────────
+      // RMA fields on the existing sales_returns table (the invoice credit-note
+      // flow keeps writing the same rows it always did — these columns are all
+      // nullable, so nothing it relies on changes).
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS order_id text`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS currency text`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS customer_email text`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS reason text`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS notes text`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS source text`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS shopify_return_id text`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS received_items jsonb`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS requested_at timestamp`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS received_at timestamp`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS completed_at timestamp`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS created_by text`,
+      `ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS updated_at timestamp`,
+      `CREATE INDEX IF NOT EXISTS sales_returns_order_id_idx ON sales_returns (order_id)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS sales_returns_shopify_return_id_idx ON sales_returns (shopify_return_id) WHERE shopify_return_id IS NOT NULL`,
+      `CREATE TABLE IF NOT EXISTS refunds (
+        id text PRIMARY KEY,
+        number text NOT NULL,
+        shopify_refund_id text,
+        shopify_order text,
+        order_id text,
+        invoice_number text,
+        return_id text,
+        customer text,
+        customer_email text,
+        source text NOT NULL,
+        status text NOT NULL,
+        requested_amount numeric,
+        amount numeric,
+        refunded_amount numeric,
+        currency text,
+        payment_method text,
+        gateway text,
+        transaction_ids text,
+        note text,
+        sync_error text,
+        attempts integer NOT NULL DEFAULT 0,
+        created_by text,
+        idempotency_key text,
+        created_at timestamp,
+        processed_at timestamp,
+        updated_at timestamp
+      )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS refunds_number_idx ON refunds (number)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS refunds_shopify_refund_id_idx ON refunds (shopify_refund_id) WHERE shopify_refund_id IS NOT NULL`,
+      `CREATE INDEX IF NOT EXISTS refunds_shopify_order_idx ON refunds (shopify_order)`,
+      `CREATE INDEX IF NOT EXISTS refunds_order_id_idx ON refunds (order_id)`,
+      `CREATE INDEX IF NOT EXISTS refunds_created_at_idx ON refunds (created_at)`,
+      `CREATE INDEX IF NOT EXISTS refunds_status_idx ON refunds (status)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS refunds_idempotency_key_idx ON refunds (idempotency_key) WHERE idempotency_key IS NOT NULL`,
+      `CREATE TABLE IF NOT EXISTS refund_line_items (
+        id text PRIMARY KEY,
+        refund_id text NOT NULL REFERENCES refunds(id) ON DELETE CASCADE,
+        shopify_line_item_id text,
+        product text,
+        sku text,
+        quantity integer,
+        amount numeric,
+        restock_type text
+      )`,
+      `CREATE INDEX IF NOT EXISTS refund_line_items_refund_id_idx ON refund_line_items (refund_id)`,
+      `CREATE INDEX IF NOT EXISTS refund_line_items_sku_idx ON refund_line_items (sku)`,
+      `CREATE TABLE IF NOT EXISTS refund_sync_events (
+        id text PRIMARY KEY,
+        refund_id text,
+        action text NOT NULL,
+        status text NOT NULL,
+        message text,
+        created_at timestamp
+      )`,
+      `CREATE INDEX IF NOT EXISTS refund_sync_events_refund_id_idx ON refund_sync_events (refund_id)`,
+      `CREATE INDEX IF NOT EXISTS refund_sync_events_created_at_idx ON refund_sync_events (created_at)`,
+      // Currency backfill for returns written before the currency was stored
+      // on the row. A return's amount comes from the order's line prices, so
+      // the order's currency is exactly its currency; only NULLs are filled and
+      // no amount is ever converted. Refund rows are deliberately NOT
+      // backfilled from the order: a multi-currency refund is in the customer's
+      // presentment currency, which is captured from Shopify at write time.
+      `UPDATE sales_returns r SET currency = upper(o.currency)
+         FROM sales_orders o
+        WHERE r.currency IS NULL AND o.shopify_id = r.order
+          AND o.currency IS NOT NULL AND btrim(o.currency) <> ''`,
     ]
     for (const stmt of upgrades) {
       await sql.unsafe(stmt).catch(() => undefined)

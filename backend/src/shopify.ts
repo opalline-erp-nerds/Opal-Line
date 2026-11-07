@@ -1113,6 +1113,43 @@ export async function applyLiveCatalog(
   return { created, updated }
 }
 
+/**
+ * Pick a variant SKU that is not already in `taken` (compared case-insensitively).
+ * Shopify stores often reuse a SKU across listings; `product_variants.sku` is
+ * unique, so a second copy gets a numeric tail (`007`, `007-2`, `007-3`, …)
+ * instead of aborting the catalog pull. The chosen key is reserved in `taken`.
+ */
+export function claimUniqueVariantSku(preferred: string, taken: Set<string>): string {
+  const base = preferred.trim() || 'VARIANT'
+  let sku = base
+  let n = 2
+  while (taken.has(sku.toLowerCase())) {
+    sku = `${base}-${n}`
+    n += 1
+    if (n > 10000) {
+      sku = `${base}-${randomUUID().slice(0, 8)}`
+      break
+    }
+  }
+  taken.add(sku.toLowerCase())
+  return sku
+}
+
+/**
+ * Keep the first non-empty barcode. A later listing that repeats it is stored
+ * with no barcode: `product_variants.barcode` is unique on this database, and
+ * a second copy must not abort the catalog pull. Empty values stay empty.
+ * A kept barcode is reserved in `taken`.
+ */
+export function claimUniqueBarcode(preferred: string | null | undefined, taken: Set<string>): string | null {
+  const base = String(preferred ?? '').trim()
+  if (!base) return null
+  const key = base.toLowerCase()
+  if (taken.has(key)) return null
+  taken.add(key)
+  return base
+}
+
 export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
   if (!isConfigured()) {
     return { ok: false, synced: 0, created: 0, updated: 0, removed: 0, errors: ['Shopify is not configured. See server/.env'], message: 'Shopify is not configured' }
@@ -1143,6 +1180,37 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
     const rows = await db.select().from(schema.products)
 
     const pricingRate = (await getLatestSilverRate())?.rate ?? 92.8
+    // Variant SKUs are unique across the whole table, not per product. Track
+    // every SKU already stored so a second listing that reuses "007" is saved
+    // with a suffix instead of failing product_variants_sku_idx and aborting
+    // the pull (which also blocks a silver-rate update that syncs first).
+    const takenVariantSkus = new Set<string>()
+    const variantSkusByProduct = new Map<string, string[]>()
+    const takenVariantBarcodes = new Set<string>()
+    const variantBarcodesByProduct = new Map<string, string[]>()
+    const existingVariantSkus = await database
+      .select({
+        sku: schema.productVariants.sku,
+        barcode: schema.productVariants.barcode,
+        productId: schema.productVariants.productId,
+      })
+      .from(schema.productVariants)
+    for (const row of existingVariantSkus) {
+      const key = String(row.sku ?? '').trim().toLowerCase()
+      if (key) {
+        takenVariantSkus.add(key)
+        const owned = variantSkusByProduct.get(row.productId) ?? []
+        owned.push(key)
+        variantSkusByProduct.set(row.productId, owned)
+      }
+      const barcode = String(row.barcode ?? '').trim().toLowerCase()
+      if (barcode) {
+        takenVariantBarcodes.add(barcode)
+        const ownedBarcodes = variantBarcodesByProduct.get(row.productId) ?? []
+        ownedBarcodes.push(barcode)
+        variantBarcodesByProduct.set(row.productId, ownedBarcodes)
+      }
+    }
     const applied = await applyLiveCatalog(live, rows, pricingRate, {
       insert: async (values) => (await database.insert(schema.products).values(values).returning())[0],
       update: async (existing, patch) => {
@@ -1174,40 +1242,73 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
       // the push. Parent stock above already carries the summed count.
       saveVariants: async (productId, options, variants) => {
         const liveVariants = variants ?? []
-        await database.delete(schema.productVariants).where(eq(schema.productVariants.productId, productId))
-        if (liveVariants.length === 0) {
-          await database.update(schema.products).set({ options: null }).where(eq(schema.products.id, productId))
-          return
-        }
-        const seenSku = new Set<string>()
-        await database.insert(schema.productVariants).values(
-          liveVariants.map((v) => {
-            const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
-            let sku = String(v.sku ?? '').trim() || `SHOP-V${v.id}`
-            // The variant sku index is unique — a store with duplicate SKUs
-            // must not abort the whole pull, so clashes get a numeric tail.
-            while (seenSku.has(sku.toLowerCase())) sku = `${sku}-2`
-            seenSku.add(sku.toLowerCase())
-            return {
-              id: randomUUID(),
-              productId,
-              title,
-              optionValues: [v.option1, v.option2, v.option3]
-                .filter((x): x is string => Boolean(x) && String(x).trim() !== ''),
-              sku,
-              barcode: v.barcode ?? null,
-              sellingPrice: Number(v.price) || null,
-              compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
-              costPrice: null,
-              grossWeight: null,
-              stock: Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0)),
-              reorderLevel: null,
-              status: 'active',
-              createdAt: new Date().toISOString(),
+        // This product's current rows are about to be replaced, so their SKUs
+        // are free again. Other products' SKUs stay reserved.
+        const released = variantSkusByProduct.get(productId) ?? []
+        for (const key of released) takenVariantSkus.delete(key)
+        const releasedBarcodes = variantBarcodesByProduct.get(productId) ?? []
+        for (const key of releasedBarcodes) takenVariantBarcodes.delete(key)
+        const claimed: string[] = []
+        const claimedBarcodes: string[] = []
+        try {
+          await database.transaction(async (tx) => {
+            await tx.delete(schema.productVariants).where(eq(schema.productVariants.productId, productId))
+            if (liveVariants.length === 0) {
+              await tx.update(schema.products).set({ options: null }).where(eq(schema.products.id, productId))
+              variantSkusByProduct.set(productId, [])
+              variantBarcodesByProduct.set(productId, [])
+              return
             }
-          }),
-        )
-        await database.update(schema.products).set({ options: options ?? null }).where(eq(schema.products.id, productId))
+            await tx.insert(schema.productVariants).values(
+              liveVariants.map((v) => {
+                const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
+                const preferred = String(v.sku ?? '').trim() || `SHOP-V${v.id}`
+                const sku = claimUniqueVariantSku(preferred, takenVariantSkus)
+                claimed.push(sku.toLowerCase())
+                if (sku !== preferred) {
+                  logger.warn(
+                    { productId, from: preferred, to: sku },
+                    'Variant SKU already used by another product — stored with a numeric suffix',
+                  )
+                }
+                const barcode = claimUniqueBarcode(v.barcode, takenVariantBarcodes)
+                if (barcode) claimedBarcodes.push(barcode.toLowerCase())
+                else if (String(v.barcode ?? '').trim()) {
+                  logger.warn(
+                    { productId, barcode: String(v.barcode).trim(), sku },
+                    'Variant barcode already used by another product — stored without a barcode',
+                  )
+                }
+                return {
+                  id: randomUUID(),
+                  productId,
+                  title,
+                  optionValues: [v.option1, v.option2, v.option3]
+                    .filter((x): x is string => Boolean(x) && String(x).trim() !== ''),
+                  sku,
+                  barcode,
+                  sellingPrice: Number(v.price) || null,
+                  compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
+                  costPrice: null,
+                  grossWeight: null,
+                  stock: Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0)),
+                  reorderLevel: null,
+                  status: 'active',
+                  createdAt: new Date().toISOString(),
+                }
+              }),
+            )
+            await tx.update(schema.products).set({ options: options ?? null }).where(eq(schema.products.id, productId))
+            variantSkusByProduct.set(productId, claimed)
+            variantBarcodesByProduct.set(productId, claimedBarcodes)
+          })
+        } catch (err) {
+          for (const key of claimed) takenVariantSkus.delete(key)
+          for (const key of released) takenVariantSkus.add(key)
+          for (const key of claimedBarcodes) takenVariantBarcodes.delete(key)
+          for (const key of releasedBarcodes) takenVariantBarcodes.add(key)
+          throw err
+        }
       },
     })
     created = applied.created
@@ -1223,11 +1324,13 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
       const liveLinked = shopifyStatus === 'synced'
       if (!genuinelyLinked || !liveLinked) continue
       await db.delete(schema.stockTransfers).where(sql`${schema.stockTransfers.sku} = ${r.sku}`)
+      await db.delete(schema.productVariants).where(eq(schema.productVariants.productId, r.id))
       await db.delete(schema.products).where(eq(schema.products.id, r.id))
       removed++
     }
 
     store.lastSync.products = new Date().toISOString()
+    store.lastError = undefined
     addLog('products', 'success', live.length, `Synced ${live.length} live products into the local catalog`)
     await persistLog({ entity: 'Product', direction: 'in', action: 'Import', status: 'success' })
     return { ok: true, synced: live.length, created, updated, removed, errors: [] }
@@ -3583,24 +3686,27 @@ export interface ShopifyOrdersImportResult {
 }
 
 function mapImportedPayment(status: string | null | undefined): string {
-  switch (status) {
+  switch (String(status ?? '').toLowerCase()) {
     case 'paid':
+    case 'partially_paid':
+    case 'partially_refunded':
+      // The coarse ERP payment field can only say paid/pending/refunded.
+      // Preserve the exact Shopify enum in shopifyFinancialStatus below.
       return 'paid'
     case 'refunded':
-    case 'partially_refunded':
+    case 'voided':
       return 'refunded'
-    case 'pending':
-      return 'pending'
     default:
       return 'pending'
   }
 }
 
 function mapImportedFulfillment(status: string | null | undefined): string {
-  switch (status) {
+  switch (String(status ?? '').toLowerCase()) {
     case 'fulfilled':
       return 'fulfilled'
     case 'partial':
+    case 'partially_fulfilled':
       return 'partial'
     default:
       return 'unfulfilled'
@@ -3609,12 +3715,10 @@ function mapImportedFulfillment(status: string | null | undefined): string {
 
 function mapImportedStatus(raw: any): string {
   if (raw.cancelled_at || String(raw.financial_status ?? '') === 'voided') return 'cancelled'
-  // Map Shopify fulfillment into pipeline stages so the kanban reflects reality
   if (raw.fulfillment_status === 'fulfilled') return 'fulfilled'
   if (raw.fulfillment_status === 'partial') return 'processing'
-  if (Array.isArray(raw.fulfillments) && raw.fulfillments.length > 0) return 'processing'
-  const closedAt = raw.closed_at ? Date.parse(raw.closed_at) : NaN
-  if (Number.isFinite(closedAt)) return 'fulfilled'
+  // Shopify closed_at means archived, not fulfilled. Archive is persisted in
+  // its own column and does not change the ERP's manual processing stage.
   return 'imported'
 }
 
@@ -3686,11 +3790,14 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             sku: li.sku ? String(li.sku) : '',
             quantity: Math.max(0, Number(li.quantity ?? 0)),
             price: Math.round(Number(li.price ?? 0) * 100) / 100,
+            fulfilledQuantity: Math.max(0, Number(li.quantity ?? 0) - Number(li.fulfillable_quantity ?? li.quantity ?? 0)),
           }))
           .filter((li: { title: string }) => li.title) ?? []
       const tags = String(o.tags ?? '').trim() || null
       const currency = String(o.currency ?? 'INR') || 'INR'
       const discount = Math.round(Number(o.total_discounts ?? 0) * 100) / 100
+      const { snapshotFromRestOrder, buildOrderPatch } = await import('./shopifyOrderPipeline')
+      const orderSnapshot = snapshotFromRestOrder(o)
 
       const billingAddress = o.billing_address ? (() => {
         // parseOrderAddress keeps region-only redacted stubs (province/country);
@@ -3706,24 +3813,22 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
         // webhook) must survive a redacted or partial payload — a whole-address
         // write of null or of a half-redacted object used to blank them out.
         const [cur] = await db
-          .select({ billingAddress: schema.salesOrders.billingAddress, shippingAddress: schema.salesOrders.shippingAddress })
+          .select()
           .from(schema.salesOrders)
           .where(eq(schema.salesOrders.shopifyId, shopifyId))
           .limit(1)
+        const statePatch = cur ? buildOrderPatch(cur, orderSnapshot).patch : {}
         await db
           .update(schema.salesOrders)
           .set({
+            ...statePatch,
             ...(!apiNameIsEmail && customerName && customerName !== 'Guest' ? { customer: customerName } : {}),
             ...(customerId ? { customerShopifyId: customerId } : {}),
             value,
-            payment,
-            fulfillment,
-            status: mapImportedStatus(o),
             items,
             tags,
             currency,
             discount,
-            lineItems: lineItems.length > 0 ? lineItems : undefined,
             // undefined from mergeAddress = nothing worth writing → drizzle
             // omits the column and the stored address is untouched.
             billingAddress: mergeAddress(cur?.billingAddress as OrderAddress | undefined, billingAddress),
@@ -3734,7 +3839,7 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
       } else {
         try {
           await db.transaction(async (tx) => {
-            await tx
+            const inserted = await tx
               .insert(schema.salesOrders)
               .values({
                 id: `shopify-${o.id}`,
@@ -3749,6 +3854,16 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
                 fulfillment,
                 invoice: null,
                 status: mapImportedStatus(o),
+                shopifyGid: orderSnapshot.gid,
+                shopifyFinancialStatus: orderSnapshot.financialStatus,
+                shopifyFulfillmentStatus: orderSnapshot.fulfillmentStatus,
+                trackingNumber: orderSnapshot.tracking.number,
+                trackingCompany: orderSnapshot.tracking.company,
+                trackingUrl: orderSnapshot.tracking.url,
+                fulfillmentIds: orderSnapshot.fulfillmentIds,
+                cancelledAt: orderSnapshot.cancelledAt,
+                closedAt: orderSnapshot.closedAt,
+                shopifySyncedAt: date,
                 date,
                 items,
                 tags,
@@ -3759,6 +3874,13 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
                 shippingAddress: shippingAddress ?? undefined,
               })
               .onConflictDoNothing()
+              .returning({ id: schema.salesOrders.id })
+
+            // Two concurrent syncs (e.g. an overlapping manual sync and webhook
+            // retry) both see the order as unknown. Only the transaction that
+            // actually inserted it may deduct stock, otherwise the same sale is
+            // deducted twice.
+            if (inserted.length === 0) return
 
             for (const li of lineItems) {
               const sku = String(li.sku ?? '').trim()

@@ -1,0 +1,73 @@
+# Staging only. One web service: the API serves the built UI from FRONTEND_DIST
+# so the browser stays on a single origin. PostgreSQL is Supabase (external).
+# Apply this blueprint when you are ready; it does not deploy by itself.
+projects:
+  - name: Opal Line
+    environments:
+      - name: staging
+        services:
+          - type: web
+            name: opal-line
+            runtime: node
+            plan: starter
+            region: singapore
+            numInstances: 1
+            buildCommand: npm ci --include=dev && npm run build -w frontend
+            startCommand: npm run start:server
+            healthCheckPath: /api/v1/health
+            envVars:
+              - key: NODE_VERSION
+                value: "20"
+              - key: NODE_ENV
+                value: production
+              # Desktop stays on 127.0.0.1. Render must opt in.
+              - key: HOST
+                value: 0.0.0.0
+              # npm runs the backend script with cwd = backend/, so this is
+              # <repo>/frontend/dist. Leave VITE_API_BASE unset so the UI calls
+              # the same origin at /api/v1.
+              - key: FRONTEND_DIST
+                value: ../frontend/dist
+              - key: TRUST_PROXY
+                value: "1"
+              # HTTPS on Render. Unset on the desktop app, which stays Secure=false.
+              - key: COOKIE_SECURE
+                value: "true"
+              - key: SHOPIFY_API_VERSION
+                value: "2025-10"
+              # Render assigns PORT. Do not set 47191–47198 here.
+              - key: DATABASE_URL
+                sync: false
+              - key: ENCRYPTION_KEY
+                sync: false
+              - key: CSRF_SECRET
+                sync: false
+              - key: SEED_ADMIN_PASSWORD
+                sync: false
+              - key: PUBLIC_BASE_URL
+                sync: false
+              - key: SHOPIFY_STORE_URL
+                sync: false
+              - key: SHOPIFY_ACCESS_TOKEN
+                sync: false
+              - key: SHOPIFY_WEBHOOK_SECRET
+                sync: false
+              # Optional. Product images. Bucket must be public. Leave empty to keep local disk.
+              - key: SUPABASE_URL
+                sync: false
+              - key: SUPABASE_SERVICE_ROLE_KEY
+                sync: false
+              - key: SUPABASE_STORAGE_BUCKET
+                sync: false
+              # Optional. Supabase Storage S3 keys, from Storage → S3 Access Keys.
+              # Daily backups are pushed only when all four are set.
+              - key: BACKUP_OFFSITE_ENDPOINT
+                sync: false
+              - key: BACKUP_OFFSITE_BUCKET
+                sync: false
+              - key: BACKUP_OFFSITE_KEY_ID
+                sync: false
+              - key: BACKUP_OFFSITE_SECRET
+                sync: false
+              - key: BACKUP_OFFSITE_REGION
+                sync: false

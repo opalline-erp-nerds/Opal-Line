@@ -1021,7 +1021,17 @@ export async function createInvoiceForOrderRow(
 
   // Loyalty: award points for this invoice (fire-and-forget, never blocks sync)
   void import('./loyalty').then(({ earnForInvoice }) =>
-    earnForInvoice({ id: invoiceId, number, customer: order.customer ?? '', grandTotal, status: order.payment === 'paid' ? 'paid' : 'issued' }),
+    earnForInvoice({
+      id: invoiceId,
+      number,
+      customer: order.customer ?? '',
+      customerEmail: customer?.email || String(order.customerEmail ?? ''),
+      customerPhone: customer?.phone || String(order.customerPhone ?? ''),
+      grandTotal,
+      status: order.payment === 'paid' ? 'paid' : 'issued',
+      // Order-linked invoices earn once, under the order's own identity.
+      shopifyOrder: order.shopifyId ?? null,
+    }),
   )
   // E-invoicing: in `automatic` mode the IRN must be generated for invoices
   // raised by THIS pipeline (fulfilment, email sync) too — not only for

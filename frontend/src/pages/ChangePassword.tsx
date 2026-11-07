@@ -1,11 +1,11 @@
 import { useState } from 'react'
-import { KeyRound, ShieldAlert } from 'lucide-react'
+import { KeyRound } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { authApi } from '@/lib/api'
 import { useAuth } from '@/auth/auth-context'
+import { AuthLayout, authInputClass, authLabelClass } from '@/components/layout/auth-layout'
 
 const RULES = [
   { test: (v: string) => v.length >= 8, label: 'At least 8 characters' },
@@ -45,81 +45,97 @@ export default function ChangePasswordPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-muted/30 p-4">
-      <Card className="w-full max-w-md">
-        <CardContent className="p-6">
-          <div className="mb-5 flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-amber-100 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
-              <ShieldAlert className="h-5 w-5" />
-            </div>
-            <div>
-              <h1 className="text-lg font-semibold">Choose a new password</h1>
-              <p className="text-sm text-muted-foreground">
-                {currentUser?.username ? `Signed in as ${currentUser.username}. ` : ''}
-                You must set a new password before using Opal Line.
-              </p>
-            </div>
-          </div>
+    <AuthLayout>
+      <div>
+        <h1 className="text-[28px] font-bold leading-tight tracking-tight text-white sm:text-3xl">
+          Choose a new password
+        </h1>
+        <p className="mt-2 text-sm text-[#cdc0ad]">
+          {currentUser?.username ? `Signed in as ${currentUser.username}. ` : ''}
+          You must set a new password before using Opal Line.
+        </p>
+      </div>
 
-          <form onSubmit={submit} className="space-y-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="currentPassword">Current password</Label>
-              <Input
-                id="currentPassword"
-                type="password"
-                autoComplete="current-password"
-                value={currentPassword}
-                onChange={(e) => setCurrentPassword(e.target.value)}
-              />
-            </div>
+      <form onSubmit={submit} className="mt-7 space-y-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="currentPassword" className={authLabelClass}>
+            Current password
+          </Label>
+          <Input
+            id="currentPassword"
+            type="password"
+            autoComplete="current-password"
+            value={currentPassword}
+            onChange={(e) => setCurrentPassword(e.target.value)}
+            className={authInputClass}
+            autoFocus
+          />
+        </div>
 
-            <div className="space-y-1.5">
-              <Label htmlFor="newPassword">New password</Label>
-              <Input
-                id="newPassword"
-                type="password"
-                autoComplete="new-password"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-              />
-              <ul className="grid grid-cols-1 gap-0.5 text-xs text-muted-foreground sm:grid-cols-2">
-                {RULES.map((r) => {
-                  const ok = r.test(newPassword)
-                  return (
-                    <li key={r.label} className={ok ? 'text-success-700 dark:text-success-300' : undefined}>
-                      {ok ? '✓' : '•'} {r.label}
-                    </li>
-                  )
-                })}
-              </ul>
-            </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="newPassword" className={authLabelClass}>
+            New password
+          </Label>
+          <Input
+            id="newPassword"
+            type="password"
+            autoComplete="new-password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            className={authInputClass}
+          />
+          <ul className="grid grid-cols-1 gap-0.5 text-xs text-[#bdae99] sm:grid-cols-2">
+            {RULES.map((r) => {
+              const ok = r.test(newPassword)
+              return (
+                <li key={r.label} className={ok ? 'text-[#8fd6a8]' : undefined}>
+                  {ok ? '✓' : '•'} {r.label}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
 
-            <div className="space-y-1.5">
-              <Label htmlFor="confirmPassword">Confirm new password</Label>
-              <Input
-                id="confirmPassword"
-                type="password"
-                autoComplete="new-password"
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-              />
-              {mismatch && <p className="text-xs text-destructive">Passwords do not match.</p>}
-            </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="confirmPassword" className={authLabelClass}>
+            Confirm new password
+          </Label>
+          <Input
+            id="confirmPassword"
+            type="password"
+            autoComplete="new-password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            className={authInputClass}
+          />
+          {mismatch && <p className="text-xs text-[#ffc3b8]">Passwords do not match.</p>}
+        </div>
 
-            {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <p role="alert" className="text-sm text-[#ffc3b8]">
+            {error}
+          </p>
+        )}
 
-            <div className="flex gap-2 pt-1">
-              <Button type="submit" disabled={!ready || busy} className="flex-1">
-                <KeyRound className="mr-2 h-4 w-4" />
-                {busy ? 'Saving…' : 'Set new password'}
-              </Button>
-              <Button type="button" variant="ghost" onClick={logout}>
-                Sign out
-              </Button>
-            </div>
-          </form>
-        </CardContent>
-      </Card>
-    </div>
+        <div className="flex gap-2 pt-1">
+          <Button
+            type="submit"
+            disabled={!ready || busy}
+            className="h-11 flex-1 rounded-lg bg-gold text-[15px] font-semibold text-gold-foreground shadow-lg shadow-black/30 hover:bg-gold/90 focus-visible:ring-2 focus-visible:ring-[#e6c16f] focus-visible:ring-offset-2 focus-visible:ring-offset-[#15110d]"
+          >
+            <KeyRound className="h-4 w-4" />
+            {busy ? 'Saving…' : 'Set new password'}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={logout}
+            className="h-11 rounded-lg px-4 text-[#e8dcc8] hover:bg-white/10 hover:text-white"
+          >
+            Sign out
+          </Button>
+        </div>
+      </form>
+    </AuthLayout>
   )
 }

@@ -6,10 +6,10 @@ import cookieParser from 'cookie-parser'
 import { randomBytes, randomUUID, createHmac, timingSafeEqual } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
 import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
-import { buildPricedOrder, type ValidatedOrderItem } from './orderPricing'
+import { buildPricedOrder, ORDER_GST_RATE, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
 import { deductOrderLineStock, resolveMovementLocation, restoreOrderLineStock } from './stock'
@@ -29,10 +29,10 @@ import { logger } from './logger'
 import { CONSTANTS } from './constants'
 import { applyTrustProxy } from './proxyTrust'
 import { PgRateLimitStore, pruneExpiredRateLimits } from './pgRateLimitStore'
-import { verifyShopifyWebhook, rejectReplayedWebhook } from './webhooks'
+import { verifyShopifyWebhook, rejectReplayedWebhook, releaseWebhookId } from './webhooks'
 import { recountCustomerStats } from './customerStats'
 import { startAutoBackup, startDailySummary } from './autoBackup'
-import { startOrderEmailIngest, stopOrderEmailIngest, pollOrderMailbox, isEmailIngestConfigured, kickEmailIngest } from './orderEmailIngest'
+import { startOrderEmailIngest, stopOrderEmailIngest, pollOrderMailbox, isEmailIngestConfigured } from './orderEmailIngest'
 import { isPiiAccessDenied, missingPiiCustomerCount, normalizeShopifyCustomerId } from './shopifyDataEnhance'
 import { applyRateSchedule, fetchSilverRateNow, getSchedulerStatus, setAutoRateEnabled, startSilverRateScheduler } from './silverRateScheduler'
 import {
@@ -43,6 +43,8 @@ import {
   updateScheduledRateChange,
 } from './scheduledRateApplier'
 import { ensureUploadsDir, UPLOADS_DIR, uploadImageHandler } from './uploads'
+import { mountFrontend, resolveFrontendDist } from './frontendStatic'
+import { HostedConfigError, isPublicHost, publicHostStartupError } from './hostedMode'
 import { routeParam } from './lib/routeParams'
 
 const app = express()
@@ -100,6 +102,11 @@ app.use((req, res, next) => {
 
 const CSRF_FILE = '.csrf-secret'
 function getCsrfSecret(): string {
+  const hostedError = publicHostStartupError()
+  if (hostedError) {
+    logger.error(hostedError)
+    process.exit(1)
+  }
   if (process.env.CSRF_SECRET) return process.env.CSRF_SECRET
   if (existsSync(CSRF_FILE)) {
     try { return readFileSync(CSRF_FILE, 'utf8').trim() } catch { /* regenerate */ }
@@ -278,10 +285,130 @@ app.get('/api/v1/health', async (_req, res) => {
 
 app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook, async (req, res) => {
   const topic = req.shopifyWebhook?.topic ?? ''
-  logger.info({ topic, shopDomain: req.shopifyWebhook?.shopDomain, webhookId: req.shopifyWebhook?.webhookId }, 'Shopify webhook received')
+  const webhookId = req.shopifyWebhook?.webhookId
+  logger.info({ topic, shopDomain: req.shopifyWebhook?.shopDomain, webhookId }, 'Shopify webhook received')
 
-  // Acknowledge immediately — Shopify considers the delivery failed after 5s
-  // and retries, so any real processing must happen after the response.
+  // Refunds are recorded BEFORE the acknowledgement. A refund is money: if the
+  // write fails we must answer non-2xx so Shopify retries, and the delivery id
+  // is released so that retry is not mistaken for a duplicate. The work is a
+  // couple of indexed writes, well inside Shopify's 5s budget.
+  if (topic.startsWith('refunds/')) {
+    try {
+      const { syncRefundFromWebhook } = await import('./shopifyRefunds')
+      const saved = await syncRefundFromWebhook(req.body as never, { action: 'webhook' })
+      if (!saved.ok) throw new Error(saved.reason ?? 'The refund could not be recorded')
+      // Loyalty reversal is idempotent per Shopify refund id; a failure here is
+      // logged but does not make Shopify resend a refund we already recorded.
+      let loyalty: { ok: boolean; reversed: number } | null = null
+      try {
+        const { handleShopifyRefund } = await import('./shopifyLoyalty')
+        loyalty = await handleShopifyRefund(req.body as never)
+      } catch (err) {
+        logger.error({ err, topic }, 'Loyalty: refund reversal failed (refund itself is recorded)')
+      }
+      logger.info({ topic, ...saved, loyalty }, 'Refund: recorded from Shopify')
+      res.json({ ok: true, refundId: saved.refundId, duplicate: saved.duplicate, loyaltyPointsReversed: loyalty?.reversed ?? 0 })
+    } catch (err) {
+      if (webhookId) await releaseWebhookId(webhookId)
+      logger.error(
+        { topic, webhookId, err: { message: err instanceof Error ? err.message : 'Unknown error' } },
+        'Refund: could not record Shopify refund — answering 500 so Shopify retries',
+      )
+      res.status(500).json({ ok: false, error: 'The refund could not be recorded' })
+    }
+    return
+  }
+
+  // Order / fulfillment events are applied BEFORE acknowledging so Shopify can
+  // retry when the authoritative state could not be persisted. These handlers
+  // are deliberately targeted and idempotent; they never run the order import's
+  // stock deduction path for an already-known order.
+  const ORDER_EVENT_TOPICS = new Set([
+    'orders/create',
+    'orders/updated',
+    'orders/edited',
+    'orders/paid',
+    'orders/fulfilled',
+    'orders/partially_fulfilled',
+    'orders/cancelled',
+  ])
+  const FULFILLMENT_EVENT_TOPICS = new Set(['fulfillments/create', 'fulfillments/update'])
+  if (ORDER_EVENT_TOPICS.has(topic) || FULFILLMENT_EVENT_TOPICS.has(topic)) {
+    try {
+      const pipeline = await import('./shopifyOrderPipeline')
+      const orderPayload = req.body as { id?: number; name?: string; admin_graphql_api_id?: string; cancelled_at?: string | null } | undefined
+      let applied
+      if (FULFILLMENT_EVENT_TOPICS.has(topic)) {
+        applied = await pipeline.applyFulfillmentWebhook(req.body, { actor: 'shopify' })
+      } else {
+        const shopifyId = orderPayload?.name ? `#${String(orderPayload.name).replace(/^#/, '')}` : null
+        applied = await pipeline.applyShopifyOrderPayload(req.body, { actor: 'shopify' })
+        // A new order can arrive before the scheduled/manual import. Import only
+        // when it is not a cancellation, and let the importer own its one-time
+        // stock deduction. Existing rows are updated by the diff-only mapper.
+        if (!applied.found && topic !== 'orders/cancelled') {
+          const { importShopifyOrders } = await import('./shopify')
+          const imported = await importShopifyOrders()
+          applied = await pipeline.applyShopifyOrderPayload(req.body, { actor: 'shopify' })
+          if (imported.ok) {
+            // Redacted API payloads are completed from the notification email
+            // (never redacted) and by a targeted GraphQL enrichment. Both were
+            // part of the previous order-webhook path and must keep running so
+            // new orders do not land with a blank customer.
+            const { kickEmailIngest } = await import('./orderEmailIngest')
+            kickEmailIngest()
+            try {
+              const { enrichOrdersFromShopify } = await import('./shopifyDataEnhance')
+              const enriched = await enrichOrdersFromShopify()
+              logger.info({ enriched: enriched.enriched, failed: enriched.failed }, 'Auto-enrich: orders updated with full customer data')
+            } catch (err) {
+              logger.error({ err }, 'Auto-enrich after order webhook failed')
+            }
+          }
+        }
+        // Restock + loyalty reversal hang off the applied cancellation, not the
+        // topic: a cancellation can first surface through `orders/updated` when
+        // the `orders/cancelled` subscription was missing for a period.
+        if (applied.orderId && applied.changed?.includes('cancelled')) {
+          const actions = await import('./shopifyOrderActions')
+          const restored = await actions.cancelLocalOrderOnce(applied.orderId)
+          if (restored.itemsRestored > 0) logger.info({ topic, orderId: applied.orderId, ...restored }, 'Order Pipeline: stock restored after cancellation')
+          if (shopifyId) {
+            const { handleShopifyOrderCancelled } = await import('./shopifyLoyalty')
+            const loyalty = await handleShopifyOrderCancelled(shopifyId)
+            if (loyalty.reversed > 0) logger.info({ topic, shopifyId, ...loyalty }, 'Loyalty: order cancellation reversed points')
+          }
+        }
+        if (topic === 'orders/paid') {
+          const { awardLoyaltyForShopifyOrders } = await import('./shopifyLoyalty')
+          await awardLoyaltyForShopifyOrders({ limit: 50 })
+        }
+      }
+      if (!applied.ok) throw new Error(applied.error ?? 'Order update could not be applied')
+      if (applied.orderId && applied.changed?.includes('became-fulfilled')) {
+        const [row] = await db!.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, applied.orderId)).limit(1)
+        if (row) {
+          const { autoInvoiceFulfilledOrder } = await import('./routes/db')
+          const { notifyOrderFulfilled } = await import('./statusNotifications')
+          await autoInvoiceFulfilledOrder(row, { userId: 'shopify' })
+          const { kickEmailIngest } = await import('./orderEmailIngest')
+          kickEmailIngest()
+          void notifyOrderFulfilled({ ...row, trackingId: row.trackingNumber, carrier: row.trackingCompany })
+        }
+      }
+      logger.info({ topic, ...applied }, 'Order Pipeline: Shopify event applied')
+      res.json({ ...applied, ok: true })
+    } catch (err) {
+      if (webhookId) await releaseWebhookId(webhookId)
+      logger.error({ topic, webhookId, err: { message: err instanceof Error ? err.message : 'Unknown error' } }, 'Order Pipeline: webhook failed — Shopify will retry')
+      res.status(500).json({ ok: false, error: 'Order update could not be applied' })
+    }
+    return
+  }
+
+  // Everything else is a cache refresh: acknowledge immediately — Shopify
+  // considers the delivery failed after 5s and retries, so heavy work (full
+  // product/customer reimports) happens after the response.
   res.json({ ok: true })
 
   try {
@@ -291,140 +418,6 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
         { topic, synced: result.synced, created: result.created, updated: result.updated, ok: result.ok },
         'Webhook: products resynced into database',
       )
-    } else if (topic === 'orders/cancelled') {
-      // Targeted cancel: reflect the cancelled status immediately from the
-      // webhook payload and give back any stock the import had deducted.
-      const order = req.body as { id?: number; name?: string } | undefined
-      const orderNumber = order?.name ? String(order.name).replace(/^#/, '') : order?.id != null ? String(order.id) : ''
-      const shopifyId = orderNumber ? `#${orderNumber}` : null
-      if (shopifyId && db) {
-        try {
-          const restored = await db.transaction(async (tx) => {
-            const [local] = await tx
-              .select({ id: schema.salesOrders.id, status: schema.salesOrders.status, lineItems: schema.salesOrders.lineItems, locationId: schema.salesOrders.locationId })
-              .from(schema.salesOrders)
-              .where(eq(schema.salesOrders.shopifyId, shopifyId))
-              .limit(1)
-            if (!local || local.status === 'cancelled') return { skipped: true, items: 0 }
-            const items = Array.isArray(local.lineItems) ? (local.lineItems as Array<{ sku?: string; quantity?: number }>) : []
-            // Cancelling puts the goods back where the sale actually left them.
-            const locationId = await resolveMovementLocation(local.locationId as string | null, tx as never)
-            let itemsRestored = 0
-            for (const li of items) {
-              const sku = String(li.sku ?? '').trim()
-              const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-              if (!sku || qty <= 0) continue
-              // Resolves variant SKUs through product_variants; an unresolvable
-              // SKU (product deleted since the sale) restores nothing, as before.
-              const restored = await restoreOrderLineStock({ tx, locationId, sku, qty })
-              if (restored) itemsRestored += qty
-            }
-            await tx
-              .update(schema.salesOrders)
-              .set({ status: 'cancelled' })
-              .where(eq(schema.salesOrders.shopifyId, shopifyId))
-            return { skipped: false, items: itemsRestored }
-          })
-          logger.info({ topic, shopifyId, ...restored }, 'Webhook: order cancelled locally')
-        } catch (err) {
-          logger.error({ topic, shopifyId, err: { message: err instanceof Error ? err.message : 'Unknown error' } }, 'Webhook: cancel handling failed')
-        }
-      } else {
-        logger.warn({ topic }, 'Webhook: orders/cancelled without an identifiable order')
-      }
-    } else if (topic === 'orders/fulfilled') {
-      // Targeted fulfillment: mark the local order fulfilled immediately and
-      // record it on the order timeline — no full reimport needed.
-      const order = req.body as {
-        id?: number
-        name?: string
-        fulfillments?: Array<{ tracking_number?: string | null; tracking_company?: string | null; tracking_url?: string | null }>
-      } | undefined
-      const orderNumber = order?.name ? String(order.name).replace(/^#/, '') : order?.id != null ? String(order.id) : ''
-      const shopifyId = orderNumber ? `#${orderNumber}` : null
-      const f = order?.fulfillments?.find((x) => x?.tracking_number)
-      const trackingId = f?.tracking_number?.trim() || null
-      const carrier = f?.tracking_company?.trim() || null
-      if (shopifyId && db) {
-        try {
-          const [local] = await db
-            .update(schema.salesOrders)
-            .set({ status: 'fulfilled' })
-            .where(and(eq(schema.salesOrders.shopifyId, shopifyId), ne(schema.salesOrders.status, 'cancelled')))
-            .returning({ id: schema.salesOrders.id })
-          if (local) {
-            const { insertOrderEvent } = await import('./routes/db')
-            const { notifyOrderFulfilled } = await import('./statusNotifications')
-            await insertOrderEvent(
-              local.id,
-              'Fulfilled',
-              trackingId
-                ? `Order fulfilled via Shopify webhook (${shopifyId}) — tracking ${trackingId}${carrier ? ` (${carrier})` : ''}`
-                : `Order marked fulfilled via Shopify webhook (${shopifyId})`,
-              'shopify',
-            )
-            const [row] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, local.id)).limit(1)
-            if (row) {
-              // PII redaction: the API customer object can be blanked, so the
-              // notification email (which carries full customer data) is the
-              // source of truth. Pull it in BEFORE notifying so the customer
-              // row and order details are complete when the message is built.
-              const { kickEmailIngest } = await import('./orderEmailIngest')
-              kickEmailIngest()
-              void notifyOrderFulfilled({ ...row, trackingId, carrier })
-            }
-            logger.info({ topic, shopifyId, trackingId }, 'Webhook: order marked fulfilled locally')
-          } else {
-            // Fulfillment arrived before the order was ever imported — import now,
-            // then record the timeline event and notify on the imported row.
-            const { importShopifyOrders } = await import('./shopify')
-            await importShopifyOrders()
-            const [row] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.shopifyId, shopifyId)).limit(1)
-            if (row) {
-              const { insertOrderEvent } = await import('./routes/db')
-              const { notifyOrderFulfilled } = await import('./statusNotifications')
-              // The webhook is authoritative that fulfillment happened — the fresh
-              // import may still carry the pre-fulfillment state (timing race).
-              if (row.status !== 'fulfilled' && row.status !== 'cancelled') {
-                await db.update(schema.salesOrders).set({ status: 'fulfilled' }).where(eq(schema.salesOrders.id, row.id))
-              }
-              await insertOrderEvent(
-                row.id,
-                'Fulfilled',
-                trackingId
-                  ? `Order fulfilled via Shopify webhook (${shopifyId}) — tracking ${trackingId}${carrier ? ` (${carrier})` : ''}`
-                  : `Order marked fulfilled via Shopify webhook (${shopifyId})`,
-                'shopify',
-              )
-              const { kickEmailIngest } = await import('./orderEmailIngest')
-              kickEmailIngest()
-              void notifyOrderFulfilled({ ...row, trackingId, carrier })
-              logger.info({ topic, shopifyId, trackingId }, 'Webhook: order imported + marked fulfilled')
-            } else {
-              logger.warn({ topic, shopifyId }, 'Webhook: orders/fulfilled matched no local order and import found none')
-            }
-          }
-        } catch (err) {
-          logger.error({ topic, shopifyId, err: { message: err instanceof Error ? err.message : 'Unknown error' } }, 'Webhook: fulfilled handling failed')
-        }
-      }
-    } else if (topic.startsWith('orders/')) {
-      // Instant sync: the webhook is the instant signal, the notification email
-      // carries the full (non-redacted) customer data — poll the mailbox now.
-      kickEmailIngest()
-      const result = await importShopifyOrders()
-      logger.info(
-        { topic, imported: result.imported, updated: result.updated, ok: result.ok },
-        'Webhook: orders reimported into database',
-      )
-      // Auto-enrich: fetch full customer data via GraphQL for any incomplete orders
-      try {
-        const { enrichOrdersFromShopify } = await import('./shopifyDataEnhance')
-        const enriched = await enrichOrdersFromShopify()
-        logger.info({ enriched: enriched.enriched, failed: enriched.failed }, 'Auto-enrich: orders updated with full customer data')
-      } catch (err) {
-        logger.error({ err }, 'Auto-enrich after order webhook failed')
-      }
     } else if (topic.startsWith('customers/')) {
       const { importShopifyCustomers } = await import('./shopify')
       const result = await importShopifyCustomers()
@@ -436,8 +429,11 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
       logger.debug({ topic }, 'Webhook topic ignored (no handler)')
     }
   } catch (err) {
+    // A failed refresh should not burn this delivery id: releasing it lets
+    // Shopify's retry re-run the import instead of being dropped as a duplicate.
+    if (webhookId) await releaseWebhookId(webhookId)
     logger.error(
-      { topic, err: { message: err instanceof Error ? err.message : 'Unknown error' } },
+      { topic, webhookId, err: { message: err instanceof Error ? err.message : 'Unknown error' } },
       'Webhook processing failed',
     )
   }
@@ -456,6 +452,8 @@ import { registerWhatsappInvoiceRoutes } from './routes/whatsappInvoice'
 registerWhatsappInvoiceRoutes(app)
 import { registerLoyaltyRoutes } from './routes/loyalty'
 registerLoyaltyRoutes(app)
+import { registerReturnRoutes } from './routes/returns'
+registerReturnRoutes(app)
 import accountingRouter from './routes/accounting.js'
 app.use('/api/v1/accounts', accountingRouter)
 app.use('/api/v1/db', dbRouter)
@@ -1469,6 +1467,133 @@ app.post('/api/v1/shopify/orders/:id/refresh', requirePermission('shopify', 'cre
   }
 })
 
+// Order Pipeline: Shopify status, reconciliation, fulfilment, tracking,
+// cancellation and archive actions. Unlike the /db router, these routes are
+// mounted directly on the app, so authenticate the session before permission
+// middleware reads req.userId. Mutation endpoints are authorized by Sales.
+app.use('/api/v1/orders/pipeline', requireAuth)
+app.get('/api/v1/orders/pipeline/status', requirePermission('sales', 'view'), async (_req, res) => {
+  try {
+    const { getOrderSyncStatus } = await import('./shopifyOrderPipeline')
+    res.json(await getOrderSyncStatus())
+  } catch (err) {
+    logger.error({ err }, 'Order Pipeline status failed')
+    res.status(500).json({ error: 'Could not load order sync status' })
+  }
+})
+
+app.post('/api/v1/orders/pipeline/reconcile', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    const { reconcileShopifyOrders } = await import('./shopifyOrderPipeline')
+    const days = req.body?.days == null ? undefined : Number(req.body.days)
+    const limit = req.body?.limit == null ? undefined : Number(req.body.limit)
+    if ((days != null && (!Number.isInteger(days) || days < 1 || days > 365)) || (limit != null && (!Number.isInteger(limit) || limit < 1 || limit > 250))) {
+      return res.status(400).json({ error: 'days must be 1–365 and limit must be 1–250' })
+    }
+    const result = await reconcileShopifyOrders({ days, limit })
+    res.status(result.ok ? 200 : 502).json(result)
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err instanceof Error ? err.message : 'Order reconciliation failed' })
+  }
+})
+
+app.post('/api/v1/orders/pipeline/:id/refresh', requirePermission('sales', 'view'), async (req, res) => {
+  try {
+    const result = await refreshPipelineOrder(String(routeParam(req.params.id) ?? '').trim(), req)
+    res.status(result.ok ? 200 : 502).json(result)
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err instanceof Error ? err.message : 'Order refresh failed' })
+  }
+})
+
+app.get('/api/v1/orders/pipeline/:id/shopify-state', requirePermission('sales', 'view'), async (req, res) => {
+  try {
+    const { getOrderFulfillmentPlan } = await import('./shopifyOrderActions')
+    const result = await getOrderFulfillmentPlan(String(routeParam(req.params.id) ?? '').trim())
+    res.status(result.ok ? 200 : 502).json(result)
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err instanceof Error ? err.message : 'Could not read Shopify order state' })
+  }
+})
+
+app.post('/api/v1/orders/pipeline/:id/fulfill', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    const items = req.body?.items
+    if (!Array.isArray(items) || items.length === 0 || items.length > 100) return res.status(400).json({ error: 'Select one or more items to fulfill' })
+    const parsed = items.map((item: any) => ({ sku: String(item?.sku ?? '').trim(), quantity: Number(item?.quantity) }))
+    if (parsed.some((item: { sku: string; quantity: number }) => !item.sku || !Number.isInteger(item.quantity) || item.quantity < 1)) {
+      return res.status(400).json({ error: 'Each selected line needs a SKU and a positive whole quantity' })
+    }
+    const { createOrderFulfillment } = await import('./shopifyOrderActions')
+    const result = await createOrderFulfillment(String(routeParam(req.params.id) ?? '').trim(), {
+      items: parsed,
+      trackingNumber: req.body?.trackingNumber == null ? null : String(req.body.trackingNumber).slice(0, 200),
+      trackingCompany: req.body?.trackingCompany == null ? null : String(req.body.trackingCompany).slice(0, 100),
+      trackingUrl: req.body?.trackingUrl == null ? null : String(req.body.trackingUrl).slice(0, 1000),
+      notifyCustomer: req.body?.notifyCustomer === true,
+    })
+    res.status(result.ok ? 200 : 502).json(result)
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err instanceof Error ? err.message : 'Shopify fulfillment failed' })
+  }
+})
+
+app.patch('/api/v1/orders/pipeline/:id/tracking', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    const { updateOrderTracking } = await import('./shopifyOrderActions')
+    const result = await updateOrderTracking(String(routeParam(req.params.id) ?? '').trim(), {
+      trackingNumber: String(req.body?.trackingNumber ?? '').slice(0, 200),
+      trackingCompany: req.body?.trackingCompany == null ? null : String(req.body.trackingCompany).slice(0, 100),
+      trackingUrl: req.body?.trackingUrl == null ? null : String(req.body.trackingUrl).slice(0, 1000),
+      notifyCustomer: req.body?.notifyCustomer === true,
+    })
+    res.status(result.ok ? 200 : 502).json(result)
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err instanceof Error ? err.message : 'Shopify tracking update failed' })
+  }
+})
+
+app.post('/api/v1/orders/pipeline/:id/cancel', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    const { cancelOrderInShopify } = await import('./shopifyOrderActions')
+    const result = await cancelOrderInShopify(String(routeParam(req.params.id) ?? '').trim(), {
+      reason: typeof req.body?.reason === 'string' ? req.body.reason : 'OTHER',
+      restock: req.body?.restock === true,
+      refund: req.body?.refund === true,
+      notifyCustomer: req.body?.notifyCustomer === true,
+      note: typeof req.body?.note === 'string' ? req.body.note.slice(0, 500) : undefined,
+    })
+    res.status(result.ok ? 200 : 502).json(result)
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err instanceof Error ? err.message : 'Shopify cancellation failed' })
+  }
+})
+
+app.post('/api/v1/orders/pipeline/:id/archive', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    const { archiveOrderInShopify } = await import('./shopifyOrderActions')
+    const result = await archiveOrderInShopify(String(routeParam(req.params.id) ?? '').trim())
+    res.status(result.ok ? 200 : 502).json(result)
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err instanceof Error ? err.message : 'Shopify archive failed' })
+  }
+})
+
+async function refreshPipelineOrder(orderId: string, req: express.Request) {
+  const { refreshOrderFromShopify } = await import('./shopifyOrderPipeline')
+  const result = await refreshOrderFromShopify(orderId, { actor: actorFromRequest(req).userId ?? 'user' })
+  const actor = actorFromRequest(req)
+  void recordActivity({
+    action: 'Refreshed Shopify Order',
+    module: 'shopify',
+    entity: `Order ${orderId}`,
+    details: result.ok ? (result.updated ? `Updated ${result.changed.join(', ')}` : 'Order is already current') : `Refresh failed: ${result.error}`,
+    userId: actor.userId,
+    ip: actor.ip,
+  })
+  return result
+}
+
 // Manual trigger for the product auto-sync scheduler
 app.post('/api/v1/shopify/products/auto-sync', requirePermission('shopify', 'create'), async (req, res) => {
   try {
@@ -1981,7 +2106,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       .limit(1)
     if (!existing) return res.status(404).json({ error: 'Order not found' })
 
-    const { customer, email, phone, payment: rawPayment, fulfillment: rawFulfillment, status, date, note, items, shippingAddress, syncToShopify } = req.body
+    const { customer, email, phone, payment: rawPayment, fulfillment: rawFulfillment, status, date, note, items, billingAddress, shippingAddress, syncToShopify } = req.body
 
     // Normalize payment and fulfillment values
     const payment = rawPayment === 'Online' || rawPayment === 'online' ? 'paid' : rawPayment
@@ -1989,19 +2114,84 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
 
     let value = Number(existing.value ?? 0)
     let itemCount = Number(existing.items ?? 0)
-    let mappedLineItems: Array<{ title: string; sku: string; quantity: number; price: number }> | null = null
+    let mappedLineItems: Array<Record<string, unknown>> | null = null
     if (items) {
+      // Lines carry their weight & pricing snapshot — the order→invoice
+      // generator reads weight/silverValue/makingValue/amount straight off
+      // manual orders, so an edit must keep that snapshot coherent instead of
+      // stripping it to {title, sku, qty, price} and invoicing ₹0 later.
+      const productSkus: string[] = Array.from(
+        new Set<string>(
+          items
+            .map((li: any) => String(li.productSku ?? li.sku ?? '').trim())
+            .filter(Boolean),
+        ),
+      )
+      const productRows = productSkus.length
+        ? await db
+            .select({ sku: schema.products.sku, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge })
+            .from(schema.products)
+            .where(inArray(schema.products.sku, productSkus))
+        : []
+      const productMap = new Map(
+        productRows.map((p) => [
+          String(p.sku ?? '').trim(),
+          { netWeight: Number(p.netWeight ?? 0), makingCharge: Number(p.makingCharge ?? 0) },
+        ]),
+      )
+      const latestRate = await getLatestSilverRate()
+      const currentRate = latestRate && latestRate.rate && latestRate.rate > 0 ? latestRate.rate : 0
+
       const mapped = items
-        .map((li: any) => ({
-          title: String(li.title ?? li.name ?? '').trim(),
-          sku: String(li.sku ?? ''),
-          quantity: Math.max(0, Math.floor(Number(li.quantity ?? li.qty ?? 0)) || 0),
-          price: Number(li.price ?? 0),
-        }))
+        .map((li: any) => {
+          const title = String(li.title ?? li.name ?? '').trim()
+          const sku = String(li.sku ?? '')
+          const quantity = Math.max(0, Math.floor(Number(li.quantity ?? li.qty ?? 0)) || 0)
+          const price = Number(li.price ?? 0)
+          // Same weight rules as create: the form's value wins, the catalogue
+          // fills in when the form sent none, total = qty × weight per piece.
+          const product = productMap.get(String(li.productSku ?? sku).trim()) ?? { netWeight: 0, makingCharge: 0 }
+          const formWeightPerPiece = Number(li.netWeight ?? 0)
+          const netWeight = formWeightPerPiece > 0 ? formWeightPerPiece : product.netWeight
+          const makingCharge =
+            li.makingCharge === undefined || li.makingCharge === null ? product.makingCharge : Number(li.makingCharge)
+          const formTotalWeight = Number(li.weight ?? 0)
+          const weight =
+            formTotalWeight > 0
+              ? Math.round(formTotalWeight * 1000) / 1000
+              : netWeight > 0
+                ? Math.round(netWeight * quantity * 1000) / 1000
+                : 0
+          // Snapshot derived from the stored per-unit price so invoicing an
+          // edited order reproduces its order value exactly (amount is the
+          // ex-GST half of price × qty; the silver/making split follows the
+          // current rate — identical to create's split while the rate holds).
+          const lineTotal = Math.round(price * quantity * 100) / 100
+          const amount = Math.round((lineTotal / (1 + ORDER_GST_RATE / 100)) * 100) / 100
+          const splitBase = currentRate + Math.max(makingCharge, 0)
+          const silverValue =
+            weight > 0 && currentRate > 0 && splitBase > 0
+              ? Math.round(amount * (currentRate / splitBase) * 100) / 100
+              : amount
+          const makingValue = Math.round((amount - silverValue) * 100) / 100
+          return {
+            title,
+            sku,
+            quantity,
+            price,
+            makingCharge,
+            ...(netWeight > 0 ? { netWeight } : {}),
+            ...(weight > 0 ? { weight, silverRate: currentRate } : { silverRate: 0 }),
+            ...(weight > 0 ? { silverValue, makingValue } : { silverValue: amount, makingValue: 0 }),
+            amount,
+            ...(li.variantId !== undefined && li.variantId !== null ? { variantId: li.variantId } : {}),
+            ...(li.productSku ? { productSku: String(li.productSku) } : {}),
+          }
+        })
         .filter((li: any) => li.title && li.quantity > 0)
       if (mapped.length > 0) {
-        value = Math.round(mapped.reduce((s: number, li: { price: number; quantity: number }) => s + li.price * li.quantity, 0) * 100) / 100
-        itemCount = mapped.reduce((s: number, li: { quantity: number }) => s + li.quantity, 0)
+        value = Math.round(mapped.reduce((s: number, li: any) => s + li.price * li.quantity, 0) * 100) / 100
+        itemCount = mapped.reduce((s: number, li: any) => s + li.quantity, 0)
         mappedLineItems = mapped
       }
     }
@@ -2016,6 +2206,12 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       ...(mappedLineItems ? { lineItems: mappedLineItems } : {}),
     }
     if (date) updates.date = new Date(String(date)).toISOString()
+    // Contact & address edits made in the order dialog must survive the save
+    // (they previously only fed the Shopify sync and were dropped from the row).
+    if (billingAddress !== undefined) updates.billingAddress = billingAddress
+    if (shippingAddress !== undefined) updates.shippingAddress = shippingAddress
+    if (email !== undefined) updates.customerEmail = String(email).trim() || null
+    if (phone !== undefined) updates.customerPhone = String(phone).trim() || null
 
     // If line items changed, rebalance product stock: restore the previous
     // items' stock, then deduct stock for the new items (mirroring the create
@@ -2148,20 +2344,12 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 // must be registered BEFORE the catch-all 404 handler below, otherwise every
 // request would be swallowed by the 404 handler before reaching express.static.
 const _resourcesPath = (process as any).resourcesPath
-const frontendDist = (() => {
-  const candidates: Array<string | null | undefined> = [
-    process.env.FRONTEND_DIST,
-    typeof _resourcesPath === 'string' ? join(_resourcesPath, 'app', 'frontend', 'dist') : null,
-    typeof _resourcesPath === 'string' ? join(_resourcesPath, 'frontend', 'dist') : null,
-    join(__dirname, '..', '..', 'frontend', 'dist'),
-  ]
-  for (const c of candidates) {
-    // Guard against the spawn env serializing an `undefined` value to the
-    // string "undefined", and only accept a candidate that actually renders.
-    if (c && c !== 'undefined' && existsSync(join(c, 'index.html'))) return c
-  }
-  return join(__dirname, '..', '..', 'frontend', 'dist')
-})()
+const frontendDist = resolveFrontendDist([
+  process.env.FRONTEND_DIST,
+  typeof _resourcesPath === 'string' ? join(_resourcesPath, 'app', 'frontend', 'dist') : null,
+  typeof _resourcesPath === 'string' ? join(_resourcesPath, 'frontend', 'dist') : null,
+  join(__dirname, '..', '..', 'frontend', 'dist'),
+])
 // Serve uploaded product images (public, read-only).
 try {
   app.use('/uploads', express.static(UPLOADS_DIR(), { fallthrough: false, maxAge: '30d' }))
@@ -2170,24 +2358,18 @@ try {
   logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Could not mount /uploads static handler')
 }
 
-if (existsSync(frontendDist)) {
-  app.use(express.static(frontendDist))
-  // SPA fallback: serve index.html for any non-API route.
-  // Express 5 uses path-to-regexp v8, which removed the bare '*' wildcard - a
-  // wildcard must now be NAMED. The name is arbitrary and unused; only the
-  // shape of the match matters.
-  //
-  // The braces matter, and the exact form was verified against express 5.2.1
-  // rather than assumed: v8 wildcards match ONE OR MORE segments, so a plain
-  // '/*splat' 404s on '/' - the app's own root. Wrapping as '/{*splat}' makes
-  // the leading slash part of the optional group and matches '/', '/products'
-  // and '/a/b/c' alike. ('/{/*splat}' compiles but only matches '/', so it is
-  // NOT equivalent.)
-  app.get('/{*splat}', (req, res, next) => {
-    if (req.path.startsWith('/api/')) return next()
-    res.sendFile(join(frontendDist, 'index.html'))
-  })
-}
+// SPA fallback: serve index.html for any non-API route.
+// Express 5 uses path-to-regexp v8, which removed the bare '*' wildcard - a
+// wildcard must now be NAMED. The name is arbitrary and unused; only the
+// shape of the match matters.
+//
+// The braces matter, and the exact form was verified against express 5.2.1
+// rather than assumed: v8 wildcards match ONE OR MORE segments, so a plain
+// '/*splat' 404s on '/' - the app's own root. Wrapping as '/{*splat}' makes
+// the leading slash part of the optional group and matches '/', '/products'
+// and '/a/b/c' alike. ('/{/*splat}' compiles but only matches '/', so it is
+// NOT equivalent.)
+mountFrontend(app, frontendDist)
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' })
@@ -2221,11 +2403,25 @@ async function startServer() {
     const boot = await bootstrapDatabase()
     if (boot.ran) logger.info({ tablesCreated: boot.tablesCreated }, 'Database bootstrap complete')
   } catch (err) {
+    if (err instanceof HostedConfigError) {
+      logger.error(err.message)
+      process.exit(1)
+    }
     logger.error({ err }, 'Database bootstrap failed — continuing with startup')
   }
 
   const server = app.listen(config.port, config.host, async () => {
     logger.info({ port: config.port, host: config.host, shopifyConfigured: isConfigured(), frontendOrigin: FRONTEND_ORIGIN }, 'Server started')
+    if (isPublicHost() && FRONTEND_ORIGIN === 'http://localhost:47195') {
+      logger.warn(
+        { frontendOrigin: FRONTEND_ORIGIN },
+        'FRONTEND_ORIGIN is still the desktop dev default. Leave it unset while this server serves the UI, and set it when the pages move to another site.',
+      )
+    }
+    const { supabaseStorageConfig } = await import('./uploads')
+    if (isPublicHost() && !supabaseStorageConfig()) {
+      logger.warn('Product images are still stored on local disk. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY so uploads survive a restart.')
+    }
     await loadSecretsFromDb()
     // Schedule the daily automated backup (7:00 PM local time).
     startAutoBackup()
@@ -2244,6 +2440,8 @@ async function startServer() {
     void import('./salesFollowups').then((f) => f.startSalesFollowUps())
     // Daily supplier payables summary (09:20): one email, never per-supplier.
     void import('./supplierPayables').then((p) => p.startSupplierPayables())
+    // Daily loyalty points expiry (03:00) — only writes when expiry is configured.
+    void import('./loyaltyScheduler').then((m) => m.startLoyaltyExpiryScheduler())
     // Weekly owner insights (Monday 08:00).
     void import('./ownerWeekly').then((w) => w.startWeeklyOwnerReport())
     startSilverRateScheduler()

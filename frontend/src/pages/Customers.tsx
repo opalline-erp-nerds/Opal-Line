@@ -24,7 +24,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { backupApi, dbApi, shopifyApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
-import type { Customer, Invoice, SalesOrder } from '@/types'
+import type { Customer, Invoice, LoyaltyEntry, SalesOrder } from '@/types'
 import { formatCurrency, formatDate, formatNumber } from '@/lib/format'
 import { initials } from '@/lib/utils'
 
@@ -55,7 +55,7 @@ export default function CustomersPage() {
   const [customerOrders, setCustomerOrders] = useState<SalesOrder[]>([])
   const [customerInvoices, setCustomerInvoices] = useState<Invoice[]>([])
   const [loyaltyBalance, setLoyaltyBalance] = useState<number | null>(null)
-  const [loyaltyEntries, setLoyaltyEntries] = useState<Array<{ id: string; type: string; points: string; balanceAfter: string | null; note: string | null; invoiceNumber: string | null; date: string }>>([])
+  const [loyaltyEntries, setLoyaltyEntries] = useState<LoyaltyEntry[]>([])
   const [adjustingPoints, setAdjustingPoints] = useState(false)
 
   // Load the customer's recent orders + invoice statement whenever the detail dialog opens
@@ -71,10 +71,11 @@ export default function CustomersPage() {
       return
     }
     let cancelled = false
-    dbApi.loyaltyBalance(viewCustomer.name)
+    // Resolve by id: Shopify-created customers can have a blank name.
+    dbApi.loyaltyBalance(viewCustomer.id)
       .then((r) => { if (!cancelled) setLoyaltyBalance(r.found ? (r.balance ?? 0) : null) })
       .catch(() => undefined)
-    dbApi.loyaltyHistory(viewCustomer.name)
+    dbApi.loyaltyHistory(viewCustomer.id)
       .then((r) => { if (!cancelled) setLoyaltyEntries(r.entries ?? []) })
       .catch(() => undefined)
     dbApi.getSalesOrders()
@@ -177,8 +178,8 @@ export default function CustomersPage() {
     if (!Number.isFinite(pts) || pts === 0) { toast.error('Enter a non-zero number'); return }
     setAdjustingPoints(true)
     try {
-      await dbApi.loyaltyAdjust(c.name, Math.round(pts), 'Manual adjustment')
-      const [b, h] = await Promise.all([dbApi.loyaltyBalance(c.name), dbApi.loyaltyHistory(c.name)])
+      await dbApi.loyaltyAdjust(c.id, Math.round(pts), 'Manual adjustment')
+      const [b, h] = await Promise.all([dbApi.loyaltyBalance(c.id), dbApi.loyaltyHistory(c.id)])
       setLoyaltyBalance(b.found ? (b.balance ?? 0) : null)
       setLoyaltyEntries(h.entries ?? [])
       toast.success(`Loyalty balance updated for ${c.name}`)
@@ -563,6 +564,16 @@ export default function CustomersPage() {
                 <Mail className="h-4 w-4" /> Email
               </Button>
             ) : null}
+            <Button
+              variant="outline"
+              onClick={() => {
+                const c = viewCustomer
+                setViewCustomer(null)
+                if (c) openEdit(c)
+              }}
+            >
+              <Pencil className="h-4 w-4" /> Edit
+            </Button>
             <Button onClick={() => { setViewCustomer(null); navigate('/sales/invoices') }}>
               <ShoppingBag className="h-4 w-4" /> Order History
             </Button>
