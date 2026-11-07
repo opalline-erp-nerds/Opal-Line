@@ -12,11 +12,11 @@ function headerFlags(header: string): { names: string[]; sameSite: string | null
   return { names, sameSite: same ? same.split('=')[1] : null }
 }
 
-async function readSetCookie(): Promise<string> {
+async function readSetCookie(maxAgeMs?: number): Promise<string> {
   const app = express()
   app.use(cookieParser())
   app.post('/login', (_req, res) => {
-    setSessionCookie(res, 'token-value')
+    setSessionCookie(res, 'token-value', maxAgeMs)
     res.json({ ok: true })
   })
   const server: Server = app.listen(0, '127.0.0.1')
@@ -57,6 +57,14 @@ test('session cookie stays non-Secure and Strict when hosted env is absent', asy
     if (prevSite === undefined) delete process.env.COOKIE_SAMESITE
     else process.env.COOKIE_SAMESITE = prevSite
   }
+})
+
+test('a rolling refresh re-issues the same token with the remaining lifetime', async () => {
+  // The browser would otherwise drop the cookie at the original login+24h
+  // even after the server extended the session row.
+  const raw = await readSetCookie(60_000)
+  assert.match(raw, /^opal\.session=token-value(?:;|$)/)
+  assert.match(raw, /Max-Age=60(?:;|$)/)
 })
 
 test('COOKIE_SECURE=true marks the session cookie Secure and keeps Strict', async () => {

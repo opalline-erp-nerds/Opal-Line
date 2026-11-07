@@ -16,7 +16,7 @@ altering that data.
 |---|---|---|
 | Passwords | argon2id hashing | `backend/src/routes/auth.ts` |
 | Password strength | ≥ 8 chars, upper + lower + digit + special | `backend/src/validation.ts` |
-| Sessions | DB-backed, opaque 32-byte token, `httpOnly` + `SameSite=Strict` cookie | `backend/src/sessions.ts` |
+| Sessions | DB-backed, opaque 32-byte token, sliding 24h idle / 7d cap, `httpOnly` + `SameSite=Strict` cookie | `backend/src/sessions.ts` |
 | Authorisation | 9 modules × 4 actions, role + per-user overrides | `backend/src/rbac.ts` |
 | CSRF | HMAC-signed token + double-submit cookie check | `backend/src/index.ts` |
 | XSS / headers | Helmet CSP, HSTS, frameguard, no-sniff | `backend/src/index.ts` |
@@ -99,8 +99,15 @@ rather than a rotating /128 address.
 
 ## 3. Sessions
 
-- A session is a **random 32-byte token** stored in the `sessions` table with
-  a 24-hour TTL, delivered as the `opal.session` cookie.
+- A session is a **random 32-byte token** stored in the `sessions` table,
+  delivered as the `opal.session` cookie.
+- Expiry is **sliding**: a 24-hour *inactivity* window (`SESSION_TTL_MS`)
+  restarted by each authenticated request, capped at **7 days absolute** from
+  creation (`SESSION_ABSOLUTE_TTL_MS`). After the cap the user signs in again.
+- The stored row and the browser cookie are both extended when the session has
+  less than 12 hours left (`SESSION_REFRESH_THRESHOLD_MS`), so a busy dashboard
+  does not write to the database on every request. The token itself never
+  rotates, so concurrent requests cannot invalidate each other.
 - The cookie is `httpOnly` and `SameSite=Strict`.
 - `secure` is **false**, deliberately: the desktop app serves over
   `http://localhost`, and a browser silently drops `Secure` cookies on plain
@@ -112,7 +119,8 @@ rather than a rotating /128 address.
   table with a TTL. `shutdownSessions()` therefore does *not* wipe the table:
   doing so logged every user out of every backend instance sharing the
   database, including the desktop app when the dev server restarted.
-- `destroyUserSessions()` exists for "log out other devices".
+- `destroyUserSessions()` exists for "log out other devices". Explicit logout
+  still deletes the row immediately.
 
 ---
 

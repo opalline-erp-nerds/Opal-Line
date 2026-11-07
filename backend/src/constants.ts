@@ -22,7 +22,16 @@ export const CONSTANTS = {
   SHOPIFY_COLLECTION_MAX_PAGES: 20 as number,
   SHOPIFY_MAX_RETRIES: 3 as number,
   SHOPIFY_BASE_RETRY_DELAY_MS: 1000 as number,
+  // Sliding inactivity window: any authenticated request in the last 24h
+  // moves the expiry forward. Previously this was a fixed 24h from login, so
+  // an actively used dashboard was signed out exactly one day after signing
+  // in. The absolute cap below still forces a fresh login eventually.
   SESSION_TTL_MS: 24 * 60 * 60 * 1000 as number,
+  SESSION_ABSOLUTE_TTL_MS: 7 * 24 * 60 * 60 * 1000 as number,
+  // Only rewrite the session row once half the idle window is gone. This
+  // keeps a busy dashboard from issuing a DB write on every request while
+  // still refreshing the cookie well before the browser drops it.
+  SESSION_REFRESH_THRESHOLD_MS: 12 * 60 * 60 * 1000 as number,
   SESSION_COOKIE_NAME: 'opal.session' as string,
   PAGINATION_DEFAULT_LIMIT: 50 as number,
   PAGINATION_MAX_LIMIT: 200 as number,
