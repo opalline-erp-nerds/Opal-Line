@@ -8,13 +8,28 @@ import { logger } from './logger'
  * skipped silently — webhooks keep working when registered manually.
  *
  * Topics handled by /api/v1/webhooks/shopify:
- *   orders/create, orders/cancelled, orders/fulfilled, products/update, customers/create
+ *   orders/create, orders/updated, orders/edited, orders/paid,
+ *   orders/cancelled, orders/fulfilled, fulfillments/create, fulfillments/update,
+ *   refunds/create, products/update, customers/create
+ *
+ * There is no `fulfillments/cancelled` topic in Shopify's API; a cancelled
+ * fulfillment arrives as `fulfillments/update` and as `orders/updated`.
+ *
+ * `orders/paid` and `refunds/create` drive loyalty points: a paid order earns,
+ * a refund reverses proportionally, a cancellation reverses in full. Both are
+ * idempotent, so Shopify retries are harmless.
  */
 
 const WEBHOOK_TOPICS = [
   'orders/create',
+  'orders/updated',
+  'orders/edited',
+  'orders/paid',
   'orders/cancelled',
   'orders/fulfilled',
+  'fulfillments/create',
+  'fulfillments/update',
+  'refunds/create',
   'products/update',
   'customers/create',
 ] as const

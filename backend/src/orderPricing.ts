@@ -25,6 +25,12 @@ export interface OrderItemInput {
   productSku?: string
   quantity?: number
   price?: number
+  /** Weight per piece (g) entered on the order form; only fills a product with no configured weight. */
+  netWeight?: number | null
+  /** Total line weight (g): qty × weight-per-piece, or a manual override from the form. */
+  weight?: number | null
+  /** Making charge per gram from the form; falls back to the catalogue when absent. */
+  makingCharge?: number | null
 }
 
 /**
@@ -81,10 +87,25 @@ export function buildPricedOrder<T extends OrderItemInput>(
   const lines = items.map((li) => {
     const sku = String(li.productSku ?? li.sku ?? '').trim()
     const product = productMap.get(sku) ?? { netWeight: 0, makingCharge: 0 }
-    const netWeight = product.netWeight
-    const makingChargePerGram = product.makingCharge
+    // A weight entered on the form wins (it must round-trip through
+    // save/refresh); the catalogue fills in when the form sent none — which
+    // covers every client that predates weight editing. Never invents a
+    // weight: an unknown, unweighted line stays 0.
+    const clientWeightPerPiece = Number(li.netWeight ?? 0)
+    const netWeight = clientWeightPerPiece > 0 ? clientWeightPerPiece : product.netWeight
+    const makingChargePerGram = li.makingCharge === undefined || li.makingCharge === null
+      ? product.makingCharge
+      : Number(li.makingCharge)
     const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-    const weight = netWeight > 0 ? roundMoney(netWeight * qty) : 0
+    // Total weight: the form's value (qty × weight-per-piece, or a manual
+    // override) wins; otherwise derive it. Grams round to 3 dp — money below
+    // keeps rounding to the paisa as before.
+    const clientTotalWeight = Number(li.weight ?? 0)
+    const weight = clientTotalWeight > 0
+      ? Math.round(clientTotalWeight * 1000) / 1000
+      : netWeight > 0
+        ? Math.round(netWeight * qty * 1000) / 1000
+        : 0
     const itemSilverRate = weight > 0 ? silverRate : 0
     const itemMakingCharge = weight > 0 ? makingChargePerGram : 0
     const silverValue = weight > 0 ? roundMoney(weight * itemSilverRate) : 0

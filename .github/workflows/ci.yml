@@ -151,13 +151,14 @@ jobs:
             echo "desktop=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # On pushes the desktop suite never starts by itself any more — tell
-      # the team when the change they just pushed WOULD have needed it.
-      - name: Notify that the desktop e2e is manual now
-        if: github.event_name == 'push' && steps.filter.outputs.desktop == 'true'
+      # The desktop job now starts on its own for anything that can change the
+      # built app, so the only pushes left without it are the docs-only ones.
+      # Say that out loud rather than leaving a silent gap.
+      - name: Notify that the desktop e2e is skipped (docs only)
+        if: github.event_name == 'push' && steps.filter.outputs.desktop == 'false'
         shell: bash
         run: |
-          echo "::notice title=Desktop installer e2e skipped::Code changes were detected, but the desktop job no longer runs automatically. Trigger it manually: Actions → CI → Run workflow (the repo owner approves before it starts)."
+          echo "::notice title=Desktop installer e2e skipped::Only docs changed in this push, so the Windows installer build and verification did not run. Any other change triggers it automatically."
 
   desktop-e2e:
     name: Desktop installer e2e (Windows)
@@ -167,12 +168,14 @@ jobs:
     # packaged backend actually execute.
     runs-on: windows-latest
     needs: [checks, changes]
-    # Owner decision: the ~28-minute desktop suite no longer runs on pushes.
-    # It runs only when someone triggers it manually (Actions → CI → Run
-    # workflow), and the environment below holds it in "waiting" until the
-    # repo owner approves. The required `checks` gate is unaffected. Run it
-    # manually before cutting a release.
-    if: github.event_name == 'workflow_dispatch'
+    # Runs for every push whose diff can change the built app — the `changes`
+    # job defines that as anything outside docs/ and root *.md, so an Electron,
+    # backend, frontend, migration or workflow change always reaches the
+    # installer build and its verification. A docs-only push still skips it,
+    # and a manual run (Actions → CI → Run workflow) always runs it. The
+    # environment below holds the run in "waiting" until the repo owner
+    # approves; the required `checks` gate is unaffected.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.changes.outputs.desktop == 'true')
     environment: desktop-e2e-gate
     timeout-minutes: 90
     env:

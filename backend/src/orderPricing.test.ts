@@ -79,3 +79,73 @@ test('lines the catalogue does not know price to zero instead of inventing a val
   assert.equal(priced.grandTotal, 0)
   assert.equal(priced.itemCount, 2, 'item count still reflects the requested units')
 })
+
+// ── Quantity → weight: catalogue weight first, form values only fill gaps ───
+test('total weight scales with quantity from the product weight per piece', () => {
+  // 10 g/pc: 1 → 10 g, 5 → 50 g, 2 → 20 g (silver jewellery, ₹60/g + ₹5/g making).
+  const w = (qty: number) =>
+    buildPricedOrder([{ title: 'Ring', sku: 'SKU-RING', quantity: qty, price: 669.5 }], PRODUCTS, RATE).lines[0].weight
+  assert.equal(w(1), 10)
+  assert.equal(w(5), 50)
+  assert.equal(w(2), 20)
+  // …and the money follows the weight: 50 g × (60 + 5) = ₹3,250 ex-GST.
+  const five = buildPricedOrder([{ title: 'Ring', sku: 'SKU-RING', quantity: 5, price: 669.5 }], PRODUCTS, RATE)
+  assert.equal(five.lines[0].amount, 3250)
+  assert.equal(five.lines[0].netWeight, 10, 'weight per piece stays the product value')
+})
+
+test('a form-supplied weight is honoured; the catalogue fills in when the form sends none', () => {
+  // Unknown-to-the-form product: no catalogue row, weight entered manually.
+  const manual = buildPricedOrder(
+    [{ title: 'Loose stone', sku: 'NO-CAT', quantity: 3, price: 0, netWeight: 2.5, makingCharge: 5 }],
+    PRODUCTS,
+    RATE,
+  )
+  assert.equal(manual.lines[0].netWeight, 2.5, 'manual weight-per-piece is honoured')
+  assert.equal(manual.lines[0].weight, 7.5, 'total weight = quantity × weight per piece')
+  assert.equal(manual.lines[0].amount, 487.5, 'priced from the manual weight (7.5 g × ₹65)')
+
+  // The form's explicit weight wins over the catalogue: a manually edited
+  // weight must round-trip through save/refresh instead of silently
+  // reverting to the product value. When the form sends none (every client
+  // that predates weight editing), the catalogue applies — below.
+  const edited = buildPricedOrder(
+    [{ title: 'Ring', sku: 'SKU-RING', quantity: 1, price: 669.5, netWeight: 99 }],
+    PRODUCTS,
+    RATE,
+  )
+  assert.equal(edited.lines[0].netWeight, 99, 'manual weight-per-piece survives the save')
+  assert.equal(edited.lines[0].weight, 99)
+
+  const fromCatalogue = buildPricedOrder(
+    [{ title: 'Ring', sku: 'SKU-RING', quantity: 1, price: 669.5 }],
+    PRODUCTS,
+    RATE,
+  )
+  assert.equal(fromCatalogue.lines[0].netWeight, 10, 'no form weight → the product weight per piece')
+  assert.equal(fromCatalogue.lines[0].weight, 10)
+  assert.equal(fromCatalogue.lines[0].amount, 650)
+})
+
+test('a manually overridden total weight drives the line pricing', () => {
+  // Form said 55 g total for qty 5 (manual edit): silver/making follow it
+  // exactly as they follow the derived weight.
+  const override = buildPricedOrder(
+    [{ title: 'Ring', sku: 'SKU-RING', quantity: 5, price: 0, netWeight: 10, weight: 55 }],
+    PRODUCTS,
+    RATE,
+  )
+  assert.equal(override.lines[0].weight, 55)
+  assert.equal(override.lines[0].silverValue, 3300, '55 g × ₹60')
+  assert.equal(override.lines[0].makingValue, 275, '55 g × ₹5')
+  assert.equal(override.lines[0].amount, 3575)
+
+  // A form-supplied making charge is used as-is; without one the catalogue's applies.
+  const freeMaking = buildPricedOrder(
+    [{ title: 'Ring', sku: 'SKU-RING', quantity: 1, price: 0, weight: 10, makingCharge: 0 }],
+    PRODUCTS,
+    RATE,
+  )
+  assert.equal(freeMaking.lines[0].makingValue, 0, 'explicit zero making charge is honoured')
+  assert.equal(freeMaking.lines[0].amount, 600, '10 g × ₹60 silver only')
+})

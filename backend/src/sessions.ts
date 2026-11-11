@@ -1,14 +1,36 @@
 import { randomBytes } from 'node:crypto'
-import { eq, gt, lt } from 'drizzle-orm'
+import { and, eq, gt, lt } from 'drizzle-orm'
 import type { NextFunction, Request, Response } from 'express'
 import { CONSTANTS } from './constants'
 import { logger } from './logger'
 import { parseDbTimestamp } from './lib/dbtime'
+import { DEFAULT_SESSION_POLICY, evaluateSession } from './lib/sessionPolicy'
 
 export interface Session {
   userId: string
   expiresAt: number
   createdAt: number
+}
+
+/** The persisted fields the session resolver needs from one row. */
+export interface StoredSession {
+  userId: string
+  createdAt: string | null
+  expiresAt: string | null
+}
+
+/** Narrow storage port so the sliding-expiry logic is testable without a DB. */
+export interface SessionStore {
+  find(token: string): Promise<StoredSession | null>
+  remove(token: string): Promise<void>
+  /** Persist `expiresAt` only when it moves the expiry forward. */
+  extend(token: string, expiresAt: string): Promise<void>
+}
+
+export interface SessionResolution {
+  userId: string | null
+  /** Set when the row was extended and the browser cookie must be re-issued. */
+  refreshExpiresAt?: number
 }
 
 declare global {
@@ -76,24 +98,82 @@ export async function createSession(userId: string): Promise<string> {
   return token
 }
 
-export async function getSessionUserId(token: string | undefined): Promise<{ userId: string | null; dbError: boolean }> {
+/**
+ * Resolve a token against a store and apply the sliding-expiry policy.
+ *
+ * Pure with respect to time (`nowMs` is injected) and storage (`store` is a
+ * port), so the regression tests can cover active-session extension, idle
+ * expiry, the absolute cap and same-token concurrency without a database.
+ */
+export async function resolveSession(
+  store: SessionStore,
+  token: string,
+  nowMs: number,
+  policy = DEFAULT_SESSION_POLICY,
+): Promise<SessionResolution> {
+  const session = await store.find(token)
+  if (!session) return { userId: null }
+
+  // Stored timestamps are UTC without a zone marker — parse as UTC or the
+  // session appears expired hours early on non-UTC machines.
+  const expiresAtMs = parseDbTimestamp(session.expiresAt)?.getTime()
+  if (!expiresAtMs || Number.isNaN(expiresAtMs)) {
+    await store.remove(token)
+    return { userId: null }
+  }
+
+  // Rows written before createdAt was populated fall back to the old fixed
+  // 24h relationship, so the absolute cap still behaves sensibly.
+  const createdAtMs = parseDbTimestamp(session.createdAt)?.getTime() ?? expiresAtMs - policy.idleTtlMs
+  const decision = evaluateSession(createdAtMs, expiresAtMs, nowMs, policy)
+
+  if (!decision.valid) {
+    await store.remove(token)
+    return { userId: null }
+  }
+
+  if (decision.extendTo === null) return { userId: session.userId }
+
+  try {
+    await store.extend(token, new Date(decision.extendTo).toISOString())
+    return { userId: session.userId, refreshExpiresAt: decision.extendTo }
+  } catch (err) {
+    // A failed extension must not reject a request the read already proved is
+    // valid; the user simply keeps the existing expiry for this request.
+    logger.warn({ err }, 'Failed to extend session expiry')
+    return { userId: session.userId }
+  }
+}
+
+export async function getSessionUserId(
+  token: string | undefined,
+): Promise<{ userId: string | null; dbError: boolean; refreshExpiresAt?: number }> {
   if (!token) return { userId: null, dbError: false }
   try {
     const { db, schema } = await import('./db/client')
     if (!db) return { userId: null, dbError: true }
 
-    const rows = await db.select().from(schema.sessions).where(eq(schema.sessions.token, token)).limit(1)
-    const session = rows[0]
-    if (!session) return { userId: null, dbError: false }
-
-    // expiresAt is stored as UTC without a zone marker — parse as UTC or the
-    // session appears expired hours early on non-UTC machines.
-    const expiresAt = parseDbTimestamp(session.expiresAt)
-    if (!expiresAt || new Date() > expiresAt) {
-      await db.delete(schema.sessions).where(eq(schema.sessions.token, token))
-      return { userId: null, dbError: false }
+    const store: SessionStore = {
+      async find(sessionToken) {
+        const rows = await db.select().from(schema.sessions).where(eq(schema.sessions.token, sessionToken)).limit(1)
+        const row = rows[0]
+        return row ? { userId: row.userId, createdAt: row.createdAt, expiresAt: row.expiresAt } : null
+      },
+      async remove(sessionToken) {
+        await db.delete(schema.sessions).where(eq(schema.sessions.token, sessionToken))
+      },
+      async extend(sessionToken, expiresAt) {
+        // Extend-only predicate: concurrent requests with the same token may
+        // both run this, but neither can move the expiry backwards.
+        await db
+          .update(schema.sessions)
+          .set({ expiresAt })
+          .where(and(eq(schema.sessions.token, sessionToken), lt(schema.sessions.expiresAt, expiresAt)))
+      },
     }
-    return { userId: session.userId, dbError: false }
+
+    const resolution = await resolveSession(store, token, Date.now())
+    return { dbError: false, ...resolution }
   } catch {
     return { userId: null, dbError: true }
   }
@@ -135,8 +215,13 @@ export function sessionCookieOptions(maxAge: number): {
   return { httpOnly: true, secure, sameSite, maxAge, path: '/' }
 }
 
-export function setSessionCookie(res: Response, token: string): void {
-  res.cookie(COOKIE_NAME, token, sessionCookieOptions(TTL_MS))
+/**
+ * `maxAgeMs` defaults to the full inactivity window for a fresh login. Rolling
+ * refreshes pass the remaining lifetime instead, which may be shorter when the
+ * absolute cap is closer than a full idle window.
+ */
+export function setSessionCookie(res: Response, token: string, maxAgeMs: number = TTL_MS): void {
+  res.cookie(COOKIE_NAME, token, sessionCookieOptions(Math.max(0, Math.floor(maxAgeMs))))
 }
 
 export function clearSessionCookie(res: Response): void {
@@ -177,7 +262,7 @@ async function userMustChangePassword(userId: string): Promise<boolean> {
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const token = tokenFromRequest(req)
-  const { userId, dbError } = await getSessionUserId(token)
+  const { userId, dbError, refreshExpiresAt } = await getSessionUserId(token)
   if (dbError) {
     res.status(503).json({ error: 'Database unavailable' })
     return
@@ -185,6 +270,13 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   if (!userId) {
     res.status(401).json({ error: 'Not authenticated' })
     return
+  }
+  // Sliding expiry: the DB row was just extended, so re-issue the cookie with
+  // the same token and the new remaining lifetime. Without this the browser
+  // would still drop the cookie at the original login time even though the
+  // server considers the session active.
+  if (token && refreshExpiresAt) {
+    setSessionCookie(res, token, refreshExpiresAt - Date.now())
   }
   // Enforce the flag the bootstrap/seed set. It used to be written but never
   // read, so accounts kept working indefinitely on their initial password.

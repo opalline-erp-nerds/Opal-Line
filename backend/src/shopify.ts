@@ -3689,24 +3689,27 @@ export interface ShopifyOrdersImportResult {
 }
 
 function mapImportedPayment(status: string | null | undefined): string {
-  switch (status) {
+  switch (String(status ?? '').toLowerCase()) {
     case 'paid':
+    case 'partially_paid':
+    case 'partially_refunded':
+      // The coarse ERP payment field can only say paid/pending/refunded.
+      // Preserve the exact Shopify enum in shopifyFinancialStatus below.
       return 'paid'
     case 'refunded':
-    case 'partially_refunded':
+    case 'voided':
       return 'refunded'
-    case 'pending':
-      return 'pending'
     default:
       return 'pending'
   }
 }
 
 function mapImportedFulfillment(status: string | null | undefined): string {
-  switch (status) {
+  switch (String(status ?? '').toLowerCase()) {
     case 'fulfilled':
       return 'fulfilled'
     case 'partial':
+    case 'partially_fulfilled':
       return 'partial'
     default:
       return 'unfulfilled'
@@ -3715,12 +3718,10 @@ function mapImportedFulfillment(status: string | null | undefined): string {
 
 function mapImportedStatus(raw: any): string {
   if (raw.cancelled_at || String(raw.financial_status ?? '') === 'voided') return 'cancelled'
-  // Map Shopify fulfillment into pipeline stages so the kanban reflects reality
   if (raw.fulfillment_status === 'fulfilled') return 'fulfilled'
   if (raw.fulfillment_status === 'partial') return 'processing'
-  if (Array.isArray(raw.fulfillments) && raw.fulfillments.length > 0) return 'processing'
-  const closedAt = raw.closed_at ? Date.parse(raw.closed_at) : NaN
-  if (Number.isFinite(closedAt)) return 'fulfilled'
+  // Shopify closed_at means archived, not fulfilled. Archive is persisted in
+  // its own column and does not change the ERP's manual processing stage.
   return 'imported'
 }
 
@@ -3792,11 +3793,14 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             sku: li.sku ? String(li.sku) : '',
             quantity: Math.max(0, Number(li.quantity ?? 0)),
             price: Math.round(Number(li.price ?? 0) * 100) / 100,
+            fulfilledQuantity: Math.max(0, Number(li.quantity ?? 0) - Number(li.fulfillable_quantity ?? li.quantity ?? 0)),
           }))
           .filter((li: { title: string }) => li.title) ?? []
       const tags = String(o.tags ?? '').trim() || null
       const currency = String(o.currency ?? 'INR') || 'INR'
       const discount = Math.round(Number(o.total_discounts ?? 0) * 100) / 100
+      const { snapshotFromRestOrder, buildOrderPatch } = await import('./shopifyOrderPipeline')
+      const orderSnapshot = snapshotFromRestOrder(o)
 
       const billingAddress = o.billing_address ? (() => {
         // parseOrderAddress keeps region-only redacted stubs (province/country);
@@ -3812,13 +3816,15 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
         // webhook) must survive a redacted or partial payload — a whole-address
         // write of null or of a half-redacted object used to blank them out.
         const [cur] = await db
-          .select({ billingAddress: schema.salesOrders.billingAddress, shippingAddress: schema.salesOrders.shippingAddress })
+          .select()
           .from(schema.salesOrders)
           .where(eq(schema.salesOrders.shopifyId, shopifyId))
           .limit(1)
+        const statePatch = cur ? buildOrderPatch(cur, orderSnapshot).patch : {}
         await db
           .update(schema.salesOrders)
           .set({
+            ...statePatch,
             ...(!apiNameIsEmail && customerName && customerName !== 'Guest' ? { customer: customerName } : {}),
             ...(customerId ? { customerShopifyId: customerId } : {}),
             // Shopify's created_at is immutable, so re-importing repairs a row
@@ -3827,14 +3833,10 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             // stay outside the dashboard's date range forever.
             date,
             value,
-            payment,
-            fulfillment,
-            status: mapImportedStatus(o),
             items,
             tags,
             currency,
             discount,
-            lineItems: lineItems.length > 0 ? lineItems : undefined,
             // undefined from mergeAddress = nothing worth writing → drizzle
             // omits the column and the stored address is untouched.
             billingAddress: mergeAddress(cur?.billingAddress as OrderAddress | undefined, billingAddress),
@@ -3853,7 +3855,7 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
       } else {
         try {
           await db.transaction(async (tx) => {
-            await tx
+            const inserted = await tx
               .insert(schema.salesOrders)
               .values({
                 id: `shopify-${o.id}`,
@@ -3868,6 +3870,16 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
                 fulfillment,
                 invoice: null,
                 status: mapImportedStatus(o),
+                shopifyGid: orderSnapshot.gid,
+                shopifyFinancialStatus: orderSnapshot.financialStatus,
+                shopifyFulfillmentStatus: orderSnapshot.fulfillmentStatus,
+                trackingNumber: orderSnapshot.tracking.number,
+                trackingCompany: orderSnapshot.tracking.company,
+                trackingUrl: orderSnapshot.tracking.url,
+                fulfillmentIds: orderSnapshot.fulfillmentIds,
+                cancelledAt: orderSnapshot.cancelledAt,
+                closedAt: orderSnapshot.closedAt,
+                shopifySyncedAt: date,
                 date,
                 items,
                 tags,
@@ -3878,6 +3890,13 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
                 shippingAddress: shippingAddress ?? undefined,
               })
               .onConflictDoNothing()
+              .returning({ id: schema.salesOrders.id })
+
+            // Two concurrent syncs (e.g. an overlapping manual sync and webhook
+            // retry) both see the order as unknown. Only the transaction that
+            // actually inserted it may deduct stock, otherwise the same sale is
+            // deducted twice.
+            if (inserted.length === 0) return
 
             for (const li of lineItems) {
               const sku = String(li.sku ?? '').trim()
