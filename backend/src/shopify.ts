@@ -1243,10 +1243,11 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
       saveVariants: async (productId, options, variants) => {
         const liveVariants = variants ?? []
         // This product's current rows are about to be replaced, so their SKUs
-        // are free again. Other products' SKUs stay reserved.
-        const released = variantSkusByProduct.get(productId) ?? []
+        // are free again. Other products' SKUs stay reserved. Copies survive
+        // a rollback: the catch puts the maps back to these lists.
+        const released = [...(variantSkusByProduct.get(productId) ?? [])]
         for (const key of released) takenVariantSkus.delete(key)
-        const releasedBarcodes = variantBarcodesByProduct.get(productId) ?? []
+        const releasedBarcodes = [...(variantBarcodesByProduct.get(productId) ?? [])]
         for (const key of releasedBarcodes) takenVariantBarcodes.delete(key)
         const claimed: string[] = []
         const claimedBarcodes: string[] = []
@@ -1255,8 +1256,6 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
             await tx.delete(schema.productVariants).where(eq(schema.productVariants.productId, productId))
             if (liveVariants.length === 0) {
               await tx.update(schema.products).set({ options: null }).where(eq(schema.products.id, productId))
-              variantSkusByProduct.set(productId, [])
-              variantBarcodesByProduct.set(productId, [])
               return
             }
             await tx.insert(schema.productVariants).values(
@@ -1299,14 +1298,18 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
               }),
             )
             await tx.update(schema.products).set({ options: options ?? null }).where(eq(schema.products.id, productId))
-            variantSkusByProduct.set(productId, claimed)
-            variantBarcodesByProduct.set(productId, claimedBarcodes)
           })
+          // Only after commit. A failed transaction must leave these maps on
+          // the rows that are still in the database.
+          variantSkusByProduct.set(productId, liveVariants.length === 0 ? [] : claimed)
+          variantBarcodesByProduct.set(productId, liveVariants.length === 0 ? [] : claimedBarcodes)
         } catch (err) {
           for (const key of claimed) takenVariantSkus.delete(key)
           for (const key of released) takenVariantSkus.add(key)
           for (const key of claimedBarcodes) takenVariantBarcodes.delete(key)
           for (const key of releasedBarcodes) takenVariantBarcodes.add(key)
+          variantSkusByProduct.set(productId, released)
+          variantBarcodesByProduct.set(productId, releasedBarcodes)
           throw err
         }
       },
@@ -3818,6 +3821,11 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           .set({
             ...(!apiNameIsEmail && customerName && customerName !== 'Guest' ? { customer: customerName } : {}),
             ...(customerId ? { customerShopifyId: customerId } : {}),
+            // Shopify's created_at is immutable, so re-importing repairs a row
+            // whose date came from a restored/older backup. Without this, an
+            // order that now exists on Shopify would keep its stale date and
+            // stay outside the dashboard's date range forever.
+            date,
             value,
             payment,
             fulfillment,
@@ -3833,6 +3841,14 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             shippingAddress: mergeAddress(cur?.shippingAddress as OrderAddress | undefined, shippingAddress),
           })
           .where(eq(schema.salesOrders.shopifyId, shopifyId))
+        // Auto-raised invoices copy the order's date, so a repaired order date
+        // must flow through to its invoice too. Otherwise the Sales, Invoices
+        // and Gross Profit tiles (all invoice-date driven) stay in the old
+        // month even though the Orders tile is correct.
+        await db
+          .update(schema.salesInvoices)
+          .set({ date })
+          .where(eq(schema.salesInvoices.shopifyOrder, shopifyId))
         updated++
       } else {
         try {
@@ -3997,8 +4013,23 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             .where(eq(schema.salesOrders.shopifyId, shopifyId))
             .limit(1)
           if (orderRow && !orderRow.invoice) {
-            const { createInvoiceForOrderRow } = await import('./orderEmailIngest')
-            await createInvoiceForOrderRow(orderRow, { deductStock: false })
+            // A restore or an earlier webhook can leave an invoice pointing at
+            // the order while the order no longer points back. Re-link that
+            // invoice instead of raising a duplicate.
+            const [existingInvoice] = await db
+              .select({ number: schema.salesInvoices.number })
+              .from(schema.salesInvoices)
+              .where(eq(schema.salesInvoices.shopifyOrder, shopifyId))
+              .limit(1)
+            if (existingInvoice) {
+              await db
+                .update(schema.salesOrders)
+                .set({ invoice: existingInvoice.number })
+                .where(eq(schema.salesOrders.id, orderRow.id))
+            } else {
+              const { createInvoiceForOrderRow } = await import('./orderEmailIngest')
+              await createInvoiceForOrderRow(orderRow, { deductStock: false })
+            }
           }
         } catch (err) {
           // The import itself succeeded — record the failure in Sync Logs
