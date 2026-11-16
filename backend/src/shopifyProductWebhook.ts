@@ -9,9 +9,6 @@ import type { SyncProduct } from './types'
 const WEBHOOK_UPSERT_OPTS = {
   mode: 'auto' as const,
   allowRemovals: false,
-  preserveLocalPriceStock: true,
-  preserveErpPrices: true,
-  preserveLocalBarcodes: true,
   mergeVariants: true,
 }
 

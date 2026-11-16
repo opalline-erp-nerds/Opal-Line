@@ -19,8 +19,6 @@ import type { SyncCustomer, SyncLogEntry, SyncOrder, SyncPrice, SyncProduct, Syn
 import { CONSTANTS } from './constants'
 import { logger } from './logger'
 import { recordAudit } from './activity'
-import { applyStockMovement } from './stock'
-
 function escapeHtml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
@@ -867,10 +865,12 @@ export type ProductDbSyncMode = 'full' | 'auto'
 
 export interface SyncProductsToDbOptions {
   mode?: ProductDbSyncMode
+  /**
+   * Delete ERP products the store no longer lists. Off unless a caller asks
+   * for it explicitly (the manual "Remove missing from ERP" checkbox): an
+   * inbound pull never decides that ERP rows should disappear.
+   */
   allowRemovals?: boolean
-  preserveLocalPriceStock?: boolean
-  preserveErpPrices?: boolean
-  preserveLocalBarcodes?: boolean
   mergeVariants?: boolean
   updatedAtMin?: string | null
   /** When set, skips Shopify catalog fetch and applies only these rows. */
@@ -1021,6 +1021,13 @@ export interface CatalogApplyIo {
     variants: SyncProduct['variants'],
     preserve: { price: boolean; stock: boolean; barcode: boolean },
   ): Promise<void>
+  /**
+   * Record which Shopify variant each existing ERP variant row corresponds to,
+   * matched by variant id then by SKU. Link bookkeeping only: it never writes
+   * an ERP field, never inserts a Shopify-only variant and never deletes an
+   * ERP-only one, because the option/variant set belongs to the ERP.
+   */
+  linkVariants?(productId: string, variants: NonNullable<SyncProduct['variants']>): Promise<void>
 }
 
 /**
@@ -1035,16 +1042,11 @@ export interface CatalogApplyIo {
  * existing row through the update path).
  */
 export interface ApplyLiveCatalogOptions {
-  preserveLocalPriceStock?: boolean
-  preserveErpPrices?: boolean
-  preserveLocalBarcodes?: boolean
   /**
-   * Products with an outbound push still queued. Shopify's copy of those rows
-   * is stale by definition (the ERP edit has not reached the store yet), so the
-   * pull must not write it back over the edit — that echo is how an ERP change
-   * used to disappear before it was ever pushed. Their identity and link are
-   * still refreshed; content, stock and the variant set are left alone until
-   * the queued job has run.
+   * Products with an outbound push still queued. Their link refresh is held
+   * back until the push has run (the push may create the listing variants
+   * this pull has not seen yet). The pull no longer needs this to protect
+   * ERP values: it never writes them, whatever this flag says.
    */
   pendingProductIds?: ReadonlySet<string>
 }
@@ -1056,9 +1058,6 @@ export async function applyLiveCatalog(
   io: CatalogApplyIo,
   options: ApplyLiveCatalogOptions = {},
 ): Promise<{ created: number; updated: number }> {
-  const preserveLocalPriceStock = options.preserveLocalPriceStock === true
-  const preserveErpPrices = options.preserveErpPrices === true
-  const preserveLocalBarcodes = options.preserveLocalBarcodes === true
   const bySku = new Map<string, CatalogRow>()
   for (const r of rows) {
     const key = String(r.sku ?? '').trim().toLowerCase()
@@ -1088,12 +1087,12 @@ export async function applyLiveCatalog(
     // haven't been pushed yet.
     const hasLiveVariants = (p.options?.length ?? 0) > 0 && (p.variants?.length ?? 0) > 0
     const saveVariants = async (productId: string) => {
-      if (preserveLocalPriceStock && existing && !io.saveVariantsMerge) return
-      const preserve = {
-        price: preserveErpPrices || preserveLocalPriceStock,
-        stock: preserveLocalPriceStock,
-        barcode: preserveLocalBarcodes,
-      }
+      // Only ever reached for a row this pull just inserted: an existing ERP
+      // product keeps its own option/variant set (see linkVariants above).
+      if (existing) return
+      // Brand-new rows have nothing to preserve, but the merge helper still
+      // takes the flags — passing "keep the ERP values" is the safe default.
+      const preserve = { price: true, stock: true, barcode: true }
       if (hasLiveVariants && io.saveVariantsMerge) {
         await io.saveVariantsMerge(productId, p.options, p.variants, preserve)
         return
@@ -1101,63 +1100,49 @@ export async function applyLiveCatalog(
       if (hasLiveVariants && io.saveVariants) await io.saveVariants(productId, p.options, p.variants)
     }
     if (existing) {
-      const hasWeight = existing.netWeight != null && Number(existing.netWeight) > 0
-      const pricing = preserveLocalPriceStock || hasWeight ? null : backComputePricing(price, pricingRate)
-      // Products created through the product dialog are linked to a pricing
-      // collection and category; that grouping is local and stable, so the pull
-      // leaves the text alone (the ids would otherwise point at names Shopify
-      // overwrote). Rows without a link keep the original behaviour.
-      const linked =
-        String(existing.collectionId ?? '').trim() !== '' || String(existing.categoryId ?? '').trim() !== ''
+      // ERP is the source of truth for every catalogue field. An inbound pull
+      // may DISCOVER a product (the insert path below) and refresh the link to
+      // one it already knows, but it never writes the store's copy over the
+      // ERP row: the next push would export that stale value straight back and
+      // the edit would be gone for good. This is what "sync overwrote my
+      // product" looked like from the outside — the flags that used to guard
+      // price/stock were opt-in and defaulted off, and name, description,
+      // vendor, product type and images were never guarded at all.
       const pendingOutbound = options.pendingProductIds?.has(existing.id) === true
       const patch: CatalogPatch = {
-        // A queued ERP edit outranks both the pull and the auto-sync preserve
-        // flags: its content has not reached the store yet, so Shopify's copy
-        // is stale by definition.
-        name: pendingOutbound ? existing.name : p.title || existing.name,
+        name: existing.name,
+        // A blank ERP barcode is a gap, not a value: filling it from the
+        // listing is not an overwrite, so that much still happens here.
         barcode:
-          preserveLocalBarcodes && String(existing.barcode ?? '').trim() !== ''
+          String(existing.barcode ?? '').trim() !== ''
             ? existing.barcode
             : p.barcode ?? existing.barcode,
-        category: linked ? existing.category : p.productType || existing.category,
-        collection: linked ? existing.collection : p.collection || p.productType || existing.collection,
-        stock: preserveLocalPriceStock || pendingOutbound
-          ? existing.stock
-          : Number.isFinite(p.inventoryQuantity)
-            ? p.inventoryQuantity
-            : existing.stock,
+        category: existing.category,
+        collection: existing.collection,
+        stock: existing.stock,
         shopifyId: String(p.id),
         shopifyStatus: 'synced',
-        status: 'active',
-        vendor: pendingOutbound ? existing.vendor : p.vendor || existing.vendor,
-        productType: pendingOutbound ? existing.productType : p.productType || existing.productType,
-        // Shopify body_html is authoritative for descriptions coming from
-        // the storefront; keep local text when Shopify has none.
-        description: pendingOutbound
-          ? existing.description
-          : p.description
-            ? p.description
-            : existing.description,
-        compareAtPrice:
-          preserveLocalPriceStock || pendingOutbound
-            ? existing.compareAtPrice
-            : effectiveCompareAt ?? existing.compareAtPrice,
-        image: pendingOutbound ? existing.image : p.image ?? existing.image,
-        // Mirror Shopify's gallery; keep any local-only uploads that aren't
-        // yet on Shopify (they'll be pushed on the next product push).
-        images: pendingOutbound
-          ? (existing.images as string[] | null)
-          : mergeImages(existing.images as string[] | null, p.images),
-        netWeight: pricing ? pricing.netWeight : existing.netWeight,
-        makingCharge: pricing ? pricing.makingCharge : existing.makingCharge,
-        silverRate: pricing ? pricingRate : existing.silverRate,
-        // Preserve existing chargeOnTax value; do not overwrite from Shopify list endpoint
+        status: existing.status ?? 'active',
+        vendor: existing.vendor,
+        productType: existing.productType,
+        description: existing.description,
+        compareAtPrice: existing.compareAtPrice,
+        image: existing.image,
+        images: existing.images as string[] | null,
+        netWeight: existing.netWeight,
+        makingCharge: existing.makingCharge,
+        silverRate: existing.silverRate,
         chargeOnTax: existing.chargeOnTax,
       }
       await io.update(existing, patch)
-      // The listing's variant set is stale for a pending edit too (it carries
-      // the old per-variant prices), so leave the local rows for the push.
-      if (!pendingOutbound) await saveVariants(existing.id)
+      // The option/variant set is ERP-owned as well: the pull only records
+      // which listing variant each ERP row points at, so the outbound push can
+      // match it back. Nothing is rewritten, added or removed from here — and
+      // not while a push is queued either, since that push may create variants
+      // this listing does not have yet.
+      if (!pendingOutbound && (p.variants?.length ?? 0) > 0 && io.linkVariants) {
+        await io.linkVariants(existing.id, p.variants ?? [])
+      }
       updated++
     } else {
       const pricing = backComputePricing(price, pricingRate)
@@ -1353,11 +1338,10 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
   if (!db) {
     return { ...empty(), errors: ['Database is not configured'], message: 'Database is not configured' }
   }
-  const mode = options.mode ?? 'full'
-  const allowRemovals = options.allowRemovals ?? mode === 'full'
-  const preserveLocalPriceStock = options.preserveLocalPriceStock ?? mode === 'auto'
-  const preserveErpPrices = options.preserveErpPrices ?? preserveLocalPriceStock
-  const preserveLocalBarcodes = options.preserveLocalBarcodes ?? mode !== 'full'
+  // Deleting ERP rows because the store does not list them is the store
+  // authoring the ERP catalogue. It only ever happens when a caller asks for
+  // it explicitly — never as a default of any mode.
+  const allowRemovals = options.allowRemovals === true
   const mergeVariants = options.mergeVariants !== false
   const fullCatalog = !options.updatedAtMin?.trim() && !options.liveProducts?.length
   const database = db
@@ -1450,35 +1434,11 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
     const applied = await applyLiveCatalog(live, rows, pricingRate, {
       insert: async (values) => (await database.insert(schema.products).values(values).returning())[0],
       update: async (existing, patch) => {
-        const sku = String(existing.sku ?? '').trim()
-        const delta = Number(patch.stock) - Number(existing.stock ?? 0)
-        if (
-          !preserveLocalPriceStock &&
-          sku &&
-          patch.stock != null &&
-          Number.isFinite(delta) &&
-          delta !== 0
-        ) {
-          // Stock never lands as a raw column write on a pull: record the
-          // change as a `shopify_sync` ledger movement so stock_levels
-          // (availability), stock_movements (audit) and the products.stock
-          // rollup stay in agreement. The semantics are unchanged — it is
-          // still a SET: the movement delta is Shopify's count minus the
-          // current local value.
-          const { stock: _pulled, ...rest } = patch
-          await applyStockMovement({
-            sku,
-            qty: delta,
-            type: 'shopify_sync',
-            refType: 'shopify_pull',
-            note: `Inventory pull → ${Number(patch.stock)} on Shopify`,
-            createdBy: 'system',
-          })
-          await database.update(schema.products).set(rest).where(eq(schema.products.id, existing.id))
-        } else {
-          // No stock change (or unknown SKU / non-finite count): plain write.
-          await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
-        }
+        // The pull never changes stock, so this is always a plain write: no
+        // `shopify_sync` ledger movement is generated, and an inbound run can
+        // therefore never double-count or deduct inventory. (Stock only moves
+        // through applyStockMovement from an ERP document.)
+        await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
       },
       // Replace-all: the listing owns the option/variant set, exactly like
       // the push. Parent stock above already carries the summed count.
@@ -1568,7 +1528,50 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
             )
           }
         : undefined,
-    }, { preserveLocalPriceStock, preserveErpPrices, preserveLocalBarcodes, pendingProductIds })
+      // ERP owns the variant set: this only writes product_variants.
+      // shopify_variant_id, matched by variant id first and by SKU second, so
+      // the outbound push (which matches by SKU) and the stock preview (which
+      // matches by id) can find the right row. A listing variant the ERP does
+      // not have is deliberately NOT adopted — importing it would make Shopify
+      // the author of the ERP's option/variant mapping, and an ERP row is
+      // never rewritten or deleted from here.
+      linkVariants: async (productId, liveVariants) => {
+        const rows = await database
+          .select()
+          .from(schema.productVariants)
+          .where(eq(schema.productVariants.productId, productId))
+        if (rows.length === 0 || liveVariants.length === 0) return
+        const bySid = new Map<string, (typeof rows)[0]>()
+        const bySku = new Map<string, (typeof rows)[0]>()
+        for (const row of rows) {
+          const sid = String(row.shopifyVariantId ?? '').trim()
+          if (sid && !bySid.has(sid)) bySid.set(sid, row)
+          const skuKey = String(row.sku ?? '').trim().toLowerCase()
+          if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, row)
+        }
+        // One ERP row can only carry one listing id (the partial unique index
+        // on shopify_variant_id enforces it), so an id match claims the row
+        // before any SKU match can reach it.
+        const claimed = new Set<string>()
+        for (const v of liveVariants) {
+          const row = bySid.get(String(v.id ?? '').trim())
+          if (row) claimed.add(row.id)
+        }
+        for (const v of liveVariants) {
+          const sid = String(v.id ?? '').trim()
+          if (!sid || bySid.has(sid)) continue
+          const skuKey = String(v.sku ?? '').trim().toLowerCase()
+          const row = skuKey ? bySku.get(skuKey) : undefined
+          if (!row || claimed.has(row.id)) continue
+          claimed.add(row.id)
+          await database
+            .update(schema.productVariants)
+            .set({ shopifyVariantId: sid })
+            .where(eq(schema.productVariants.id, row.id))
+          bySid.set(sid, row)
+        }
+      },
+    }, { pendingProductIds })
     created = applied.created
     updated = applied.updated
 

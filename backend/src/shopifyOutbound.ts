@@ -192,6 +192,72 @@ export interface OutboundTickResult {
 }
 
 /**
+ * Record outbound work for every product the store already lists.
+ *
+ * "Sync Now" used to be a pull that could only ever move Shopify's values into
+ * the ERP. The catalogue pull is now read-only for ERP-managed fields, so the
+ * button finishes the job the other way round: it queues the ERP content,
+ * price and stock for every listed product and lets the worker (or the flush
+ * below) deliver them. Unlisted products are skipped — the queue never
+ * creates a listing, it only ever updates one.
+ */
+export async function queueCatalogOutbound(
+  kinds: OutboundKind[] = ['product', 'price', 'inventory'],
+  reason = 'Sync Now',
+): Promise<{ queued: number; skipped: number }> {
+  const out = { queued: 0, skipped: 0 }
+  if (!db || !isConfigured() || kinds.length === 0) return out
+  let rows: Array<{ id: string; shopifyId: string | null; status: string | null }>
+  try {
+    rows = await db
+      .select({ id: schema.products.id, shopifyId: schema.products.shopifyId, status: schema.products.status })
+      .from(schema.products)
+      .where(or(isNull(schema.products.status), eq(schema.products.status, 'active')))
+  } catch {
+    return out
+  }
+  for (const row of rows) {
+    if (!isListedOnShopify(row.shopifyId)) {
+      out.skipped++
+      continue
+    }
+    let queued = false
+    for (const kind of kinds) {
+      if (await enqueueShopifyJob({ kind, productId: row.id, reason })) queued = true
+    }
+    if (queued) out.queued++
+  }
+  return out
+}
+
+/**
+ * Drain what is due right now, bounded by batch count AND wall clock.
+ *
+ * Sync Now is a button: it must return promptly even on a large catalogue, so
+ * the remainder is left for the worker's 15-second tick rather than holding the
+ * HTTP response open while thousands of Shopify calls rate-limit. Small
+ * catalogues finish inside the deadline, which is what the tests rely on.
+ */
+export async function flushOutboundShopifyJobs(
+  options: { maxBatches?: number; deadlineMs?: number; limit?: number } = {},
+): Promise<OutboundTickResult> {
+  const maxBatches = Math.max(1, options.maxBatches ?? 5)
+  const deadlineMs = Math.max(0, options.deadlineMs ?? 8_000)
+  const limit = Math.max(1, Math.min(options.limit ?? 100, 100))
+  const total: OutboundTickResult = { processed: 0, failed: 0, deferred: 0 }
+  const deadline = Date.now() + deadlineMs
+  for (let batch = 0; batch < maxBatches; batch++) {
+    const tick = await runOutboundShopifyJobs(limit)
+    total.processed += tick.processed
+    total.failed += tick.failed
+    total.deferred += tick.deferred
+    if (tick.processed + tick.failed + tick.deferred === 0) break
+    if (Date.now() >= deadline) break
+  }
+  return total
+}
+
+/**
  * Put jobs left in `running` back on the queue.
  *
  * A job is claimed by flipping `pending` → `running`, and only a settle

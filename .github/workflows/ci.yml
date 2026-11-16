@@ -110,21 +110,22 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
 
-      # Outbound ERP -> Shopify queue: the real worker against the in-memory
-      # Admin REST mock, in a database of its own. It needs PostgreSQL too, so
-      # it skips on the plain unit-test step above and runs here for real.
+      # Product catalogue ownership + the durable outbound queue: the real
+      # worker and the real sync against the in-memory Admin REST mock, each in
+      # a database of its own. They need PostgreSQL too, so they skip on the
+      # plain unit-test step above and run here for real.
       #
       # The step provisions opal_line_outbound_base rather than reusing
-      # `postgres`, so this suite can never collide with the sync or
+      # `postgres`, so these suites can never collide with the sync or
       # stock-transfer steps (each of those also builds its own throwaway
       # catalog from the URL it is given). Provisioning goes through the
       # `postgres` package the backend already depends on, so the step does
       # not assume psql is on the runner image. REQUIRE_DB_TESTS=1 makes a
       # missing DATABASE_URL fail the step instead of skipping it green.
-      - name: Shopify outbound queue test (needs PostgreSQL)
+      - name: Shopify sync ownership tests (needs PostgreSQL)
         run: |
           DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres node -e 'const s=require("postgres");const c=s(process.env.DATABASE_URL,{max:1});(async()=>{await c.unsafe("DROP DATABASE IF EXISTS opal_line_outbound_base WITH (FORCE)");await c.unsafe("CREATE DATABASE opal_line_outbound_base");await c.end({timeout:5});console.log("provisioned opal_line_outbound_base")})().catch(e=>{console.error(e);process.exit(1)})'
-          node --import tsx --test --test-force-exit "src/shopifyOutbound.test.ts"
+          node --import tsx --test --test-concurrency=1 --test-force-exit "src/shopifyOutbound.test.ts" "src/shopify.erpAuthority.test.ts"
         working-directory: backend
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/opal_line_outbound_base

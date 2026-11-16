@@ -143,9 +143,9 @@ describe('applyLiveCatalog (product pull SKU reconciliation)', () => {
 
     const dupRows = rows.filter((r) => r.sku === 'SLR-001')
     assert.equal(dupRows.length, 1, 'duplicate SKU collapses onto a single local row')
-    // The second live product wins the row — the same behaviour a warm
-    // database always had through the update path.
-    assert.equal(dupRows[0].name, 'Silver Solitaire Ring')
+    // The row was CREATED from the first listing, so it keeps that content —
+    // the second listing takes the update path, which only refreshes the link.
+    assert.equal(dupRows[0].name, 'nose Pins')
     assert.equal(dupRows[0].shopifyId, '8201324658781')
     assert.equal(rows.find((r) => r.sku === 'SLC-001')?.name, 'Silver Chain')
   })
@@ -161,12 +161,19 @@ describe('applyLiveCatalog (product pull SKU reconciliation)', () => {
     })
     const { rows, insertCalls, io } = fakeCatalog([existing])
     const live = liveProduct({ id: 77, title: 'New Name', sku: 'abc-1', price: '2500' })
+    const before = { name: existing.name, description: existing.description, vendor: existing.vendor }
 
     const result = await shopify.applyLiveCatalog([live], [existing], 92.8, io)
 
     assert.deepEqual(result, { created: 0, updated: 1 })
     assert.equal(insertCalls.length, 0, 'an existing SKU must never insert')
-    assert.equal(existing.name, 'New Name')
+    // ERP is authoritative: the update path refreshes the link, not the content.
+    assert.deepEqual(
+      { name: existing.name, description: existing.description, vendor: existing.vendor },
+      before,
+      'the pull must not import the listing content over the ERP row',
+    )
+    assert.equal(existing.name, 'Old Name')
     assert.equal(existing.shopifyId, '77')
     assert.equal(existing.shopifyStatus, 'synced')
     // Existing weight means the pricing pass is skipped — local pricing wins.
@@ -251,22 +258,26 @@ describe('normalizeProduct (Shopify-style options & variants)', () => {
 })
 
 describe('applyLiveCatalog (variant sync)', () => {
-  /** fakeCatalog plus a recording saveVariants hook. */
+  /** fakeCatalog plus recording saveVariants / linkVariants hooks. */
   function variantAwareCatalog(initial: CatalogRow[]) {
     const base = fakeCatalog(initial)
     const variantCalls: Array<{ productId: string; options: unknown; variants: unknown }> = []
+    const linkCalls: Array<{ productId: string; variants: unknown }> = []
     const io: CatalogApplyIo = {
       ...base.io,
       async saveVariants(productId, options, variants) {
         variantCalls.push({ productId, options, variants })
       },
+      async linkVariants(productId, variants) {
+        linkCalls.push({ productId, variants })
+      },
     }
-    return { ...base, io, variantCalls }
+    return { ...base, io, variantCalls, linkCalls }
   }
 
-  test('a variant listing saves its options + variants through the io', async () => {
+  test('a variant listing only refreshes the link, never the variant rows', async () => {
     const existing = localRow({ id: 'row-v', sku: 'RING-S-MAT', shopifyId: '555', stock: 8, netWeight: 5 })
-    const { io, variantCalls, insertCalls } = variantAwareCatalog([existing])
+    const { io, variantCalls, linkCalls, insertCalls } = variantAwareCatalog([existing])
     const live = liveProduct({
       id: 555,
       sku: 'RING-S-MAT',
@@ -281,9 +292,10 @@ describe('applyLiveCatalog (variant sync)', () => {
 
     assert.deepEqual(result, { created: 0, updated: 1 })
     assert.equal(insertCalls.length, 0)
-    assert.equal(variantCalls.length, 1, 'saveVariants fires once for the variant listing')
-    assert.equal(variantCalls[0].productId, 'row-v')
-    assert.equal((variantCalls[0].variants as SyncProduct['variants'])?.length, 2)
+    assert.equal(variantCalls.length, 0, 'the ERP option/variant set is never replaced from the pull')
+    assert.equal(linkCalls.length, 1, 'the listing link is refreshed once')
+    assert.equal(linkCalls[0].productId, 'row-v')
+    assert.equal((linkCalls[0].variants as SyncProduct['variants'])?.length, 2)
   })
 
   test('a pushed variant product matches its local row by shopifyId, not SKU', async () => {
@@ -291,7 +303,7 @@ describe('applyLiveCatalog (variant sync)', () => {
     // product carries the first variant's SKU — SKU-only matching would
     // insert a duplicate product under RING-S-MAT.
     const parent = localRow({ id: 'row-parent', sku: 'RING', shopifyId: '777', netWeight: 5, stock: 8 })
-    const { io, variantCalls, insertCalls } = variantAwareCatalog([parent])
+    const { io, variantCalls, linkCalls, insertCalls } = variantAwareCatalog([parent])
     const live = liveProduct({
       id: 777,
       sku: 'RING-S-MAT', // a VARIANT sku, not the parent's
@@ -306,8 +318,9 @@ describe('applyLiveCatalog (variant sync)', () => {
 
     assert.deepEqual(result, { created: 0, updated: 1 })
     assert.equal(insertCalls.length, 0, 'no duplicate insert under the variant SKU')
-    assert.equal(variantCalls.length, 1)
-    assert.equal(variantCalls[0].productId, 'row-parent')
+    assert.equal(variantCalls.length, 0, 'the parent keeps its own variant rows')
+    assert.equal(linkCalls.length, 1)
+    assert.equal(linkCalls[0].productId, 'row-parent')
   })
 
   test('a simple listing never wipes local variants', async () => {
@@ -321,12 +334,14 @@ describe('applyLiveCatalog (variant sync)', () => {
     assert.equal(variantCalls.length, 0, 'saveVariants must not fire for a simple product')
   })
 
-  test('preserveLocalPriceStock keeps ERP stock on update', async () => {
-    const existing = localRow({ id: 'row-stock', sku: 'KEEP-ST', stock: 42 })
+  test('the pull keeps ERP stock on update', async () => {
+    const existing = localRow({ id: 'row-stock', sku: 'KEEP-ST', stock: 42, compareAtPrice: 700 })
     const { io, rows } = fakeCatalog([existing])
-    const live = liveProduct({ id: 40, sku: 'KEEP-ST', inventoryQuantity: 1, price: '9999' })
-    await shopify.applyLiveCatalog([live], rows, 92.8, io, { preserveLocalPriceStock: true })
-    assert.equal(rows[0].stock, 42)
+    const live = liveProduct({ id: 40, sku: 'KEEP-ST', inventoryQuantity: 1, price: '9999', compareAtPrice: '19999' })
+    await shopify.applyLiveCatalog([live], rows, 92.8, io)
+    assert.equal(rows[0].stock, 42, 'a pull never imports Shopify stock over the ERP value')
+    assert.equal(rows[0].compareAtPrice, 700, 'nor the compare-at price')
+    assert.equal(rows[0].name, existing.name, 'nor the product name')
   })
 
   test('claimUniqueVariantSku suffixes a SKU another product already owns', () => {

@@ -33,7 +33,7 @@ import { verifyShopifyWebhook, rejectReplayedWebhook, releaseWebhookId } from '.
 import { recountCustomerStats } from './customerStats'
 import { startAutoBackup, startDailySummary } from './autoBackup'
 import { startOrderEmailIngest, stopOrderEmailIngest, pollOrderMailbox, isEmailIngestConfigured } from './orderEmailIngest'
-import { startShopifyOutboundWorker, stopShopifyOutboundWorker } from './shopifyOutbound'
+import { startShopifyOutboundWorker, stopShopifyOutboundWorker, queueCatalogOutbound, flushOutboundShopifyJobs, type OutboundKind } from './shopifyOutbound'
 import { isPiiAccessDenied, missingPiiCustomerCount, normalizeShopifyCustomerId } from './shopifyDataEnhance'
 import { applyRateSchedule, fetchSilverRateNow, getSchedulerStatus, setAutoRateEnabled, startSilverRateScheduler } from './silverRateScheduler'
 import {
@@ -756,6 +756,28 @@ app.post('/api/v1/shopify/sync', requirePermission('shopify', 'create'), validat
       } catch (e) {
         logger.error({ err: e }, 'Post-sync enrichment failed')
       }
+      // ERP owns the catalogue, so "Sync Now" finishes by sending ERP values to
+      // the store: the pull above only discovers listings and refreshes links.
+      // Orders and customers keep the opposite direction — they are imported
+      // from Shopify, which is where they originate.
+      const catalogue = selected.includes('products') || selected.includes('inventory') || selected.includes('price')
+      if (catalogue) {
+        try {
+          const kinds: OutboundKind[] = []
+          if (selected.includes('products')) kinds.push('product', 'price', 'inventory')
+          if (selected.includes('price') && !kinds.includes('price')) kinds.push('price')
+          if (selected.includes('inventory') && !kinds.includes('inventory')) kinds.push('inventory')
+          const queued = await queueCatalogOutbound(kinds)
+          const flushed = await flushOutboundShopifyJobs()
+          dbResults.push =
+            `${queued.queued} queued, ${flushed.processed} pushed` +
+            (flushed.failed > 0 ? `, ${flushed.failed} failed` : '') +
+            (queued.skipped > 0 ? ` (${queued.skipped} not on Shopify)` : '')
+        } catch (e) {
+          dbResults.push = e instanceof Error ? e.message : 'failed'
+          logger.error({ err: e }, 'Sync Now: catalogue push failed')
+        }
+      }
     }
 
     void recordActivity({
@@ -900,8 +922,8 @@ app.post('/api/v1/shopify/products/purge', requirePermission('shopify', 'delete'
 
 app.get('/api/v1/shopify/products/sync-stock-preview', requirePermission('shopify', 'view'), async (_req, res) => {
   try {
-    const { previewStockChangesFromShopify } = await import('./shopifyProductSyncPreview')
-    res.json(await previewStockChangesFromShopify())
+    const { previewStockChangesToShopify } = await import('./shopifyProductSyncPreview')
+    res.json(await previewStockChangesToShopify())
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(502).json({ ok: false, error: message })
@@ -911,15 +933,27 @@ app.get('/api/v1/shopify/products/sync-stock-preview', requirePermission('shopif
 app.post('/api/v1/shopify/products/sync-db', requirePermission('shopify', 'create'), async (req, res) => {
   try {
     const allowRemovals = req.body?.allowRemovals === true
-    const overwriteStockFromShopify = req.body?.overwriteStockFromShopify === true
+    // ERP is authoritative for the catalogue: this pull discovers new listings
+    // and refreshes links, and never writes the store's copy over an ERP row.
+    // What it will not do is import stock — the push below sends ERP stock to
+    // Shopify instead.
     const result = await syncProductsToDb({
       mode: 'full',
       allowRemovals,
-      preserveLocalPriceStock: !overwriteStockFromShopify,
-      preserveErpPrices: true,
-      preserveLocalBarcodes: true,
       mergeVariants: true,
     })
+    // The pull discovers listings and refreshes links; ERP-owned values travel
+    // the other way. Same queue, same retries and Sync Logs entries as the
+    // worker uses for an ordinary edit.
+    let push: string | undefined
+    try {
+      const queued = await queueCatalogOutbound(['product', 'price', 'inventory'], 'Full Sync Now')
+      const flushed = await flushOutboundShopifyJobs()
+      push = `${queued.queued} queued, ${flushed.processed} pushed${flushed.failed > 0 ? `, ${flushed.failed} failed` : ''}`
+    } catch (err) {
+      logger.error({ err }, 'Full sync: catalogue push failed')
+      push = 'push failed'
+    }
     const actor = actorFromRequest(req)
     void recordActivity({
       action: 'Synced Products',
@@ -929,7 +963,7 @@ app.post('/api/v1/shopify/products/sync-db', requirePermission('shopify', 'creat
       userId: actor.userId,
       ip: actor.ip,
     })
-    res.status(result.ok ? 200 : 502).json(result)
+    res.status(result.ok ? 200 : 502).json({ ...result, push })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(502).json({ error: message })
@@ -1618,8 +1652,7 @@ app.post('/api/v1/shopify/products/auto-sync', requirePermission('shopify', 'cre
   try {
     const { runManualProductAutoSync } = await import('./productAutoSync')
     const allowRemovals = req.body?.allowRemovals === true
-    const overwriteStockFromShopify = req.body?.overwriteStockFromShopify === true
-    const result = await runManualProductAutoSync(allowRemovals, overwriteStockFromShopify)
+    const result = await runManualProductAutoSync(allowRemovals)
     res.json(result)
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'

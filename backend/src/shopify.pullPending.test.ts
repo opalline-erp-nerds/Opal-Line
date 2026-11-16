@@ -1,8 +1,13 @@
-// The inbound catalog pull must not overwrite an ERP edit that is queued but
-// not yet pushed. Without this guard the push/pull echo reverts the edit (the
-// pull writes Shopify's older title/stock back, the queued push then sends the
-// reverted value) — which is exactly how "changes made in ERP never reach
-// Shopify" looked from the outside.
+// The inbound catalogue pull must never write Shopify's copy over an ERP row.
+// The old contract had the pull overwrite name/description/vendor/stock unless
+// a product happened to have an outbound job queued — so a plain "Sync Now"
+// reverted the edit the next push was about to send, and the store and the ERP
+// traded each other's stale values forever.
+//
+// ERP now owns the catalogue: the pull only refreshes the link to a product
+// (and, while a push is queued, not even that). `pendingProductIds` is still
+// consulted for the variant-link refresh, because a queued push may create the
+// listing variants this pull has not seen yet.
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { applyLiveCatalog, type CatalogPatch, type CatalogRow } from './shopify'
@@ -56,8 +61,22 @@ function liveProduct(): SyncProduct {
     inventoryQuantity: 2,
     inventoryItemId: 7_000_001,
     variantId: 6_000_001,
-    options: [],
-    variants: [],
+    options: [{ name: 'Size', values: ['S'] }],
+    variants: [
+      {
+        id: 6_000_001,
+        title: 'S',
+        option1: 'S',
+        option2: null,
+        option3: null,
+        sku: 'PULL-001',
+        barcode: null,
+        price: '900.00',
+        compareAtPrice: null,
+        inventoryQuantity: 2,
+        inventoryItemId: 7_000_001,
+      },
+    ],
     createdAt: '2026-01-01T00:00:00Z',
     updatedAt: '2026-01-01T00:00:00Z',
   }
@@ -66,9 +85,11 @@ function liveProduct(): SyncProduct {
 function run(pendingProductIds?: ReadonlySet<string>) {
   const patches: CatalogPatch[] = []
   let variantSaves = 0
+  let linkCalls = 0
   return {
     patches,
     variantSaves: () => variantSaves,
+    linkCalls: () => linkCalls,
     promise: applyLiveCatalog(
       [liveProduct()],
       [localRow()],
@@ -81,14 +102,17 @@ function run(pendingProductIds?: ReadonlySet<string>) {
         saveVariants: async () => {
           variantSaves += 1
         },
+        linkVariants: async () => {
+          linkCalls += 1
+        },
       },
       { pendingProductIds },
     ),
   }
 }
 
-test('a queued ERP edit wins over the inbound pull', async () => {
-  const { promise, patches, variantSaves } = run(new Set([PRODUCT_ID]))
+test('a queued ERP edit is not reverted by the inbound pull', async () => {
+  const { promise, patches, variantSaves, linkCalls } = run(new Set([PRODUCT_ID]))
   await promise
   assert.equal(patches.length, 1)
   const patch = patches[0]
@@ -101,21 +125,28 @@ test('a queued ERP edit wins over the inbound pull', async () => {
   assert.equal(patch.shopifyId, '5000001', 'the link itself is still refreshed')
   assert.equal(patch.shopifyStatus, 'synced')
   assert.equal(variantSaves(), 0, 'the listing variant set is left for the pending push')
+  assert.equal(linkCalls(), 0, 'the variant link waits for the queued push')
 })
 
-test('without pending work the pull stays authoritative', async () => {
-  const { promise, patches } = run()
+test('with nothing queued the pull still keeps every ERP value', async () => {
+  const { promise, patches, linkCalls } = run()
   await promise
+  assert.equal(patches.length, 1)
   const patch = patches[0]
-  assert.equal(patch.name, 'Shopify old name', 'Shopify remains the source when nothing is queued')
-  assert.equal(patch.description, 'Shopify old copy')
-  assert.equal(patch.stock, 2)
-  assert.equal(patch.vendor, 'Shopify vendor')
+  assert.equal(patch.name, 'ERP edited name', 'the pull is never the source of the name')
+  assert.equal(patch.description, 'ERP edited copy', 'nor of the description')
+  assert.equal(patch.stock, 9, 'nor of the stock')
+  assert.equal(patch.vendor, 'ERP vendor')
+  assert.equal(patch.compareAtPrice, null, 'nor of the price')
+  assert.equal(patch.shopifyId, '5000001', 'only the link is refreshed')
+  assert.equal(linkCalls(), 1, 'the variant link is refreshed when nothing is queued')
 })
 
 test('a different product being pending does not freeze this one', async () => {
-  const { promise, patches } = run(new Set(['some-other-product']))
+  const { promise, patches, linkCalls } = run(new Set(['some-other-product']))
   await promise
-  assert.equal(patches[0].name, 'Shopify old name')
-  assert.equal(patches[0].stock, 2)
+  const patch = patches[0]
+  assert.equal(patch.name, 'ERP edited name', 'ERP values win whatever the queue holds')
+  assert.equal(patch.stock, 9)
+  assert.equal(linkCalls(), 1, 'this product is not held back by another product\'s queue')
 })
