@@ -207,6 +207,8 @@ const STOCK_LEDGER_DDL: string[] = [
      END IF;
    END $$`,
   `CREATE UNIQUE INDEX IF NOT EXISTS product_variants_sku_idx ON product_variants (sku)`,
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS shopify_variant_id text`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS product_variants_shopify_variant_id_idx ON product_variants (shopify_variant_id) WHERE shopify_variant_id IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS product_variants_product_id_idx ON product_variants (product_id)`,
 ]
 

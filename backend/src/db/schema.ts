@@ -188,6 +188,7 @@ export const productVariants = pgTable('product_variants', {
   optionValues: jsonb('option_values').notNull(),
   sku: text('sku').notNull(),
   barcode: text('barcode'),
+  shopifyVariantId: text('shopify_variant_id'),
   sellingPrice: numericNumber('selling_price'),
   compareAtPrice: numericNumber('compare_at_price'),
   costPrice: numericNumber('cost_price'),

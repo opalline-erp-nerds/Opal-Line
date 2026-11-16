@@ -321,6 +321,14 @@ describe('applyLiveCatalog (variant sync)', () => {
     assert.equal(variantCalls.length, 0, 'saveVariants must not fire for a simple product')
   })
 
+  test('preserveLocalPriceStock keeps ERP stock on update', async () => {
+    const existing = localRow({ id: 'row-stock', sku: 'KEEP-ST', stock: 42 })
+    const { io, rows } = fakeCatalog([existing])
+    const live = liveProduct({ id: 40, sku: 'KEEP-ST', inventoryQuantity: 1, price: '9999' })
+    await shopify.applyLiveCatalog([live], rows, 92.8, io, { preserveLocalPriceStock: true })
+    assert.equal(rows[0].stock, 42)
+  })
+
   test('claimUniqueVariantSku suffixes a SKU another product already owns', () => {
     const taken = new Set<string>(['007'])
     assert.equal(shopify.claimUniqueVariantSku('007', taken), '007-2')

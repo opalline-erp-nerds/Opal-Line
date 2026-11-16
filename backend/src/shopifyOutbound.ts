@@ -263,7 +263,10 @@ async function recordJobLog(job: JobRow, outcome: JobOutcome & { sku?: string | 
   if (!isKind(job.kind)) return
   try {
     const shopify = await import('./shopify')
-    await shopify.persistLog({
+    // Named for the exported symbol (upstream renamed it from `persistLog`);
+    // calling it directly means a future rename fails the typecheck instead of
+    // being swallowed by the catch below and silently dropping outbound logs.
+    await shopify.persistShopifySyncLog({
       entity: LOG_ENTITY_BY_KIND[job.kind],
       shopifyId: outcome.sku ?? job.productId,
       direction: 'out',
