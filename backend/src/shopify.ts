@@ -114,7 +114,7 @@ function addLog(resource: SyncResource, status: SyncLogEntry['status'], count: n
 
 let dbLogSeq = 0
 
-async function persistLog(entry: {
+export async function persistShopifySyncLog(entry: {
   entity: string
   shopifyId?: string | null
   direction: 'in' | 'out'
@@ -140,6 +140,8 @@ async function persistLog(entry: {
     // Log persistence must never break a sync.
   }
 }
+
+const persistLog = persistShopifySyncLog
 
 const entityFor: Record<SyncResource, { entity: string; action: string }> = {
   orders: { entity: 'Order', action: 'Imported' },
@@ -867,7 +869,12 @@ export interface SyncProductsToDbOptions {
   mode?: ProductDbSyncMode
   allowRemovals?: boolean
   preserveLocalPriceStock?: boolean
+  preserveErpPrices?: boolean
+  preserveLocalBarcodes?: boolean
+  mergeVariants?: boolean
   updatedAtMin?: string | null
+  /** When set, skips Shopify catalog fetch and applies only these rows. */
+  liveProducts?: SyncProduct[]
   /** When set, post-fetch guard runs before writing (scheduled auto-sync). */
   catalogGuard?: (liveCount: number, fullCatalog: boolean) => { ok: boolean; reason?: string } | null
 }
@@ -1007,6 +1014,13 @@ export interface CatalogApplyIo {
     options: SyncProduct['options'],
     variants: SyncProduct['variants'],
   ): Promise<void>
+  /** Upsert Shopify variants by shopify_variant_id; keeps ERP-only rows. */
+  saveVariantsMerge?(
+    productId: string,
+    options: SyncProduct['options'],
+    variants: SyncProduct['variants'],
+    preserve: { price: boolean; stock: boolean; barcode: boolean },
+  ): Promise<void>
 }
 
 /**
@@ -1022,6 +1036,8 @@ export interface CatalogApplyIo {
  */
 export interface ApplyLiveCatalogOptions {
   preserveLocalPriceStock?: boolean
+  preserveErpPrices?: boolean
+  preserveLocalBarcodes?: boolean
 }
 
 export async function applyLiveCatalog(
@@ -1032,6 +1048,8 @@ export async function applyLiveCatalog(
   options: ApplyLiveCatalogOptions = {},
 ): Promise<{ created: number; updated: number }> {
   const preserveLocalPriceStock = options.preserveLocalPriceStock === true
+  const preserveErpPrices = options.preserveErpPrices === true
+  const preserveLocalBarcodes = options.preserveLocalBarcodes === true
   const bySku = new Map<string, CatalogRow>()
   for (const r of rows) {
     const key = String(r.sku ?? '').trim().toLowerCase()
@@ -1061,7 +1079,16 @@ export async function applyLiveCatalog(
     // haven't been pushed yet.
     const hasLiveVariants = (p.options?.length ?? 0) > 0 && (p.variants?.length ?? 0) > 0
     const saveVariants = async (productId: string) => {
-      if (preserveLocalPriceStock && existing) return
+      if (preserveLocalPriceStock && existing && !io.saveVariantsMerge) return
+      const preserve = {
+        price: preserveErpPrices || preserveLocalPriceStock,
+        stock: preserveLocalPriceStock,
+        barcode: preserveLocalBarcodes,
+      }
+      if (hasLiveVariants && io.saveVariantsMerge) {
+        await io.saveVariantsMerge(productId, p.options, p.variants, preserve)
+        return
+      }
       if (hasLiveVariants && io.saveVariants) await io.saveVariants(productId, p.options, p.variants)
     }
     if (existing) {
@@ -1075,7 +1102,10 @@ export async function applyLiveCatalog(
         String(existing.collectionId ?? '').trim() !== '' || String(existing.categoryId ?? '').trim() !== ''
       const patch: CatalogPatch = {
         name: p.title || existing.name,
-        barcode: p.barcode ?? existing.barcode,
+        barcode:
+          preserveLocalBarcodes && String(existing.barcode ?? '').trim() !== ''
+            ? existing.barcode
+            : p.barcode ?? existing.barcode,
         category: linked ? existing.category : p.productType || existing.category,
         collection: linked ? existing.collection : p.collection || p.productType || existing.collection,
         stock: preserveLocalPriceStock
@@ -1194,6 +1224,88 @@ export function claimUniqueBarcode(preferred: string | null | undefined, taken: 
   return base
 }
 
+export async function mergeProductVariantsFromShopify(
+  database: NonNullable<typeof db>,
+  productId: string,
+  options: SyncProduct['options'],
+  liveVariants: NonNullable<SyncProduct['variants']>,
+  preserve: { price: boolean; stock: boolean; barcode: boolean },
+  takenVariantSkus: Set<string>,
+  takenVariantBarcodes: Set<string>,
+): Promise<void> {
+  const existingRows = await database
+    .select()
+    .from(schema.productVariants)
+    .where(eq(schema.productVariants.productId, productId))
+  const byShopifyId = new Map<string, (typeof existingRows)[0]>()
+  for (const row of existingRows) {
+    const sid = String(row.shopifyVariantId ?? '').trim()
+    if (sid) byShopifyId.set(sid, row)
+  }
+  await database.transaction(async (tx) => {
+    for (const v of liveVariants) {
+      const shopifyVariantId = String(v.id)
+      const prior = byShopifyId.get(shopifyVariantId)
+      const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
+      const preferredSku = String(v.sku ?? '').trim() || `SHOP-V${v.id}`
+      const optionValues = [v.option1, v.option2, v.option3].filter((x): x is string => Boolean(x) && String(x).trim() !== '')
+      if (prior) {
+        const sku = prior.sku
+        const barcode =
+          preserve.barcode && String(prior.barcode ?? '').trim() !== ''
+            ? prior.barcode
+            : claimUniqueBarcode(v.barcode, takenVariantBarcodes) ?? prior.barcode
+        const sellingPrice =
+          preserve.price && prior.sellingPrice != null ? prior.sellingPrice : Number(v.price) || prior.sellingPrice
+        const stock =
+          preserve.stock && prior.stock != null
+            ? prior.stock
+            : Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0))
+        await tx
+          .update(schema.productVariants)
+          .set({
+            title,
+            optionValues,
+            sku,
+            barcode,
+            sellingPrice,
+            compareAtPrice:
+              preserve.price && prior.compareAtPrice != null
+                ? prior.compareAtPrice
+                : v.compareAtPrice != null && Number(v.compareAtPrice) > 0
+                  ? Number(v.compareAtPrice)
+                  : prior.compareAtPrice,
+            stock,
+            shopifyVariantId,
+            status: 'active',
+          })
+          .where(eq(schema.productVariants.id, prior.id))
+      } else {
+        const sku = claimUniqueVariantSku(preferredSku, takenVariantSkus)
+        const barcode = claimUniqueBarcode(v.barcode, takenVariantBarcodes)
+        await tx.insert(schema.productVariants).values({
+          id: randomUUID(),
+          productId,
+          title,
+          optionValues,
+          sku,
+          barcode,
+          shopifyVariantId,
+          sellingPrice: Number(v.price) || null,
+          compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
+          costPrice: null,
+          grossWeight: null,
+          stock: Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0)),
+          reorderLevel: null,
+          status: 'active',
+          createdAt: new Date().toISOString(),
+        })
+      }
+    }
+    await tx.update(schema.products).set({ options: options?.length ? options : null }).where(eq(schema.products.id, productId))
+  })
+}
+
 export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): Promise<ProductsDbSyncResult> {
   const started = Date.now()
   const empty = (): ProductsDbSyncResult => ({
@@ -1216,7 +1328,10 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
   const mode = options.mode ?? 'full'
   const allowRemovals = options.allowRemovals ?? mode === 'full'
   const preserveLocalPriceStock = options.preserveLocalPriceStock ?? mode === 'auto'
-  const fullCatalog = !options.updatedAtMin?.trim()
+  const preserveErpPrices = options.preserveErpPrices ?? preserveLocalPriceStock
+  const preserveLocalBarcodes = options.preserveLocalBarcodes ?? mode !== 'full'
+  const mergeVariants = options.mergeVariants !== false
+  const fullCatalog = !options.updatedAtMin?.trim() && !options.liveProducts?.length
   const database = db
   if (!(await acquireSyncLock('products'))) {
     return {
@@ -1234,7 +1349,11 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
   let updated = 0
   let removed = 0
   try {
-    await syncProducts(options.updatedAtMin)
+    if (options.liveProducts?.length) {
+      store.products = options.liveProducts
+    } else {
+      await syncProducts(options.updatedAtMin)
+    }
 
     const live = store.products
     const guard = options.catalogGuard?.(live.length, fullCatalog)
@@ -1402,7 +1521,20 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
           throw err
         }
       },
-    }, { preserveLocalPriceStock })
+      saveVariantsMerge: mergeVariants
+        ? async (productId, options, variants, preserve) => {
+            await mergeProductVariantsFromShopify(
+              database,
+              productId,
+              options,
+              variants ?? [],
+              preserve,
+              takenVariantSkus,
+              takenVariantBarcodes,
+            )
+          }
+        : undefined,
+    }, { preserveLocalPriceStock, preserveErpPrices, preserveLocalBarcodes })
     created = applied.created
     updated = applied.updated
 

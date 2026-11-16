@@ -413,10 +413,11 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
 
   try {
     if (topic.startsWith('products/')) {
-      const result = await syncProductsToDb()
+      const { handleProductWebhook } = await import('./shopifyProductWebhook')
+      const result = await handleProductWebhook(topic, req.body)
       logger.info(
-        { topic, synced: result.synced, created: result.created, updated: result.updated, ok: result.ok },
-        'Webhook: products resynced into database',
+        { topic, synced: result.synced, created: result.created, updated: result.updated, removed: result.removed, ok: result.ok },
+        'Webhook: product change applied to database',
       )
     } else if (topic.startsWith('customers/')) {
       const { importShopifyCustomers } = await import('./shopify')
