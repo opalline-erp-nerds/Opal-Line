@@ -899,10 +899,28 @@ app.post('/api/v1/shopify/products/purge', requirePermission('shopify', 'delete'
   }
 })
 
+app.get('/api/v1/shopify/products/sync-stock-preview', requirePermission('shopify', 'view'), async (_req, res) => {
+  try {
+    const { previewStockChangesFromShopify } = await import('./shopifyProductSyncPreview')
+    res.json(await previewStockChangesFromShopify())
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error'
+    res.status(502).json({ ok: false, error: message })
+  }
+})
+
 app.post('/api/v1/shopify/products/sync-db', requirePermission('shopify', 'create'), async (req, res) => {
   try {
-    const allowRemovals = req.body?.allowRemovals !== false
-    const result = await syncProductsToDb({ mode: 'full', allowRemovals, preserveLocalPriceStock: false })
+    const allowRemovals = req.body?.allowRemovals === true
+    const overwriteStockFromShopify = req.body?.overwriteStockFromShopify === true
+    const result = await syncProductsToDb({
+      mode: 'full',
+      allowRemovals,
+      preserveLocalPriceStock: !overwriteStockFromShopify,
+      preserveErpPrices: true,
+      preserveLocalBarcodes: true,
+      mergeVariants: true,
+    })
     const actor = actorFromRequest(req)
     void recordActivity({
       action: 'Synced Products',
@@ -1601,7 +1619,8 @@ app.post('/api/v1/shopify/products/auto-sync', requirePermission('shopify', 'cre
   try {
     const { runManualProductAutoSync } = await import('./productAutoSync')
     const allowRemovals = req.body?.allowRemovals === true
-    const result = await runManualProductAutoSync(allowRemovals)
+    const overwriteStockFromShopify = req.body?.overwriteStockFromShopify === true
+    const result = await runManualProductAutoSync(allowRemovals, overwriteStockFromShopify)
     res.json(result)
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'

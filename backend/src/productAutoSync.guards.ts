@@ -5,6 +5,8 @@ export const AUTO_SYNC_PAUSE_AFTER_FAILURES = 5
 
 export const INTERVAL_WARN_BELOW_SECONDS = 300
 export const INTERVAL_SUGGEST_SECONDS = 900
+/** Upper bound for routine auto-sync (30 minutes). */
+export const INTERVAL_ROUTINE_MAX_SECONDS = 1800
 
 export function evaluateShopGuard(configuredShop: string | null, storedShop: string | null): CatalogGuardResult {
   const shop = configuredShop?.trim().toLowerCase() ?? ''

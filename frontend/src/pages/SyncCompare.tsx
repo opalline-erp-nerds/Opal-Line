@@ -87,6 +87,12 @@ export default function SyncComparePage() {
     }>
   } | null>(null)
   const [removeMissing, setRemoveMissing] = useState(false)
+  const [overwriteStock, setOverwriteStock] = useState(false)
+  const [stockPreview, setStockPreview] = useState<{
+    parentChanges: number
+    variantChanges: number
+    samples: Array<{ sku: string; field: string; old: number; new: number }>
+  } | null>(null)
   const [intervalDraft, setIntervalDraft] = useState('6')
   const [intervalUnit, setIntervalUnit] = useState<IntervalUnit>('hours')
   const [autoBusy, setAutoBusy] = useState(false)
@@ -131,7 +137,33 @@ export default function SyncComparePage() {
     }
   }
 
+  const previewStock = async () => {
+    setAutoBusy(true)
+    setAutoMsg(null)
+    try {
+      const p = await shopifyApi.previewSyncStock()
+      if (!p.ok) {
+        setStockPreview(null)
+        setAutoMsg({ ok: false, text: p.message ?? 'Stock preview failed' })
+        return
+      }
+      setStockPreview({ parentChanges: p.parentChanges, variantChanges: p.variantChanges, samples: p.samples })
+      setAutoMsg({
+        ok: true,
+        text: `Stock preview: ${p.parentChanges} parent · ${p.variantChanges} variant row(s) would change.`,
+      })
+    } catch (e) {
+      setAutoMsg({ ok: false, text: e instanceof Error ? e.message : 'Stock preview failed' })
+    } finally {
+      setAutoBusy(false)
+    }
+  }
+
   const runNow = async () => {
+    if (overwriteStock && !stockPreview) {
+      setAutoMsg({ ok: false, text: 'Run Preview stock before a full sync with overwrite enabled.' })
+      return
+    }
     if (removeMissing) {
       const ok = window.confirm(
         'Remove local products that are linked to Shopify but no longer exist in the live catalog? This cannot be undone.',
@@ -141,7 +173,7 @@ export default function SyncComparePage() {
     setAutoBusy(true)
     setAutoMsg(null)
     try {
-      const r = await shopifyApi.runAutoSync({ allowRemovals: removeMissing })
+      const r = await shopifyApi.runAutoSync({ allowRemovals: removeMissing, overwriteStockFromShopify: overwriteStock })
       await loadAuto()
       setAutoMsg(r.ok
         ? {
@@ -310,14 +342,39 @@ export default function SyncComparePage() {
                 />
                 Remove missing from ERP (manual only)
               </label>
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={overwriteStock}
+                  onChange={(e) => setOverwriteStock(e.target.checked)}
+                  disabled={autoBusy}
+                />
+                Overwrite stock from Shopify
+              </label>
+              <Button size="sm" variant="outline" onClick={() => void previewStock()} disabled={autoBusy}>
+                Preview stock
+              </Button>
               <Button size="sm" variant="outline" onClick={() => void runNow()} disabled={autoBusy}>
                 <RefreshCw className={autoBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} /> Full Sync Now
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
               Scheduled auto-sync is <strong>incremental</strong> (changes since the last success) and never overwrites ERP price/stock or
-              removes products. <strong>Full Sync Now</strong> loads the entire catalog; removals happen only with the checkbox and confirmation.
+              removes products. <strong>Full Sync Now</strong> keeps ERP prices and barcodes; stock updates only when you tick overwrite and preview.
+              For hosted stores, <strong>15–30 minutes</strong> is a practical auto-sync window (webhooks cover most catalog edits between runs).
             </p>
+            {stockPreview && stockPreview.samples.length > 0 && (
+              <div className="rounded-md border px-3 py-2 text-xs">
+                <p className="mb-1 font-semibold">Stock preview sample (up to 10)</p>
+                <ul className="space-y-0.5">
+                  {stockPreview.samples.map((s, i) => (
+                    <li key={i}>
+                      <span className="font-mono">{s.sku}</span> {s.field}: {s.old} → {s.new}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {autoMsg && (
               <p className={`text-xs font-medium ${autoMsg.ok ? 'text-success-700' : 'text-destructive'}`}>{autoMsg.text}</p>
             )}

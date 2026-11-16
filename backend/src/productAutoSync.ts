@@ -16,6 +16,7 @@ import {
   shouldPauseAutoSync,
   INTERVAL_WARN_BELOW_SECONDS,
   INTERVAL_SUGGEST_SECONDS,
+  INTERVAL_ROUTINE_MAX_SECONDS,
 } from './productAutoSync.guards'
 import {
   getProductAutoSyncMeta,
@@ -129,7 +130,11 @@ function toRunResult(result: Awaited<ReturnType<typeof syncProductsToDb>>): Prod
   }
 }
 
-async function runInternal(manual: boolean, allowRemovals: boolean): Promise<ProductAutoSyncRunResult> {
+async function runInternal(
+  manual: boolean,
+  allowRemovals: boolean,
+  overwriteStockFromShopify = false,
+): Promise<ProductAutoSyncRunResult> {
   if (isProductSyncInProgress()) {
     return { ok: true, skippedRun: true, skipped: 1, message: 'Product sync already in progress' }
   }
@@ -167,7 +172,10 @@ async function runInternal(manual: boolean, allowRemovals: boolean): Promise<Pro
   const result = await syncProductsToDb({
     mode: manual ? 'full' : 'auto',
     allowRemovals: manual && allowRemovals,
-    preserveLocalPriceStock: !manual,
+    preserveLocalPriceStock: manual ? !overwriteStockFromShopify : true,
+    preserveErpPrices: true,
+    preserveLocalBarcodes: true,
+    mergeVariants: true,
     updatedAtMin,
     catalogGuard: (liveCount, isFull) => {
       const verdict = evaluateCatalogGuards({
@@ -249,9 +257,12 @@ export async function runScheduledProductAutoSync(): Promise<ProductAutoSyncRunR
 }
 
 /** Manual Sync Now — full catalog; removals only when allowRemovals is true. */
-export async function runManualProductAutoSync(allowRemovals = false): Promise<ProductAutoSyncRunResult> {
+export async function runManualProductAutoSync(
+  allowRemovals = false,
+  overwriteStockFromShopify = false,
+): Promise<ProductAutoSyncRunResult> {
   try {
-    const out = await runInternal(true, allowRemovals)
+    const out = await runInternal(true, allowRemovals, overwriteStockFromShopify)
     if (out.ok && !out.skippedRun) {
       consecutiveFailures = 0
       paused = false
@@ -351,7 +362,7 @@ export async function getAutoSyncStatus(): Promise<{
   const seconds = await getAutoSyncIntervalSeconds()
   const intervalWarning =
     seconds > 0 && seconds < INTERVAL_WARN_BELOW_SECONDS
-      ? `Intervals under 5 minutes increase Shopify API usage. Consider ${formatAutoSyncInterval(INTERVAL_SUGGEST_SECONDS)} or longer.`
+      ? `Intervals under 5 minutes increase Shopify API usage. Consider ${formatAutoSyncInterval(INTERVAL_SUGGEST_SECONDS)}–${formatAutoSyncInterval(INTERVAL_ROUTINE_MAX_SECONDS)}; webhooks catch edits between runs.`
       : null
   return {
     intervalSeconds: seconds,

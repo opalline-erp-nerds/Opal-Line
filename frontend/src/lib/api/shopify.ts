@@ -170,7 +170,15 @@ export const shopifyApi = {
       method: 'POST',
       body: JSON.stringify({ value, unit }),
     }),
-  runAutoSync: (opts?: { allowRemovals?: boolean }) =>
+  previewSyncStock: () =>
+    request<{
+      ok: boolean
+      parentChanges: number
+      variantChanges: number
+      samples: Array<{ sku: string; field: 'stock' | 'variant_stock'; old: number; new: number }>
+      message?: string
+    }>('/shopify/products/sync-stock-preview'),
+  runAutoSync: (opts?: { allowRemovals?: boolean; overwriteStockFromShopify?: boolean }) =>
     request<{
       ok: boolean
       synced?: number
@@ -184,7 +192,10 @@ export const shopifyApi = {
       warnings?: string[]
     }>('/shopify/products/auto-sync', {
       method: 'POST',
-      body: JSON.stringify(opts ?? {}),
+      body: JSON.stringify({
+        allowRemovals: opts?.allowRemovals === true,
+        overwriteStockFromShopify: opts?.overwriteStockFromShopify === true,
+      }),
     }),
   testEmail: (to?: string) =>
     request<{ ok: boolean; to?: string; error?: string }>('/settings/test-email', { method: 'POST', body: JSON.stringify({ to }) }),
