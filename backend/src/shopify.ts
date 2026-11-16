@@ -1337,6 +1337,8 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
   const mergeVariants = options.mergeVariants !== false
   const fullCatalog = !options.updatedAtMin?.trim() && !options.liveProducts?.length
   const database = db
+  const { ensureProductVariantsShopifyIdColumn } = await import('./db/productVariantsSchema')
+  await ensureProductVariantsShopifyIdColumn()
   if (!(await acquireSyncLock('products'))) {
     return {
       ...empty(),
