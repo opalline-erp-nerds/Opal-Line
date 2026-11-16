@@ -33,6 +33,7 @@ import { verifyShopifyWebhook, rejectReplayedWebhook, releaseWebhookId } from '.
 import { recountCustomerStats } from './customerStats'
 import { startAutoBackup, startDailySummary } from './autoBackup'
 import { startOrderEmailIngest, stopOrderEmailIngest, pollOrderMailbox, isEmailIngestConfigured } from './orderEmailIngest'
+import { startShopifyOutboundWorker, stopShopifyOutboundWorker } from './shopifyOutbound'
 import { isPiiAccessDenied, missingPiiCustomerCount, normalizeShopifyCustomerId } from './shopifyDataEnhance'
 import { applyRateSchedule, fetchSilverRateNow, getSchedulerStatus, setAutoRateEnabled, startSilverRateScheduler } from './silverRateScheduler'
 import {
@@ -2426,6 +2427,9 @@ async function startServer() {
     void import('./autoBackup').then((m) => m.startBackupVerification())
     // Periodic Shopify product pull (interval from settings; 0 = disabled).
     void import('./productAutoSync').then((m) => m.startProductAutoSync())
+    // Durable ERP → Shopify queue: drains product/price/stock pushes recorded by
+    // ERP writes, with retries, so an edit is never waiting on a UI button.
+    startShopifyOutboundWorker()
     // Daily business summary email (9:00 AM IST).
     startDailySummary()
     // Hourly sweep of expired per-IP rate-limit rows.
@@ -2515,6 +2519,7 @@ async function startServer() {
   function gracefulShutdown(signal: string) {
     logger.info({ signal }, 'Shutting down gracefully')
     stopOrderEmailIngest()
+    stopShopifyOutboundWorker()
     server.close(() => {
       shutdownSessions()
       logger.info('Server closed')

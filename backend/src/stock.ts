@@ -15,6 +15,7 @@ import { and, eq, sql } from 'drizzle-orm'
 import { randomBytes } from 'node:crypto'
 import { db } from './db/client'
 import * as schema from './db/schema'
+import { enqueueShopifyJob, isListedOnShopify } from './shopifyOutbound'
 
 /** Anything the app can do to a stock balance. */
 export type MovementType =
@@ -385,6 +386,7 @@ export async function applyStockMovement(input: StockMovementInput): Promise<num
       sku: schema.products.sku,
       stock: schema.products.stock,
       costPrice: schema.products.costPrice,
+      shopifyId: schema.products.shopifyId,
     })
     .from(schema.products)
     .where(eq(schema.products.sku, sku))
@@ -472,6 +474,20 @@ export async function applyStockMovement(input: StockMovementInput): Promise<num
     createdBy: input.createdBy,
     date: new Date().toISOString(),
   })
+
+  // ERP-originated stock change → queue the Shopify level update. `shopify_sync`
+  // movements ARE the inbound pull: pushing those back would echo Shopify's own
+  // number at the store (and loop). The job rides the caller's transaction, so
+  // a rejected document takes its pending push with it. Failures are retried by
+  // the outbound worker and reported in Sync Logs.
+  if (type !== 'shopify_sync' && isListedOnShopify(row.shopifyId)) {
+    await enqueueShopifyJob({
+      kind: 'inventory',
+      productId: row.id,
+      tx: input.tx,
+      reason: `stock movement ${type}`,
+    })
+  }
 
   return Math.floor(num(total?.qty))
 }

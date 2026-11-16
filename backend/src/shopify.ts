@@ -105,7 +105,7 @@ function addLog(resource: SyncResource, status: SyncLogEntry['status'], count: n
 
 let dbLogSeq = 0
 
-async function persistLog(entry: {
+export async function persistLog(entry: {
   entity: string
   shopifyId?: string | null
   direction: 'in' | 'out'
@@ -992,6 +992,15 @@ export async function applyLiveCatalog(
   rows: CatalogRow[],
   pricingRate: number,
   io: CatalogApplyIo,
+  /**
+   * Products with an outbound push still queued. Shopify's copy of those rows
+   * is stale by definition (the ERP edit has not reached the store yet), so the
+   * pull must not write it back over the edit — that echo is how an ERP change
+   * used to disappear before it was ever pushed. Their identity and link are
+   * still refreshed; content, stock and the variant set are left alone until
+   * the queued job has run.
+   */
+  opts: { pendingProductIds?: ReadonlySet<string> } = {},
 ): Promise<{ created: number; updated: number }> {
   const bySku = new Map<string, CatalogRow>()
   for (const r of rows) {
@@ -1033,25 +1042,36 @@ export async function applyLiveCatalog(
       // overwrote). Rows without a link keep the original behaviour.
       const linked =
         String(existing.collectionId ?? '').trim() !== '' || String(existing.categoryId ?? '').trim() !== ''
+      const pendingOutbound = opts.pendingProductIds?.has(existing.id) === true
       const patch: CatalogPatch = {
-        name: p.title || existing.name,
+        name: pendingOutbound ? existing.name : p.title || existing.name,
         barcode: p.barcode ?? existing.barcode,
         category: linked ? existing.category : p.productType || existing.category,
         collection: linked ? existing.collection : p.collection || p.productType || existing.collection,
-        stock: Number.isFinite(p.inventoryQuantity) ? p.inventoryQuantity : existing.stock,
+        stock: pendingOutbound
+          ? existing.stock
+          : Number.isFinite(p.inventoryQuantity)
+            ? p.inventoryQuantity
+            : existing.stock,
         shopifyId: String(p.id),
         shopifyStatus: 'synced',
         status: 'active',
-        vendor: p.vendor || existing.vendor,
-        productType: p.productType || existing.productType,
+        vendor: pendingOutbound ? existing.vendor : p.vendor || existing.vendor,
+        productType: pendingOutbound ? existing.productType : p.productType || existing.productType,
         // Shopify body_html is authoritative for descriptions coming from
         // the storefront; keep local text when Shopify has none.
-        description: p.description ? p.description : existing.description,
-        compareAtPrice: effectiveCompareAt ?? existing.compareAtPrice,
-        image: p.image ?? existing.image,
+        description: pendingOutbound
+          ? existing.description
+          : p.description
+            ? p.description
+            : existing.description,
+        compareAtPrice: pendingOutbound ? existing.compareAtPrice : effectiveCompareAt ?? existing.compareAtPrice,
+        image: pendingOutbound ? existing.image : p.image ?? existing.image,
         // Mirror Shopify's gallery; keep any local-only uploads that aren't
         // yet on Shopify (they'll be pushed on the next product push).
-        images: mergeImages(existing.images as string[] | null, p.images),
+        images: pendingOutbound
+          ? (existing.images as string[] | null)
+          : mergeImages(existing.images as string[] | null, p.images),
         netWeight: pricing ? pricing.netWeight : existing.netWeight,
         makingCharge: pricing ? pricing.makingCharge : existing.makingCharge,
         silverRate: pricing ? pricingRate : existing.silverRate,
@@ -1059,7 +1079,9 @@ export async function applyLiveCatalog(
         chargeOnTax: existing.chargeOnTax,
       }
       await io.update(existing, patch)
-      await saveVariants(existing.id)
+      // The listing's variant set is stale for a pending edit too (it carries
+      // the old per-variant prices), so leave the local rows for the push.
+      if (!pendingOutbound) await saveVariants(existing.id)
       updated++
     } else {
       const pricing = backComputePricing(price, pricingRate)
@@ -1178,6 +1200,10 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
     const liveShopifyIds = new Set(live.map((p) => String(p.id)).filter(Boolean))
 
     const rows = await db.select().from(schema.products)
+    // Outbound work still in flight: those rows keep their local values so the
+    // pull cannot undo an ERP edit before its queued push has run.
+    const { pendingShopifyProductIds } = await import('./shopifyOutbound')
+    const pendingProductIds = await pendingShopifyProductIds()
 
     const pricingRate = (await getLatestSilverRate())?.rate ?? 92.8
     // Variant SKUs are unique across the whole table, not per product. Track
@@ -1310,7 +1336,7 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
           throw err
         }
       },
-    })
+    }, { pendingProductIds })
     created = applied.created
     updated = applied.updated
 
