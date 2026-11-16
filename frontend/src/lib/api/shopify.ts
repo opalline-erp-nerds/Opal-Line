@@ -127,13 +127,65 @@ export const shopifyApi = {
   refreshOrder: (orderId: string) =>
     request<{ ok: boolean; updated?: boolean; message?: string }>(`/shopify/orders/${encodeURIComponent(orderId)}/refresh`, { method: 'POST' }),
   getAutoSyncStatus: () =>
-    request<{ intervalHours: number; enabled: boolean; nextRunAt: string | null; lastRunAt: string | null; lastResult: { ok: boolean; synced?: number; created?: number; updated?: number; message?: string } | null; history: Array<{ at: string; ok: boolean; created?: number; updated?: number; message?: string }> }>('/shopify/products/auto-sync/status'),
+    request<{
+      intervalSeconds: number
+      intervalHours: number
+      intervalLabel: string
+      enabled: boolean
+      nextRunAt: string | null
+      lastRunAt: string | null
+      lastResult: {
+        ok: boolean
+        synced?: number
+        created?: number
+        updated?: number
+        removed?: number
+        skipped?: number
+        failed?: number
+        durationMs?: number
+        message?: string
+        warnings?: string[]
+        skippedRun?: boolean
+        paused?: boolean
+      } | null
+      paused: boolean
+      pauseWarning: string | null
+      consecutiveFailures: number
+      intervalWarning: string | null
+      history: Array<{
+        at: string
+        ok: boolean
+        created?: number
+        updated?: number
+        skipped?: number
+        failed?: number
+        durationMs?: number
+        message?: string
+      }>
+    }>('/shopify/products/auto-sync/status'),
   getAutoSyncInterval: () =>
-    request<{ intervalHours: number }>('/shopify/products/auto-sync/interval'),
-  setAutoSyncInterval: (intervalHours: number) =>
-    request<{ ok: boolean; intervalHours: number }>('/shopify/products/auto-sync/interval', { method: 'POST', body: JSON.stringify({ intervalHours }) }),
-  runAutoSync: () =>
-    request<{ ok: boolean; synced?: number; created?: number; updated?: number; message?: string }>('/shopify/products/auto-sync', { method: 'POST' }),
+    request<{ intervalSeconds: number; intervalHours: number; intervalLabel: string }>('/shopify/products/auto-sync/interval'),
+  setAutoSyncInterval: (value: number, unit: 'seconds' | 'minutes' | 'hours') =>
+    request<{ ok: boolean; intervalSeconds: number; intervalLabel: string }>('/shopify/products/auto-sync/interval', {
+      method: 'POST',
+      body: JSON.stringify({ value, unit }),
+    }),
+  runAutoSync: (opts?: { allowRemovals?: boolean }) =>
+    request<{
+      ok: boolean
+      synced?: number
+      created?: number
+      updated?: number
+      removed?: number
+      skipped?: number
+      failed?: number
+      durationMs?: number
+      message?: string
+      warnings?: string[]
+    }>('/shopify/products/auto-sync', {
+      method: 'POST',
+      body: JSON.stringify(opts ?? {}),
+    }),
   testEmail: (to?: string) =>
     request<{ ok: boolean; to?: string; error?: string }>('/settings/test-email', { method: 'POST', body: JSON.stringify({ to }) }),
   whatsappStatus: () =>

@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import {
   Table,
   TableBody,
@@ -35,6 +36,16 @@ const stateBadge = (state: string) => {
 }
 
 type Filter = 'all' | 'diffs' | 'local-only' | 'shopify-only'
+type IntervalUnit = 'seconds' | 'minutes' | 'hours'
+
+const maxForUnit = (unit: IntervalUnit) => (unit === 'hours' ? 168 : unit === 'minutes' ? 168 * 60 : 168 * 3600)
+
+function draftFromSeconds(seconds: number): { value: string; unit: IntervalUnit } {
+  if (seconds <= 0) return { value: '0', unit: 'minutes' }
+  if (seconds % 3600 === 0) return { value: String(seconds / 3600), unit: 'hours' }
+  if (seconds % 60 === 0) return { value: String(seconds / 60), unit: 'minutes' }
+  return { value: String(seconds), unit: 'seconds' }
+}
 
 export default function SyncComparePage() {
   const [rows, setRows] = useState<SyncCompareRow[]>([])
@@ -46,8 +57,38 @@ export default function SyncComparePage() {
   const [pullMsg, setPullMsg] = useState<{ ok: boolean; text: string } | null>(null)
 
   // Auto-sync scheduler state
-  const [auto, setAuto] = useState<{ intervalHours: number; enabled: boolean; nextRunAt: string | null; lastRunAt: string | null; lastResult: { ok: boolean; synced?: number; created?: number; updated?: number; message?: string } | null; history: Array<{ at: string; ok: boolean; created?: number; updated?: number; message?: string }> } | null>(null)
+  const [auto, setAuto] = useState<{
+    intervalSeconds: number
+    intervalLabel: string
+    enabled: boolean
+    nextRunAt: string | null
+    lastRunAt: string | null
+    lastResult: {
+      ok: boolean
+      created?: number
+      updated?: number
+      skipped?: number
+      failed?: number
+      durationMs?: number
+      message?: string
+    } | null
+    paused: boolean
+    pauseWarning: string | null
+    intervalWarning: string | null
+    history: Array<{
+      at: string
+      ok: boolean
+      created?: number
+      updated?: number
+      skipped?: number
+      failed?: number
+      durationMs?: number
+      message?: string
+    }>
+  } | null>(null)
+  const [removeMissing, setRemoveMissing] = useState(false)
   const [intervalDraft, setIntervalDraft] = useState('6')
+  const [intervalUnit, setIntervalUnit] = useState<IntervalUnit>('hours')
   const [autoBusy, setAutoBusy] = useState(false)
   const [autoMsg, setAutoMsg] = useState<{ ok: boolean; text: string } | null>(null)
 
@@ -55,7 +96,9 @@ export default function SyncComparePage() {
     try {
       const s = await shopifyApi.getAutoSyncStatus()
       setAuto(s)
-      setIntervalDraft(String(s.intervalHours))
+      const draft = draftFromSeconds(s.intervalSeconds)
+      setIntervalDraft(draft.value)
+      setIntervalUnit(draft.unit)
     } catch { /* card simply stays hidden */ }
   }, [])
 
@@ -67,16 +110,20 @@ export default function SyncComparePage() {
   }, [loadAuto])
 
   const saveInterval = async () => {
-    const hours = Number(intervalDraft)
-    if (!Number.isFinite(hours) || hours < 0 || hours > 168) {
-      setAutoMsg({ ok: false, text: 'Interval must be 0–168 hours (0 disables auto-sync).' })
+    const value = Number(intervalDraft)
+    const max = maxForUnit(intervalUnit)
+    if (!Number.isFinite(value) || value < 0 || value > max) {
+      setAutoMsg({ ok: false, text: `Enter 0 to disable, or 1–${max} ${intervalUnit} (minimum 1 minute when enabled).` })
       return
     }
     setAutoBusy(true)
     try {
-      await shopifyApi.setAutoSyncInterval(hours)
+      const r = await shopifyApi.setAutoSyncInterval(value, intervalUnit)
       await loadAuto()
-      setAutoMsg({ ok: true, text: hours === 0 ? 'Auto-sync disabled.' : `Auto-sync every ${hours} hour${hours === 1 ? '' : 's'}.` })
+      setAutoMsg({
+        ok: true,
+        text: value === 0 ? 'Auto-sync disabled.' : `Auto-sync: ${r.intervalLabel}.`,
+      })
     } catch (e) {
       setAutoMsg({ ok: false, text: e instanceof Error ? e.message : 'Failed to save interval' })
     } finally {
@@ -85,13 +132,22 @@ export default function SyncComparePage() {
   }
 
   const runNow = async () => {
+    if (removeMissing) {
+      const ok = window.confirm(
+        'Remove local products that are linked to Shopify but no longer exist in the live catalog? This cannot be undone.',
+      )
+      if (!ok) return
+    }
     setAutoBusy(true)
     setAutoMsg(null)
     try {
-      const r = await shopifyApi.runAutoSync()
+      const r = await shopifyApi.runAutoSync({ allowRemovals: removeMissing })
       await loadAuto()
       setAutoMsg(r.ok
-        ? { ok: true, text: `Synced: ${r.created ?? 0} new, ${r.updated ?? 0} updated.` }
+        ? {
+            ok: true,
+            text: `Full sync: ${r.created ?? 0} new, ${r.updated ?? 0} updated, ${r.removed ?? 0} removed, ${r.skipped ?? 0} skipped${r.durationMs != null ? ` (${Math.round(r.durationMs / 1000)}s)` : ''}.`,
+          }
         : { ok: false, text: r.message ?? 'Sync failed' })
     } catch (e) {
       setAutoMsg({ ok: false, text: e instanceof Error ? e.message : 'Sync failed' })
@@ -179,37 +235,89 @@ export default function SyncComparePage() {
                 <Clock className="h-4 w-4 text-muted-foreground" />
                 <h3 className="font-semibold text-foreground">Auto-Sync Schedule</h3>
               </div>
-              <Badge variant={auto.enabled ? 'success' : 'muted'}>{auto.enabled ? `Every ${auto.intervalHours}h` : 'Disabled'}</Badge>
+              <Badge variant={auto.enabled ? 'success' : 'muted'}>{auto.intervalLabel}</Badge>
             </div>
-            <div className="grid gap-3 text-sm sm:grid-cols-3">
+            {auto.paused && auto.pauseWarning && (
+              <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive">
+                {auto.pauseWarning}
+              </p>
+            )}
+            {auto.intervalWarning && (
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-900 dark:text-amber-200">
+                {auto.intervalWarning}
+              </p>
+            )}
+            <div className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
               <div>
                 <p className="text-xs text-muted-foreground">Last run</p>
                 <p className="font-medium">{auto.lastRunAt ? new Date(auto.lastRunAt).toLocaleString() : 'Not yet run'}</p>
+                {auto.lastResult?.durationMs != null && (
+                  <p className="text-xs text-muted-foreground">{Math.round(auto.lastResult.durationMs / 1000)}s</p>
+                )}
               </div>
               <div>
                 <p className="text-xs text-muted-foreground">Next run</p>
-                <p className="font-medium">{auto.enabled ? (auto.nextRunAt ? new Date(auto.nextRunAt).toLocaleString() : 'On next restart') : '—'}</p>
+                <p className="font-medium">
+                  {auto.enabled && !auto.paused
+                    ? auto.nextRunAt
+                      ? new Date(auto.nextRunAt).toLocaleString()
+                      : 'On next restart'
+                    : '—'}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Last counts</p>
+                <p className="font-medium text-xs leading-relaxed">
+                  {auto.lastResult
+                    ? `${auto.lastResult.created ?? 0} created · ${auto.lastResult.updated ?? 0} updated · ${auto.lastResult.skipped ?? 0} skipped · ${auto.lastResult.failed ?? 0} failed`
+                    : '—'}
+                </p>
               </div>
               <div>
                 <p className="text-xs text-muted-foreground">Last result</p>
-                <p className="font-medium">{auto.lastResult ? (auto.lastResult.ok ? `${auto.lastResult.created ?? 0} new · ${auto.lastResult.updated ?? 0} updated` : 'Failed') : '—'}</p>
+                <p className="font-medium">
+                  {auto.lastResult ? (auto.lastResult.ok ? 'OK' : auto.lastResult.message ?? 'Failed') : '—'}
+                </p>
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Input
                 type="number"
                 min={0}
-                max={168}
+                max={maxForUnit(intervalUnit)}
                 value={intervalDraft}
                 onChange={(e) => setIntervalDraft(e.target.value)}
                 className="w-24"
               />
-              <span className="text-xs text-muted-foreground">hours (0 = off)</span>
+              <Select
+                className="w-32"
+                value={intervalUnit}
+                onValueChange={(v) => setIntervalUnit(v as IntervalUnit)}
+                options={[
+                  { value: 'seconds', label: 'Seconds' },
+                  { value: 'minutes', label: 'Minutes' },
+                  { value: 'hours', label: 'Hours' },
+                ]}
+              />
+              <span className="text-xs text-muted-foreground">0 = off · min 1 min when on</span>
               <Button size="sm" variant="outline" onClick={saveInterval} disabled={autoBusy}>Save Interval</Button>
-              <Button size="sm" variant="outline" onClick={runNow} disabled={autoBusy}>
-                <RefreshCw className={autoBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} /> Sync Now
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={removeMissing}
+                  onChange={(e) => setRemoveMissing(e.target.checked)}
+                  disabled={autoBusy}
+                />
+                Remove missing from ERP (manual only)
+              </label>
+              <Button size="sm" variant="outline" onClick={() => void runNow()} disabled={autoBusy}>
+                <RefreshCw className={autoBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} /> Full Sync Now
               </Button>
             </div>
+            <p className="text-xs text-muted-foreground">
+              Scheduled auto-sync is <strong>incremental</strong> (changes since the last success) and never overwrites ERP price/stock or
+              removes products. <strong>Full Sync Now</strong> loads the entire catalog; removals happen only with the checkbox and confirmation.
+            </p>
             {autoMsg && (
               <p className={`text-xs font-medium ${autoMsg.ok ? 'text-success-700' : 'text-destructive'}`}>{autoMsg.text}</p>
             )}
@@ -221,7 +329,10 @@ export default function SyncComparePage() {
                     <div key={i} className="flex items-center justify-between gap-2 border-b border-border/60 px-3 py-1.5 text-xs last:border-0">
                       <span className="shrink-0 text-muted-foreground">{new Date(h.at).toLocaleString()}</span>
                       {h.ok ? (
-                        <span className="font-medium text-success-700">{h.created ?? 0} new · {h.updated ?? 0} updated</span>
+                        <span className="font-medium text-success-700">
+                          {h.created ?? 0} new · {h.updated ?? 0} upd · {h.skipped ?? 0} skip
+                          {h.durationMs != null ? ` · ${Math.round(h.durationMs / 1000)}s` : ''}
+                        </span>
                       ) : (
                         <span className="max-w-[60%] truncate font-medium text-destructive" title={h.message}>{h.message ?? 'Failed'}</span>
                       )}

@@ -900,7 +900,8 @@ app.post('/api/v1/shopify/products/purge', requirePermission('shopify', 'delete'
 
 app.post('/api/v1/shopify/products/sync-db', requirePermission('shopify', 'create'), async (req, res) => {
   try {
-    const result = await syncProductsToDb()
+    const allowRemovals = req.body?.allowRemovals !== false
+    const result = await syncProductsToDb({ mode: 'full', allowRemovals, preserveLocalPriceStock: false })
     const actor = actorFromRequest(req)
     void recordActivity({
       action: 'Synced Products',
@@ -1597,8 +1598,9 @@ async function refreshPipelineOrder(orderId: string, req: express.Request) {
 // Manual trigger for the product auto-sync scheduler
 app.post('/api/v1/shopify/products/auto-sync', requirePermission('shopify', 'create'), async (req, res) => {
   try {
-    const { runProductAutoSync } = await import('./productAutoSync')
-    const result = await runProductAutoSync()
+    const { runManualProductAutoSync } = await import('./productAutoSync')
+    const allowRemovals = req.body?.allowRemovals === true
+    const result = await runManualProductAutoSync(allowRemovals)
     res.json(result)
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
@@ -1759,11 +1761,16 @@ app.post('/api/v1/settings/offsite-backup/sync', requireAuth, requirePermission(
   res.json(await syncBackupsOffsite())
 })
 
-// Read/update the auto-sync interval (hours; 0 = disabled)
+// Read/update product auto-sync interval (seconds; 0 = disabled). Also accepts value + unit or legacy intervalHours.
 app.get('/api/v1/shopify/products/auto-sync/interval', requirePermission('shopify', 'view'), async (_req, res) => {
   try {
-    const { getAutoSyncIntervalHours } = await import('./productAutoSync')
-    res.json({ intervalHours: await getAutoSyncIntervalHours() })
+    const { getAutoSyncIntervalSeconds, getAutoSyncIntervalHours, formatAutoSyncInterval } = await import('./productAutoSync')
+    const intervalSeconds = await getAutoSyncIntervalSeconds()
+    res.json({
+      intervalSeconds,
+      intervalHours: await getAutoSyncIntervalHours(),
+      intervalLabel: formatAutoSyncInterval(intervalSeconds),
+    })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(502).json({ error: message })
@@ -1772,17 +1779,17 @@ app.get('/api/v1/shopify/products/auto-sync/interval', requirePermission('shopif
 
 app.post('/api/v1/shopify/products/auto-sync/interval', requirePermission('shopify', 'edit'), async (req, res) => {
   try {
-    const hours = Number(req.body?.intervalHours)
-    if (!Number.isFinite(hours) || hours < 0 || hours > 168) {
-      return res.status(400).json({ error: 'intervalHours must be between 0 and 168' })
+    const { resolveAutoSyncIntervalSeconds, setAutoSyncIntervalSeconds, getAutoSyncIntervalSeconds, formatAutoSyncInterval } = await import('./productAutoSync')
+    const resolved = resolveAutoSyncIntervalSeconds((req.body ?? {}) as Record<string, unknown>)
+    if (typeof resolved === 'object' && 'error' in resolved) {
+      return res.status(400).json({ error: resolved.error })
     }
-    const { setAutoSyncIntervalHours, getAutoSyncIntervalHours } = await import('./productAutoSync')
-    await setAutoSyncIntervalHours(hours)
-    // Restart the schedule loop so the new interval applies immediately
+    await setAutoSyncIntervalSeconds(resolved)
     const { stopProductAutoSync, startProductAutoSync } = await import('./productAutoSync')
     stopProductAutoSync()
     startProductAutoSync()
-    res.json({ ok: true, intervalHours: await getAutoSyncIntervalHours() })
+    const intervalSeconds = await getAutoSyncIntervalSeconds()
+    res.json({ ok: true, intervalSeconds, intervalLabel: formatAutoSyncInterval(intervalSeconds) })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(502).json({ error: message })
