@@ -1238,16 +1238,20 @@ export async function mergeProductVariantsFromShopify(
     .from(schema.productVariants)
     .where(eq(schema.productVariants.productId, productId))
   const byShopifyId = new Map<string, (typeof existingRows)[0]>()
+  const bySkuLocal = new Map<string, (typeof existingRows)[0]>()
   for (const row of existingRows) {
     const sid = String(row.shopifyVariantId ?? '').trim()
     if (sid) byShopifyId.set(sid, row)
+    const skuKey = String(row.sku ?? '').trim().toLowerCase()
+    if (skuKey) bySkuLocal.set(skuKey, row)
   }
   await database.transaction(async (tx) => {
     for (const v of liveVariants) {
       const shopifyVariantId = String(v.id)
-      const prior = byShopifyId.get(shopifyVariantId)
-      const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
       const preferredSku = String(v.sku ?? '').trim() || `SHOP-V${v.id}`
+      const prior =
+        byShopifyId.get(shopifyVariantId) ?? bySkuLocal.get(preferredSku.toLowerCase())
+      const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
       const optionValues = [v.option1, v.option2, v.option3].filter((x): x is string => Boolean(x) && String(x).trim() !== '')
       if (prior) {
         const sku = prior.sku
