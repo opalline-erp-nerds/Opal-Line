@@ -17,6 +17,17 @@ const baseDbUrl = process.env.DATABASE_URL?.trim() ?? ''
 const TEST_DB = 'opal_line_outbound_test'
 const MOCK_HOST = 'mock-outbound-test.myshopify.com'
 
+// The dedicated CI step sets REQUIRE_DB_TESTS=1. Without it a runner that has
+// lost its database (or a workflow that dropped the DATABASE_URL env) would
+// skip this whole suite and still report green — a silent coverage hole in the
+// one suite that proves the worker's failure handling. Local runs keep the
+// graceful skip; CI must fail loudly instead.
+if (process.env.REQUIRE_DB_TESTS === '1' && !baseDbUrl) {
+  throw new Error(
+    'REQUIRE_DB_TESTS=1 but DATABASE_URL is not set — the outbound suite would have been skipped',
+  )
+}
+
 function scratchUrl(base: string): string {
   const url = new URL(base)
   url.pathname = `/${TEST_DB}`
