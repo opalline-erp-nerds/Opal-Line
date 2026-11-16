@@ -89,6 +89,15 @@ function releaseSyncLock() {
   store.syncing = false
 }
 
+export function isProductSyncInProgress(): boolean {
+  return syncLockAcquired || store.syncing
+}
+
+export function getConfiguredShopDomain(): string | null {
+  if (!isConfigured()) return null
+  return config.shop
+}
+
 let logSeq = 0
 
 function addLog(resource: SyncResource, status: SyncLogEntry['status'], count: number, message?: string) {
@@ -105,7 +114,7 @@ function addLog(resource: SyncResource, status: SyncLogEntry['status'], count: n
 
 let dbLogSeq = 0
 
-async function persistLog(entry: {
+export async function persistShopifySyncLog(entry: {
   entity: string
   shopifyId?: string | null
   direction: 'in' | 'out'
@@ -131,6 +140,8 @@ async function persistLog(entry: {
     // Log persistence must never break a sync.
   }
 }
+
+const persistLog = persistShopifySyncLog
 
 const entityFor: Record<SyncResource, { entity: string; action: string }> = {
   orders: { entity: 'Order', action: 'Imported' },
@@ -514,8 +525,12 @@ async function attachInventoryToProducts() {
   }))
 }
 
-async function syncProducts(): Promise<number> {
-  const raw = await paginate<any>('products', 'status=active')
+export type PullLiveProductsOptions = { updatedAtMin?: string | null }
+
+export async function pullLiveProducts(options: PullLiveProductsOptions = {}): Promise<number> {
+  const min = options.updatedAtMin?.trim()
+  const initialQuery = min ? `status=active&updated_at_min=${encodeURIComponent(min)}` : 'status=active'
+  const raw = await paginate<any>('products', initialQuery)
   store.products = raw.map(normalizeProduct).slice(0, MAX_STORE_ITEMS)
   try {
     await attachInventoryToProducts()
@@ -537,6 +552,10 @@ async function syncProducts(): Promise<number> {
     // Collections are an enhancement too; never fail the catalog pull over them.
   }
   return store.products.length
+}
+
+async function syncProducts(updatedAtMin?: string | null): Promise<number> {
+  return pullLiveProducts({ updatedAtMin })
 }
 
 /**
@@ -844,14 +863,35 @@ async function syncInventory(): Promise<number> {
   return store.inventory.length
 }
 
+export type ProductDbSyncMode = 'full' | 'auto'
+
+export interface SyncProductsToDbOptions {
+  mode?: ProductDbSyncMode
+  allowRemovals?: boolean
+  preserveLocalPriceStock?: boolean
+  preserveErpPrices?: boolean
+  preserveLocalBarcodes?: boolean
+  mergeVariants?: boolean
+  updatedAtMin?: string | null
+  /** When set, skips Shopify catalog fetch and applies only these rows. */
+  liveProducts?: SyncProduct[]
+  /** When set, post-fetch guard runs before writing (scheduled auto-sync). */
+  catalogGuard?: (liveCount: number, fullCatalog: boolean) => { ok: boolean; reason?: string } | null
+}
+
 export interface ProductsDbSyncResult {
   ok: boolean
   synced: number
   created: number
   updated: number
   removed: number
+  skipped: number
+  failed: number
+  durationMs: number
   errors: string[]
   message?: string
+  warnings?: string[]
+  skippedRun?: boolean
 }
 
 /**
@@ -974,6 +1014,13 @@ export interface CatalogApplyIo {
     options: SyncProduct['options'],
     variants: SyncProduct['variants'],
   ): Promise<void>
+  /** Upsert Shopify variants by shopify_variant_id; keeps ERP-only rows. */
+  saveVariantsMerge?(
+    productId: string,
+    options: SyncProduct['options'],
+    variants: SyncProduct['variants'],
+    preserve: { price: boolean; stock: boolean; barcode: boolean },
+  ): Promise<void>
 }
 
 /**
@@ -987,12 +1034,22 @@ export interface CatalogApplyIo {
  * products_sku_idx (warm databases never hit it — both products map onto the
  * existing row through the update path).
  */
+export interface ApplyLiveCatalogOptions {
+  preserveLocalPriceStock?: boolean
+  preserveErpPrices?: boolean
+  preserveLocalBarcodes?: boolean
+}
+
 export async function applyLiveCatalog(
   live: SyncProduct[],
   rows: CatalogRow[],
   pricingRate: number,
   io: CatalogApplyIo,
+  options: ApplyLiveCatalogOptions = {},
 ): Promise<{ created: number; updated: number }> {
+  const preserveLocalPriceStock = options.preserveLocalPriceStock === true
+  const preserveErpPrices = options.preserveErpPrices === true
+  const preserveLocalBarcodes = options.preserveLocalBarcodes === true
   const bySku = new Map<string, CatalogRow>()
   for (const r of rows) {
     const key = String(r.sku ?? '').trim().toLowerCase()
@@ -1022,11 +1079,21 @@ export async function applyLiveCatalog(
     // haven't been pushed yet.
     const hasLiveVariants = (p.options?.length ?? 0) > 0 && (p.variants?.length ?? 0) > 0
     const saveVariants = async (productId: string) => {
+      if (preserveLocalPriceStock && existing && !io.saveVariantsMerge) return
+      const preserve = {
+        price: preserveErpPrices || preserveLocalPriceStock,
+        stock: preserveLocalPriceStock,
+        barcode: preserveLocalBarcodes,
+      }
+      if (hasLiveVariants && io.saveVariantsMerge) {
+        await io.saveVariantsMerge(productId, p.options, p.variants, preserve)
+        return
+      }
       if (hasLiveVariants && io.saveVariants) await io.saveVariants(productId, p.options, p.variants)
     }
     if (existing) {
       const hasWeight = existing.netWeight != null && Number(existing.netWeight) > 0
-      const pricing = hasWeight ? null : backComputePricing(price, pricingRate)
+      const pricing = preserveLocalPriceStock || hasWeight ? null : backComputePricing(price, pricingRate)
       // Products created through the product dialog are linked to a pricing
       // collection and category; that grouping is local and stable, so the pull
       // leaves the text alone (the ids would otherwise point at names Shopify
@@ -1035,10 +1102,17 @@ export async function applyLiveCatalog(
         String(existing.collectionId ?? '').trim() !== '' || String(existing.categoryId ?? '').trim() !== ''
       const patch: CatalogPatch = {
         name: p.title || existing.name,
-        barcode: p.barcode ?? existing.barcode,
+        barcode:
+          preserveLocalBarcodes && String(existing.barcode ?? '').trim() !== ''
+            ? existing.barcode
+            : p.barcode ?? existing.barcode,
         category: linked ? existing.category : p.productType || existing.category,
         collection: linked ? existing.collection : p.collection || p.productType || existing.collection,
-        stock: Number.isFinite(p.inventoryQuantity) ? p.inventoryQuantity : existing.stock,
+        stock: preserveLocalPriceStock
+          ? existing.stock
+          : Number.isFinite(p.inventoryQuantity)
+            ? p.inventoryQuantity
+            : existing.stock,
         shopifyId: String(p.id),
         shopifyStatus: 'synced',
         status: 'active',
@@ -1047,7 +1121,7 @@ export async function applyLiveCatalog(
         // Shopify body_html is authoritative for descriptions coming from
         // the storefront; keep local text when Shopify has none.
         description: p.description ? p.description : existing.description,
-        compareAtPrice: effectiveCompareAt ?? existing.compareAtPrice,
+        compareAtPrice: preserveLocalPriceStock ? existing.compareAtPrice : effectiveCompareAt ?? existing.compareAtPrice,
         image: p.image ?? existing.image,
         // Mirror Shopify's gallery; keep any local-only uploads that aren't
         // yet on Shopify (they'll be pushed on the next product push).
@@ -1150,16 +1224,127 @@ export function claimUniqueBarcode(preferred: string | null | undefined, taken: 
   return base
 }
 
-export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
+export async function mergeProductVariantsFromShopify(
+  database: NonNullable<typeof db>,
+  productId: string,
+  options: SyncProduct['options'],
+  liveVariants: NonNullable<SyncProduct['variants']>,
+  preserve: { price: boolean; stock: boolean; barcode: boolean },
+  takenVariantSkus: Set<string>,
+  takenVariantBarcodes: Set<string>,
+): Promise<void> {
+  const existingRows = await database
+    .select()
+    .from(schema.productVariants)
+    .where(eq(schema.productVariants.productId, productId))
+  const byShopifyId = new Map<string, (typeof existingRows)[0]>()
+  const bySkuLocal = new Map<string, (typeof existingRows)[0]>()
+  for (const row of existingRows) {
+    const sid = String(row.shopifyVariantId ?? '').trim()
+    if (sid) byShopifyId.set(sid, row)
+    const skuKey = String(row.sku ?? '').trim().toLowerCase()
+    if (skuKey) bySkuLocal.set(skuKey, row)
+  }
+  await database.transaction(async (tx) => {
+    for (const v of liveVariants) {
+      const shopifyVariantId = String(v.id)
+      const preferredSku = String(v.sku ?? '').trim() || `SHOP-V${v.id}`
+      const prior =
+        byShopifyId.get(shopifyVariantId) ?? bySkuLocal.get(preferredSku.toLowerCase())
+      const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
+      const optionValues = [v.option1, v.option2, v.option3].filter((x): x is string => Boolean(x) && String(x).trim() !== '')
+      if (prior) {
+        const sku = prior.sku
+        const barcode =
+          preserve.barcode && String(prior.barcode ?? '').trim() !== ''
+            ? prior.barcode
+            : claimUniqueBarcode(v.barcode, takenVariantBarcodes) ?? prior.barcode
+        const sellingPrice =
+          preserve.price && prior.sellingPrice != null ? prior.sellingPrice : Number(v.price) || prior.sellingPrice
+        const stock =
+          preserve.stock && prior.stock != null
+            ? prior.stock
+            : Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0))
+        await tx
+          .update(schema.productVariants)
+          .set({
+            title,
+            optionValues,
+            sku,
+            barcode,
+            sellingPrice,
+            compareAtPrice:
+              preserve.price && prior.compareAtPrice != null
+                ? prior.compareAtPrice
+                : v.compareAtPrice != null && Number(v.compareAtPrice) > 0
+                  ? Number(v.compareAtPrice)
+                  : prior.compareAtPrice,
+            stock,
+            shopifyVariantId,
+            status: 'active',
+          })
+          .where(eq(schema.productVariants.id, prior.id))
+      } else {
+        const sku = claimUniqueVariantSku(preferredSku, takenVariantSkus)
+        const barcode = claimUniqueBarcode(v.barcode, takenVariantBarcodes)
+        await tx.insert(schema.productVariants).values({
+          id: randomUUID(),
+          productId,
+          title,
+          optionValues,
+          sku,
+          barcode,
+          shopifyVariantId,
+          sellingPrice: Number(v.price) || null,
+          compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
+          costPrice: null,
+          grossWeight: null,
+          stock: Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0)),
+          reorderLevel: null,
+          status: 'active',
+          createdAt: new Date().toISOString(),
+        })
+      }
+    }
+    await tx.update(schema.products).set({ options: options?.length ? options : null }).where(eq(schema.products.id, productId))
+  })
+}
+
+export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): Promise<ProductsDbSyncResult> {
+  const started = Date.now()
+  const empty = (): ProductsDbSyncResult => ({
+    ok: false,
+    synced: 0,
+    created: 0,
+    updated: 0,
+    removed: 0,
+    skipped: 0,
+    failed: 0,
+    durationMs: Date.now() - started,
+    errors: [],
+  })
   if (!isConfigured()) {
-    return { ok: false, synced: 0, created: 0, updated: 0, removed: 0, errors: ['Shopify is not configured. See server/.env'], message: 'Shopify is not configured' }
+    return { ...empty(), errors: ['Shopify is not configured. See server/.env'], message: 'Shopify is not configured' }
   }
   if (!db) {
-    return { ok: false, synced: 0, created: 0, updated: 0, removed: 0, errors: ['Database is not configured'], message: 'Database is not configured' }
+    return { ...empty(), errors: ['Database is not configured'], message: 'Database is not configured' }
   }
+  const mode = options.mode ?? 'full'
+  const allowRemovals = options.allowRemovals ?? mode === 'full'
+  const preserveLocalPriceStock = options.preserveLocalPriceStock ?? mode === 'auto'
+  const preserveErpPrices = options.preserveErpPrices ?? preserveLocalPriceStock
+  const preserveLocalBarcodes = options.preserveLocalBarcodes ?? mode !== 'full'
+  const mergeVariants = options.mergeVariants !== false
+  const fullCatalog = !options.updatedAtMin?.trim() && !options.liveProducts?.length
   const database = db
   if (!(await acquireSyncLock('products'))) {
-    return { ok: false, synced: 0, created: 0, updated: 0, removed: 0, errors: [], message: 'A sync is already in progress' }
+    return {
+      ...empty(),
+      ok: true,
+      skipped: 1,
+      skippedRun: true,
+      message: 'A sync is already in progress',
+    }
   }
 
   // Hoisted out of the try block so a failure still reports how far the pull
@@ -1168,9 +1353,30 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
   let updated = 0
   let removed = 0
   try {
-    await syncProducts()
+    if (options.liveProducts?.length) {
+      store.products = options.liveProducts
+    } else {
+      await syncProducts(options.updatedAtMin)
+    }
 
     const live = store.products
+    const guard = options.catalogGuard?.(live.length, fullCatalog)
+    if (guard && !guard.ok) {
+      return {
+        ok: true,
+        synced: 0,
+        created: 0,
+        updated: 0,
+        removed: 0,
+        skipped: live.length,
+        failed: 0,
+        durationMs: Date.now() - started,
+        errors: [],
+        skippedRun: true,
+        message: guard.reason,
+        warnings: guard.reason ? [guard.reason] : undefined,
+      }
+    }
     const liveSkus = new Set(live.map((p) => (String(p.sku ?? '').trim() || `SHOP-${p.id}`).toLowerCase()).filter(Boolean))
     // Variant products carry a variant's SKU on Shopify, so a local parent's
     // SKU is no longer in liveSkus — also index by Shopify id or the
@@ -1216,7 +1422,13 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
       update: async (existing, patch) => {
         const sku = String(existing.sku ?? '').trim()
         const delta = Number(patch.stock) - Number(existing.stock ?? 0)
-        if (sku && patch.stock != null && Number.isFinite(delta) && delta !== 0) {
+        if (
+          !preserveLocalPriceStock &&
+          sku &&
+          patch.stock != null &&
+          Number.isFinite(delta) &&
+          delta !== 0
+        ) {
           // Stock never lands as a raw column write on a pull: record the
           // change as a `shopify_sync` ledger movement so stock_levels
           // (availability), stock_movements (audit) and the products.stock
@@ -1313,9 +1525,40 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
           throw err
         }
       },
-    })
+      saveVariantsMerge: mergeVariants
+        ? async (productId, options, variants, preserve) => {
+            await mergeProductVariantsFromShopify(
+              database,
+              productId,
+              options,
+              variants ?? [],
+              preserve,
+              takenVariantSkus,
+              takenVariantBarcodes,
+            )
+          }
+        : undefined,
+    }, { preserveLocalPriceStock, preserveErpPrices, preserveLocalBarcodes })
     created = applied.created
     updated = applied.updated
+
+    if (!allowRemovals) {
+      store.lastSync.products = new Date().toISOString()
+      store.lastError = undefined
+      addLog('products', 'success', live.length, `Synced ${live.length} live products into the local catalog`)
+      await persistLog({ entity: 'Product', direction: 'in', action: 'Import', status: 'success' })
+      return {
+        ok: true,
+        synced: live.length,
+        created,
+        updated,
+        removed: 0,
+        skipped: 0,
+        failed: 0,
+        durationMs: Date.now() - started,
+        errors: [],
+      }
+    }
 
     for (const r of rows) {
       const key = String(r.sku ?? '').trim().toLowerCase()
@@ -1336,7 +1579,17 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
     store.lastError = undefined
     addLog('products', 'success', live.length, `Synced ${live.length} live products into the local catalog`)
     await persistLog({ entity: 'Product', direction: 'in', action: 'Import', status: 'success' })
-    return { ok: true, synced: live.length, created, updated, removed, errors: [] }
+    return {
+      ok: true,
+      synced: live.length,
+      created,
+      updated,
+      removed,
+      skipped: 0,
+      failed: 0,
+      durationMs: Date.now() - started,
+      errors: [],
+    }
   } catch (err) {
     let message = err instanceof Error ? err.message : 'Unknown error'
     // Drizzle wraps the postgres error as `cause`; surface it so the sync log
@@ -1346,7 +1599,18 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
     if (cause && !message.includes(cause)) message = `${message} — ${cause}`
     store.lastError = message
     await persistLog({ entity: 'Product', direction: 'in', action: 'Import', status: 'failed', error: message, retry: true })
-    return { ok: false, synced: 0, created, updated, removed, errors: [message], message }
+    return {
+      ok: false,
+      synced: 0,
+      created,
+      updated,
+      removed,
+      skipped: 0,
+      failed: 1,
+      durationMs: Date.now() - started,
+      errors: [message],
+      message,
+    }
   } finally {
     releaseSyncLock()
   }

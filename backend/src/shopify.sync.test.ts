@@ -628,7 +628,7 @@ test(
       assert.equal(finalBySku.get('MOCK-SYNC-001-M')?.sellingPrice, 1200)
       assert.equal(finalBySku.get('MOCK-SYNC-001-S')?.stock, 2)
       assert.equal(finalBySku.get('MOCK-SYNC-001-S')?.sellingPrice, 950)
-      assert.notEqual(finalBySku.get('MOCK-SYNC-001-M')?.id, pulledM.id, 'second pull replaced the variant rows again')
+      assert.equal(finalBySku.get('MOCK-SYNC-001-M')?.id, pulledM.id, 'merge pull keeps variant row ids when Shopify variant ids match')
 
       assert.deepEqual(mock.unmatched, [], 'every Admin API endpoint the sync touches is modelled by the mock')
     } finally {

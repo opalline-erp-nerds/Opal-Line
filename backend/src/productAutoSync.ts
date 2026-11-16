@@ -1,77 +1,287 @@
 import { db } from './db/client'
 import * as schema from './db/schema'
 import { eq } from 'drizzle-orm'
-import { syncProductsToDb } from './shopify'
+import { getConfiguredShopDomain, isProductSyncInProgress, syncProductsToDb } from './shopify'
 import { logger } from './logger'
 import { escapeHtml } from './htmlEscape'
+import {
+  DEFAULT_INTERVAL_SECONDS,
+  formatAutoSyncInterval,
+  readStoredIntervalSeconds,
+  clampIntervalSeconds,
+} from './productAutoSync.interval'
+import {
+  evaluateCatalogGuards,
+  evaluateShopGuard,
+  shouldPauseAutoSync,
+  INTERVAL_WARN_BELOW_SECONDS,
+  INTERVAL_SUGGEST_SECONDS,
+  INTERVAL_ROUTINE_MAX_SECONDS,
+} from './productAutoSync.guards'
+import {
+  getProductAutoSyncMeta,
+  patchProductAutoSyncMeta,
+  recordSuccessfulProductAutoSync,
+} from './productAutoSync.metadata'
+
+export { resolveAutoSyncIntervalSeconds, formatAutoSyncInterval } from './productAutoSync.interval'
+
+export type ProductAutoSyncRunResult = {
+  ok: boolean
+  synced?: number
+  created?: number
+  updated?: number
+  removed?: number
+  skipped?: number
+  failed?: number
+  durationMs?: number
+  message?: string
+  warnings?: string[]
+  skippedRun?: boolean
+  paused?: boolean
+}
+
+type RunRecord = {
+  at: string
+  ok: boolean
+  created?: number
+  updated?: number
+  skipped?: number
+  failed?: number
+  durationMs?: number
+  message?: string
+}
 
 /**
  * Product auto-sync scheduler — periodically pulls the live Shopify catalog
- * into the local DB so prices/stock/products never drift for long.
- * Interval hours live in settings.autoSyncIntervalHours (0 = disabled,
- * default 6). One run = syncProductsToDb() (creates + updates, never deletes).
+ * into the local DB. Interval is stored as autoSyncIntervalSeconds in
+ * settings.notificationSettings (0 = disabled). Legacy autoSyncIntervalHours
+ * is still read. Default 6 hours.
  */
 
-const DEFAULT_INTERVAL_HOURS = 6
 let timer: NodeJS.Timeout | null = null
 let lastRunAt: string | null = null
 let nextRunAt: string | null = null
-let lastResult: { ok: boolean; synced?: number; created?: number; updated?: number; message?: string } | null = null
+let lastResult: ProductAutoSyncRunResult | null = null
 let consecutiveFailures = 0
-let runHistory: Array<{ at: string; ok: boolean; created?: number; updated?: number; message?: string }> = []
+let runHistory: RunRecord[] = []
+let paused = false
+let pauseWarning: string | null = null
 
-export async function getAutoSyncIntervalHours(): Promise<number> {
-  if (!db) return DEFAULT_INTERVAL_HOURS
+export async function getAutoSyncIntervalSeconds(): Promise<number> {
+  if (!db) return DEFAULT_INTERVAL_SECONDS
   try {
-    // Stored inside the settings jsonb bucket (no dedicated column needed).
     const [row] = await db.select({ notificationSettings: schema.settings.notificationSettings }).from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
-    const raw = (row?.notificationSettings as Record<string, unknown> | null)?.autoSyncIntervalHours
-    const n = Number(raw)
-    return Number.isFinite(n) && n >= 0 ? n : DEFAULT_INTERVAL_HOURS
+    return readStoredIntervalSeconds((row?.notificationSettings ?? null) as Record<string, unknown> | null)
   } catch {
-    return DEFAULT_INTERVAL_HOURS
+    return DEFAULT_INTERVAL_SECONDS
+  }
+}
+
+/** Rounded whole hours for older clients. Sub-hour intervals show as 0. */
+export async function getAutoSyncIntervalHours(): Promise<number> {
+  const seconds = await getAutoSyncIntervalSeconds()
+  if (seconds <= 0) return 0
+  return Math.floor(seconds / 3600)
+}
+
+export async function setAutoSyncIntervalSeconds(seconds: number): Promise<void> {
+  if (!db) return
+  const n = clampIntervalSeconds(seconds)
+  const [row] = await db.select({ notificationSettings: schema.settings.notificationSettings }).from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
+  const current = (row?.notificationSettings ?? {}) as Record<string, unknown>
+  const hours = n === 0 ? 0 : Math.round((n / 3600) * 1000) / 1000
+  await db
+    .update(schema.settings)
+    .set({
+      notificationSettings: {
+        ...current,
+        autoSyncIntervalSeconds: n,
+        autoSyncIntervalHours: hours,
+      },
+    })
+    .where(eq(schema.settings.id, 'app'))
+  if (n > 0) {
+    consecutiveFailures = 0
+    paused = false
+    pauseWarning = null
+    await patchProductAutoSyncMeta({ paused: false })
   }
 }
 
 export async function setAutoSyncIntervalHours(hours: number): Promise<void> {
-  if (!db) return
-  const n = Number.isFinite(hours) && hours >= 0 ? Math.floor(hours) : DEFAULT_INTERVAL_HOURS
-  const [row] = await db.select({ notificationSettings: schema.settings.notificationSettings }).from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
-  const current = (row?.notificationSettings ?? {}) as Record<string, unknown>
-  await db
-    .update(schema.settings)
-    .set({ notificationSettings: { ...current, autoSyncIntervalHours: n } })
-    .where(eq(schema.settings.id, 'app'))
+  const h = Number.isFinite(hours) && hours >= 0 ? Math.floor(hours) : 0
+  await setAutoSyncIntervalSeconds(h === 0 ? 0 : h * 3600)
 }
 
-export async function runProductAutoSync(): Promise<{ ok: boolean; synced?: number; created?: number; updated?: number; message?: string }> {
-  const record = (ok: boolean, message?: string, created?: number, updated?: number) => {
-    runHistory = [{ at: new Date().toISOString(), ok, message, created, updated }, ...runHistory].slice(0, 50)
+function toRunResult(result: Awaited<ReturnType<typeof syncProductsToDb>>): ProductAutoSyncRunResult {
+  return {
+    ok: result.ok,
+    synced: result.synced,
+    created: result.created,
+    updated: result.updated,
+    removed: result.removed,
+    skipped: result.skipped,
+    failed: result.failed,
+    durationMs: result.durationMs,
+    message: result.message ?? result.errors?.[0],
+    warnings: result.warnings,
+    skippedRun: result.skippedRun,
   }
-  try {
-    const result = await syncProductsToDb()
-    lastRunAt = new Date().toISOString()
-    lastResult = { ok: result.ok, synced: result.synced, created: result.created, updated: result.updated, message: result.ok ? undefined : result.errors?.[0] }
-    if (result.ok) {
-      consecutiveFailures = 0
-      logger.info({ synced: result.synced, created: result.created, updated: result.updated }, 'Product auto-sync completed')
-      record(true, undefined, result.created, result.updated)
-    } else {
-      consecutiveFailures++
-      logger.warn({ err: result.errors?.[0] }, 'Product auto-sync failed')
-      record(false, result.errors?.[0])
-      await maybeAlertSyncFailures()
+}
+
+async function runInternal(
+  manual: boolean,
+  allowRemovals: boolean,
+  overwriteStockFromShopify = false,
+): Promise<ProductAutoSyncRunResult> {
+  if (isProductSyncInProgress()) {
+    return { ok: true, skippedRun: true, skipped: 1, message: 'Product sync already in progress' }
+  }
+  if (!manual && paused) {
+    return {
+      ok: false,
+      paused: true,
+      message: pauseWarning ?? 'Auto-sync is paused after repeated failures. Run a manual sync or change the interval to resume.',
     }
+  }
+
+  const meta = await getProductAutoSyncMeta()
+  if (!manual && meta.paused) {
+    paused = true
+    pauseWarning =
+      pauseWarning ??
+      'Auto-sync is paused after repeated failures. Run a manual sync or change the interval to resume.'
+    return { ok: false, paused: true, message: pauseWarning }
+  }
+
+  const configuredShop = getConfiguredShopDomain()
+  const incremental = !manual && Boolean(meta.lastSuccessAt)
+  const fullCatalog = manual || !incremental
+  const updatedAtMin = incremental ? meta.lastSuccessAt : null
+
+  const preShop = evaluateShopGuard(configuredShop, meta.shopDomain)
+  if (!preShop.ok && preShop.skipFailures) {
+    const msg = preShop.reason
+    lastRunAt = new Date().toISOString()
+    lastResult = { ok: true, skippedRun: true, skipped: 1, message: msg, warnings: [msg] }
+    recordRun(lastResult)
     return lastResult
+  }
+
+  const result = await syncProductsToDb({
+    mode: manual ? 'full' : 'auto',
+    allowRemovals: manual && allowRemovals,
+    preserveLocalPriceStock: manual ? !overwriteStockFromShopify : true,
+    preserveErpPrices: true,
+    preserveLocalBarcodes: true,
+    mergeVariants: true,
+    updatedAtMin,
+    catalogGuard: (liveCount, isFull) => {
+      const verdict = evaluateCatalogGuards({
+        configuredShop,
+        storedShop: meta.shopDomain,
+        fullCatalog: isFull,
+        liveCount,
+        lastFullCount: meta.lastFullCount,
+      })
+      return verdict.ok ? null : { ok: false as const, reason: verdict.reason }
+    },
+  })
+
+  const out = toRunResult(result)
+  lastRunAt = new Date().toISOString()
+  lastResult = out
+
+  if (result.skippedRun) {
+    recordRun(out)
+    return out
+  }
+
+  if (result.ok) {
+    consecutiveFailures = 0
+    paused = false
+    pauseWarning = null
+    await recordSuccessfulProductAutoSync(result.synced, fullCatalog)
+    logger.info(
+      { synced: result.synced, created: result.created, updated: result.updated, durationMs: result.durationMs, manual },
+      'Product auto-sync completed',
+    )
+    recordRun(out)
+    return out
+  }
+
+  consecutiveFailures++
+  logger.warn({ err: result.errors?.[0], consecutiveFailures }, 'Product auto-sync failed')
+  recordRun(out)
+  await maybeAlertSyncFailures()
+  if (shouldPauseAutoSync(consecutiveFailures)) {
+    paused = true
+    pauseWarning = `Auto-sync paused after ${consecutiveFailures} failed runs in a row. Fix Shopify connectivity and run Sync Now, or change the interval to resume.`
+    await patchProductAutoSyncMeta({ paused: true })
+    out.paused = true
+    out.warnings = [...(out.warnings ?? []), pauseWarning]
+    out.message = pauseWarning
+  }
+  return out
+}
+
+function recordRun(out: ProductAutoSyncRunResult): void {
+  runHistory = [
+    {
+      at: new Date().toISOString(),
+      ok: out.ok && !out.skippedRun,
+      created: out.created,
+      updated: out.updated,
+      skipped: out.skipped,
+      failed: out.failed,
+      durationMs: out.durationMs,
+      message: out.message,
+    },
+    ...runHistory,
+  ].slice(0, 50)
+}
+
+/** Scheduled tick — incremental when possible, never removes local rows. */
+export async function runScheduledProductAutoSync(): Promise<ProductAutoSyncRunResult> {
+  try {
+    return await runInternal(false, false)
   } catch (err) {
     lastRunAt = new Date().toISOString()
-    lastResult = { ok: false, message: err instanceof Error ? err.message : 'Unknown error' }
+    lastResult = { ok: false, message: err instanceof Error ? err.message : 'Unknown error', failed: 1 }
     consecutiveFailures++
-    logger.warn({ err }, 'Product auto-sync failed')
-    record(false, lastResult.message)
+    recordRun(lastResult)
     await maybeAlertSyncFailures()
     return lastResult
   }
+}
+
+/** Manual Sync Now — full catalog; removals only when allowRemovals is true. */
+export async function runManualProductAutoSync(
+  allowRemovals = false,
+  overwriteStockFromShopify = false,
+): Promise<ProductAutoSyncRunResult> {
+  try {
+    const out = await runInternal(true, allowRemovals, overwriteStockFromShopify)
+    if (out.ok && !out.skippedRun) {
+      consecutiveFailures = 0
+      paused = false
+      pauseWarning = null
+      await patchProductAutoSyncMeta({ paused: false })
+      if (!timer) schedule()
+    }
+    return out
+  } catch (err) {
+    lastRunAt = new Date().toISOString()
+    lastResult = { ok: false, message: err instanceof Error ? err.message : 'Unknown error', failed: 1 }
+    recordRun(lastResult)
+    return lastResult
+  }
+}
+
+/** @deprecated Use runScheduledProductAutoSync or runManualProductAutoSync */
+export async function runProductAutoSync(): Promise<ProductAutoSyncRunResult> {
+  return runScheduledProductAutoSync()
 }
 
 /** Email after 2 consecutive failures; re-alert every further failure. */
@@ -92,29 +302,43 @@ async function maybeAlertSyncFailures(): Promise<void> {
   }
 }
 
-export function getAutoSyncHistory(): Array<{ at: string; ok: boolean; created?: number; updated?: number; message?: string }> {
+export function getAutoSyncHistory(): RunRecord[] {
   return runHistory
 }
 
 function schedule(): void {
   timer = null
   void (async () => {
-    const hours = await getAutoSyncIntervalHours()
-    if (hours <= 0) {
+    const seconds = await getAutoSyncIntervalSeconds()
+    if (seconds <= 0) {
       logger.debug('Product auto-sync disabled (interval = 0)')
       nextRunAt = null
       return
     }
-    await runProductAutoSync()
-    nextRunAt = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString()
-    timer = setTimeout(schedule, hours * 60 * 60 * 1000)
+    if (paused) {
+      logger.warn('Product auto-sync is paused — scheduler idle until interval is changed or manual sync succeeds')
+      nextRunAt = null
+      return
+    }
+    await runScheduledProductAutoSync()
+    const delayMs = seconds * 1000
+    nextRunAt = new Date(Date.now() + delayMs).toISOString()
+    timer = setTimeout(schedule, delayMs)
     timer.unref()
   })()
 }
 
 export function startProductAutoSync(): void {
   if (timer) return
-  schedule()
+  void getProductAutoSyncMeta().then((m) => {
+    paused = m.paused
+    if (m.paused) {
+      pauseWarning =
+        pauseWarning ??
+        'Auto-sync is paused after repeated failures. Run a manual sync or change the interval to resume.'
+    }
+    schedule()
+  })
 }
 
 export function stopProductAutoSync(): void {
@@ -122,13 +346,35 @@ export function stopProductAutoSync(): void {
   timer = null
 }
 
-export async function getAutoSyncStatus(): Promise<{ intervalHours: number; enabled: boolean; nextRunAt: string | null; lastRunAt: string | null; lastResult: typeof lastResult }> {
-  const hours = await getAutoSyncIntervalHours()
+export async function getAutoSyncStatus(): Promise<{
+  intervalSeconds: number
+  intervalHours: number
+  intervalLabel: string
+  enabled: boolean
+  nextRunAt: string | null
+  lastRunAt: string | null
+  lastResult: ProductAutoSyncRunResult | null
+  paused: boolean
+  pauseWarning: string | null
+  consecutiveFailures: number
+  intervalWarning: string | null
+}> {
+  const seconds = await getAutoSyncIntervalSeconds()
+  const intervalWarning =
+    seconds > 0 && seconds < INTERVAL_WARN_BELOW_SECONDS
+      ? `Intervals under 5 minutes increase Shopify API usage. Consider ${formatAutoSyncInterval(INTERVAL_SUGGEST_SECONDS)}–${formatAutoSyncInterval(INTERVAL_ROUTINE_MAX_SECONDS)}; webhooks catch edits between runs.`
+      : null
   return {
-    intervalHours: hours,
-    enabled: hours > 0,
-    nextRunAt,
+    intervalSeconds: seconds,
+    intervalHours: seconds <= 0 ? 0 : Math.floor(seconds / 3600),
+    intervalLabel: formatAutoSyncInterval(seconds),
+    enabled: seconds > 0,
+    nextRunAt: paused ? null : nextRunAt,
     lastRunAt,
     lastResult,
+    paused,
+    pauseWarning,
+    consecutiveFailures,
+    intervalWarning,
   }
 }
