@@ -38,6 +38,17 @@ const MAX_RETRY_MS = 60 * 60 * 1000
 const TICK_MS = 15_000
 /** Jobs handled per tick, so one huge backlog cannot monopolise the process. */
 const BATCH = 10
+/**
+ * A `running` row that has made no progress for this long belongs to a dead
+ * worker, not a live one.
+ *
+ * A claim writes `updated_at` once and never touches it again, so this is the
+ * age of the attempt, not of the row. It has to exceed the worst legitimate
+ * run: one product through one push function, where every Shopify request can
+ * retry 3× with exponential backoff (SHOPIFY_MAX_RETRIES=3, base 1s) on top of
+ * a cold catalog warm-up — that is minutes under a full outage, never 15.
+ */
+export const STALE_RUNNING_MS = 15 * 60_000
 
 /** A product is genuinely listed only with a numeric Shopify id (never a `#MO-` placeholder). */
 export function isListedOnShopify(shopifyId: string | null | undefined): boolean {
@@ -180,6 +191,75 @@ export interface OutboundTickResult {
   deferred: number
 }
 
+/**
+ * Put jobs left in `running` back on the queue.
+ *
+ * A job is claimed by flipping `pending` → `running`, and only a settle
+ * (done / pending / failed) ever flips it back. If the process dies between
+ * those two — a deploy, a SIGKILL, an OOM — nothing else in the system moves
+ * the row, so it would sit in `running` for ever: never retried, and (because
+ * `pendingShopifyProductIds` counts `running`) it would also freeze the
+ * inbound pull for that product for ever, which is the opposite of what the
+ * queue is for.
+ *
+ * Two callers:
+ *
+ *   - **worker start**, with `staleAfterMs: 0` — the previous process is gone
+ *     and the configured deployment runs one instance, so every claim visible
+ *     at boot is orphaned and should resume immediately rather than after the
+ *     staleness window. The first tick is a full interval away, so this cannot
+ *     race a claim of our own. A second instance booting while the first is
+ *     mid-push would re-run that job; the push functions only ever write
+ *     absolute values (product fields, price, `inventory_levels/set`) and
+ *     never create, so the worst case is one redundant idempotent call.
+ *   - **every tick**, with the default window — the crash that leaves a claim
+ *     behind usually happens *while* the server is already up, so the boot
+ *     pass alone would not catch it.
+ *
+ * `attempts` is deliberately left alone: the interrupted attempt was already
+ * counted at claim time, so a job that keeps getting killed still reaches
+ * MAX_OUTBOUND_ATTEMPTS and becomes visibly `failed` instead of looping.
+ * `last_error` keeps the root cause of the previous attempt (the recovery
+ * note only lands when there was no error yet) — Sync Logs already carries
+ * every failure, and overwriting the error with "recovered" would hide what
+ * the operator actually needs to read.
+ */
+export async function recoverInterruptedOutboundJobs(options: { staleAfterMs?: number } = {}): Promise<number> {
+  if (!db) return 0
+  const staleAfterMs = Math.max(0, options.staleAfterMs ?? STALE_RUNNING_MS)
+  try {
+    // `updated_at` holds an ISO (UTC) wall clock written from nowIso(), so it
+    // is compared against the UTC wall clock in SQL — reading it back would
+    // give a timezone-less string that JS parses as local time (the same trap
+    // as next_attempt_at below).
+    const recovered = await db
+      .update(schema.shopifySyncJobs)
+      .set({
+        status: 'pending',
+        nextAttemptAt: nowIso(),
+        lastError: sql`coalesce(${schema.shopifySyncJobs.lastError}, 'Recovered an interrupted run (server restart or stalled worker)')`,
+        updatedAt: nowIso(),
+      })
+      .where(
+        and(
+          eq(schema.shopifySyncJobs.status, 'running'),
+          or(
+            isNull(schema.shopifySyncJobs.updatedAt),
+            lte(schema.shopifySyncJobs.updatedAt, sql`(now() at time zone 'utc') - make_interval(secs => ${staleAfterMs / 1000})`),
+          ),
+        ),
+      )
+      .returning({ id: schema.shopifySyncJobs.id })
+    if (recovered.length > 0) {
+      logger.info({ count: recovered.length, staleAfterMs }, 'Shopify outbound: recovered interrupted jobs')
+    }
+    return recovered.length
+  } catch {
+    // Table not created yet (mid-upgrade) — try again next tick.
+    return 0
+  }
+}
+
 interface JobRow {
   id: string
   kind: string
@@ -286,7 +366,14 @@ async function recordJobLog(job: JobRow, outcome: JobOutcome & { sku?: string | 
  */
 export async function runOutboundShopifyJobs(limit = BATCH): Promise<OutboundTickResult> {
   const result: OutboundTickResult = { processed: 0, failed: 0, deferred: 0 }
-  if (!db || !isConfigured()) return result
+  if (!db) return result
+  // Safety net for a claim that outlived its worker: the boot pass only runs
+  // once, so an interruption that happens while this process is already up is
+  // picked up here once the row stops making progress. Runs before the
+  // isConfigured() check on purpose — a token that was removed must not leave
+  // a claim frozen for ever.
+  await recoverInterruptedOutboundJobs()
+  if (!isConfigured()) return result
 
   let due: Array<{ id: string }>
   try {
@@ -402,6 +489,13 @@ let ticking = false
 
 export function startShopifyOutboundWorker(): void {
   if (timer) return
+  // Boot pass: whatever the previous process was holding when it died resumes
+  // immediately instead of waiting out the staleness window. Nothing has
+  // claimed a job yet in this process, so the age-0 window cannot take work
+  // that is still in flight here.
+  void recoverInterruptedOutboundJobs({ staleAfterMs: 0 }).catch((err) =>
+    logger.warn({ err }, 'Shopify outbound: startup recovery failed'),
+  )
   timer = setInterval(() => {
     // Skip overlapping ticks; one slow Shopify call must not pile up work.
     if (ticking) return

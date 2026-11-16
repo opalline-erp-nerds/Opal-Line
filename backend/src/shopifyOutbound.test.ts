@@ -369,6 +369,60 @@ test(
       // Once pushed, the store catches up and a later pull agrees.
       await outbound.runOutboundShopifyJobs()
       assert.equal(mock.product.title, 'Edited In ERP', 'the queued edit then reached Shopify')
+
+      // ── 7. A claim interrupted by a restart becomes processable again ───
+      // A job is only ever moved out of `running` by its own settle. Killed
+      // between claim and settle (deploy, SIGKILL, OOM), the row would sit in
+      // `running` for ever: never retried, and the inbound pull would keep
+      // treating that product as "push pending" for ever too. This is the
+      // regression for that freeze.
+      await db.update(s.products).set({ name: 'Interrupted Edit' }).where(eq(s.products.id, productId))
+      await outbound.queueProductOutbound({ id: productId, shopifyId: String(mock.product.id) }, { content: true })
+      await db
+        .update(s.shopifySyncJobs)
+        .set({ status: 'running', attempts: 1, updatedAt: new Date().toISOString() })
+        .where(eq(s.shopifySyncJobs.kind, 'product'))
+
+      // (a) a claim this fresh may still belong to a live worker: a tick must
+      // not steal it, or two workers would push the same product at once.
+      const inFlight = await outbound.runOutboundShopifyJobs()
+      assert.equal(inFlight.processed, 0, 'a fresh claim is left to the worker that holds it')
+      assert.equal(mock.product.title, 'Edited In ERP', 'nothing was pushed for the in-flight claim')
+      const [held] = await db.select().from(s.shopifySyncJobs).where(eq(s.shopifySyncJobs.kind, 'product'))
+      assert.equal(held.status, 'running', 'the in-flight row is untouched')
+
+      // (b) a restart re-arms it immediately instead of waiting out the window.
+      const bootRecovered = await outbound.recoverInterruptedOutboundJobs({ staleAfterMs: 0 })
+      assert.equal(bootRecovered, 1, 'the boot pass re-arms what the previous process was holding')
+      const [rearmed] = await db.select().from(s.shopifySyncJobs).where(eq(s.shopifySyncJobs.kind, 'product'))
+      assert.equal(rearmed.status, 'pending', 'the interrupted job is processable again')
+      assert.equal(rearmed.attempts, 1, 'the interrupted attempt still counts against the retry budget')
+
+      const resumed = await outbound.runOutboundShopifyJobs()
+      assert.equal(resumed.processed, 1, 'the recovered job ran')
+      assert.equal(mock.product.title, 'Interrupted Edit', 'the interrupted push reached Shopify')
+      const [afterResume] = await db.select().from(s.shopifySyncJobs).where(eq(s.shopifySyncJobs.kind, 'product'))
+      assert.equal(afterResume.status, 'done', 'the recovered job settles like any other')
+
+      // ── 8. A claim that dies while the server stays up is also recovered ─
+      // The boot pass only runs once, so an interruption after start-up is
+      // caught by the tick's staleness window instead.
+      await db.update(s.products).set({ name: 'Crashed Edit' }).where(eq(s.products.id, productId))
+      await outbound.queueProductOutbound({ id: productId, shopifyId: String(mock.product.id) }, { content: true })
+      await db
+        .update(s.shopifySyncJobs)
+        .set({
+          status: 'running',
+          attempts: 1,
+          updatedAt: new Date(Date.now() - outbound.STALE_RUNNING_MS - 60_000).toISOString(),
+        })
+        .where(eq(s.shopifySyncJobs.kind, 'product'))
+
+      const staleTick = await outbound.runOutboundShopifyJobs()
+      assert.equal(staleTick.processed, 1, 'a stalled claim is recovered by the tick itself')
+      assert.equal(mock.product.title, 'Crashed Edit', 'the recovered push reached Shopify')
+      const [afterStall] = await db.select().from(s.shopifySyncJobs).where(eq(s.shopifySyncJobs.kind, 'product'))
+      assert.equal(afterStall.status, 'done', 'the recovered job settles')
     } finally {
       globalThis.fetch = originalFetch
       try {
