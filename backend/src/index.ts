@@ -20,7 +20,7 @@ import { rbacRouter } from './routes/rbac'
 import { backupRouter } from './routes/backup'
 import { printTemplatesRouter } from './routes/printTemplates'
 import { computeUserPermissions, enforceRbac, requirePermission } from './rbac'
-import { requireAuth, shutdownSessions } from './sessions'
+import { csrfCookieOptions, requireAuth, shutdownSessions } from './sessions'
 import { systemRouter } from './routes/systemStatus'
 import { reportsRouter } from './routes/reports'
 import { actorFromRequest, recordActivity } from './activity'
@@ -149,12 +149,10 @@ function verifyCsrfToken(token: string): boolean {
 app.get('/api/v1/csrf-token', (req, res) => {
   const sessionId = req.cookies?.[CONSTANTS.SESSION_COOKIE_NAME] || 'anonymous'
   const token = generateCsrfToken(sessionId)
-  res.cookie(CSRF_COOKIE, token, {
-    httpOnly: false,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    path: '/',
-  })
+  // Same Secure/SameSite policy as the session cookie, and a Max-Age matching
+  // the token's 1-hour validity, so the double-submit cookie is actually
+  // stored and sent in hosted mode instead of being silently dropped.
+  res.cookie(CSRF_COOKIE, token, csrfCookieOptions(60 * 60 * 1000))
   res.json({ csrfToken: token })
 })
 

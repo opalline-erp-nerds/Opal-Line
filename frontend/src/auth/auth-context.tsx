@@ -7,6 +7,8 @@ export interface AuthContextValue {
   permissionsMeta: UserPermissions | null
   users: User[]
   loading: boolean
+  /** True when the last session probe failed for a transient reason. */
+  sessionUnavailable: boolean
   login: (username: string, password: string) => Promise<void>
   logout: () => void
   hasPermission: (moduleKey: string, action: keyof ModulePermission) => boolean
