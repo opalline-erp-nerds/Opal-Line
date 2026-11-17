@@ -972,10 +972,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
         }
       }
       let pushed = false
-      const linked = saved.shopifyId != null && String(saved.shopifyId).trim() !== '' && !String(saved.shopifyId).trim().startsWith('#')
-      const priceChanged =
-        Number(saved.sellingPrice ?? 0) !== Number(product?.sellingPrice ?? 0) ||
-        Number(saved.compareAtPrice ?? 0) !== Number(product?.compareAtPrice ?? 0)
       if (form.pushToShopify) {
         // New/placeholder listings are created; already-listed products get
         // their content + local images pushed as an update by the backend.
@@ -999,16 +995,12 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           )
         }
       }
-      // Price changes always travel through the dedicated price endpoint — the
-      // content/image push intentionally leaves variants untouched.
-      if (mode === 'edit' && linked && priceChanged) {
-        try {
-          const r = await shopifyApi.updateProductPrice(saved.id)
-          pushed = r.updated === 1 || pushed
-        } catch {
-          // Best-effort; the local price is saved and can be pushed from Shopify → Price tools.
-        }
-      }
+      // Price and content changes on a listed product are queued by the backend
+      // during the save itself (see POST/PATCH /db/products) and pushed by the
+      // durable outbound worker with retries. This used to be a fire-and-forget
+      // request whose failure was swallowed here — the store then kept the old
+      // price and nothing reported it. Leaving the sync to the backend means a
+      // failure can no longer disappear silently; it shows in Shopify → Sync Logs.
       onOpenChange(false)
       onSaved(saved, pushed)
     } catch (e) {

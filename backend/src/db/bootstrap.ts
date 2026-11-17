@@ -52,6 +52,29 @@ async function tableExists(sql: postgres.Sql, name: string): Promise<boolean> {
 }
 
 /**
+ * Durable outbound Shopify queue (ERP → Shopify), applied from both
+ * createSchema (fresh installs) and applyUpgrades (existing installs) — the
+ * same rule STOCK_LEDGER_DDL documents: never declare this DDL twice.
+ */
+const SHOPIFY_OUTBOUND_DDL: string[] = [
+  `CREATE TABLE IF NOT EXISTS shopify_sync_jobs (
+    id text PRIMARY KEY,
+    idempotency_key text NOT NULL,
+    kind text NOT NULL,
+    product_id text NOT NULL,
+    status text NOT NULL DEFAULT 'pending',
+    attempts integer NOT NULL DEFAULT 0,
+    next_attempt_at timestamp,
+    last_error text,
+    created_at timestamp,
+    updated_at timestamp
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS shopify_sync_jobs_key_idx ON shopify_sync_jobs (idempotency_key)`,
+  `CREATE INDEX IF NOT EXISTS shopify_sync_jobs_status_idx ON shopify_sync_jobs (status, next_attempt_at)`,
+  `CREATE INDEX IF NOT EXISTS shopify_sync_jobs_product_idx ON shopify_sync_jobs (product_id)`,
+]
+
+/**
  * Per-location stock balances and the append-only movement ledger.
  *
  * Declared once and applied from both createSchema (fresh installs) and
@@ -863,6 +886,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
     await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS stock_transfers_number_idx ON stock_transfers (number)`)
 
     for (const stmt of STOCK_LEDGER_DDL) await tx.unsafe(stmt)
+    for (const stmt of SHOPIFY_OUTBOUND_DDL) await tx.unsafe(stmt)
     for (const stmt of COLLECTIONS_DDL) await tx.unsafe(stmt)
 
     // ── Finance ───────────────────────────────────────────────────────────
@@ -1532,6 +1556,7 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
 async function applyUpgrades(sql: postgres.Sql): Promise<void> {
   const upgrades: string[] = [
     ...STOCK_LEDGER_DDL,
+    ...SHOPIFY_OUTBOUND_DDL,
     ...COLLECTIONS_DDL,
     // Login lockout became a per-install switch (Settings → Security → Login
     // lockout), off by default. Existing installs get the column as false,

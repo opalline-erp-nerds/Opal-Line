@@ -200,8 +200,22 @@ export async function destroyUserSessions(userId: string): Promise<void> {
   }
 }
 
-/** Desktop leaves both unset: Secure stays off (http://localhost drops a Secure
- * cookie) and SameSite stays Strict. Hosted mode opts in with COOKIE_SECURE=true. */
+/**
+ * Desktop leaves both unset: Secure stays off (http://localhost drops a Secure
+ * cookie) and SameSite stays Strict. Hosted mode opts in with COOKIE_SECURE=true.
+ *
+ * SameSite=None is only honoured by browsers together with Secure: a None +
+ * Secure=false cookie is dropped on arrival, which presents as "signed in, then
+ * signed out on the next request". Force Secure whenever None is selected so a
+ * cross-site deployment cannot configure itself into that.
+ */
+function resolveCookiePolicy(): { secure: boolean; sameSite: 'strict' | 'lax' | 'none' } {
+  const secureFlag = /^(1|true|yes)$/i.test((process.env.COOKIE_SECURE ?? '').trim())
+  const raw = (process.env.COOKIE_SAMESITE ?? '').trim().toLowerCase()
+  const sameSite = raw === 'lax' || raw === 'none' || raw === 'strict' ? raw : 'strict'
+  return { secure: secureFlag || sameSite === 'none', sameSite }
+}
+
 export function sessionCookieOptions(maxAge: number): {
   httpOnly: true
   secure: boolean
@@ -209,10 +223,23 @@ export function sessionCookieOptions(maxAge: number): {
   maxAge: number
   path: '/'
 } {
-  const secure = /^(1|true|yes)$/i.test((process.env.COOKIE_SECURE ?? '').trim())
-  const raw = (process.env.COOKIE_SAMESITE ?? '').trim().toLowerCase()
-  const sameSite = raw === 'lax' || raw === 'none' || raw === 'strict' ? raw : 'strict'
-  return { httpOnly: true, secure, sameSite, maxAge, path: '/' }
+  return { httpOnly: true, ...resolveCookiePolicy(), maxAge, path: '/' }
+}
+
+/**
+ * Attributes for the readable CSRF double-submit cookie. It carries the same
+ * Secure/SameSite policy as the session cookie: a Secure+Lax CSRF cookie next
+ * to a None session cookie is never stored or sent on the cross-site POST, so
+ * the double-submit defence silently degrades to nothing.
+ */
+export function csrfCookieOptions(maxAge: number): {
+  httpOnly: false
+  secure: boolean
+  sameSite: 'strict' | 'lax' | 'none'
+  maxAge: number
+  path: '/'
+} {
+  return { httpOnly: false, ...resolveCookiePolicy(), maxAge, path: '/' }
 }
 
 /**

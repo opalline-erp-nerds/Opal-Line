@@ -10,6 +10,7 @@ import type {
   SalesOrder,
   Supplier,
 } from '@/types'
+import { notifyUnauthorized, sessionEpoch } from '@/auth/sessionSignal'
 
 // `?.` keeps this module importable outside Vite (node --test, SSR) where
 // import.meta.env does not exist; Vite still statically injects the env object.
@@ -65,6 +66,9 @@ export class ApiError extends Error {
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const isFormData = init?.body instanceof FormData
   const isStateChanging = init?.method && !['GET', 'HEAD', 'OPTIONS'].includes(init.method)
+  // Remember which session generation this request belongs to: a 401 is only
+  // accepted if the session has not been re-established since it started.
+  const requestEpoch = sessionEpoch()
   
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   
@@ -93,9 +97,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
           | { error?: string; code?: string; message?: string; products?: ApiErrorDetail['products'] }
           | null
         if (retryRes.status === 401 && !path.startsWith('/auth/')) {
-          if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
-            window.location.href = '/login'
-          }
+          notifyUnauthorized(requestEpoch)
         }
         throw new ApiError(retryRes.status, body?.message ?? body?.error ?? `API error ${retryRes.status}`, {
           code: body?.code,
@@ -111,10 +113,11 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const body = (await res.json().catch(() => null)) as
       | { error?: string; code?: string; message?: string; products?: ApiErrorDetail['products'] }
       | null
+    // Hand the loss to the auth provider. It clears the session once and the
+    // router moves to /login, so a burst of failing requests does not reload
+    // the page (and a stale request cannot sign out a newer session).
     if (res.status === 401 && !path.startsWith('/auth/')) {
-      if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
-        window.location.href = '/login'
-      }
+      notifyUnauthorized(requestEpoch)
     }
     throw new ApiError(res.status, body?.message ?? body?.error ?? `API error ${res.status}`, {
       code: body?.code,
@@ -131,6 +134,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
  */
 export async function requestText(path: string, init?: RequestInit): Promise<string> {
   const isStateChanging = init?.method && !['GET', 'HEAD', 'OPTIONS'].includes(init.method)
+  const requestEpoch = sessionEpoch()
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (isStateChanging) {
     const token = await fetchCsrfToken()
@@ -143,6 +147,7 @@ export async function requestText(path: string, init?: RequestInit): Promise<str
   })
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
+    if (res.status === 401 && !path.startsWith('/auth/')) notifyUnauthorized(requestEpoch)
     throw new ApiError(res.status, body?.error ?? `API error ${res.status}`)
   }
   return res.text()

@@ -30,6 +30,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ProductDialog } from '@/components/product-dialog'
 import { productImageGallery } from '@/lib/product-image'
 import { dbApi, shopifyApi } from '@/lib/api'
+import { describeSyncResult } from '@/lib/syncResult'
 import type { Product, ProductVariant, SilverRate } from '@/types'
 import { formatCurrency, formatDate, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
@@ -108,9 +109,15 @@ export default function ProductDetailPage() {
     setSyncing(true)
     try {
       const res = await shopifyApi.sync(['products'])
+      // The queue push is asynchronous: the backend confirms the pull here and
+      // reports the outbound tally in db.push when it sent one. A refusal
+      // (lock held by the scheduled auto-sync) arrives as { ok: false,
+      // message } with no `results` — never read into it unguarded.
+      const outcome = describeSyncResult(res, 'products')
       const fresh = await dbApi.getProductById(product.id)
       if (fresh) setProduct(fresh)
-      setNotice(`Shopify sync complete — ${res.results.products?.count ?? 0} products up to date.`)
+      if (outcome.ok) setNotice(outcome.message)
+      else toast.error(outcome.message)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Sync failed')
     } finally {

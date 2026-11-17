@@ -926,6 +926,37 @@ export const syncLogs = pgTable('sync_logs', {
   shopifyIdIdx: index('sync_logs_shopify_id_idx').on(table.shopifyId),
 }))
 
+/**
+ * Durable outbound Shopify work queue (ERP → Shopify).
+ *
+ * Inbound sync (Shopify → ERP) is a pull; ERP-originated edits used to reach
+ * Shopify only when the user clicked a push button, and a failed push was
+ * forgotten. Every ERP write now records an intent here, and the worker in
+ * src/shopifyOutbound.ts drains it with retries. `idempotency_key` is
+ * `kind:productId`, so ten edits of one product coalesce into one job and a
+ * duplicate enqueue can never apply the same change twice.
+ */
+export const shopifySyncJobs = pgTable('shopify_sync_jobs', {
+  id: text('id').primaryKey(),
+  /** `kind:productId` — one open job per resource, enforced by the unique index. */
+  idempotencyKey: text('idempotency_key').notNull(),
+  /** product | price | inventory */
+  kind: text('kind').notNull(),
+  productId: text('product_id').notNull(),
+  /** pending | running | done | failed (failed = attempts exhausted, needs a human). */
+  status: text('status').notNull().default('pending'),
+  attempts: integer('attempts').notNull().default(0),
+  /** Earliest time the worker may pick this job up (retry backoff). */
+  nextAttemptAt: ts('next_attempt_at'),
+  lastError: text('last_error'),
+  createdAt: ts('created_at'),
+  updatedAt: ts('updated_at'),
+}, (table) => ({
+  keyIdx: uniqueIndex('shopify_sync_jobs_key_idx').on(table.idempotencyKey),
+  statusIdx: index('shopify_sync_jobs_status_idx').on(table.status, table.nextAttemptAt),
+  productIdx: index('shopify_sync_jobs_product_idx').on(table.productId),
+}))
+
 /** One step of a silver-rate apply run, stored with the rate row (step_log). */
 export interface SilverRateStepRecord {
   key: 'sync' | 'rate' | 'reprice' | 'match' | 'push'

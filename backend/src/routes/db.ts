@@ -42,6 +42,7 @@ import {
 import { invoiceTotals } from '../invoiceTotals'
 import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
 import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
+import { queueProductOutbound } from '../shopifyOutbound'
 import { escapeHtml } from '../htmlEscape'
 import { routeParam } from '../lib/routeParams'
 import {
@@ -4861,8 +4862,39 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
     const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, existing.id)).returning()
     if (!row) return res.status(404).json({ error: 'Not found' })
     if (body.sellingPrice !== undefined) await recordProductPrice(row.id, row.sellingPrice)
+    // ERP edit → Shopify. Before this, an edit reached the store only if the
+    // user flipped "Push to Shopify" in the dialog (off by default on edit),
+    // so the store kept the old title/description and the next inbound pull
+    // wrote it back. The save now records exactly what changed as durable
+    // outbound work; the worker in shopifyOutbound.ts pushes it (with retries)
+    // and every outcome is visible in Shopify → Sync Logs.
+    const contentFields = [
+      'name',
+      'description',
+      'vendor',
+      'supplier',
+      'tags',
+      'image',
+      'images',
+      'productType',
+      'collection',
+      'collectionId',
+      'category',
+      'categoryId',
+      'options',
+      'chargeOnTax',
+      'trackInventory',
+      'purity',
+      'huid',
+    ]
+    const contentChanged = contentFields.some((key) => body[key] !== undefined)
+    const priceChanged =
+      (body.sellingPrice !== undefined && Number(row.sellingPrice ?? 0) !== Number(existing.sellingPrice ?? 0)) ||
+      (body.compareAtPrice !== undefined &&
+        Number(row.compareAtPrice ?? 0) !== Number(existing.compareAtPrice ?? 0))
+    const shopifySync = await queueProductOutbound(row, { content: contentChanged, price: priceChanged })
     recordCrud('products', 'Updated', req, row)
-    res.json(row)
+    res.json({ ...row, shopifySync })
   } catch (err) {
     logger.error({ err }, 'product update failed')
     res.status(400).json({ error: 'Failed to update product' })
@@ -5110,7 +5142,7 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
   const { options, variants } = parsed.data
   try {
     const [product] = await db!
-      .select({ id: s.products.id, sku: s.products.sku, stock: s.products.stock })
+      .select({ id: s.products.id, sku: s.products.sku, stock: s.products.stock, shopifyId: s.products.shopifyId })
       .from(s.products)
       .where(eq(s.products.id, routeParam(req.params.id)))
       .limit(1)
@@ -5203,6 +5235,11 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
       }
     })
 
+    // The dialog owns the whole option/variant set: content (options), every
+    // variant price and every variant stock count can change in one save. All
+    // three travel through the outbound queue for a listed product — the
+    // variant set is matched back by SKU by the existing push code.
+    const shopifySync = await queueProductOutbound(product, { content: true, price: true, inventory: true })
     recordCrud('products', 'Updated', req, { ...product, name: `variants of ${product.sku}` })
     const saved = await db!.select().from(s.productVariants).where(eq(s.productVariants.productId, product.id))
     const [parent] = await db!
@@ -5210,7 +5247,7 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
       .from(s.products)
       .where(eq(s.products.id, product.id))
       .limit(1)
-    res.json({ options: parent?.options ?? options, variants: saved, stock: parent?.stock ?? newSum })
+    res.json({ options: parent?.options ?? options, variants: saved, stock: parent?.stock ?? newSum, shopifySync })
   } catch (err) {
     logger.error({ err }, 'product variants save failed')
     res.status(400).json({ error: 'Failed to save variants' })

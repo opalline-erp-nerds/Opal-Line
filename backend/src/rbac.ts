@@ -139,7 +139,17 @@ export function requirePermission(moduleKey: string, action: keyof ModulePermiss
       res.status(503).json({ error: 'Database unavailable, cannot verify permissions' })
       return
     }
-    const perms = await computeUserPermissions(userId)
+    let perms: UserPermissions | null
+    try {
+      perms = await computeUserPermissions(userId)
+    } catch (err) {
+      // A failed lookup is a storage problem, not a dead session. Answering
+      // 401 here made the client treat a database blip as a logout; 503 keeps
+      // the session intact and lets the request be retried.
+      logger.error({ err: { message: err instanceof Error ? err.message : String(err) } }, 'RBAC permission check failed')
+      res.status(503).json({ error: 'Database unavailable, cannot verify permissions' })
+      return
+    }
     if (!perms) {
       res.status(401).json({ error: 'User not found' })
       return
@@ -216,6 +226,8 @@ export function enforceRbac(req: Request, res: Response, next: NextFunction) {
     })
     .catch((err) => {
       logger.error({ err: { message: err.message } }, 'RBAC permission check failed')
-      res.status(500).json({ error: 'Permission check failed' })
+      // Storage failure, not a permission decision: 503 tells the client to
+      // retry instead of treating the user as unauthorized.
+      res.status(503).json({ error: 'Database unavailable, cannot verify permissions' })
     })
 }

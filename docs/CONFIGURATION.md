@@ -71,6 +71,8 @@ DATABASE_URL=postgresql://user:pass@ep-cool-name.eu-central-1.aws.neon.tech/neon
 | `ENCRYPTION_KEY` | 64-char hex | AES-256-GCM key encrypting secrets stored in DB (Shopify token, SMTP, WhatsApp). **Leave empty on first run** — auto-generated to `.encryption-key`. Set the same value on every server sharing one database. |
 | `CSRF_SECRET` | random hex | HMAC key for CSRF tokens. Auto-generated to `.csrf-secret` when empty. |
 | `SEED_ADMIN_PASSWORD` | `Opal@2026` | Password for the superadmin created on a fresh install (bootstrap), by `npm run db:seed`, and by `npm run auth:reset`. Default `Opal@2026`; fresh installs still force a password change at first sign-in. |
+| `COOKIE_SECURE` | `true` | Marks the `opal.session` cookie `Secure`. Leave empty for the desktop app (plain `http://localhost` drops a `Secure` cookie); set `true` on Render or any HTTPS deployment. |
+| `COOKIE_SAMESITE` | `strict` / `lax` / `none` | Session cookie `SameSite` policy (default `strict`). Use `none` only when the UI and API are on different sites; it forces `Secure`. |
 | `TRUST_PROXY` | `1` / `loopback` / `"10.0.0.1,10.0.0.2"` | Trust Express `X-Forwarded-*` headers (needed behind nginx/Cloudflare for correct rate-limit keys and `req.ip`). **Never enable when directly exposed** — it lets clients spoof IPs. |
 
 ```env

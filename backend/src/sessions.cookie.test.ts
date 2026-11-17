@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import type { Server } from 'node:http'
 import express from 'express'
 import cookieParser from 'cookie-parser'
-import { setSessionCookie } from './sessions'
+import { csrfCookieOptions, setSessionCookie } from './sessions'
 
 function headerFlags(header: string): { names: string[]; sameSite: string | null } {
   const attrs = header.split(';').slice(1).map((part) => part.trim())
@@ -76,6 +76,43 @@ test('COOKIE_SECURE=true marks the session cookie Secure and keeps Strict', asyn
     const flags = headerFlags(await readSetCookie())
     assert.equal(flags.names.includes('Secure'), true)
     assert.equal(flags.sameSite, 'Strict')
+  } finally {
+    if (prevSecure === undefined) delete process.env.COOKIE_SECURE
+    else process.env.COOKIE_SECURE = prevSecure
+    if (prevSite === undefined) delete process.env.COOKIE_SAMESITE
+    else process.env.COOKIE_SAMESITE = prevSite
+  }
+})
+
+test('SameSite=None forces Secure so the browser does not drop the cookie', async () => {
+  const prevSecure = process.env.COOKIE_SECURE
+  const prevSite = process.env.COOKIE_SAMESITE
+  delete process.env.COOKIE_SECURE
+  process.env.COOKIE_SAMESITE = 'none'
+  try {
+    const flags = headerFlags(await readSetCookie())
+    assert.equal(flags.names.includes('Secure'), true)
+    assert.equal(flags.sameSite, 'None')
+  } finally {
+    if (prevSecure === undefined) delete process.env.COOKIE_SECURE
+    else process.env.COOKIE_SECURE = prevSecure
+    if (prevSite === undefined) delete process.env.COOKIE_SAMESITE
+    else process.env.COOKIE_SAMESITE = prevSite
+  }
+})
+
+test('the CSRF double-submit cookie follows the session cookie policy', () => {
+  const prevSecure = process.env.COOKIE_SECURE
+  const prevSite = process.env.COOKIE_SAMESITE
+  process.env.COOKIE_SECURE = 'true'
+  process.env.COOKIE_SAMESITE = 'none'
+  try {
+    const options = csrfCookieOptions(60 * 60 * 1000)
+    assert.equal(options.httpOnly, false)
+    assert.equal(options.secure, true)
+    assert.equal(options.sameSite, 'none')
+    assert.equal(options.maxAge, 60 * 60 * 1000)
+    assert.equal(options.path, '/')
   } finally {
     if (prevSecure === undefined) delete process.env.COOKIE_SECURE
     else process.env.COOKIE_SECURE = prevSecure
