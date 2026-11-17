@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { backupApi, dbApi, shopifyApi } from '@/lib/api'
+import { describeSyncResult } from '@/lib/syncResult'
 import { exportTable } from '@/lib/export'
 import type { Customer, Invoice, LoyaltyEntry, SalesOrder } from '@/types'
 import { formatCurrency, formatDate, formatNumber } from '@/lib/format'
@@ -212,7 +213,10 @@ export default function CustomersPage() {
     setImporting(true)
     try {
       const res = await shopifyApi.sync(['customers'])
-      toast.success(`Imported ${res.results.customers?.count ?? 0} customers from Shopify`)
+      // Same contract as the product page: a refused sync has no `results`.
+      const outcome = describeSyncResult(res, 'customers')
+      if (outcome.ok) toast.success(outcome.message)
+      else toast.error(outcome.message)
       await dbApi.getCustomers().then(setCustomers)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Import failed')
