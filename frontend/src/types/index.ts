@@ -562,6 +562,18 @@ export interface InventoryLocation {
   type: 'store' | 'warehouse' | 'workshop'
   city: string
   manager: string
+  /**
+   * The EXISTING Shopify location this ERP stock location mirrors stock to —
+   * stored as Shopify's numeric location id (never a name). Null = unmapped.
+   */
+  shopifyLocationId?: string | null
+}
+
+/** One location that already exists on the connected Shopify store. */
+export interface ShopifyStoreLocation {
+  shopifyLocationId: string
+  name: string
+  gid: string
 }
 
 /** Per-location aggregates shown on the locations list. */
@@ -605,22 +617,69 @@ export interface ProductCategory {
 
 export type TransferStatus = 'pending' | 'in-transit' | 'received' | 'cancelled'
 
+/** One end of a transfer route as the API resolves it (null = removed). */
+export interface TransferLocationRef {
+  id: string
+  name: string
+  type: string | null
+  city: string | null
+}
+
 export interface StockTransfer {
   id: string
   number: string
   from: string
   to: string
   product: string
+  /** The SKU of what is actually moving — the variant's SKU when one is set. */
   sku: string
+  /** The exact variant moved; null on transfers created before variant selection. */
+  variantId?: string | null
+  /** Resolved variant name for display; null for an unattributed/product-level transfer. */
+  variantTitle?: string | null
+  variantSku?: string | null
   qty: number
   weight: number
   initiatedBy: string
+  /** Display name for initiatedBy (a user id); resolved server-side. */
+  initiatedByName?: string | null
   status: TransferStatus
   date: string
   /** Quantity counted on arrival. Undefined when received in full. */
   receivedQty?: number
   /** receivedQty - qty. Negative is short in transit, positive is an overage. */
   variance?: number
+  /** Resolved endpoints; absent on older payloads, resolved client-side. */
+  fromLocation?: TransferLocationRef | null
+  toLocation?: TransferLocationRef | null
+}
+
+/** One ledger entry of a transfer's dispatch/receive/cancel trail. */
+export interface TransferHistoryEntry {
+  id: string
+  type: string
+  qty: number
+  stockAfter: number | null
+  /** The variant these units moved; null on rows written before it existed. */
+  variantId?: string | null
+  locationId: string | null
+  locationName: string | null
+  note: string | null
+  by: string | null
+  byName: string | null
+  date: string
+}
+
+/** GET /db/inventory/transfers/:id — the full detail view payload. */
+export interface StockTransferDetail extends StockTransfer {
+  productName?: string | null
+  initiatedByName?: string | null
+  dispatch?: { at: string; by: string | null; byName: string | null } | null
+  receive?: { at: string; by: string | null; byName: string | null; qty: number; note: string | null } | null
+  cancel?: { at: string; by: string | null; byName: string | null } | null
+  /** Which location holds the goods right now (inTransit = neither). */
+  owner?: { locationId: string | null; name: string | null; inTransit: boolean }
+  history?: TransferHistoryEntry[]
 }
 
 export interface StockCategory {
@@ -629,6 +688,64 @@ export interface StockCategory {
   qty: number
   weight: number
   value: number
+}
+
+/**
+ * A product-level balance no variant has claimed. `variants` lists the
+ * variants that COULD claim it; empty means the product has none at all (which
+ * is legitimate, not an anomaly).
+ */
+export interface UnattributedBalance {
+  productId: string
+  productName: string
+  productSku: string
+  locationId: string
+  locationName: string | null
+  qty: number
+  variants: Array<{ id: string; title: string; sku: string; stock: number }>
+}
+
+/**
+ * A balance whose product row no longer exists. Preserved exactly as found —
+ * reported for a human to judge, never moved, deleted or re-attached.
+ */
+export interface OrphanedBalance {
+  productId: string
+  variantId: string | null
+  locationId: string
+  locationName: string | null
+  qty: number
+  movements: number
+  note: string
+}
+
+export interface StockConsistencyMismatch {
+  productId: string
+  productSku?: string
+  variantId?: string
+  variantSku?: string
+  kind: 'rollup' | 'variant-mirror'
+  productStock?: number
+  variantStock?: number
+  ledgerTotal: number
+  /** For a rollup mismatch: how much of the ledger is unattributed. */
+  unattributed?: number
+  note: string
+}
+
+/** GET /db/inventory/stock-anomalies — report only, nothing is changed. */
+export interface StockAnomalies {
+  unattributed: UnattributedBalance[]
+  productLevel: UnattributedBalance[]
+  orphaned: OrphanedBalance[]
+  consistency: { ok: boolean; mismatches: StockConsistencyMismatch[]; preLedger: number }
+  totals: {
+    attributedUnits: number
+    unattributedUnits: number
+    productLevelUnits: number
+    orphanedUnits: number
+    ledgerUnits: number
+  }
 }
 
 export type ActivityType =

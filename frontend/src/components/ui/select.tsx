@@ -5,6 +5,8 @@ import { cn } from '@/lib/utils'
 export interface SelectOption {
   label: string
   value: string
+  /** Renders a greyed-out option that cannot be picked (e.g. the location already chosen on the other side). */
+  disabled?: boolean
 }
 
 export interface SelectProps
@@ -34,7 +36,7 @@ const Select = React.forwardRef<HTMLSelectElement, SelectProps>(
           </option>
         ) : null}
         {options.map((o) => (
-          <option key={o.value} value={o.value}>
+          <option key={o.value} value={o.value} disabled={o.disabled}>
             {o.label}
           </option>
         ))}

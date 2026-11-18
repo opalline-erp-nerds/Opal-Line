@@ -29,6 +29,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Skeleton } from '@/components/ui/skeleton'
 import { ProductDialog } from '@/components/product-dialog'
 import { productImageGallery } from '@/lib/product-image'
+import { variantFinalPrice } from '@/lib/productVariants'
+import { rowLocationLabel } from '@/lib/locations'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { describeSyncResult } from '@/lib/syncResult'
 import type { Product, ProductVariant, SilverRate } from '@/types'
@@ -254,7 +256,12 @@ export default function ProductDetailPage() {
                     <TableRow key={v.id}>
                       <TableCell className="font-medium text-foreground">{v.title}</TableCell>
                       <TableCell className="font-mono text-xs">{v.sku}</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatCurrency(v.sellingPrice ?? 0)}</TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {/* Base selling price + the row's additional amount —
+                            the same number the push sends to Shopify. A
+                            Default-Title mirror row shows the base alone. */}
+                        {formatCurrency(variantFinalPrice(product.sellingPrice, v.sellingPrice, v.name))}
+                      </TableCell>
                       <TableCell className="text-right tabular-nums">{Math.floor(Number(v.stock) || 0)} pcs</TableCell>
                     </TableRow>
                   ))}
@@ -512,12 +519,20 @@ const MOVEMENT_LABEL: Record<string, string> = {
 const EXPORT_COLUMNS: Array<{ accessorKey: string; header: string }> = [
   { accessorKey: 'date', header: 'Date' },
   { accessorKey: 'type', header: 'Movement' },
+  { accessorKey: 'variant', header: 'Variant' },
   { accessorKey: 'location', header: 'Location' },
   { accessorKey: 'qty', header: 'Qty' },
   { accessorKey: 'stockAfter', header: 'Balance After' },
   { accessorKey: 'reference', header: 'Reference' },
   { accessorKey: 'note', header: 'Note' },
 ]
+
+/** `Red · OL-GIF-001-RED`, `Unattributed (legacy)`, or '' for product-level. */
+function movementVariantLabel(m: { variantTitle?: string | null; variantSku?: string | null; unattributed?: boolean }): string {
+  if (m.variantTitle || m.variantSku) return [m.variantTitle, m.variantSku].filter(Boolean).join(' · ')
+  if (m.unattributed) return 'Unattributed (legacy)'
+  return ''
+}
 
 /**
  * The stock ledger for one product: every movement with the balance it left
@@ -555,7 +570,9 @@ function StockHistory({ sku, productName }: { sku: string; productName: string }
     const rows = movements.map((m) => ({
       date: m.date ? new Date(m.date).toISOString() : '',
       type: MOVEMENT_LABEL[m.type] ?? m.type,
-      location: m.locationId ?? '',
+      variant: movementVariantLabel(m),
+      // The exported file is user-facing too: the readable label, never the id.
+      location: rowLocationLabel(m),
       qty: Number(m.qty ?? 0),
       stockAfter: Number(m.stockAfter ?? 0),
       reference: m.refType ? `${m.refType}${m.refId ? `:${m.refId}` : ''}` : '',
@@ -584,9 +601,21 @@ function StockHistory({ sku, productName }: { sku: string; productName: string }
             </p>
           ) : (
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              {/* One card per (location, variant): a multi-variant product has
+                  several rows at the same location and they all matter. */}
               {levels.map((l) => (
-                <div key={l.locationId} className="rounded-md border bg-card p-3">
-                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground">{l.locationId}</p>
+                <div
+                  key={l.variantId ? `${l.locationId}::${l.variantId}` : l.locationId}
+                  className="rounded-md border bg-card p-3"
+                >
+                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground" title={l.locationName ?? undefined}>
+                    {rowLocationLabel(l)}
+                  </p>
+                  {l.variantSku || l.variantTitle ? (
+                    <p className="mt-0.5 truncate text-[11px] text-foreground/80" title={l.variantSku ?? undefined}>
+                      {[l.variantTitle, l.variantSku].filter(Boolean).join(' · ')}
+                    </p>
+                  ) : null}
                   <p className="mt-0.5 text-sm font-semibold tabular-nums text-foreground">{l.qty} pcs</p>
                 </div>
               ))}
@@ -651,15 +680,32 @@ function StockHistory({ sku, productName }: { sku: string; productName: string }
               {movements.slice(0, 100).map((m) => {
                 const qty = Number(m.qty ?? 0)
                 const incoming = qty > 0
+                const where = rowLocationLabel(m)
                 return (
                   <li key={m.id} className="flex items-center justify-between gap-4 py-2.5">
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium text-foreground">
                         {MOVEMENT_LABEL[m.type] ?? m.type}
+                        {m.variantTitle || m.variantSku ? (
+                          <Badge variant="muted" className="ml-2 align-middle font-normal">
+                            {[m.variantTitle, m.variantSku].filter(Boolean).join(' · ')}
+                          </Badge>
+                        ) : m.unattributed ? (
+                          // Legacy movement on a product that HAS variants:
+                          // no variant can be named for it without guessing, so
+                          // it is labelled for what it is and left alone.
+                          <Badge
+                            variant="warning"
+                            className="ml-2 align-middle font-normal"
+                            title="Written before variant tracking — this product's variants cannot be guessed for it"
+                          >
+                            Unattributed
+                          </Badge>
+                        ) : null}
                       </p>
                       <p className="text-[11px] text-muted-foreground">
                         {m.date ? formatDateTime(m.date) : '—'}
-                        {m.locationId ? ` · ${m.locationId}` : ''}
+                        {where !== '—' ? ` · ${where}` : ''}
                         {m.note ? ` · ${m.note}` : ''}
                       </p>
                     </div>

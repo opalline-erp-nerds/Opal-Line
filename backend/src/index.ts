@@ -1005,10 +1005,30 @@ app.post('/api/v1/shopify/products/:id/pull', requirePermission('shopify', 'edit
       sellingPrice: local.pieceRateProduct
         ? local.sellingPrice
         : Number.isFinite(price) ? price : local.sellingPrice,
-      stock: Number.isFinite(shop.inventoryQuantity) ? shop.inventoryQuantity : local.stock,
+      // Stock is deliberately NOT written here: only the difference to what
+      // the ledger already holds is posted below, so per-location and
+      // per-variant balances stay intact instead of being overwritten by one
+      // product-wide number.
       name: shop.title || local.name,
       image: shop.image ?? local.image,
     }).where(eq(dbMod.schema.products.id, localId))
+
+    // The store's number is a TARGET reached through the ledger. `shopify_sync`
+    // marks it as an inbound pull, which also keeps it from being echoed back
+    // to Shopify (the outbound worker skips those movements).
+    const pulledStock = Number(shop.inventoryQuantity)
+    let stock: number | null = local.stock
+    if (Number.isFinite(pulledStock)) {
+      const { setStockTotalTo } = await import('./stock')
+      stock = await setStockTotalTo({
+        sku: String(local.sku ?? ''),
+        target: pulledStock,
+        type: 'shopify_sync',
+        refType: 'shopify_pull',
+        note: `stock pulled from Shopify (was ${Number(local.stock ?? 0)})`,
+        createdBy: actorFromRequest(req).userId ?? 'system',
+      })
+    }
 
     const actor = actorFromRequest(req)
     void recordActivity({
@@ -1019,7 +1039,7 @@ app.post('/api/v1/shopify/products/:id/pull', requirePermission('shopify', 'edit
       userId: actor.userId,
       ip: actor.ip,
     })
-    res.json({ ok: true, pulled: { price, stock: shop.inventoryQuantity, title: shop.title } })
+    res.json({ ok: true, pulled: { price, stock: stock ?? shop.inventoryQuantity, title: shop.title } })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(502).json({ error: message })

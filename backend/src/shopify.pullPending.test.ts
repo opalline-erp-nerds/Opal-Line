@@ -118,7 +118,10 @@ test('a queued ERP edit is not reverted by the inbound pull', async () => {
   const patch = patches[0]
   assert.equal(patch.name, 'ERP edited name', 'the queued title is not reverted')
   assert.equal(patch.description, 'ERP edited copy', 'the queued description is not reverted')
-  assert.equal(patch.stock, 9, 'the queued stock count is not reverted')
+  // Stock is not in the patch at all any more: the pull writes no stock column
+  // (stronger than "writes the ERP's value back" — nothing can overwrite a
+  // balance, not even an echo of a value that has since moved).
+  assert.equal(patch.stock, undefined, 'the queued stock count cannot be reverted by the pull')
   assert.equal(patch.vendor, 'ERP vendor')
   assert.equal(patch.productType, 'Rings')
   assert.deepEqual(patch.images, ['/uploads/erp.jpg'], 'queued local images survive the pull')
@@ -135,7 +138,7 @@ test('with nothing queued the pull still keeps every ERP value', async () => {
   const patch = patches[0]
   assert.equal(patch.name, 'ERP edited name', 'the pull is never the source of the name')
   assert.equal(patch.description, 'ERP edited copy', 'nor of the description')
-  assert.equal(patch.stock, 9, 'nor of the stock')
+  assert.equal(patch.stock, undefined, 'nor of the stock — the patch carries no stock column at all')
   assert.equal(patch.vendor, 'ERP vendor')
   assert.equal(patch.compareAtPrice, null, 'nor of the price')
   assert.equal(patch.shopifyId, '5000001', 'only the link is refreshed')
@@ -147,6 +150,6 @@ test('a different product being pending does not freeze this one', async () => {
   await promise
   const patch = patches[0]
   assert.equal(patch.name, 'ERP edited name', 'ERP values win whatever the queue holds')
-  assert.equal(patch.stock, 9)
+  assert.equal(patch.stock, undefined, 'ERP values win whatever the queue holds')
   assert.equal(linkCalls(), 1, 'this product is not held back by another product\'s queue')
 })

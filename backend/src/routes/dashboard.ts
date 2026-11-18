@@ -2174,17 +2174,23 @@ dashboardRouter.get('/dashboard/stock-running', async (_req, res) => {
     // able to say it.
     const [levels, locRows] = await Promise.all([
       db!.select({ locationId: schema.stockLevels.locationId, productId: schema.stockLevels.productId, qty: schema.stockLevels.qty }).from(schema.stockLevels),
-      db!.select({ id: schema.inventoryLocations.id, name: schema.inventoryLocations.name, type: schema.inventoryLocations.type }).from(schema.inventoryLocations),
+      db!.select({ id: schema.inventoryLocations.id, name: schema.inventoryLocations.name, type: schema.inventoryLocations.type, city: schema.inventoryLocations.city }).from(schema.inventoryLocations),
     ])
     const byProductId = new Map(products.map((p) => [p.id, p]))
     const locationMeta = new Map(locRows.map((l) => [l.id, l]))
-    const acc = new Map<string, { name: string; type: string; products: number; quantity: number; valueAtCost: number; valueAtRetail: number }>()
+    // A level whose location row was deleted must NOT surface the raw id as a
+    // label — the report shows the same fallback the rest of the inventory
+    // module uses, and an unknown type rather than a guessed 'store'.
+    const UNAVAILABLE = 'Location unavailable'
+    const acc = new Map<string, { name: string; type: string; city: string | null; products: number; quantity: number; valueAtCost: number; valueAtRetail: number }>()
     for (const lv of levels) {
       const product = byProductId.get(lv.productId)
       const qty = num(lv.qty)
+      const meta = locationMeta.get(lv.locationId)
       const cur = acc.get(lv.locationId) ?? {
-        name: locationMeta.get(lv.locationId)?.name ?? lv.locationId,
-        type: locationMeta.get(lv.locationId)?.type ?? 'store',
+        name: meta?.name ?? UNAVAILABLE,
+        type: meta?.type ?? '',
+        city: meta?.city ?? null,
         products: 0,
         quantity: 0,
         valueAtCost: 0,
@@ -2204,6 +2210,7 @@ dashboardRouter.get('/dashboard/stock-running', async (_req, res) => {
           id,
           name: v.name,
           type: v.type,
+          city: v.city,
           products: v.products,
           quantity: v.quantity,
           valueAtCost,

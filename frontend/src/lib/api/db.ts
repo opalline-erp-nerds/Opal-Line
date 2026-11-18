@@ -24,6 +24,7 @@ import type {
   GstReportResult,
   Invoice,
   InventoryLocation,
+  ShopifyStoreLocation,
   LocationStockSummary,
   InvoiceItem,
   KpiCardData,
@@ -35,6 +36,7 @@ import type {
   Product,
   ProductOption,
   ProductVariant,
+  StockAnomalies,
   PurchaseInvoice,
   PurchaseInvoiceDetail,
   PurchaseInvoiceInput,
@@ -53,6 +55,7 @@ import type {
   ProfitAnalytics,
   StockCategory,
   StockTransfer,
+  StockTransferDetail,
   Supplier,
   SyncLog,
   TopCategory,
@@ -545,17 +548,28 @@ export const dbApi = {
    * encoding only the SKU (e.g. `OL-RNG-001`), never a barcode.
    */
   scanProduct: (code: string) =>
-    request<{ data: { id: string; name: string; sku: string; stock: number | null; category: string | null } }>(
-      `/db/products/scan?code=${encodeURIComponent(code)}`,
-    ),
+    request<{
+      data: {
+        id: string
+        name: string
+        sku: string
+        stock: number | null
+        category: string | null
+        /** Set when the scanned LABEL belonged to one variant of the product. */
+        variantId?: string | null
+        variantTitle?: string | null
+        variantSku?: string | null
+      }
+    }>(`/db/products/scan?code=${encodeURIComponent(code)}`),
   /**
    * Apply a counted stock sheet at ONE location. The backend reads that
    * location's balance as the baseline and adjusts it, so a count never
    * silently corrects a different shop. Omitting locationId falls back to the
-   * default store.
+   * default store. A row may name a `variantId` to count one variant alone —
+   * which is what a multi-variant product needs.
    */
   applyStockCount: (
-    counts: Array<{ id: string; counted: number }>,
+    counts: Array<{ id: string; counted: number; variantId?: string }>,
     mode: 'set' | 'adjust',
     pushToShopify?: boolean,
     locationId?: string,
@@ -568,13 +582,34 @@ export const dbApi = {
       },
     ),
   /**
-   * Set a product's count at ONE location (from the product edit dialog).
-   * The backend records a count_adjust movement and keeps the rollup in sync.
+   * Set a product's count. With a `locationId` (or a `variantId`) it sets that
+   * one bucket; with neither it sets the PRODUCT'S TOTAL across every location
+   * — which is what "Add Stock" means. The backend posts the difference as a
+   * count_adjust movement, so balances are never overwritten.
    */
   setProductStock: (productId: string, stock: number, locationId?: string) =>
-    request<{ ok: boolean; changed: boolean; stock: number; previous: number; locationId: string }>(
+    request<{ ok: boolean; changed: boolean; stock: number; previous: number; locationId: string | null; scope?: string }>(
       `/db/products/${encodeURIComponent(productId)}/stock`,
       { method: 'PATCH', body: JSON.stringify(locationId ? { stock, locationId } : { stock }) },
+    ),
+  /**
+   * Where stock cannot be explained yet: unattributed product-level balances
+   * (a multi-variant product's stock no variant has claimed), product-level
+   * balances on variant-less products, orphaned balances whose product row is
+   * gone (report-only), plus the consistency re-check of every rollup and
+   * mirror against its own balances.
+   */
+  getStockAnomalies: () => request<StockAnomalies>('/db/inventory/stock-anomalies'),
+  /**
+   * Attribute ONE unattributed balance to ONE variant of the same product.
+   * `confirm` must be true: the caller has to have asked the user first, and
+   * the action is written to the activity log. Nothing is deleted, split or
+   * moved between locations — the balance simply becomes that variant's.
+   */
+  attributeStockBalance: (body: { productId: string; locationId: string; variantId: string; confirm: boolean }) =>
+    request<{ ok: boolean; qty: number; variantSku: string; variantTitle: string; productSku: string }>(
+      '/db/inventory/stock-anomalies/attribute',
+      { method: 'POST', body: JSON.stringify(body) },
     ),
   /**
    * Next free SKU for a category, computed by the backend from live product +
@@ -762,6 +797,8 @@ export const dbApi = {
   getSalesReturns: () => list<SalesReturn>('/db/sales-returns', PAGED),
   getPurchaseReturns: () => list<PurchaseReturn>('/db/purchase-returns', PAGED),
   getStockTransfers: () => list<StockTransfer>('/db/inventory/transfers', PAGED),
+  getStockTransferDetail: (id: string) =>
+    request<StockTransferDetail>(`/db/inventory/transfers/${encodeURIComponent(id)}`),
   getInventoryLocations: () => list<InventoryLocation>('/db/inventory/locations', PAGED),
   /**
    * Inventory pricing collections (Silver Jewels → silver-rate, Other
@@ -858,8 +895,14 @@ export const dbApi = {
     return res as Array<{
       id: string
       productId: string | null
+      /** The variant these units moved; null on rows written before it existed. */
+      variantId: string | null
       sku: string | null
       locationId: string | null
+      /** Resolved location metadata for display; null when the location row is gone. */
+      locationName: string | null
+      locationType: string | null
+      locationCity: string | null
       type: string
       qty: number
       stockAfter: number | null
@@ -869,20 +912,48 @@ export const dbApi = {
       note: string | null
       createdBy: string | null
       date: string | null
+      /** The variant these units moved — name and SKU for display. */
+      variantTitle: string | null
+      variantSku: string | null
+      /**
+       * No variant, on a product that HAS variants: genuinely unattributed
+       * legacy stock. Never guessed onto a variant — displayed as what it is.
+       */
+      unattributed: boolean
     }>
   },
-  /** Stock on hand per location. */
-  getStockLevels: async (sku?: string) => {
-    const qs = sku ? `?sku=${encodeURIComponent(sku)}` : ''
+  /** Stock on hand per location, optionally narrowed to ONE variant. */
+  getStockLevels: async (sku?: string, variantId?: string) => {
+    const params = new URLSearchParams()
+    if (sku) params.set('sku', sku)
+    if (variantId) params.set('variantId', variantId)
+    const qs = params.toString() ? `?${params.toString()}` : ''
     const res = await request(`/db/inventory/levels${qs}`)
-    return res as Array<{ productId: string; sku: string | null; locationId: string; qty: number }>
+    return res as Array<{
+      productId: string
+      sku: string | null
+      /** The variant this balance belongs to; null for an unattributed row. */
+      variantId: string | null
+      variantSku: string | null
+      variantTitle: string | null
+      locationId: string
+      qty: number
+      /** Resolved location metadata for display; null when the location row is gone. */
+      locationName: string | null
+      locationType: string | null
+      locationCity: string | null
+    }>
   },
   /**
    * Create a pending transfer. Stock moves on dispatch, not on creation, and
    * the transfer number is minted server-side — never derived from a client
    * list count, which goes stale under multi-computer use.
+   *
+   * `variantId` names the exact variant being moved; it is REQUIRED for a
+   * product with more than one variant, and optional (resolved to the single
+   * variant) for everything else.
    */
-  createStockTransfer: async (body: { sku: string; qty: number; from: string; to: string; weight?: number }) => {
+  createStockTransfer: async (body: { sku: string; variantId?: string; qty: number; from: string; to: string; weight?: number }) => {
     return request<{ id: string; number: string; status: string }>('/db/inventory/transfers', {
       method: 'POST',
       body: JSON.stringify(body),
@@ -923,6 +994,15 @@ export const dbApi = {
     request<InventoryLocation & { openingLines: number }>('/db/inventory/locations', {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+  /** The store's EXISTING Shopify locations (read-only; nothing is created). */
+  getShopifyStoreLocations: () =>
+    request<{ locations: ShopifyStoreLocation[] }>('/db/inventory/locations/shopify'),
+  /** Map this ERP location to an existing Shopify location; null clears it. */
+  setInventoryLocationShopifyMapping: (id: string, shopifyLocationId: string | null) =>
+    request<InventoryLocation>(`/db/inventory/locations/${encodeURIComponent(id)}/shopify-location`, {
+      method: 'PATCH',
+      body: JSON.stringify({ shopifyLocationId }),
     }),
   /** Cancel a transfer; an in-transit one returns its stock to the source. */
   cancelStockTransfer: async (id: string) =>

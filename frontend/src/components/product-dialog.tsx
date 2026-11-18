@@ -9,6 +9,8 @@ import { Switch } from '@/components/ui/switch'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { toast } from '@/components/ui/confirm'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
+import { hasRealOptions } from '@/lib/productVariants'
+import { formatLocationLabel, rowLocationLabel } from '@/lib/locations'
 import {
   CATEGORY_PREFIX,
   combineOptions,
@@ -535,7 +537,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     Promise.all([dbApi.getStockLevels(product.sku), dbApi.getInventoryLocations()])
       .then(([rows, locs]) => {
         if (cancelled) return
-        const nameFor = (id: string) => locs.find((l) => l.id === id)?.name ?? id
         const mine = rows
           .filter((r) => r.productId === pid)
           .sort((a, b) => String(a.locationId).localeCompare(String(b.locationId)))
@@ -543,12 +544,16 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           mine.length > 0
             ? mine.map((r) => {
                 const qty = Math.floor(Number(r.qty) || 0)
-                return { locationId: r.locationId, name: nameFor(r.locationId), original: qty, value: String(qty) }
+                // The levels API resolves name/type/city; a level whose
+                // location was deleted reads as the fallback, never as an id.
+                return { locationId: r.locationId, name: rowLocationLabel(r), original: qty, value: String(qty) }
               })
             : [
                 {
                   locationId: 'LOC-DEFAULT',
-                  name: locs.find((l) => l.id === 'LOC-DEFAULT')?.name ?? 'Main Store',
+                  name: locs.find((l) => l.id === 'LOC-DEFAULT')
+                    ? formatLocationLabel(locs.find((l) => l.id === 'LOC-DEFAULT'))
+                    : 'Main Store',
                   original: seed,
                   value: String(seed),
                 },
@@ -592,11 +597,9 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       if (Number.isFinite(p)) {
         const rounded = String(Math.round(p * 100) / 100)
         next.sellingPrice = rounded
-        // The auto-calculated price flows through to every variant that still
-        // carries it; variant prices the user edited individually stay put.
-        if (variants.length > 0 && f.sellingPrice !== rounded) {
-          setVariants((vs) => vs.map((v) => (v.price === f.sellingPrice ? { ...v, price: rounded } : v)))
-        }
+        // Variant rows hold ADDITIONAL amounts over this base price (the
+        // push sends base + add-on), so a change to the base must never be
+        // copied into them — each row keeps whatever the user configured.
       }
       return next
     })
@@ -689,7 +692,10 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   // product, last option varying fastest — same as Shopify). Rows are keyed
   // by their joined title, so editing one option's values keeps every
   // unchanged combination's SKU/price/stock intact.
-  const hasVariants = options.length > 0
+  // The Shopify single-variant placeholder (Title / Default Title) that every
+  // flat legacy product carries does NOT count: those products price from the
+  // base alone and their mirror row has no add-on column to edit.
+  const hasVariants = hasRealOptions(options)
 
   const syncVariants = (nextOptions: ProductOption[], prev: VariantDraft[]) => {
     const combos = combineOptions(nextOptions)
@@ -702,7 +708,10 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     // generic OL-GEN code for variants waiting on one. They are filled in as
     // soon as the category's proposal lands (see applyProposal).
     const parentSku = form.sku.trim()
-    const defaultPrice = form.sellingPrice.trim()
+    // A variant row stores the ADDITIONAL amount over the product's selling
+    // price (base 618 + add-on 200 → Shopify 818), so a freshly minted
+    // combination starts at 0 — the base price, no add-on.
+    const defaultPrice = '0'
     const next: VariantDraft[] = combos.map((combo) => {
       const kept = byTitle.get(combo.title)
       if (kept) return { ...kept, optionValues: combo.optionValues }
@@ -1251,7 +1260,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                     <thead>
                       <tr className="border-b bg-muted/40 text-left text-[11px] uppercase tracking-wide text-muted-foreground">
                         <th className="px-3 py-2 font-medium">Variant</th>
-                        <th className="px-3 py-2 font-medium">Price (₹)</th>
+                        <th className="px-3 py-2 font-medium">Add to price (₹)</th>
                         <th className="px-3 py-2 font-medium">Stock (pcs)</th>
                         <th className="px-3 py-2 font-medium">SKU</th>
                       </tr>
@@ -1267,7 +1276,8 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                               min={0}
                               value={v.price}
                               onChange={(e) => setVariantField(i, 'price', e.target.value)}
-                              aria-label={`Price for ${v.title}`}
+                              aria-label={`Additional price for ${v.title}`}
+                              placeholder="0"
                               className="h-8 w-24"
                             />
                           </td>
@@ -1296,9 +1306,9 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                   </table>
                 </div>
                 <p className="text-[11px] text-muted-foreground">
-                  SKUs are minted per variant using the Product codes settings. Price follows the
-                  product's auto-calculated price until you override it per row. The product's stock is the sum of
-                  its variants.
+                  SKUs are minted per variant using the Product codes settings. Each row's price is an
+                  amount ADDED to the product's selling price — 0 sends the base price, 200 sends base
+                  + ₹200. The product's stock is the sum of its variants.
                 </p>
               </div>
             ) : null}

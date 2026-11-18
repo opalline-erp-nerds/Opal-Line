@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { shopifyApi } from '@/lib/api'
 import type { SyncInventory } from '@/types/shopify'
 import { formatNumber } from '@/lib/format'
+import { LOCATION_UNAVAILABLE } from '@/lib/locations'
 
 export default function ShopifyInventoryPage() {
   const [pushing, setPushing] = useState(false)
@@ -46,7 +47,9 @@ export default function ShopifyInventoryPage() {
       {
         accessorKey: 'locationName',
         header: 'Location',
-        cell: ({ row }) => <span className="text-muted-foreground">{row.original.locationName}</span>,
+        cell: ({ row }) => (
+          <span className="text-muted-foreground">{row.original.locationName || LOCATION_UNAVAILABLE}</span>
+        ),
       },
       {
         accessorKey: 'available',
@@ -62,12 +65,9 @@ export default function ShopifyInventoryPage() {
         meta: { align: 'right' as const },
         cell: ({ row }) => <span className="font-mono text-[12px] text-muted-foreground">{row.original.inventoryItemId}</span>,
       },
-      {
-        accessorKey: 'locationId',
-        header: 'Location ID',
-        meta: { align: 'right' as const },
-        cell: ({ row }) => <span className="font-mono text-[12px] text-muted-foreground">{row.original.locationId}</span>,
-      },
+      // No "Location ID" column: Shopify's location id is an internal
+      // identifier. The Location column above carries the human name, with the
+      // shared fallback when a name is missing.
     ],
     [],
   )

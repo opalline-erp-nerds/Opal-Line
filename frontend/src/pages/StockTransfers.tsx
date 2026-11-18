@@ -26,8 +26,9 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { DialogFooter } from '@/components/ui/dialog'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
-import type { InventoryLocation, Product, StockTransfer, TransferStatus } from '@/types'
+import type { InventoryLocation, Product, ProductVariant, StockTransfer, StockTransferDetail, TransferHistoryEntry, TransferStatus } from '@/types'
 import { formatDateTime, formatNumber, formatWeight } from '@/lib/format'
+import { resolveRouteEndpoint, routeOptionLabel, transferOwnerLabel, type RouteEndpoint } from '@/lib/transferRoute'
 
 const statusVariant: Record<TransferStatus, { label: string; variant: 'success' | 'warning' | 'info' | 'muted' }> = {
   pending: { label: 'Pending', variant: 'warning' },
@@ -46,7 +47,12 @@ export default function StockTransfersPage() {
 
   const [dialogOpen, setDialogOpen] = useState(false)
   const [receiveDialogOpen, setReceiveDialogOpen] = useState(false)
-  const [form, setForm] = useState({ product: '', from: '', to: '', qty: '' })
+  const [detailOpen, setDetailOpen] = useState(false)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [detail, setDetail] = useState<StockTransferDetail | null>(null)
+  const [form, setForm] = useState({ product: '', variant: '', from: '', to: '', qty: '' })
+  // Variants of the picked product: a transfer moves ONE of them.
+  const [variants, setVariants] = useState<ProductVariant[]>([])
 
   useEffect(() => {
     Promise.all([dbApi.getStockTransfers(), dbApi.getInventoryLocations(), dbApi.getProducts()]).then(
@@ -74,14 +80,21 @@ export default function StockTransfersPage() {
   )
 
   /**
-   * Transfers store the location ID; rows created before that keep the display
-   * name. Resolving through the locations list keeps both readable — and keeps
-   * search working over whatever the row actually holds.
+   * The API resolves from/to into readable endpoints; resolveRouteEndpoint
+   * also covers older payloads (id- or name-valued rows) and degrades a
+   * deleted location to "Removed location" instead of leaking a UUID — which
+   * is exactly what the old screen showed (`LOC-DEFAULT → <uuid>`).
    */
-  const locationLabel = useCallback((value: string | null | undefined) => {
-    if (!value) return '—'
-    return locations.find((l) => l.id === value || l.name === value)?.name ?? value
-  }, [locations])
+  const endpointFor = useCallback(
+    (raw: string | null | undefined, enriched?: { name: string; type?: string | null; city?: string | null } | null): RouteEndpoint =>
+      resolveRouteEndpoint(enriched, raw, locations),
+    [locations],
+  )
+  const locationLabel = useCallback(
+    (value: string | null | undefined, enriched?: { name: string; type?: string | null; city?: string | null } | null) =>
+      endpointFor(value, enriched).title,
+    [endpointFor],
+  )
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -91,8 +104,10 @@ export default function StockTransfersPage() {
         t.number.toLowerCase().includes(q) ||
         t.product.toLowerCase().includes(q) ||
         t.sku.toLowerCase().includes(q) ||
-        locationLabel(t.from).toLowerCase().includes(q) ||
-        locationLabel(t.to).toLowerCase().includes(q)
+        String(t.variantTitle ?? '').toLowerCase().includes(q) ||
+        String(t.variantSku ?? '').toLowerCase().includes(q) ||
+        locationLabel(t.from, t.fromLocation).toLowerCase().includes(q) ||
+        locationLabel(t.to, t.toLocation).toLowerCase().includes(q)
       const matchStatus = !statusFilter || t.status === statusFilter
       return matchQ && matchStatus
     })
@@ -102,10 +117,43 @@ export default function StockTransfersPage() {
   const [error, setError] = useState('')
 
   const selectedProduct = products.find((p) => p.id === form.product)
-  // Stock is held per location, so the source dropdown must show what that
-  // location actually holds rather than the product's global total.
+  const selectedVariant = variants.find((v) => v.id === form.variant) ?? null
+  // A product with more than one variant cannot be moved "as a whole": which
+  // colour left the shelf would be a guess. Exactly one variant means the
+  // choice is already made for the user.
+  const needsVariant = variants.length > 1
+
+  // The variant set belongs to the picked product. A single-variant product
+  // selects its one variant automatically so the ordinary case needs no extra
+  // click (and the backend resolves it anyway, belt and braces). The previous
+  // product's set is cleared in the change handler rather than here: setState
+  // synchronously inside an effect would re-render on every product change.
+  useEffect(() => {
+    let cancelled = false
+    if (!form.product) return
+    const productId = form.product
+    queueMicrotask(() => {
+      dbApi.getProductVariants(productId)
+        .then((r) => {
+          if (cancelled) return
+          const list = r.variants ?? []
+          setVariants(list)
+          if (list.length === 1) {
+            setForm((f) => (f.product === productId ? { ...f, variant: list[0]!.id } : f))
+          }
+        })
+        .catch(() => { if (!cancelled) setVariants([]) })
+    })
+    return () => { cancelled = true }
+  }, [form.product])
+
+  // Stock is held per location AND per variant, so the source dropdown shows
+  // what that location holds for the SELECTED variant — never the product's
+  // total across variants (which is what made a Red transfer read White's
+  // balance before).
   const [levels, setLevels] = useState<Array<{ locationId: string; qty: number }>>([])
   const selectedSku = selectedProduct?.sku
+  const levelVariantId = form.variant
 
   useEffect(() => {
     let cancelled = false
@@ -114,18 +162,21 @@ export default function StockTransfersPage() {
         setLevels([])
         return
       }
-      dbApi.getStockLevels(selectedSku).then((rows) => {
+      dbApi.getStockLevels(selectedSku, levelVariantId || undefined).then((rows) => {
         if (!cancelled) setLevels(rows.map((r) => ({ locationId: r.locationId, qty: r.qty })))
       }).catch(() => { if (!cancelled) setLevels([]) })
     })
     return () => { cancelled = true }
-  }, [selectedSku])
+  }, [selectedSku, levelVariantId])
 
   const availableAtSource = useMemo(() => {
     if (!selectedProduct || !form.from) return null
+    // Nothing can be said about availability until the variant is chosen:
+    // showing the product total there would invite an over-transfer.
+    if (needsVariant && !form.variant) return null
     // form.from is the location's ID, the same key the stock-levels API uses.
     return levels.find((x) => x.locationId === form.from)?.qty ?? 0
-  }, [selectedProduct, form.from, levels])
+  }, [selectedProduct, form.from, form.variant, needsVariant, levels])
 
   const handleCreate = async () => {
     const product = products.find((p) => p.id === form.product)
@@ -135,20 +186,27 @@ export default function StockTransfersPage() {
       setError('Enter a positive whole-number quantity')
       return
     }
+    if (needsVariant && !form.variant) {
+      setError(`"${product.name}" has ${variants.length} variants — select the variant to move`)
+      return
+    }
     setSaving(true)
     setError('')
     try {
       // No number is sent: the backend mints it. A number derived from the
       // loaded list collides the moment two computers create transfers.
+      // The variant names the exact units; a product with one variant sends it
+      // too (auto-selected), and a variant-less legacy product sends none.
       await dbApi.createStockTransfer({
         from: form.from,
         to: form.to,
-        sku: product.sku,
+        sku: selectedVariant?.sku ?? product.sku,
+        variantId: form.variant || undefined,
         qty,
-        weight: Number((qty * product.netWeight).toFixed(1)),
+        weight: Number((qty * (selectedVariant?.grossWeight ?? product.netWeight)).toFixed(1)),
       })
       setDialogOpen(false)
-      setForm({ product: '', from: '', to: '', qty: '' })
+      setForm({ product: '', variant: '', from: '', to: '', qty: '' })
       toast.success('Transfer created — dispatch it to move the stock')
       load()
     } catch (e) {
@@ -172,6 +230,21 @@ export default function StockTransfersPage() {
       throw e
     }
   }, [load])
+
+  /** Detail view: one fetch, rendered from the enriched payload. */
+  const openDetail = useCallback(async (id: string) => {
+    setDetailOpen(true)
+    setDetailLoading(true)
+    setDetail(null)
+    try {
+      setDetail(await dbApi.getStockTransferDetail(id))
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not load transfer details')
+      setDetailOpen(false)
+    } finally {
+      setDetailLoading(false)
+    }
+  }, [])
 
   /**
    * Counted quantity per in-transit transfer. Seeded with the dispatched
@@ -232,21 +305,32 @@ export default function StockTransfersPage() {
         cell: ({ row }) => (
           <div>
             <p className="font-medium text-foreground">{row.original.product}</p>
-            <p className="text-[11px] text-muted-foreground">{row.original.sku}</p>
+            <p className="text-[11px] text-muted-foreground">
+              {row.original.variantTitle ? `${row.original.variantTitle} · ` : ''}
+              {row.original.variantSku ?? row.original.sku}
+            </p>
           </div>
         ),
       },
       {
         id: 'route',
         header: 'Route',
-        meta: { headerClassName: 'min-w-[240px]' },
-        cell: ({ row }) => (
-          <div className="flex items-center gap-1.5 text-[12.5px]">
-            <span className="max-w-[130px] truncate text-muted-foreground">{locationLabel(row.original.from)}</span>
-            <ArrowRightIcon />
-            <span className="max-w-[130px] truncate font-medium text-foreground">{locationLabel(row.original.to)}</span>
-          </div>
-        ),
+        meta: { headerClassName: 'min-w-[320px]' },
+        cell: ({ row }) => {
+          const from = endpointFor(row.original.from, row.original.fromLocation)
+          const to = endpointFor(row.original.to, row.original.toLocation)
+          return (
+            <div className="min-w-0 space-y-1">
+              <div className="flex items-start gap-2">
+                <RouteEnd label="From" endpoint={from} />
+                <span className="mt-5 shrink-0"><ArrowRightIcon /></span>
+                <RouteEnd label="To" endpoint={to} />
+              </div>
+              {/* Where the stock sits right now — the question the old list never answered. */}
+              <p className="text-[11px] text-muted-foreground">{transferOwnerLabel(row.original, locations)}</p>
+            </div>
+          )
+        },
       },
       {
         accessorKey: 'qty',
@@ -260,7 +344,13 @@ export default function StockTransfersPage() {
         meta: { align: 'right' as const },
         cell: ({ row }) => <span className="tabular-nums text-muted-foreground">{formatWeight(row.original.weight)}</span>,
       },
-      { accessorKey: 'initiatedBy', header: 'By', cell: ({ row }) => <span className="text-muted-foreground">{row.original.initiatedBy}</span> },
+      {
+        accessorKey: 'initiatedBy',
+        header: 'By',
+        cell: ({ row }) => (
+          <span className="text-muted-foreground">{row.original.initiatedByName ?? row.original.initiatedBy}</span>
+        ),
+      },
       {
         id: 'variance',
         header: 'Variance',
@@ -302,7 +392,7 @@ export default function StockTransfersPage() {
                       <Truck className="h-3.5 w-3.5 text-info-700" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>Dispatch — stock leaves {locationLabel(row.original.from)}</TooltipContent>
+                  <TooltipContent>Dispatch — stock leaves {locationLabel(row.original.from, row.original.fromLocation)}</TooltipContent>
                 </Tooltip>
               )}
               {row.original.status === 'in-transit' && (
@@ -312,7 +402,7 @@ export default function StockTransfersPage() {
                       <ArrowDownToLine className="h-3.5 w-3.5 text-success-600" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>Receive — stock arrives at {locationLabel(row.original.to)}</TooltipContent>
+                  <TooltipContent>Receive — stock arrives at {locationLabel(row.original.to, row.original.toLocation)}</TooltipContent>
                 </Tooltip>
               )}
               {(row.original.status === 'pending' || row.original.status === 'in-transit') && (
@@ -327,18 +417,18 @@ export default function StockTransfersPage() {
               )}
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon-sm" disabled>
+                  <Button variant="ghost" size="icon-sm" onClick={() => openDetail(row.original.id)}>
                     <Eye className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>{row.original.status === 'received' ? 'Received' : 'Available once received'}</TooltipContent>
+                <TooltipContent>View transfer details</TooltipContent>
               </Tooltip>
             </TooltipProvider>
           </div>
         ),
       },
     ],
-    [updateStatus],
+    [updateStatus, openDetail, locations, endpointFor, locationLabel],
   )
 
   return (
@@ -384,7 +474,7 @@ export default function StockTransfersPage() {
                           <div className="flex items-center justify-between gap-3">
                             <div className="min-w-0">
                               <p className="font-medium text-foreground">{t.number}</p>
-                              <p className="truncate text-xs text-muted-foreground">{t.product} · dispatched {t.qty} pcs · {locationLabel(t.from)} → {locationLabel(t.to)}</p>
+                              <p className="truncate text-xs text-muted-foreground">{t.product} · dispatched {t.qty} pcs · {locationLabel(t.from, t.fromLocation)} → {locationLabel(t.to, t.toLocation)}</p>
                             </div>
                             <Button size="sm" disabled={invalid} onClick={() => receive(t)}>
                               <CheckCircle2 className="h-3.5 w-3.5" /> Receive
@@ -418,15 +508,15 @@ export default function StockTransfersPage() {
               open={dialogOpen}
               onOpenChange={setDialogOpen}
               size="sm"
-              isDirty={dialogOpen && Boolean(form.product || form.from || form.to || form.qty)}
+              isDirty={dialogOpen && Boolean(form.product || form.variant || form.from || form.to || form.qty)}
               title="New Stock Transfer"
-              description="Select a product and the locations to move stock between."
+              description="Select a product, the variant to move and the two locations."
               footer={
                 <DialogFooter>
                   <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
                   <Button
                     onClick={handleCreate}
-                    disabled={!form.product || !form.from || !form.to || form.from === form.to || !form.qty || Number(form.qty) < 1 || saving || (availableAtSource != null && Number(form.qty) > availableAtSource)}
+                    disabled={!form.product || !form.from || !form.to || form.from === form.to || !form.qty || Number(form.qty) < 1 || (needsVariant && !form.variant) || saving || (availableAtSource != null && Number(form.qty) > availableAtSource)}
                   >
                     {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUpFromLine className="h-4 w-4" />} Create Transfer
                   </Button>
@@ -440,9 +530,39 @@ export default function StockTransfersPage() {
                       id="transfer-product"
                       options={products.map((p) => ({ value: p.id, label: `${p.name} (${p.stock} in stock)` }))}
                       value={form.product}
-                      onValueChange={(v) => setForm((f) => ({ ...f, product: v }))}
+                      onValueChange={(v) => {
+                        setVariants([])
+                        setForm((f) => ({ ...f, product: v, variant: '' }))
+                      }}
                       placeholder="Select product"
                     />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="transfer-variant">Variant</Label>
+                    <Select
+                      id="transfer-variant"
+                      options={variants.map((v) => ({
+                        value: v.id,
+                        label: `${v.title || v.name || 'Default'} · ${v.sku} · ${formatNumber(v.stock ?? 0)} pcs`,
+                      }))}
+                      value={form.variant}
+                      onValueChange={(v) => setForm((f) => ({ ...f, variant: v }))}
+                      placeholder={
+                        !form.product
+                          ? 'Select a product first'
+                          : variants.length === 0
+                            ? 'No variants — stock moves as one'
+                            : 'Select variant'
+                      }
+                      disabled={!form.product || variants.length <= 1}
+                    />
+                    {needsVariant && !form.variant ? (
+                      <p className="text-xs text-destructive">This product has {variants.length} variants — choose the one to move.</p>
+                    ) : selectedVariant ? (
+                      <p className="text-xs text-muted-foreground">
+                        Moving <span className="font-medium text-foreground">{selectedVariant.title || selectedVariant.sku}</span> ({selectedVariant.sku})
+                      </p>
+                    ) : null}
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1.5">
@@ -450,10 +570,17 @@ export default function StockTransfersPage() {
                       <Select
                         id="transfer-from"
                         options={locations.map((l) => {
-                          const held = levels.find((x) => x.locationId === l.id)?.qty
+                          // Per-VARIANT balance at each location; unknown until
+                          // the variant is chosen (never the product total).
+                          const held = needsVariant && !form.variant
+                            ? null
+                            : levels.find((x) => x.locationId === l.id)?.qty ?? 0
                           return {
                             value: l.id,
-                            label: selectedProduct ? `${l.name} (${held ?? 0} pcs)` : l.name,
+                            label: held != null && selectedProduct ? `${routeOptionLabel(l)} (${held} pcs)` : routeOptionLabel(l),
+                            // The destination can never be the source: the
+                            // option greys out instead of failing on submit.
+                            disabled: form.to === l.id,
                           }
                         })}
                         value={form.from}
@@ -465,13 +592,29 @@ export default function StockTransfersPage() {
                       <Label htmlFor="transfer-to">To</Label>
                       <Select
                         id="transfer-to"
-                        options={locations.map((l) => ({ value: l.id, label: l.name }))}
+                        options={locations.map((l) => ({
+                          value: l.id,
+                          label: routeOptionLabel(l),
+                          disabled: form.from === l.id,
+                        }))}
                         value={form.to}
                         onValueChange={(v) => setForm((f) => ({ ...f, to: v }))}
                         placeholder="To location"
                       />
                     </div>
                   </div>
+                  {form.from && form.to ? (
+                    form.from === form.to ? (
+                      <p className="text-xs text-destructive">Source and destination must be different locations.</p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        Route:{' '}
+                        <span className="font-medium text-foreground">{endpointFor(form.from).title}</span>
+                        {' → '}
+                        <span className="font-medium text-foreground">{endpointFor(form.to).title}</span>
+                      </p>
+                    )
+                  ) : null}
                   <div className="space-y-1.5">
                     <Label htmlFor="transfer-qty">Quantity (pcs)</Label>
                     <Input
@@ -482,14 +625,182 @@ export default function StockTransfersPage() {
                       value={form.qty}
                       onChange={(e) => setForm((f) => ({ ...f, qty: e.target.value }))}
                     />
+                    {availableAtSource != null ? (
+                      form.qty && Number(form.qty) > availableAtSource ? (
+                        <p className="text-xs text-destructive">
+                          Only {availableAtSource} pcs{selectedVariant ? ` of ${selectedVariant.sku}` : ''} at the source — this transfer would take {form.qty}.
+                        </p>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">Available at source: {availableAtSource} pcs</p>
+                      )
+                    ) : needsVariant && !form.variant ? (
+                      <p className="text-xs text-muted-foreground">Pick a variant to see what the source holds.</p>
+                    ) : null}
                   </div>
                   {selectedProduct && form.qty ? (
                     <p className="text-xs text-muted-foreground">
-                      Weight: <span className="font-medium text-foreground">{formatWeight(Number(form.qty) * selectedProduct.netWeight)}</span> · {selectedProduct.name}
+                      Weight:{' '}
+                      <span className="font-medium text-foreground">
+                        {formatWeight(Number(form.qty) * (selectedVariant?.grossWeight ?? selectedProduct.netWeight))}
+                      </span>{' '}
+                      · {selectedVariant ? `${selectedProduct.name} — ${selectedVariant.title || selectedVariant.sku}` : selectedProduct.name}
                     </p>
                   ) : null}
                 </div>
                 {error ? <p className="px-6 pb-4 text-sm text-red-600 dark:text-red-400">{error}</p> : null}
+            </AppDialog>
+            <AppDialog
+              open={detailOpen}
+              onOpenChange={(o) => {
+                setDetailOpen(o)
+                if (!o) setDetail(null)
+              }}
+              size="lg"
+              title={detail ? `Transfer ${detail.number}` : 'Transfer details'}
+              description="Full trail: who moved what, where it went, and who holds it now."
+              footer={
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => setDetailOpen(false)}>Close</Button>
+                </DialogFooter>
+              }
+            >
+              {detailLoading || !detail ? (
+                <p className="py-6 text-center text-sm text-muted-foreground">
+                  {detailLoading ? 'Loading transfer…' : 'Transfer could not be loaded.'}
+                </p>
+              ) : (
+                <div className="space-y-4">
+                  {/* The one answer the old view never gave: who owns the stock now. */}
+                  <div className="rounded-lg border bg-muted/40 px-3 py-2.5">
+                    <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Stock now belongs to</p>
+                    <p className="text-sm font-semibold text-foreground">
+                      {detail.owner?.inTransit
+                        ? 'In transit — held at neither location'
+                        : detail.owner?.name ?? 'Unknown location'}
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="rounded-lg border p-3">
+                      <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">From</p>
+                      <p className="truncate text-sm font-medium text-foreground">
+                        {endpointFor(detail.from, detail.fromLocation).title}
+                      </p>
+                      {endpointFor(detail.from, detail.fromLocation).subtitle ? (
+                        <p className="text-xs text-muted-foreground">{endpointFor(detail.from, detail.fromLocation).subtitle}</p>
+                      ) : null}
+                    </div>
+                    <div className="rounded-lg border p-3">
+                      <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">To</p>
+                      <p className="truncate text-sm font-medium text-foreground">
+                        {endpointFor(detail.to, detail.toLocation).title}
+                      </p>
+                      {endpointFor(detail.to, detail.toLocation).subtitle ? (
+                        <p className="text-xs text-muted-foreground">{endpointFor(detail.to, detail.toLocation).subtitle}</p>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-sm sm:grid-cols-4">
+                    <DetailField label="Product" value={detail.productName ?? detail.product} />
+                    <DetailField label="Variant" value={detail.variantTitle ?? '—'} />
+                    <DetailField label="SKU" value={detail.variantSku ?? detail.sku} mono />
+                    <DetailField label="Quantity" value={`${formatNumber(detail.qty)} pcs`} />
+                  </div>
+                  <div className="grid grid-cols-1 gap-x-4 gap-y-2.5 text-sm sm:grid-cols-3">
+                    <DetailField label="Weight" value={formatWeight(detail.weight)} />
+                    <DetailField label="Transfer" value={`${detail.number}`} mono />
+                    <DetailField label="Status" value={statusVariant[detail.status].label} />
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-x-4 gap-y-2.5 text-sm sm:grid-cols-3">
+                    <DetailField
+                      label="Created by"
+                      value={`${detail.initiatedByName ?? detail.initiatedBy ?? '—'} · ${formatDateTime(detail.date)}`}
+                    />
+                    <DetailField
+                      label="Dispatched by"
+                      value={
+                        detail.dispatch
+                          ? `${detail.dispatch.byName ?? detail.dispatch.by ?? '—'} · ${formatDateTime(detail.dispatch.at)}`
+                          : 'Not dispatched'
+                      }
+                    />
+                    <DetailField
+                      label="Received by"
+                      value={
+                        detail.receive
+                          ? `${detail.receive.byName ?? detail.receive.by ?? '—'} · ${formatDateTime(detail.receive.at)}`
+                          : detail.status === 'received'
+                            ? 'Received'
+                            : 'Not received'
+                      }
+                    />
+                  </div>
+
+                  {(detail.status === 'received' || detail.receive?.note || detail.cancel) && (
+                    <div className="space-y-1 rounded-lg border p-3 text-sm">
+                      {detail.status === 'received' && (
+                        <p className="text-foreground">
+                          <span className="font-medium">Variance:</span>{' '}
+                          {detail.variance == null || detail.variance === 0
+                            ? 'none — counted quantity matched the dispatch'
+                            : `${formatNumber(Math.abs(detail.variance))} ${detail.variance < 0 ? 'short' : 'over'} of ${formatNumber(detail.qty)} dispatched`}
+                          {detail.receive?.note ? (
+                            <span className="text-muted-foreground"> · {detail.receive.note}</span>
+                          ) : null}
+                        </p>
+                      )}
+                      {detail.cancel ? (
+                        <p className="text-muted-foreground">
+                          Cancelled by {detail.cancel.byName ?? detail.cancel.by ?? '—'} · {formatDateTime(detail.cancel.at)}
+                        </p>
+                      ) : null}
+                    </div>
+                  )}
+
+                  <div>
+                    <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                      Transfer history
+                      {detail.variantTitle || detail.variantSku ? (
+                        <span className="ml-2 normal-case tracking-normal text-foreground/70">
+                          · {detail.variantTitle ?? ''}{detail.variantTitle && detail.variantSku ? ' ' : ''}{detail.variantSku ? `(${detail.variantSku})` : ''}
+                        </span>
+                      ) : null}
+                    </p>
+                    {(detail.history ?? []).length === 0 ? (
+                      <p className="text-sm text-muted-foreground">
+                        No stock movements yet{detail.status === 'pending' ? ' — the goods are still at the source.' : '.'}
+                      </p>
+                    ) : (
+                      <ol className="space-y-2">
+                        {(detail.history ?? []).map((h) => (
+                          <li key={h.id} className="flex items-start gap-2.5 text-[12.5px]">
+                            <span
+                              className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${
+                                h.type === 'transfer_out' ? 'bg-info-500' : 'bg-success-500'
+                              }`}
+                            />
+                            <div className="min-w-0">
+                              <p className="text-foreground">
+                                <span className="font-medium">{historyLine(h)}</span>
+                                {h.stockAfter != null ? (
+                                  <span className="text-muted-foreground"> · balance {formatNumber(h.stockAfter)}</span>
+                                ) : null}
+                              </p>
+                              <p className="text-[11px] text-muted-foreground">
+                                {formatDateTime(h.date)}
+                                {h.byName ?? h.by ? ` · ${h.byName ?? h.by}` : ''}
+                                {h.note ? ` · ${h.note}` : ''}
+                              </p>
+                            </div>
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                  </div>
+                </div>
+              )}
             </AppDialog>
           </>
         }
@@ -549,4 +860,42 @@ function ArrowRightIcon() {
       <path d="M3 8h9M9 4.5L12.5 8 9 11.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   )
+}
+
+/** One end of the route: tiny From/To label over the name and its context line. */
+function RouteEnd({ label, endpoint }: { label: string; endpoint: RouteEndpoint }) {
+  return (
+    <div className="min-w-0 max-w-[150px]">
+      <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{label}</p>
+      <p
+        className={`truncate text-[12.5px] ${endpoint.missing ? 'italic text-muted-foreground' : 'font-medium text-foreground'}`}
+        title={endpoint.subtitle ? `${endpoint.title} (${endpoint.subtitle})` : endpoint.title}
+      >
+        {endpoint.title}
+      </p>
+      {endpoint.subtitle ? <p className="truncate text-[10.5px] text-muted-foreground">{endpoint.subtitle}</p> : null}
+    </div>
+  )
+}
+
+/** Label/value pair inside the detail dialog. */
+function DetailField({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="min-w-0">
+      <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{label}</p>
+      <p className={`truncate text-foreground ${mono ? 'font-mono text-[12.5px]' : ''}`} title={value}>
+        {value}
+      </p>
+    </div>
+  )
+}
+
+/** One ledger row as a sentence: dispatched / received / returned. */
+function historyLine(h: TransferHistoryEntry): string {
+  const where = h.locationName ?? (h.type === 'transfer_out' ? 'the source' : 'the destination')
+  if (h.type === 'transfer_out') return `Dispatched ${formatNumber(h.qty)} pcs from ${where}`
+  if (String(h.note ?? '').toLowerCase().includes('cancel')) {
+    return `Returned ${formatNumber(h.qty)} pcs to ${where} — transfer cancelled`
+  }
+  return `Received ${formatNumber(h.qty)} pcs at ${where}`
 }

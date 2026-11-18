@@ -54,6 +54,7 @@ import {
   findVariantById,
   matchProductByCode,
   productVariants,
+  variantFinalPrice,
   variantLabel,
   variantOptions,
 } from '@/lib/productVariants'
@@ -999,7 +1000,11 @@ export default function SalesOrdersPage() {
       silverRate,
       netWeight: p.netWeight,
       makingCharge: p.makingCharge,
-      fallback: first?.sellingPrice ?? p.sellingPrice,
+      // A real variant row carries the ADDITIONAL amount — bill base + add-on,
+      // exactly what Shopify is told. A Default-Title mirror prices from base.
+      fallback: first
+        ? variantFinalPrice(p.sellingPrice, first.sellingPrice, first.name)
+        : p.sellingPrice,
     })
     setLineItems((prev) =>
       prev.map((li) => {
@@ -1040,7 +1045,10 @@ export default function SalesOrdersPage() {
                 silverRate,
                 netWeight: p.netWeight,
                 makingCharge: p.makingCharge,
-                fallback: v.sellingPrice ?? row.price,
+                fallback:
+                  v.sellingPrice == null
+                    ? row.price
+                    : variantFinalPrice(p.sellingPrice, v.sellingPrice, v.name),
               }) ?? row.price,
               netWeight: p.netWeight,
               makingCharge: p.makingCharge,
@@ -1071,7 +1079,9 @@ export default function SalesOrdersPage() {
       silverRate,
       netWeight: p.netWeight,
       makingCharge: p.makingCharge,
-      fallback: variant?.sellingPrice ?? p.sellingPrice,
+      fallback: variant
+        ? variantFinalPrice(p.sellingPrice, variant.sellingPrice, variant.name)
+        : p.sellingPrice,
     }) ?? 0
     setScanFeedback({ ok: true, text: `Added ${title}${price ? ` · ₹${price.toFixed(2)}` : ''}` })
     setLineItems((prev) => {

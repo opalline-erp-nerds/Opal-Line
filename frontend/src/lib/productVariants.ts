@@ -71,6 +71,48 @@ export function variantLabel(v: ProductVariant): string {
   return v.name || v.sku || v.id
 }
 
+/**
+ * True when a variant row is the Shopify single-variant placeholder — the
+ * "Default Title" mirror every flat/legacy product carries. Its stored price
+ * is a legacy absolute value and must never be added to the base.
+ */
+export function isDefaultVariantName(name: string | null | undefined): boolean {
+  const t = String(name ?? '').trim().toLowerCase()
+  return t === '' || t === 'default title'
+}
+
+/**
+ * Final price of a variant, mirroring the backend push rule
+ * (backend/src/shopify.ts → variantPushPrice): a real option row is the ERP
+ * selling price (base) plus the row's additional amount (base 618 + add-on
+ * 200 → 818), while a "Default Title" mirror row prices from the base alone —
+ * adding its stored value would double the product. The stored numbers are
+ * never rewritten here, so re-reading after an edit or sync always re-derives
+ * the same final price.
+ */
+export function variantFinalPrice(
+  basePrice: number | null | undefined,
+  additionalPrice: number | null | undefined,
+  variantName: string | null | undefined,
+): number {
+  const base = Number.isFinite(Number(basePrice)) ? Number(basePrice) : 0
+  if (isDefaultVariantName(variantName)) return Math.round(base * 100) / 100
+  const additional = Number.isFinite(Number(additionalPrice)) ? Number(additionalPrice) : 0
+  return Math.round((base + additional) * 100) / 100
+}
+
+/**
+ * True when option definitions describe REAL variants: the Shopify
+ * single-variant placeholder (Title / Default Title) that every flat legacy
+ * product carries does not count — such products price from the base alone.
+ */
+export function hasRealOptions(options: Array<{ name?: string; values?: string[] }> | null | undefined): boolean {
+  if (!Array.isArray(options)) return false
+  return options.some((o) =>
+    Array.isArray(o?.values) && o.values.some((v) => String(v ?? '').trim() !== 'Default Title'),
+  )
+}
+
 /** Dropdown options for a product's variants. */
 export function variantOptions(product: Pick<Product, 'variants'> | null | undefined): Array<{
   value: string

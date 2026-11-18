@@ -10,6 +10,7 @@ import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { dbApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
+import { LOCATION_UNAVAILABLE, locationTypeLabel } from '@/lib/locations'
 import { formatCurrency, formatNumber } from '@/lib/format'
 import { StockDemandBarChart, StockDemandDonut } from '@/components/charts/stock-demand-chart'
 
@@ -28,6 +29,7 @@ export interface StockRunningLocation {
   id: string
   name: string
   type: string
+  city?: string | null
   products: number
   quantity: number
   valueAtCost: number
@@ -195,8 +197,19 @@ export default function StockRunningPage() {
 
   const locationColumns = useMemo<ColumnDef<StockRunningLocation>[]>(
     () => [
-      { accessorKey: 'name', header: 'Location', cell: ({ row }) => <span className="font-medium text-foreground">{row.original.name}</span> },
-      { accessorKey: 'type', header: 'Type', cell: ({ row }) => <Badge variant="muted">{row.original.type}</Badge> },
+      {
+        accessorKey: 'name',
+        header: 'Location',
+        cell: ({ row }) => (
+          // A level whose location row was deleted arrives as the shared
+          // fallback from the API — styled quietly, never as a raw id.
+          <span className={row.original.name === LOCATION_UNAVAILABLE ? 'italic text-muted-foreground' : 'font-medium text-foreground'}>
+            {row.original.name}
+          </span>
+        ),
+      },
+      { accessorKey: 'type', header: 'Type', cell: ({ row }) => <Badge variant="muted">{locationTypeLabel(row.original.type) || '—'}</Badge> },
+      { accessorKey: 'city', header: 'City', cell: ({ row }) => <span className="text-muted-foreground">{row.original.city || '—'}</span> },
       { accessorKey: 'products', header: 'Products', meta: { align: 'right' as const }, cell: ({ row }) => <span className="tabular-nums">{formatNumber(row.original.products)}</span> },
       { accessorKey: 'quantity', header: 'Units', meta: { align: 'right' as const }, cell: ({ row }) => <span className="tabular-nums font-medium">{formatNumber(row.original.quantity)}</span> },
       { accessorKey: 'valueAtCost', header: 'Value at Cost', meta: { align: 'right' as const }, cell: ({ row }) => <span className="tabular-nums">{formatCurrency(row.original.valueAtCost)}</span> },

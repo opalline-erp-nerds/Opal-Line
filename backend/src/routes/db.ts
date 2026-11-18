@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Router, type Request, type Response, json as expressJson } from 'express'
 import argon2 from 'argon2'
-import { desc, eq, ilike, inArray, or, sql, and, gte, lte, ne } from 'drizzle-orm'
+import { desc, eq, ilike, inArray, or, sql, and, gte, lte, ne, isNull, type SQL } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
 import {
   duplicateScanMessage,
@@ -11,7 +11,7 @@ import {
 } from '../scanCode'
 import { findProductsBySku, generateUniqueSku, productCodeSettings } from '../lib/skuIdentity'
 import { isGenericSku, migrationWarnings, planSkuMigration, type SkuReferences } from '../lib/skuMigration'
-import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, resolveMovementLocation, type Tx } from '../stock'
+import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, levelAt, resolveMovementLocation, setStockTotalTo, type Tx } from '../stock'
 import { applyInvoiceReturn, aggregateReturnedBySku, nextInvoiceStatus, summarizeReturnLines } from '../invoiceReturn'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
@@ -41,8 +41,10 @@ import {
 } from '../lib/stockAging'
 import { invoiceTotals } from '../invoiceTotals'
 import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
+import { splitQtyAcrossVariants } from '../lib/variantSplit'
 import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
 import { queueProductOutbound } from '../shopifyOutbound'
+import { fetchStoreLocations, isShopifyLocationId, type ShopifyStoreLocation } from '../shopifyLocations'
 import { escapeHtml } from '../htmlEscape'
 import { routeParam } from '../lib/routeParams'
 import {
@@ -748,22 +750,367 @@ dbRouter.get('/products/scan', requirePermission('inventory', 'view'), async (re
     // Exact SKU match only — no fuzzy/partial matching and no barcode lookup,
     // so a scan can never resolve to the wrong product.
     const rows = await findProductsBySku(db!, code)
-    if (rows.length === 0) return res.status(404).json({ error: 'No product matches that SKU' })
+    if (rows.length === 0) {
+      // A label printed for a VARIANT carries the variant's SKU. Without this
+      // a multi-variant product could not be counted by label at all — the
+      // scan 404'd and the counter had no way to name the variant it counted.
+      const variants = await db!
+        .select({ id: s.productVariants.id, productId: s.productVariants.productId, title: s.productVariants.title, sku: s.productVariants.sku })
+        .from(s.productVariants)
+        .where(sql`upper(${s.productVariants.sku}) = upper(${code})`)
+        .limit(2)
+      if (variants.length === 0) return res.status(404).json({ error: 'No product matches that SKU' })
+      if (variants.length > 1) return res.status(409).json({ error: duplicateScanMessage() })
+      const [parent] = await db!
+        .select({ id: s.products.id, name: s.products.name, sku: s.products.sku, stock: s.products.stock, category: s.products.category, status: s.products.status })
+        .from(s.products)
+        .where(eq(s.products.id, variants[0]!.productId))
+        .limit(1)
+      if (!parent) return res.status(404).json({ error: 'No product matches that SKU' })
+      if (parent.status && parent.status !== 'active') {
+        return res.status(409).json({ error: inactiveProductMessage(parent.name, parent.status) })
+      }
+      return res.json({
+        data: {
+          id: parent.id,
+          name: parent.name,
+          sku: parent.sku,
+          stock: parent.stock,
+          category: parent.category,
+          variantId: variants[0]!.id,
+          variantTitle: variants[0]!.title,
+          variantSku: variants[0]!.sku,
+        },
+      })
+    }
     if (rows.length > 1) return res.status(409).json({ error: duplicateScanMessage() })
     const row = rows[0]
     if (row.status && row.status !== 'active') {
       return res.status(409).json({ error: inactiveProductMessage(row.name, row.status) })
     }
-    res.json({ data: { id: row.id, name: row.name, sku: row.sku, stock: row.stock, category: row.category } })
+    res.json({
+      data: {
+        id: row.id,
+        name: row.name,
+        sku: row.sku,
+        stock: row.stock,
+        category: row.category,
+        // A product SKU does not name a variant; the caller resolves the set
+        // (and expands a multi-variant product into one row per variant).
+        variantId: null,
+        variantTitle: null,
+        variantSku: null,
+      },
+    })
   } catch (err) {
     logger.error({ err }, 'product scan lookup failed')
     res.status(500).json({ error: 'Scan lookup failed' })
   }
 })
 
+/**
+ * Where stock cannot be explained yet — reported, never guessed at.
+ *
+ * Three separate things, deliberately kept apart because they need three
+ * different responses:
+ *
+ *  • `unattributed`  product-level balances on products that DO have variants:
+ *    nobody has said which variant holds them. They count towards the product
+ *    total and towards NO variant (that is what keeps
+ *    `products.stock = attributed + unattributed` honest). Reconciling one is
+ *    a deliberate act below, never an automatic split.
+ *  • `productLevel`  product-level balances on products with no variant rows:
+ *    legitimate by nature (nothing to attribute them to), listed only so the
+ *    totals reconcile.
+ *  • `orphaned`      balances whose product row is GONE. Preserved exactly as
+ *    they are: they are evidence, not spare stock, and are only ever reported
+ *    — no endpoint here can move, delete or re-attach them.
+ *
+ * `consistency` re-checks the invariant for every product: the rollup against
+ * its balances, and every variant counter against its own.
+ */
+dbRouter.get('/inventory/stock-anomalies', requirePermission('inventory', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const index = await locationIndex()
+    const levelRows = await db!
+      .select({ productId: s.stockLevels.productId, variantId: s.stockLevels.variantId, locationId: s.stockLevels.locationId, qty: s.stockLevels.qty })
+      .from(s.stockLevels)
+    const productRows = await db!
+      .select({ id: s.products.id, name: s.products.name, sku: s.products.sku, stock: s.products.stock })
+      .from(s.products)
+    const productById = new Map(productRows.map((p) => [p.id, p]))
+    const holderIds = [...new Set(levelRows.filter((r) => !r.variantId).map((r) => r.productId))]
+    const variantRows = holderIds.length
+      ? await db!.select().from(s.productVariants).where(inArray(s.productVariants.productId, holderIds))
+      : []
+    const variantsByProduct = new Map<string, typeof variantRows>()
+    for (const v of variantRows) {
+      const list = variantsByProduct.get(v.productId) ?? []
+      list.push(v)
+      variantsByProduct.set(v.productId, list)
+    }
+
+    // Product-level balances, split into "has variants" and "has none".
+    const productLevel: Array<Record<string, unknown>> = []
+    const unattributed: Array<Record<string, unknown>> = []
+    for (const row of levelRows.filter((r) => !r.variantId)) {
+      const product = productById.get(row.productId)
+      if (!product) continue
+      const entry = {
+        productId: row.productId,
+        productName: product.name,
+        productSku: product.sku,
+        locationId: row.locationId,
+        locationName: pickLocation(index, row.locationId)?.name ?? null,
+        qty: Math.floor(Number(row.qty ?? 0)),
+        variants: (variantsByProduct.get(row.productId) ?? []).map((v) => ({
+          id: v.id,
+          title: v.title,
+          sku: v.sku,
+          stock: Number(v.stock ?? 0),
+        })),
+      }
+      if (entry.variants.length > 0) unattributed.push(entry)
+      else productLevel.push(entry)
+    }
+
+    // Orphans: balances whose product no longer exists. Reported with their
+    // ledger history so a human can judge them — never touched.
+    const orphanLevelRows = levelRows.filter((r) => !productById.has(r.productId))
+    const orphanProductIds = [...new Set(orphanLevelRows.map((r) => r.productId))]
+    const movementCounts = orphanProductIds.length
+      ? await db!
+          .select({ productId: s.stockMovements.productId, n: sql<number>`count(*)::int` })
+          .from(s.stockMovements)
+          .where(inArray(s.stockMovements.productId, orphanProductIds))
+          .groupBy(s.stockMovements.productId)
+      : []
+    const movementCountByProduct = new Map(movementCounts.map((m) => [m.productId, Number(m.n ?? 0)]))
+    const orphaned = orphanLevelRows.map((row) => ({
+      productId: row.productId,
+      variantId: row.variantId ?? null,
+      locationId: row.locationId,
+      locationName: pickLocation(index, row.locationId)?.name ?? null,
+      qty: Math.floor(Number(row.qty ?? 0)),
+      movements: movementCountByProduct.get(row.productId) ?? 0,
+      note: 'Product row no longer exists — preserved as evidence, no action available without explicit approval',
+    }))
+    const orphanedUnits = orphaned.reduce((sum, r) => sum + Number(r.qty), 0)
+
+    // Consistency, per product: rollup vs balances, and each mirror vs its own
+    // balances. `preLedger` (no balance rows yet, rollup still set) is the
+    // one legitimate difference: the first movement materialises it.
+    const totalsByProduct = new Map<string, number>()
+    for (const row of levelRows) {
+      totalsByProduct.set(row.productId, (totalsByProduct.get(row.productId) ?? 0) + Math.floor(Number(row.qty ?? 0)))
+    }
+    const attributedByProduct = new Map<string, number>()
+    const variantLedgerByVariant = new Map<string, number>()
+    for (const row of levelRows) {
+      if (!row.variantId) continue
+      attributedByProduct.set(row.productId, (attributedByProduct.get(row.productId) ?? 0) + Math.floor(Number(row.qty ?? 0)))
+      variantLedgerByVariant.set(row.variantId, (variantLedgerByVariant.get(row.variantId) ?? 0) + Math.floor(Number(row.qty ?? 0)))
+    }
+    const mismatches: Array<Record<string, unknown>> = []
+    let preLedger = 0
+    for (const product of productRows) {
+      const ledger = totalsByProduct.get(product.id) ?? 0
+      const rollup = Math.floor(Number(product.stock ?? 0))
+      if (ledger === rollup) continue
+      if (ledger === 0) {
+        preLedger++
+        continue
+      }
+      mismatches.push({
+        productId: product.id,
+        productSku: product.sku,
+        kind: 'rollup',
+        productStock: rollup,
+        ledgerTotal: ledger,
+        unattributed: ledger - (attributedByProduct.get(product.id) ?? 0),
+        note: 'products.stock disagrees with its own balances',
+      })
+    }
+    const allVariants = await db!
+      .select({ id: s.productVariants.id, productId: s.productVariants.productId, sku: s.productVariants.sku, stock: s.productVariants.stock })
+      .from(s.productVariants)
+    for (const variant of allVariants) {
+      const ledger = variantLedgerByVariant.get(variant.id) ?? 0
+      const mirror = Math.floor(Number(variant.stock ?? 0))
+      if (ledger === mirror) continue
+      const productHasLevels = totalsByProduct.has(variant.productId)
+      if (!productHasLevels && mirror !== 0) {
+        preLedger++
+        continue
+      }
+      mismatches.push({
+        productId: variant.productId,
+        variantId: variant.id,
+        variantSku: variant.sku,
+        kind: 'variant-mirror',
+        variantStock: mirror,
+        ledgerTotal: ledger,
+        note: 'variant counter disagrees with its own balances',
+      })
+    }
+
+    const attributedUnits = [...variantLedgerByVariant.values()].reduce((sum, v) => sum + v, 0)
+    const unattributedUnits = unattributed.reduce((sum, r) => sum + Number(r.qty), 0)
+    const productLevelUnits = productLevel.reduce((sum, r) => sum + Number(r.qty), 0)
+
+    res.json({
+      unattributed,
+      productLevel,
+      orphaned,
+      consistency: {
+        ok: mismatches.length === 0,
+        mismatches,
+        preLedger,
+      },
+      totals: {
+        attributedUnits,
+        unattributedUnits,
+        productLevelUnits,
+        orphanedUnits,
+        // Every balance the ledger holds, including orphans that belong to no
+        // product — so the three buckets above always add up to this.
+        ledgerUnits: levelRows.reduce((sum, r) => sum + Math.floor(Number(r.qty ?? 0)), 0),
+      },
+    })
+  } catch (err) {
+    logger.error({ err }, 'stock anomaly report failed')
+    res.status(500).json({ error: 'Could not report stock anomalies' })
+  }
+})
+
+/**
+ * Attribute ONE unattributed balance to ONE variant of the same product.
+ *
+ * This is a re-keying, not a stock movement: no quantity is created, moved
+ * between locations or split — the whole balance at that location goes to the
+ * variant the caller names, in one transaction, and the activity log records
+ * who did it and what moved. Hence:
+ *   • `confirm: true` is required — an unconfirmed call is refused outright;
+ *   • the balance and the variant must both exist and belong together;
+ *   • orphans and totals are untouched: nothing here can delete stock.
+ */
+dbRouter.post('/inventory/stock-anomalies/attribute', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const productId = String(req.body?.productId ?? '').trim()
+    const locationId = String(req.body?.locationId ?? '').trim()
+    const variantId = String(req.body?.variantId ?? '').trim()
+    const confirm = req.body?.confirm === true
+    if (!productId || !locationId || !variantId) {
+      return res.status(400).json({ error: 'productId, locationId and variantId are required' })
+    }
+    if (!confirm) {
+      return res.status(400).json({
+        error: 'Explicit confirmation is required: attribute this balance only when a count proves which variant holds it',
+      })
+    }
+
+    const moved = await db!.transaction(async (tx) => {
+      // Product lock first — the same order every stock writer takes.
+      const [product] = await tx
+        .select({ id: s.products.id, name: s.products.name, sku: s.products.sku })
+        .from(s.products)
+        .where(eq(s.products.id, productId))
+        .limit(1)
+        .for('update')
+      if (!product) throw Object.assign(new Error('Product not found'), { status: 404 })
+      const [variant] = await tx
+        .select({ id: s.productVariants.id, title: s.productVariants.title, sku: s.productVariants.sku })
+        .from(s.productVariants)
+        .where(and(eq(s.productVariants.id, variantId), eq(s.productVariants.productId, productId)))
+        .limit(1)
+      if (!variant) throw Object.assign(new Error('That variant does not belong to this product'), { status: 400 })
+
+      const [source] = await tx
+        .select({ qty: s.stockLevels.qty })
+        .from(s.stockLevels)
+        .where(and(
+          eq(s.stockLevels.productId, productId),
+          eq(s.stockLevels.locationId, locationId),
+          isNull(s.stockLevels.variantId),
+        ))
+        .limit(1)
+        .for('update')
+      if (!source) throw Object.assign(new Error('No unattributed balance at that location'), { status: 404 })
+      const qty = Math.floor(Number(source.qty ?? 0))
+
+      // Merge into the variant's row when it already has one at this location
+      // (both partial uniques allow the pair to exist), otherwise re-key.
+      const [existing] = await tx
+        .select({ qty: s.stockLevels.qty })
+        .from(s.stockLevels)
+        .where(and(
+          eq(s.stockLevels.productId, productId),
+          eq(s.stockLevels.locationId, locationId),
+          eq(s.stockLevels.variantId, variantId),
+        ))
+        .limit(1)
+        .for('update')
+      if (existing) {
+        await tx
+          .update(s.stockLevels)
+          .set({ qty: Math.floor(Number(existing.qty ?? 0)) + qty })
+          .where(and(
+            eq(s.stockLevels.productId, productId),
+            eq(s.stockLevels.locationId, locationId),
+            eq(s.stockLevels.variantId, variantId),
+          ))
+        await tx.delete(s.stockLevels).where(and(
+          eq(s.stockLevels.productId, productId),
+          eq(s.stockLevels.locationId, locationId),
+          isNull(s.stockLevels.variantId),
+        ))
+      } else {
+        await tx.update(s.stockLevels).set({ variantId }).where(and(
+          eq(s.stockLevels.productId, productId),
+          eq(s.stockLevels.locationId, locationId),
+          isNull(s.stockLevels.variantId),
+        ))
+      }
+
+      // Mirrors follow the balances (the product total is unchanged: this
+      // moves nothing, it only says which variant already holds it).
+      const [variantTotal] = await tx
+        .select({ qty: sql<number>`coalesce(sum(${s.stockLevels.qty}), 0)` })
+        .from(s.stockLevels)
+        .where(eq(s.stockLevels.variantId, variantId))
+      await tx.update(s.productVariants).set({ stock: Math.floor(Number(variantTotal?.qty ?? 0)) })
+        .where(eq(s.productVariants.id, variantId))
+      const [productTotal] = await tx
+        .select({ qty: sql<number>`coalesce(sum(${s.stockLevels.qty}), 0)` })
+        .from(s.stockLevels)
+        .where(eq(s.stockLevels.productId, productId))
+      await tx.update(s.products).set({ stock: Math.floor(Number(productTotal?.qty ?? 0)) })
+        .where(eq(s.products.id, productId))
+      return { qty, productName: product.name, productSku: product.sku, variantTitle: variant.title, variantSku: variant.sku }
+    })
+
+    recordCrud('inventory/stock-anomalies', 'Attributed', req, {
+      name: `${moved.productSku} → ${moved.variantSku}`,
+      productId,
+      locationId,
+      variantId,
+      qty: moved.qty,
+      from: 'unattributed product-level balance',
+      to: `${moved.variantTitle} (${moved.variantSku})`,
+    })
+    res.json({ ok: true, ...moved, locationId, variantId })
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 500
+    if (status === 500) logger.error({ err }, 'stock attribution failed')
+    res.status(status).json({ error: err instanceof Error ? err.message : 'Could not attribute the balance' })
+  }
+})
+
 // Bulk stock-count: apply counted quantities for many products at once.
-// body: { counts: [{ id, counted }], mode: 'set' | 'adjust', locationId?: string,
-//         pushToShopify?: boolean }
+// body: { counts: [{ id, counted, variantId? }], mode: 'set' | 'adjust',
+//         locationId?: string, pushToShopify?: boolean }
 dbRouter.post('/inventory/stock-count', requirePermission('inventory', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
@@ -793,12 +1140,12 @@ dbRouter.post('/inventory/stock-count', requirePermission('inventory', 'edit'), 
           errors.push(`${c.id}: product not found`)
           continue
         }
-        const [level] = await db!
-          .select({ qty: s.stockLevels.qty })
-          .from(s.stockLevels)
-          .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, locationId)))
-          .limit(1)
-        const current = stockAtLocation(level?.qty)
+        // What is on hand AT the counted location: for a variant count, that
+        // variant's row; otherwise every variant's row summed. Reading a single
+        // stock_levels row (which is what this did) counted only ONE variant of
+        // a multi-variant product and so "corrected" the others.
+        const variantId = c.variantId ?? null
+        const current = await levelAt(db!, product.id, locationId, variantId)
         const delta = stockCountDelta(current, c.counted, mode)
         if (delta === 0) {
           applied++
@@ -808,6 +1155,7 @@ dbRouter.post('/inventory/stock-count', requirePermission('inventory', 'edit'), 
         // a count_adjust movement so the ledger explains the new balance.
         await applyStockMovement({
           sku: String(product.sku ?? ''),
+          variantId,
           qty: delta,
           type: 'count_adjust',
           locationId,
@@ -1836,6 +2184,43 @@ function planImportRow(
   }
 }
 
+/**
+ * A CSV row's `stock` cell is a TARGET, and the ledger is what has to reach
+ * it: writing it straight into products.stock (what both import routes did)
+ * left the per-location, per-variant balances disagreeing with the rollup the
+ * moment more than one location held stock.
+ *
+ * Only the difference moves, through setStockTotalTo:
+ *   • existing product → a count correction; a reduction is spread across the
+ *     locations that hold the stock and a growth joins them, so no allocation
+ *     is silently overwritten;
+ *   • new product → the row is inserted with zero stock and its counted
+ *     quantity is posted as an `opening` movement, so the product is born
+ *     inside the ledger with real history instead of a bare column value.
+ *
+ * `stock === null` means the CSV had no stock column at all: stock is left
+ * exactly as it was, which is what these routes did before.
+ */
+async function applyImportedStock(
+  row: { sku: string },
+  stock: number | null,
+  opts: { rowNo: number; isNew: boolean; errors: string[] },
+): Promise<void> {
+  if (stock == null) return
+  try {
+    await setStockTotalTo({
+      sku: row.sku,
+      target: stock,
+      type: opts.isNew ? 'opening' : 'count_adjust',
+      refType: 'import',
+      note: `stock ${stock} from CSV row ${opts.rowNo}`,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'unknown error'
+    opts.errors.push(`Row ${opts.rowNo} (${row.sku}): stock ${stock} was not applied — ${message}`)
+  }
+}
+
 dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
@@ -1893,15 +2278,20 @@ dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), a
       try {
         if (hit) {
           const patch: Record<string, unknown> = { ...text }
-          for (const [k, v] of Object.entries(numeric)) if (v != null) patch[k] = v
+          // `stock` never lands in a column write: it is reached as the delta
+          // to a target, through the ledger (see applyImportedStock).
+          for (const [k, v] of Object.entries(numeric)) if (v != null && k !== 'stock') patch[k] = v
           // The collection's pricing model wins over whatever the columns say.
           Object.assign(patch, plan.pricing ?? {})
           await db!.update(s.products).set(patch).where(eq(s.products.id, hit.id))
+          await applyImportedStock({ sku: hit.sku }, numeric.stock, { rowNo, isNew: false, errors })
           updated++
         } else {
           const values: Record<string, unknown> = {
             id: randomUUID(), sku, ...text, ...numeric,
-            stock: numeric.stock ?? 0,
+            // Zero on purpose: the counted quantity arrives as an opening
+            // movement below, so the product starts inside the ledger.
+            stock: 0,
             reorderLevel: numeric.reorderLevel ?? 5,
             purity: numeric.purity ?? 92.5,
             trackInventory: true,
@@ -1912,6 +2302,7 @@ dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), a
           }
           Object.assign(values, plan.pricing ?? {})
           const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
+          await applyImportedStock({ sku: row.sku }, numeric.stock, { rowNo, isNew: true, errors })
           bySku.set(skuKey, { id: row.id, sku, sellingPrice: row.sellingPrice })
           created++
         }
@@ -2050,15 +2441,20 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
       try {
         if (hit) {
           const patch: Record<string, unknown> = { ...text }
-          for (const [k, v] of Object.entries(numeric)) if (v != null) patch[k] = v
+          // `stock` never lands in a column write: it is reached as the delta
+          // to a target, through the ledger (see applyImportedStock).
+          for (const [k, v] of Object.entries(numeric)) if (v != null && k !== 'stock') patch[k] = v
           // The collection's pricing model wins over whatever the columns say.
           Object.assign(patch, plan.pricing ?? {})
           await db!.update(s.products).set(patch).where(eq(s.products.id, hit.id))
+          await applyImportedStock({ sku: hit.sku }, numeric.stock, { rowNo, isNew: false, errors })
           updated++
         } else {
           const values: Record<string, unknown> = {
             id: randomUUID(), sku, ...text, ...numeric,
-            stock: numeric.stock ?? 0,
+            // Zero on purpose: the counted quantity arrives as an opening
+            // movement below, so the product starts inside the ledger.
+            stock: 0,
             reorderLevel: numeric.reorderLevel ?? 5,
             purity: numeric.purity ?? 92.5,
             trackInventory: true,
@@ -2069,6 +2465,7 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
           }
           Object.assign(values, plan.pricing ?? {})
           const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
+          await applyImportedStock({ sku: row.sku }, numeric.stock, { rowNo, isNew: true, errors })
           bySku.set(skuKey, { id: row.id, sku, sellingPrice: row.sellingPrice })
           created++
         }
@@ -3688,6 +4085,95 @@ dbRouter.get('/inventory/locations/stock-summary', requirePermission('inventory'
 })
 
 /**
+ * The store's EXISTING Shopify locations, for the mapping dropdown.
+ * Read-only GraphQL: nothing in this module ever creates or deletes a store
+ * location — the ERP maps to what the store already has.
+ */
+dbRouter.get('/inventory/locations/shopify', requirePermission('inventory', 'view'), async (_req, res) => {
+  try {
+    const locations = await fetchStoreLocations()
+    res.json({ locations })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Could not fetch Shopify locations'
+    logger.error({ err }, 'Shopify locations fetch failed')
+    res.status(502).json({ error: message })
+  }
+})
+
+/**
+ * Map one ERP stock location to an existing Shopify location (or clear with
+ * `null`). The persisted value is Shopify's NUMERIC location id — never a
+ * display name — and it must be an id the store actually reports, so a typo
+ * can never silently point stock at the wrong place.
+ */
+dbRouter.patch(
+  '/inventory/locations/:id/shopify-location',
+  requirePermission('inventory', 'edit'),
+  async (req, res) => {
+    if (!requireDb(res)) return
+    try {
+      const [location] = await db!
+        .select()
+        .from(s.inventoryLocations)
+        .where(eq(s.inventoryLocations.id, routeParam(req.params.id)))
+        .limit(1)
+      if (!location) return res.status(404).json({ error: 'Location not found' })
+
+      const raw = req.body?.shopifyLocationId
+      if (raw == null || raw === '') {
+        const [row] = await db!
+          .update(s.inventoryLocations)
+          .set({ shopifyLocationId: null })
+          .where(eq(s.inventoryLocations.id, location.id))
+          .returning()
+        recordCrud('inventory/locations', 'Updated', req, { ...row, shopifyLocationId: null })
+        return res.json(stripHash(row))
+      }
+
+      const shopifyLocationId = String(raw).trim()
+      if (!isShopifyLocationId(shopifyLocationId)) {
+        return res
+          .status(400)
+          .json({ error: 'shopifyLocationId must be a Shopify numeric location id, or null to clear the mapping' })
+      }
+
+      // Must be an EXISTING location on the store — never invent one.
+      let storeLocations: ShopifyStoreLocation[]
+      try {
+        storeLocations = await fetchStoreLocations()
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'unknown error'
+        return res.status(502).json({ error: `Cannot verify the Shopify location: ${message}` })
+      }
+      if (!storeLocations.some((l) => l.shopifyLocationId === shopifyLocationId)) {
+        return res.status(400).json({ error: 'That Shopify location does not exist on the store' })
+      }
+
+      try {
+        const [row] = await db!
+          .update(s.inventoryLocations)
+          .set({ shopifyLocationId })
+          .where(eq(s.inventoryLocations.id, location.id))
+          .returning()
+        recordCrud('inventory/locations', 'Updated', req, { ...row })
+        res.json(stripHash(row))
+      } catch (err) {
+        // Partial unique index: one ERP location per store location.
+        if (errorText(err).includes('duplicate key')) {
+          return res
+            .status(400)
+            .json({ error: 'That Shopify location is already mapped to another ERP location' })
+        }
+        throw err
+      }
+    } catch (err) {
+      logger.error({ err }, 'Shopify location mapping failed')
+      res.status(500).json({ error: 'Could not save the Shopify location mapping' })
+    }
+  },
+)
+
+/**
  * Create a location, optionally counting stock in at the point of opening it.
  *
  * A new location starts empty, so without this the only way to give it stock is
@@ -4018,8 +4504,186 @@ dbRouter.patch('/inventory/categories/:id', requirePermission('inventory', 'edit
   }
 })
 
-dbRouter.get('/inventory/transfers', listOf(s.stockTransfers, s.stockTransfers.date))
-dbRouter.get('/inventory/transfers/:id', oneOf(s.stockTransfers, s.stockTransfers.id))
+// ─── Stock transfers: readable routes and detail ────────────────────────────
+// from/to store canonical inventory_locations IDs; rows written before the
+// backfill still hold display names, and a row may reference a location that
+// has since been deleted. Everything below resolves either shape into a
+// readable reference and degrades to an explicit "removed location" marker —
+// a raw id must never reach the screen.
+
+interface TransferLocationRef {
+  id: string
+  name: string
+  type: string | null
+  city: string | null
+}
+
+/** All locations indexed by id AND by name (legacy transfers store the name). */
+async function locationIndex(): Promise<{
+  byId: Map<string, TransferLocationRef>
+  byName: Map<string, TransferLocationRef>
+}> {
+  const rows = await db!.select().from(s.inventoryLocations)
+  const byId = new Map<string, TransferLocationRef>()
+  const byName = new Map<string, TransferLocationRef>()
+  for (const l of rows) {
+    const ref: TransferLocationRef = { id: l.id, name: l.name, type: l.type ?? null, city: l.city ?? null }
+    byId.set(l.id, ref)
+    if (!byName.has(l.name)) byName.set(l.name, ref)
+  }
+  return { byId, byName }
+}
+
+function pickLocation(
+  index: { byId: Map<string, TransferLocationRef>; byName: Map<string, TransferLocationRef> },
+  value: string | null | undefined,
+): TransferLocationRef | null {
+  const v = String(value ?? '').trim()
+  if (!v) return null
+  return index.byId.get(v) ?? index.byName.get(v) ?? null
+}
+
+dbRouter.get('/inventory/transfers', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const result = await paginate(s.stockTransfers, req.query, s.stockTransfers.date, req)
+    const index = await locationIndex()
+    // initiatedBy stores a user id; resolve it once for the page so the list
+    // never shows a raw id in the "By" column.
+    const actorIds = [...new Set(result.data.map((r) => r.initiatedBy).filter((x): x is string => Boolean(x)))]
+    const actors = actorIds.length
+      ? await db!.select({ id: s.users.id, name: s.users.name }).from(s.users).where(inArray(s.users.id, actorIds))
+      : []
+    const actorName = (id: string | null | undefined) =>
+      id ? (actors.find((u) => u.id === id)?.name ?? null) : null
+    // Which variant each row moves, resolved once per page: the list shows the
+    // variant name beside the SKU rather than a bare product.
+    const variantIds = [...new Set(result.data.map((r) => r.variantId).filter((x): x is string => Boolean(x)))]
+    const variants = variantIds.length
+      ? await db!.select().from(s.productVariants).where(inArray(s.productVariants.id, variantIds))
+      : []
+    const variantById = new Map(variants.map((v) => [v.id, v]))
+    res.json({
+      ...result,
+      data: result.data.map((row) => ({
+        ...row,
+        fromLocation: pickLocation(index, row.from),
+        toLocation: pickLocation(index, row.to),
+        initiatedByName: actorName(row.initiatedBy),
+        variantTitle: row.variantId ? (variantById.get(row.variantId)?.title ?? null) : null,
+        variantSku: row.variantId ? (variantById.get(row.variantId)?.sku ?? null) : null,
+      })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'stock transfers list failed')
+    res.status(500).json({ error: 'Could not load stock transfers' })
+  }
+})
+
+/**
+ * One transfer with everything the detail view needs: resolved endpoints,
+ * readable actor names, the ledger history that IS the dispatch/receive/cancel
+ * trail, and which location currently owns the stock. The ledger is never
+ * written here — this endpoint only reads.
+ */
+dbRouter.get('/inventory/transfers/:id', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [transfer] = await db!.select().from(s.stockTransfers)
+      .where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1)
+    if (!transfer) return res.status(404).json({ error: 'Not found' })
+
+    const index = await locationIndex()
+    const fromLocation = pickLocation(index, transfer.from)
+    const toLocation = pickLocation(index, transfer.to)
+
+    // The stored `product` is a snapshot from creation; prefer the live name.
+    // A transfer that moves a variant resolves through it — its SKU is the
+    // variant's, so looking the parent up by that SKU would miss.
+    const [variant] = transfer.variantId
+      ? await db!.select().from(s.productVariants).where(eq(s.productVariants.id, transfer.variantId)).limit(1)
+      : await db!.select().from(s.productVariants).where(eq(s.productVariants.sku, String(transfer.sku ?? ''))).limit(1)
+    const [product] = variant
+      ? await db!.select({ name: s.products.name }).from(s.products).where(eq(s.products.id, variant.productId)).limit(1)
+      : await db!.select({ name: s.products.name }).from(s.products)
+          .where(eq(s.products.sku, String(transfer.sku ?? ''))).limit(1)
+
+    // The ledger is the transfer's history: dispatch posts transfer_out at the
+    // source, receive posts transfer_in at the destination (carrying the
+    // variance note), and cancelling an in-transit transfer posts transfer_in
+    // back at the source with its own note.
+    const movements = await db!.select().from(s.stockMovements)
+      .where(and(eq(s.stockMovements.refType, 'stock_transfer'), eq(s.stockMovements.refId, transfer.id)))
+      .orderBy(s.stockMovements.date)
+
+    const actorIds = [...new Set(
+      [transfer.initiatedBy, ...movements.map((m) => m.createdBy)].filter((x): x is string => Boolean(x)),
+    )]
+    const users = actorIds.length
+      ? await db!.select({ id: s.users.id, name: s.users.name }).from(s.users).where(inArray(s.users.id, actorIds))
+      : []
+    const actorName = (id: string | null | undefined): string | null =>
+      id ? (users.find((u) => u.id === id)?.name ?? null) : null
+
+    const outbound = movements.find((m) => m.type === 'transfer_out') ?? null
+    const inbound = movements.filter((m) => m.type === 'transfer_in')
+    const cancelReturn = inbound.find((m) => String(m.note ?? '').toLowerCase().includes('cancel')) ?? null
+    const receive = inbound.find((m) => m !== cancelReturn) ?? null
+
+    // Who holds the goods right now: pending and cancelled stock sits at the
+    // source, in-transit stock sits at neither, received stock is the
+    // destination's.
+    const owner =
+      transfer.status === 'received'
+        ? { locationId: toLocation?.id ?? null, name: toLocation?.name ?? null, inTransit: false }
+        : transfer.status === 'in-transit'
+          ? { locationId: null, name: null, inTransit: true }
+          : { locationId: fromLocation?.id ?? null, name: fromLocation?.name ?? null, inTransit: false }
+
+    res.json({
+      ...transfer,
+      productName: product?.name ?? transfer.product ?? null,
+      variantId: transfer.variantId ?? variant?.id ?? null,
+      variantTitle: variant?.title ?? null,
+      variantSku: variant?.sku ?? null,
+      fromLocation,
+      toLocation,
+      initiatedByName: actorName(transfer.initiatedBy),
+      dispatch: outbound
+        ? { at: outbound.date, by: outbound.createdBy ?? null, byName: actorName(outbound.createdBy) }
+        : null,
+      receive: receive
+        ? {
+            at: receive.date,
+            by: receive.createdBy ?? null,
+            byName: actorName(receive.createdBy),
+            qty: Number(receive.qty ?? 0),
+            note: receive.note ?? null,
+          }
+        : null,
+      cancel: cancelReturn
+        ? { at: cancelReturn.date, by: cancelReturn.createdBy ?? null, byName: actorName(cancelReturn.createdBy) }
+        : null,
+      owner,
+      history: movements.map((m) => ({
+        id: m.id,
+        type: String(m.type ?? ''),
+        qty: Number(m.qty ?? 0),
+        stockAfter: m.stockAfter == null ? null : Number(m.stockAfter),
+        variantId: m.variantId ?? null,
+        locationId: m.locationId ?? null,
+        locationName: pickLocation(index, m.locationId)?.name ?? null,
+        note: m.note ?? null,
+        by: m.createdBy ?? null,
+        byName: actorName(m.createdBy),
+        date: m.date,
+      })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'stock transfer detail failed')
+    res.status(500).json({ error: 'Could not load transfer details' })
+  }
+})
 
 // The stock ledger: every movement, newest first. Optionally filtered to one
 // SKU and/or a date window, which is what the product page shows.
@@ -4049,29 +4713,107 @@ dbRouter.get('/inventory/movements', requirePermission('inventory', 'view'), asy
       .where(where)
       .orderBy(desc(s.stockMovements.date))
       .limit(limit)
-    res.json(rows)
+    // Resolve the location metadata (so the UI can render `Main Store · Store ·
+    // Chennai`) AND the variant each row moved — a movement that names a
+    // variant shows its name and SKU; one that cannot be named is flagged as
+    // unattributed rather than being guessed onto whatever variant exists.
+    const index = await locationIndex()
+    const variantIds = [...new Set(rows.map((r) => r.variantId).filter((v): v is string => Boolean(v)))]
+    const holderIds = [...new Set(rows.filter((r) => !r.variantId && r.productId).map((r) => r.productId as string))]
+    const [variants, holders] = await Promise.all([
+      variantIds.length
+        ? db!.select().from(s.productVariants).where(inArray(s.productVariants.id, variantIds))
+        : Promise.resolve([]),
+      holderIds.length
+        ? db!.select({ productId: s.productVariants.productId })
+            .from(s.productVariants)
+            .where(inArray(s.productVariants.productId, holderIds))
+            .groupBy(s.productVariants.productId)
+        : Promise.resolve([]),
+    ])
+    const variantById = new Map(variants.map((v) => [v.id, v]))
+    const productsWithVariants = new Set(holders.map((h) => h.productId))
+    res.json(rows.map((row) => {
+      const loc = pickLocation(index, row.locationId)
+      const variant = row.variantId ? variantById.get(row.variantId) : undefined
+      return {
+        ...row,
+        variantTitle: variant?.title ?? null,
+        variantSku: variant?.sku ?? null,
+        // No variant AND the product has variants → genuinely unattributed
+        // legacy stock. A product with no variants at all is product-level by
+        // nature, not unattributed. Either way: never guessed.
+        unattributed: !row.variantId && Boolean(row.productId && productsWithVariants.has(row.productId)),
+        locationName: loc?.name ?? null,
+        locationType: loc?.type ?? null,
+        locationCity: loc?.city ?? null,
+      }
+    }))
   } catch (err) {
     logger.error({ err }, 'stock movements list failed')
     res.status(500).json({ error: 'Could not load stock movements' })
   }
 })
 
-// Stock on hand per location for one product, or for everything.
+// Stock on hand per location for one product (optionally one of its
+// variants), or for everything.
 dbRouter.get('/inventory/levels', requirePermission('inventory', 'view'), async (req, res) => {
   if (!requireDb(res)) return
   try {
     const sku = typeof req.query.sku === 'string' ? req.query.sku.trim() : ''
-    const rows = sku
-      ? await db!.select().from(s.stockLevels).innerJoin(s.products, eq(s.products.id, s.stockLevels.productId)).where(eq(s.products.sku, sku))
-      : await db!.select().from(s.stockLevels)
-    res.json(rows.map((r) => {
-      const level = 'stock_levels' in r ? r.stock_levels : r
-      const product = 'products' in r ? r.products : null
+    const variantId = typeof req.query.variantId === 'string' ? req.query.variantId.trim() : ''
+    const productId = typeof req.query.productId === 'string' ? req.query.productId.trim() : ''
+
+    // A balance row is (product, variant, location), so filtering by product
+    // now returns ONE ROW PER VARIANT — the client picks the one for the
+    // variant it is moving rather than the first row it happens to see.
+    const conditions: SQL[] = []
+    if (sku) {
+      const [product] = await db!.select({ id: s.products.id }).from(s.products).where(eq(s.products.sku, sku)).limit(1)
+      if (!product) return res.json([])
+      conditions.push(eq(s.stockLevels.productId, product.id))
+    } else if (productId) {
+      conditions.push(eq(s.stockLevels.productId, productId))
+    }
+    if (variantId) conditions.push(eq(s.stockLevels.variantId, variantId))
+
+    const rows = await db!
+      .select()
+      .from(s.stockLevels)
+      .where(conditions.length ? and(...conditions) : undefined)
+
+    // Enrich with the variant and product each row belongs to, in two queries
+    // rather than a join that would have to change shape per filter.
+    const variantIds = [...new Set(rows.map((r) => r.variantId).filter((v): v is string => Boolean(v)))]
+    const holderIds = [...new Set(rows.map((r) => r.productId))]
+    const [variants, holders] = await Promise.all([
+      variantIds.length
+        ? db!.select().from(s.productVariants).where(inArray(s.productVariants.id, variantIds))
+        : Promise.resolve([]),
+      holderIds.length
+        ? db!.select({ id: s.products.id, sku: s.products.sku }).from(s.products).where(inArray(s.products.id, holderIds))
+        : Promise.resolve([]),
+    ])
+    const variantById = new Map(variants.map((v) => [v.id, v]))
+    const productById = new Map(holders.map((p) => [p.id, p]))
+
+    // Same enrichment as /inventory/movements: the id stays for API use, the
+    // name/type/city ride along for display.
+    const index = await locationIndex()
+    res.json(rows.map((level) => {
+      const variant = level.variantId ? variantById.get(level.variantId) : undefined
+      const loc = pickLocation(index, level.locationId)
       return {
         productId: level.productId,
-        sku: product?.sku ?? null,
+        sku: productById.get(level.productId)?.sku ?? null,
+        variantId: level.variantId ?? null,
+        variantSku: variant?.sku ?? null,
+        variantTitle: variant?.title ?? null,
         locationId: level.locationId,
         qty: Number(level.qty ?? 0),
+        locationName: loc?.name ?? null,
+        locationType: loc?.type ?? null,
+        locationCity: loc?.city ?? null,
       }
     }))
   } catch (err) {
@@ -4098,6 +4840,7 @@ dbRouter.post('/inventory/transfers', requirePermission('inventory', 'edit'), as
   if (!requireDb(res)) return
   try {
     const sku = String(req.body?.sku ?? '').trim()
+    const requestedVariantId = req.body?.variantId == null ? '' : String(req.body.variantId).trim()
     const qty = Number(req.body?.qty)
     const fromRaw = String(req.body?.from ?? '').trim()
     const toRaw = String(req.body?.to ?? '').trim()
@@ -4112,49 +4855,25 @@ dbRouter.post('/inventory/transfers', requirePermission('inventory', 'edit'), as
       if (!to) throw Object.assign(new Error(`Unknown destination location "${toRaw}"`), { status: 400 })
       if (from === to) throw Object.assign(new Error('Source and destination must differ'), { status: 400 })
 
+      // The posted SKU may be the product's or (for callers that already know
+      // it) the variant's — both must land on the parent product row.
       const [product] = await tx.select({ id: s.products.id, name: s.products.name }).from(s.products).where(eq(s.products.sku, sku)).limit(1)
-      if (!product) throw Object.assign(new Error(`Unknown SKU ${sku}`), { status: 404 })
-
-      // Lock the product before checking source stock. Concurrent transfers and
-      // sales then serialize on the same row instead of both trusting a stale balance.
-      await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.id, product.id)).for('update')
-      const [fromLevel] = await tx.select({ qty: s.stockLevels.qty })
-        .from(s.stockLevels)
-        .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, from)))
-        .limit(1)
-      const available = Number(fromLevel?.qty ?? 0)
-      if (available < qty) {
-        throw Object.assign(new Error(`Only ${available} in stock at ${fromRaw}, tried to move ${qty}`), { status: 400 })
+      if (!product) {
+        const [viaVariant] = await tx
+          .select({ productId: s.productVariants.productId })
+          .from(s.productVariants)
+          .where(eq(s.productVariants.sku, sku))
+          .limit(1)
+        if (viaVariant) {
+          const [parent] = await tx.select({ id: s.products.id, name: s.products.name }).from(s.products).where(eq(s.products.id, viaVariant.productId)).limit(1)
+          if (parent) return transferWithin(tx, parent, from, to, fromRaw, sku, requestedVariantId, qty, req)
+        }
+        throw Object.assign(new Error(`Unknown SKU ${sku}`), { status: 404 })
       }
-
-      // Generate identifiers on the server. Client-side list counts are stale
-      // under multi-computer use and can produce duplicate transfer numbers.
-      // The 8-hex suffix is random, not sequential: two concurrent creates cannot
-      // race for a shared counter, and the unique index is the final backstop.
-      const number = `ST-${new Date().getFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`
-      // from/to store the canonical location IDs — the id, not a display name
-      // that breaks the moment a location is renamed. The bootstrap upgrade
-      // migrates legacy name-valued rows to their IDs.
-      const [row] = await tx.insert(s.stockTransfers).values({
-        id: randomUUID(),
-        number,
-        from,
-        to,
-        product: product.name ?? null,
-        sku,
-        qty,
-        weight: req.body?.weight != null ? Number(req.body.weight) : null,
-        initiatedBy: actorFromRequest(req).userId ?? 'system',
-        // Pending means the goods are still sitting at the source. Stock moves
-        // on dispatch, not on creation — otherwise a transfer that is never
-        // dispatched has already emptied the shelf it was meant to refill.
-        status: 'pending',
-        date: new Date().toISOString(),
-      }).returning()
-      return row
+      return transferWithin(tx, product, from, to, fromRaw, sku, requestedVariantId, qty, req)
     })
 
-    recordCrud('stockTransfers', 'Created', req, { number: created.number, sku, qty, from: created.from, to: created.to })
+    recordCrud('stockTransfers', 'Created', req, { number: created.number, sku: created.sku, qty, from: created.from, to: created.to })
     res.status(201).json(created)
   } catch (err) {
     const status = (err as { status?: number }).status ?? 500
@@ -4162,6 +4881,134 @@ dbRouter.post('/inventory/transfers', requirePermission('inventory', 'edit'), as
     res.status(status).json({ error: err instanceof Error ? err.message : 'Transfer failed' })
   }
 })
+
+/**
+ * Validates the variant and the source balance, then writes the transfer row.
+ *
+ * The variant is MANDATORY for a product that has more than one: a transfer
+ * that only names the parent cannot say which colour left the shelf, and the
+ * deduction would have to be guessed. A single-variant product resolves to its
+ * one variant automatically, so nothing changes for the ordinary case.
+ */
+async function transferWithin(
+  tx: Tx,
+  product: { id: string; name: string },
+  from: string,
+  to: string,
+  fromLabel: string,
+  sku: string,
+  requestedVariantId: string,
+  qty: number,
+  req: Request,
+): Promise<typeof s.stockTransfers.$inferSelect> {
+  const variants = await tx
+    .select({ id: s.productVariants.id, sku: s.productVariants.sku })
+    .from(s.productVariants)
+    .where(eq(s.productVariants.productId, product.id))
+    .orderBy(s.productVariants.sku, s.productVariants.id)
+
+  let variantId: string | null = null
+  if (requestedVariantId) {
+    const match = variants.find((v) => v.id === requestedVariantId)
+    if (!match) throw Object.assign(new Error('That variant does not belong to this product'), { status: 400 })
+    variantId = match.id
+  } else {
+    const bySku = variants.find((v) => v.sku === sku)
+    if (bySku) variantId = bySku.id
+    else if (variants.length === 1) variantId = variants[0]!.id
+    else if (variants.length > 1) {
+      throw Object.assign(
+        new Error(`"${product.name}" has ${variants.length} variants — select the variant to move`),
+        { status: 400 },
+      )
+    }
+  }
+  // Store the SKU of what is actually moving, so the record, its history and
+  // any later re-resolution all name the same units.
+  const transferSku = variantId ? (variants.find((v) => v.id === variantId)?.sku ?? sku) : sku
+
+  // Lock the product before checking source stock. Concurrent transfers and
+  // sales then serialize on the same row instead of both trusting a stale balance.
+  await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.id, product.id)).for('update')
+  // Availability is the SOURCE's balance for THIS variant (the product's total
+  // at that location for a variant-less product-level transfer).
+  const available = await levelAt(tx, product.id, from, variantId)
+  if (available < qty) {
+    const what = variantId ? ' of this variant' : ''
+    throw Object.assign(
+      new Error(`Only ${available}${what} in stock at ${fromLabel}, tried to move ${qty}`),
+      { status: 400 },
+    )
+  }
+
+  // Generate identifiers on the server. Client-side list counts are stale
+  // under multi-computer use and can produce duplicate transfer numbers.
+  // The 8-hex suffix is random, not sequential: two concurrent creates cannot
+  // race for a shared counter, and the unique index is the final backstop.
+  const number = `ST-${new Date().getFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`
+  // from/to store the canonical location IDs — the id, not a display name
+  // that breaks the moment a location is renamed. The bootstrap upgrade
+  // migrates legacy name-valued rows to their IDs.
+  const [row] = await tx.insert(s.stockTransfers).values({
+    id: randomUUID(),
+    number,
+    from,
+    to,
+    product: product.name ?? null,
+    variantId,
+    sku: transferSku,
+    qty,
+    weight: req.body?.weight != null ? Number(req.body.weight) : null,
+    initiatedBy: actorFromRequest(req).userId ?? 'system',
+    // Pending means the goods are still sitting at the source. Stock moves
+    // on dispatch, not on creation — otherwise a transfer that is never
+    // dispatched has already emptied the shelf it was meant to refill.
+    status: 'pending',
+    date: new Date().toISOString(),
+  }).returning()
+  if (!row) throw Object.assign(new Error('Could not create the transfer'), { status: 500 })
+  return row
+}
+
+/**
+ * What a transfer record actually moves: its stored variant when it has one,
+ * otherwise whatever its SKU resolves to today.
+ *
+ * The stored variant wins because it is what the document was created for —
+ * a variant deleted after dispatch must not silently redirect a receive onto
+ * a different variant, so the SKU is only consulted when the variant is gone
+ * (or was never recorded, for transfers created before variant selection).
+ */
+async function resolveTransferStock(
+  tx: Tx,
+  transfer: { sku: string | null; variantId: string | null },
+): Promise<{ productId: string; ledgerSku: string; variantId: string | null } | null> {
+  const sku = String(transfer.sku ?? '').trim()
+  if (transfer.variantId) {
+    const [variant] = await tx
+      .select({ productId: s.productVariants.productId, sku: s.productVariants.sku })
+      .from(s.productVariants)
+      .where(eq(s.productVariants.id, transfer.variantId))
+      .limit(1)
+    if (variant?.productId) {
+      const [parent] = await tx.select({ sku: s.products.sku }).from(s.products).where(eq(s.products.id, variant.productId)).limit(1)
+      if (parent?.sku) return { productId: variant.productId, ledgerSku: parent.sku, variantId: transfer.variantId }
+    }
+  }
+  if (!sku) return null
+  const [product] = await tx.select({ id: s.products.id, sku: s.products.sku }).from(s.products).where(eq(s.products.sku, sku)).limit(1)
+  if (product) return { productId: product.id, ledgerSku: product.sku, variantId: null }
+  const [variant] = await tx
+    .select({ id: s.productVariants.id, productId: s.productVariants.productId, sku: s.productVariants.sku })
+    .from(s.productVariants)
+    .where(eq(s.productVariants.sku, sku))
+    .limit(1)
+  if (variant) {
+    const [parent] = await tx.select({ sku: s.products.sku }).from(s.products).where(eq(s.products.id, variant.productId)).limit(1)
+    if (parent?.sku) return { productId: variant.productId, ledgerSku: parent.sku, variantId: variant.id }
+  }
+  return null
+}
 
 /** Dispatch: the goods leave the source, so the balance there drops. */
 dbRouter.post('/inventory/transfers/:id/dispatch', requirePermission('inventory', 'edit'), async (req, res) => {
@@ -4181,14 +5028,11 @@ dbRouter.post('/inventory/transfers/:id/dispatch', requirePermission('inventory'
       if (!from || !to) throw Object.assign(new Error('Transfer locations no longer exist'), { status: 400 })
 
       const sku = String(transfer.sku ?? '')
-      const [product] = await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.sku, sku)).limit(1)
-      if (!product) throw Object.assign(new Error(`Unknown SKU ${sku}`), { status: 400 })
-      const [level] = await tx
-        .select({ qty: s.stockLevels.qty })
-        .from(s.stockLevels)
-        .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, from)))
-        .limit(1)
-      const available = Number(level?.qty ?? 0)
+      // Which variant leaves the shelf is decided by the record, not by
+      // re-guessing from the parent product.
+      const target = await resolveTransferStock(tx, transfer)
+      if (!target) throw Object.assign(new Error(`Unknown SKU ${sku}`), { status: 400 })
+      const available = await levelAt(tx, target.productId, from, target.variantId)
       if (available < Number(transfer.qty ?? 0)) {
         throw Object.assign(new Error(`Only ${available} in stock at ${transfer.from}, tried to move ${transfer.qty}`), { status: 400 })
       }
@@ -4198,7 +5042,8 @@ dbRouter.post('/inventory/transfers/:id/dispatch', requirePermission('inventory'
       // movement rides the caller's transaction: if the status update below
       // fails, the deduction rolls back with it rather than evaporating stock.
       await applyStockMovement({
-        sku,
+        sku: target.ledgerSku,
+        variantId: target.variantId,
         qty: -Number(transfer.qty ?? 0),
         type: 'transfer_out',
         locationId: from,
@@ -4259,8 +5104,13 @@ dbRouter.post('/inventory/transfers/:id/receive', requirePermission('inventory',
       // received === 0 is legitimate (everything was lost or refused); it just
       // has no inbound movement to post.
       if (received > 0) {
+        // The same variant that left the source arrives here — a receive can
+        // never credit a different variant of the same product.
+        const target = await resolveTransferStock(tx, transfer)
+        if (!target) throw Object.assign(new Error(`Unknown SKU ${String(transfer.sku ?? '')}`), { status: 400 })
         await applyStockMovement({
-          sku: String(transfer.sku ?? ''),
+          sku: target.ledgerSku,
+          variantId: target.variantId,
           qty: received,
           type: 'transfer_in',
           locationId: to,
@@ -4312,8 +5162,11 @@ dbRouter.post('/inventory/transfers/:id/cancel', requirePermission('inventory', 
         // It left the source on dispatch, so cancelling returns it there. The
         // return must commit with the status flip, or a failed cancel would
         // leave stock duplicated (deducted on dispatch, "restored" here).
+        const target = await resolveTransferStock(tx, transfer)
+        if (!target) throw Object.assign(new Error(`Unknown SKU ${String(transfer.sku ?? '')}`), { status: 400 })
         await applyStockMovement({
-          sku: String(transfer.sku ?? ''),
+          sku: target.ledgerSku,
+          variantId: target.variantId,
           qty: Number(transfer.qty ?? 0),
           type: 'transfer_in',
           locationId: from,
@@ -4924,20 +5777,70 @@ dbRouter.patch('/products/:id/stock', requirePermission('inventory', 'edit'), as
       return res.status(400).json({ error: 'stock must be a whole number of 0 or more' })
     }
 
-    const locationId = await resolveMovementLocation(String(req.body?.locationId ?? ''))
-    const [level] = await db!
-      .select({ qty: s.stockLevels.qty })
-      .from(s.stockLevels)
-      .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, locationId)))
-      .limit(1)
-    let current = stockAtLocation(level?.qty)
-    if (!level) {
+    const requestedLocation = String(req.body?.locationId ?? '').trim()
+    // Optional: count/set ONE variant instead of the product as a whole.
+    const variantId = String(req.body?.variantId ?? '').trim() || null
+    if (variantId) {
+      const [variant] = await db!
+        .select({ id: s.productVariants.id })
+        .from(s.productVariants)
+        .where(and(eq(s.productVariants.id, variantId), eq(s.productVariants.productId, product.id)))
+        .limit(1)
+      if (!variant) return res.status(400).json({ error: 'That variant does not belong to this product' })
+    }
+
+    // Two questions, one endpoint:
+    //   • with a location (or a variant) → set THAT bucket — what the product
+    //     dialog means when it edits one location's count;
+    //   • with neither → set the PRODUCT's total across every location, which
+    //     is what "Add Stock" in the products list means. Only the difference
+    //     moves, and it is spread so no location is driven negative.
+    if (!variantId && !requestedLocation) {
+      const [held] = await db!
+        .select({ qty: sql<number>`coalesce(sum(${s.stockLevels.qty}), 0)` })
+        .from(s.stockLevels)
+        .where(eq(s.stockLevels.productId, product.id))
+      const [anyLevel] = await db!
+        .select({ locationId: s.stockLevels.locationId })
+        .from(s.stockLevels)
+        .where(eq(s.stockLevels.productId, product.id))
+        .limit(1)
+      // A product the ledger has never seen still counts as its rollup until
+      // the first movement materialises it (adoption), so that is the previous.
+      const previous = anyLevel ? Math.floor(Number(held?.qty ?? 0)) : stockAtLocation(product.stock)
+      const next = await setStockTotalTo({
+        sku,
+        target,
+        refType: 'product_edit',
+        note: `total stock set to ${target} (was ${previous})`,
+        createdBy: actorFromRequest(req).userId ?? 'system',
+      })
+      return res.json({
+        ok: true,
+        changed: next !== previous,
+        stock: next ?? target,
+        previous,
+        locationId: null,
+        scope: 'total',
+      })
+    }
+
+    const locationId = await resolveMovementLocation(requestedLocation)
+    // What is on hand AT this location — every variant's row summed, or the
+    // one variant's own row. Reading a single stock_levels row counted only
+    // one variant of a multi-variant product.
+    let current = await levelAt(db!, product.id, locationId, variantId)
+    if (current === 0) {
       const [anywhere] = await db!
         .select({ locationId: s.stockLevels.locationId })
         .from(s.stockLevels)
         .where(eq(s.stockLevels.productId, product.id))
         .limit(1)
-      if (!anywhere && locationId === DEFAULT_LOCATION_ID) current = stockAtLocation(product.stock)
+      if (!anywhere && locationId === DEFAULT_LOCATION_ID) {
+        current = variantId
+          ? stockAtLocation((await db!.select({ stock: s.productVariants.stock }).from(s.productVariants).where(eq(s.productVariants.id, variantId)).limit(1))[0]?.stock)
+          : stockAtLocation(product.stock)
+      }
     }
 
     const delta = target - current
@@ -4946,6 +5849,7 @@ dbRouter.patch('/products/:id/stock', requirePermission('inventory', 'edit'), as
     }
     const next = await applyStockMovement({
       sku,
+      variantId,
       qty: delta,
       type: 'count_adjust',
       locationId,
@@ -5166,11 +6070,6 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
       .limit(1)
     if (skuClash) return res.status(400).json({ error: `SKU ${skuClash.sku} is already used by another product`, field: 'sku' })
     const newSum = variants.reduce((a, v) => a + Math.max(0, Math.floor(v.stock)), 0)
-    const [oldAgg] = await db!
-      .select({ sum: sql<number>`coalesce(sum(${s.productVariants.stock}), 0)` })
-      .from(s.productVariants)
-      .where(eq(s.productVariants.productId, product.id))
-    const oldSum = Math.floor(Number(oldAgg?.sum ?? 0))
 
     // The barcode workflow is removed from the app, but the legacy column is
     // still what the Shopify sync reads for existing variants. A replace-all
@@ -5185,53 +6084,142 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
       prevVariants.map((r) => [String(r.sku ?? '').trim().toUpperCase(), r.barcode]),
     )
 
+    // What the LEDGER holds today, per variant and per location. The dialog
+    // sends TARGETS; the balance rows (not the variant row's counter, which is
+    // only a mirror) are what has to move to reach them.
+    const prevLevels = await db!
+      .select({ variantId: s.stockLevels.variantId, locationId: s.stockLevels.locationId, qty: s.stockLevels.qty })
+      .from(s.stockLevels)
+      .where(eq(s.stockLevels.productId, product.id))
+    const ledgerBySku = new Map<string, { total: number; locations: Array<{ locationId: string; qty: number }> }>()
+    for (const lv of prevLevels) {
+      if (!lv.variantId) continue
+      const sku = prevVariants.find((r) => r.id === lv.variantId)?.sku
+      const key = String(sku ?? '').trim().toUpperCase()
+      if (!key) continue
+      const entry = ledgerBySku.get(key) ?? { total: 0, locations: [] }
+      entry.total += Math.floor(Number(lv.qty ?? 0))
+      entry.locations.push({ locationId: lv.locationId, qty: Math.floor(Number(lv.qty ?? 0)) })
+      ledgerBySku.set(key, entry)
+    }
+    const unattributed = prevLevels.filter((lv) => !lv.variantId)
+
+    // Ids are decided up front so the movements below can name the rows the
+    // replace is about to write.
+    const planned = variants.map((v) => ({
+      id: v.id?.trim() || randomUUID(),
+      productId: product.id,
+      title: v.title.trim(),
+      optionValues: v.optionValues,
+      sku: v.sku.trim(),
+      barcode: (v.id?.trim() && prevBarcodeById.get(v.id.trim())) || prevBarcodeBySku.get(v.sku.trim().toUpperCase()) || null,
+      sellingPrice: v.sellingPrice ?? null,
+      compareAtPrice: v.compareAtPrice ?? null,
+      costPrice: v.costPrice ?? null,
+      grossWeight: v.grossWeight ?? null,
+      stock: Math.max(0, Math.floor(v.stock)),
+      reorderLevel: v.reorderLevel ?? null,
+      status: v.status ?? 'active',
+      createdAt: new Date().toISOString(),
+    }))
+
     await db!.transaction(async (tx) => {
       await tx.delete(s.productVariants).where(eq(s.productVariants.productId, product.id))
-      if (variants.length > 0) {
-        await tx.insert(s.productVariants).values(
-          variants.map((v) => {
-            const keepBarcode =
-              (v.id?.trim() && prevBarcodeById.get(v.id.trim())) ||
-              prevBarcodeBySku.get(v.sku.trim().toUpperCase()) ||
-              null
-            return {
-              id: v.id?.trim() || randomUUID(),
-              productId: product.id,
-              title: v.title.trim(),
-              optionValues: v.optionValues,
-              sku: v.sku.trim(),
-              barcode: keepBarcode,
-              sellingPrice: v.sellingPrice ?? null,
-              compareAtPrice: v.compareAtPrice ?? null,
-              costPrice: v.costPrice ?? null,
-              grossWeight: v.grossWeight ?? null,
-              stock: Math.max(0, Math.floor(v.stock)),
-              reorderLevel: v.reorderLevel ?? null,
-              status: v.status ?? 'active',
-              createdAt: new Date().toISOString(),
-            }
-          }),
-        )
+      if (planned.length > 0) {
+        await tx.insert(s.productVariants).values(planned)
       }
       await tx
         .update(s.products)
         .set({ options })
         .where(eq(s.products.id, product.id))
-      // Roll the variant-stock difference into the parent's ledger as a
-      // count correction — visible in stock history, never a silent overwrite.
-      const delta = newSum - oldSum
-      const sku = String(product.sku ?? '').trim()
-      if (delta !== 0 && sku) {
-        await applyStockMovement({
-          sku,
-          qty: delta,
-          type: 'count_adjust',
-          locationId: await ensureDefaultLocation(),
-          refType: 'product_edit',
-          note: `variant stock ${oldSum} → ${newSum} (${delta > 0 ? '+' : ''}${delta})`,
-          createdBy: actorFromRequest(req).userId ?? 'system',
-          tx,
-        })
+
+      // Balances follow a variant whose ID changed but whose SKU (the identity
+      // the dialog matches on) did not — a re-created row must not orphan the
+      // stock it has always held.
+      const plannedBySku = new Map(planned.map((p) => [p.sku.trim().toUpperCase(), p.id]))
+      for (const prev of prevVariants) {
+        const target = plannedBySku.get(String(prev.sku ?? '').trim().toUpperCase())
+        if (target && target !== prev.id) {
+          await tx.update(s.stockLevels).set({ variantId: target }).where(eq(s.stockLevels.variantId, prev.id))
+        }
+      }
+      // A variant REMOVED from the set keeps its quantity as unattributed
+      // product stock: units must never disappear from the books because a row
+      // was deleted. The next count can attribute or remove them explicitly.
+      const keptIds = new Set(planned.map((p) => p.id))
+      for (const prev of prevVariants) {
+        if (keptIds.has(prev.id)) continue
+        if (plannedBySku.has(String(prev.sku ?? '').trim().toUpperCase())) continue
+        await tx.update(s.stockLevels).set({ variantId: null }).where(eq(s.stockLevels.variantId, prev.id))
+      }
+
+      // Stock nobody has claimed yet is attributed HERE, by the counts the user
+      // just typed: their numbers are the only truthful basis that exists for
+      // it, and the split is exact (the parts sum to the original balance).
+      if (unattributed.length > 0) {
+        const weights = planned.map((p) => ({ variantId: p.id, weight: p.stock, key: p.sku }))
+        const totalUnattributed = unattributed.reduce((sum, lv) => sum + Math.floor(Number(lv.qty ?? 0)), 0)
+        if (totalUnattributed !== 0 && weights.some((w) => w.weight > 0)) {
+          for (const lv of unattributed) {
+            const shares = splitQtyAcrossVariants(Math.floor(Number(lv.qty ?? 0)), weights)
+            await tx
+              .delete(s.stockLevels)
+              .where(and(
+                eq(s.stockLevels.productId, product.id),
+                eq(s.stockLevels.locationId, lv.locationId),
+                sql`${s.stockLevels.variantId} is null`,
+              ))
+            for (const share of shares) {
+              if (share.qty === 0) continue
+              await tx.insert(s.stockLevels).values({
+                productId: product.id,
+                variantId: share.variantId,
+                locationId: lv.locationId,
+                qty: share.qty,
+              })
+            }
+          }
+        }
+      }
+
+      // Then move each variant's ledger to its target: growth arrives at the
+      // default store (where stock has always been counted in), a reduction is
+      // spread across the locations that actually hold it so no single balance
+      // is driven negative by the rounding.
+      const defaultLocation = await ensureDefaultLocation(tx)
+      for (const p of planned) {
+        const heldRows = await tx
+          .select({ locationId: s.stockLevels.locationId, qty: s.stockLevels.qty })
+          .from(s.stockLevels)
+          .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.variantId, p.id)))
+        const current = heldRows.reduce((sum, r) => sum + Math.floor(Number(r.qty ?? 0)), 0)
+        const desired = Math.max(0, Math.floor(p.stock))
+        const delta = desired - current
+        if (delta === 0) continue
+        const parts = delta > 0
+          ? [{ locationId: defaultLocation, qty: delta }]
+          : splitQtyAcrossVariants(
+              delta,
+              heldRows.map((r) => ({
+                variantId: r.locationId,
+                weight: Math.floor(Number(r.qty ?? 0)),
+                key: r.locationId,
+              })),
+            ).map((part) => ({ locationId: part.variantId, qty: part.qty }))
+        for (const part of parts) {
+          if (part.qty === 0) continue
+          await applyStockMovement({
+            sku: String(product.sku ?? ''),
+            variantId: p.id,
+            qty: part.qty,
+            type: 'count_adjust',
+            locationId: part.locationId,
+            refType: 'product_edit',
+            note: `variant ${p.sku} stock set to ${desired} (${delta > 0 ? '+' : ''}${delta} from ${current})`,
+            createdBy: actorFromRequest(req).userId ?? 'system',
+            tx,
+          })
+        }
       }
     })
 
@@ -5292,6 +6280,7 @@ const resourceModule: Record<string, string> = {
   'sales-returns': 'sales',
   'purchase-returns': 'purchase',
   'inventory/locations': 'inventory',
+  'inventory/stock-anomalies': 'inventory',
   'inventory/transfers': 'inventory',
   'bank-accounts': 'accounts',
   ledger: 'accounts',
@@ -5321,6 +6310,7 @@ const RESOURCE_LABELS: Record<string, string> = {
   'sales-returns': 'Sales Return',
   'purchase-returns': 'Purchase Return',
   'inventory/locations': 'Inventory Location',
+  'inventory/stock-anomalies': 'Inventory Stock',
   'inventory/transfers': 'Stock Transfer',
   'bank-accounts': 'Bank Account',
   ledger: 'Ledger Entry',
@@ -5379,6 +6369,11 @@ for (const [name, table] of Object.entries(resources)) {
         delete body.accountNumber
       }
       if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
+      if (name === 'inventory/locations' && 'shopifyLocationId' in body) {
+        return res.status(400).json({
+          error: 'Use PATCH /inventory/locations/:id/shopify-location to set the Shopify mapping',
+        })
+      }
       if (!body.id) body.id = randomUUID()
       const [row] = await db!.insert(table).values(body).returning()
       recordCrud(name, 'Created', req, row)
@@ -5416,6 +6411,14 @@ for (const [name, table] of Object.entries(resources)) {
         delete body.accountNumber
       }
       delete body.id
+      // The Shopify location mapping has its own validated endpoint (it must
+      // verify the id against the store); the generic path must not accept an
+      // unvalidated value for it.
+      if (name === 'inventory/locations' && 'shopifyLocationId' in body) {
+        return res.status(400).json({
+          error: 'Use PATCH /inventory/locations/:id/shopify-location to change the Shopify mapping',
+        })
+      }
       if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
       const [row] = await db!.update(table).set(body).where(eq(table.id, routeParam(req.params.id))).returning()
       if (!row) return res.status(404).json({ error: 'Not found' })
