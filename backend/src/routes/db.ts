@@ -96,6 +96,66 @@ function errorText(err: unknown): string {
   return `${err.message} ${causeText}`.trim()
 }
 
+const EXPENSE_STATUSES = ['pending', 'approved', 'rejected'] as const
+const EXPENSE_PAYMENT_METHODS = ['upi', 'bank transfer', 'net banking', 'card', 'cash'] as const
+
+function expenseValidationError(message: string): never {
+  const err = new Error(message) as Error & { expenseValidation?: boolean }
+  err.expenseValidation = true
+  throw err
+}
+
+/** Validate the fields the Expenses UI can write. Partial mode is used by PATCH
+ * so approving or editing one field cannot silently erase another. */
+function validateExpensePayload(body: Record<string, unknown>, partial: boolean): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  const readText = (key: 'category' | 'description') => {
+    if (partial && body[key] === undefined) return
+    const value = String(body[key] ?? '').trim()
+    if (!value) expenseValidationError(`${key} is required`)
+    out[key] = value
+  }
+  readText('category')
+  readText('description')
+
+  if (!partial || body.amount !== undefined) {
+    const amount = Number(body.amount)
+    if (!Number.isFinite(amount) || amount <= 0) expenseValidationError('amount must be greater than zero')
+    out.amount = Math.round((amount + Number.EPSILON) * 100) / 100
+  }
+
+  if (!partial || body.paymentMethod !== undefined) {
+    const method = String(body.paymentMethod ?? '').trim()
+    if (!EXPENSE_PAYMENT_METHODS.includes(method.toLowerCase() as (typeof EXPENSE_PAYMENT_METHODS)[number])) {
+      expenseValidationError(`paymentMethod must be one of: UPI, Bank Transfer, Net Banking, Card, Cash`)
+    }
+    out.paymentMethod = method
+  }
+
+  if (!partial || body.status !== undefined) {
+    const status = String(body.status ?? 'pending').trim().toLowerCase()
+    if (!EXPENSE_STATUSES.includes(status as (typeof EXPENSE_STATUSES)[number])) {
+      expenseValidationError(`status must be one of: ${EXPENSE_STATUSES.join(', ')}`)
+    }
+    out.status = status
+  }
+
+  if (!partial || body.date !== undefined) {
+    const raw = body.date ?? new Date().toISOString()
+    const date = new Date(String(raw))
+    if (Number.isNaN(date.getTime())) expenseValidationError('date must be a valid date')
+    out.date = date.toISOString()
+  }
+
+  return out
+}
+
+async function expenseActorName(req: Request): Promise<string> {
+  if (!req.userId || !db) return 'System'
+  const [user] = await db.select({ name: s.users.name }).from(s.users).where(eq(s.users.id, req.userId)).limit(1)
+  return user?.name?.trim() || 'System'
+}
+
 function sanitize(body: Record<string, unknown>, table: any): Record<string, unknown> {
   const allowed = new Set(columnsOf(table))
   const out: Record<string, unknown> = {}
@@ -2529,7 +2589,20 @@ dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), a
     const status = String(req.body?.status ?? '').trim()
     const allowed = ['imported', 'confirmed', 'processing', 'fulfilled', 'cancelled']
     if (!allowed.includes(status)) return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` })
-    const [row] = await db!.update(s.salesOrders).set({ status }).where(eq(s.salesOrders.id, routeParam(req.params.id))).returning()
+    // Cancellation is an explicit lifecycle action: a Shopify-linked order is
+    // cancelled in Shopify first (and restocked once), an ERP order locally.
+    if (status === 'cancelled') {
+      const { cancelOrderLifecycle } = await import('../shopifyOrderActions')
+      const cancelled = await cancelOrderLifecycle(routeParam(req.params.id))
+      if (!cancelled.ok) return res.status(502).json({ error: cancelled.error ?? 'Order could not be cancelled' })
+    }
+    // Keep `cancelled_at` in step with the stage: the dashboard treats either
+    // marker as cancelled, and reopening an order must clear it or the order
+    // (and its invoice) would stay excluded from sales forever.
+    const [row] = await db!.update(s.salesOrders)
+      .set({ status, cancelledAt: status === 'cancelled' ? new Date().toISOString() : null })
+      .where(eq(s.salesOrders.id, routeParam(req.params.id)))
+      .returning()
     if (!row) return res.status(404).json({ error: 'Order not found' })
     const actor = actorFromRequest(req)
     await insertOrderEvent(row.id, 'Status Change', `Status moved to ${status}`, actor.userId ?? 'system')
@@ -2911,8 +2984,22 @@ dbRouter.post('/sales-orders/bulk-status', requirePermission('sales', 'edit'), a
     let updated = 0
     let invoicesCreated = 0
     const newInvoices: string[] = []
+    const errors: string[] = []
     for (const id of ids) {
-      const [row] = await db!.update(s.salesOrders).set({ status }).where(eq(s.salesOrders.id, id)).returning()
+      if (status === 'cancelled') {
+        const { cancelOrderLifecycle } = await import('../shopifyOrderActions')
+        const cancelled = await cancelOrderLifecycle(id)
+        if (!cancelled.ok) {
+          errors.push(`${id}: ${cancelled.error ?? 'cancellation failed'}`)
+          continue
+        }
+      }
+      // Same lifecycle rule as the single-order endpoint: cancellation sets the
+      // timestamp, any other stage clears it so reopened orders count again.
+      const [row] = await db!.update(s.salesOrders)
+        .set({ status, cancelledAt: status === 'cancelled' ? new Date().toISOString() : null })
+        .where(eq(s.salesOrders.id, id))
+        .returning()
       if (row) {
         updated++
         await insertOrderEvent(id, 'Status Change', `Bulk status moved to ${status}`, actorFromRequest(req).userId ?? 'system')
@@ -2925,7 +3012,7 @@ dbRouter.post('/sales-orders/bulk-status', requirePermission('sales', 'edit'), a
       }
     }
     recordCrud('sales-orders', 'Updated', req, { bulkStatus: status, updated })
-    res.json({ updated, status, invoicesCreated, newInvoices })
+    res.json({ updated, status, invoicesCreated, newInvoices, failed: errors.length, errors })
   } catch (err) {
     logger.error({ err }, 'bulk status failed')
     res.status(500).json({ error: 'Bulk status update failed' })
@@ -6375,6 +6462,10 @@ for (const [name, table] of Object.entries(resources)) {
         : isUser
           ? await prepareUserBody(req.body ?? {})
           : sanitize(req.body ?? {}, table)
+      if (name === 'expenses') {
+        body = { ...body, ...validateExpensePayload(body, false) }
+        body.by = await expenseActorName(req)
+      }
       if (isUser) {
         const escalation = await assertNoPrivilegeEscalation(req, body)
         if (escalation) return res.status(403).json({ error: escalation })
@@ -6393,14 +6484,19 @@ for (const [name, table] of Object.entries(resources)) {
       const [row] = await db!.insert(table).values(body).returning()
       recordCrud(name, 'Created', req, row)
       if (name === 'expenses') {
-        void import('../accounting/postings').then(({ postExpenseJournal }) => postExpenseJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, expenseId: row.id }, 'Failed to auto-post expense journal'))
+        // Await the ledger write so a freshly created/approved expense is
+        // already in Accounts when the client reloads or navigates away.
+        const { postExpenseJournal } = await import('../accounting/postings')
+        await postExpenseJournal(row.id, req.userId ?? null)
       } else if (name === 'payments') {
         void import('../accounting/postings').then(({ postPaymentJournal }) => postPaymentJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId: row.id }, 'Failed to auto-post payment journal'))
       }
       res.status(201).json(stripHash(row))
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
-      if (name === 'suppliers' || msg.includes('password') || msg.includes('Password')) {
+      if ((err as { expenseValidation?: boolean })?.expenseValidation) {
+        res.status(400).json({ error: msg })
+      } else if (name === 'suppliers' || msg.includes('password') || msg.includes('Password')) {
         res.status(400).json({ error: msg })
       } else {
         res.status(400).json({ error: 'Failed to create resource' })
@@ -6422,6 +6518,11 @@ for (const [name, table] of Object.entries(resources)) {
         : isUser
           ? await prepareUserBody(req.body ?? {}, true)
           : sanitize(req.body ?? {}, table)
+      if (name === 'expenses') {
+        body = { ...body, ...validateExpensePayload(body, true) }
+        // The recorder is historical; an editor must not rewrite it.
+        delete body.by
+      }
       if (isUser) {
         const escalation = await assertNoPrivilegeEscalation(req, body)
         if (escalation) return res.status(403).json({ error: escalation })
@@ -6431,6 +6532,20 @@ for (const [name, table] of Object.entries(resources)) {
         delete body.accountNumber
       }
       delete body.id
+      // Order lifecycle: an explicit cancellation must reach Shopify when the
+      // order is linked, and always restores stock + stamps cancelled_at —
+      // whichever endpoint the client uses. Reopening clears the marker so the
+      // order (and its invoice) count again.
+      if (name === 'sales-orders' && typeof body.status === 'string') {
+        if (body.status.trim().toLowerCase() === 'cancelled') {
+          const { cancelOrderLifecycle } = await import('../shopifyOrderActions')
+          const cancelled = await cancelOrderLifecycle(routeParam(req.params.id))
+          if (!cancelled.ok) return res.status(502).json({ error: cancelled.error ?? 'Order could not be cancelled' })
+          body.cancelledAt = new Date().toISOString()
+        } else {
+          body.cancelledAt = null
+        }
+      }
       // The Shopify location mapping has its own validated endpoint (it must
       // verify the id against the store); the generic path must not accept an
       // unvalidated value for it.
@@ -6444,14 +6559,19 @@ for (const [name, table] of Object.entries(resources)) {
       if (!row) return res.status(404).json({ error: 'Not found' })
       recordCrud(name, 'Updated', req, row)
       if (name === 'expenses') {
-        void import('../accounting/postings').then(({ postExpenseJournal }) => postExpenseJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, expenseId: row.id }, 'Failed to sync expense journal'))
+        // Approval posts; pending/rejected removes any earlier posting. The
+        // journal upsert is keyed by expense id, so re-approval cannot duplicate.
+        const { postExpenseJournal } = await import('../accounting/postings')
+        await postExpenseJournal(row.id, req.userId ?? null)
       } else if (name === 'payments') {
         void import('../accounting/postings').then(({ postPaymentJournal }) => postPaymentJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId: row.id }, 'Failed to sync payment journal'))
       }
       res.json(stripHash(row))
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
-      if (name === 'suppliers' || msg.includes('password') || msg.includes('Password')) {
+      if ((err as { expenseValidation?: boolean })?.expenseValidation) {
+        res.status(400).json({ error: msg })
+      } else if (name === 'suppliers' || msg.includes('password') || msg.includes('Password')) {
         res.status(400).json({ error: msg })
       } else {
         res.status(400).json({ error: 'Failed to update resource' })
@@ -6473,7 +6593,8 @@ for (const [name, table] of Object.entries(resources)) {
       await db!.delete(table).where(eq(table.id, routeParam(req.params.id)))
       recordCrud(name, 'Deleted', req, existing)
       if (name === 'expenses') {
-        void import('../accounting/postings').then(({ removeExpenseJournal }) => removeExpenseJournal(existing.id, req.userId ?? null)).catch((err) => logger.warn({ err, expenseId: existing.id }, 'Failed to remove expense journal'))
+        const { removeExpenseJournal } = await import('../accounting/postings')
+        await removeExpenseJournal(existing.id, req.userId ?? null)
       } else if (name === 'payments') {
         void import('../accounting/postings').then(({ removePaymentJournal }) => removePaymentJournal(existing.id, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId: existing.id }, 'Failed to remove payment journal'))
       } else if (name === 'sales-returns') {

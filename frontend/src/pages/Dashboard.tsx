@@ -141,6 +141,7 @@ export default function DashboardPage() {
   const [customRange, setCustomRange] = useState<DateRange>(() => loadStoredRange()?.range ?? defaultRange())
   const [kpisError, setKpisError] = useState<string | null>(null)
   const [dbError, setDbError] = useState<string | null>(null)
+  const [refreshTick, setRefreshTick] = useState(0)
 
   // Persist the page-wide range in sessionStorage: it survives in-app
   // navigation and a reload, and clears when the app closes.
@@ -151,6 +152,24 @@ export default function DashboardPage() {
       /* storage unavailable — the range just won't persist */
     }
   }, [period, customRange])
+
+  // Shopify webhooks and syncs land on the server, so the page re-reads its
+  // figures when the tab regains focus and once a minute while it stays open.
+  // Same widgets and layout — only the data is refreshed.
+  useEffect(() => {
+    const refresh = () => setRefreshTick((n) => n + 1)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') refresh()
+    }
+    const timer = window.setInterval(refresh, 60_000)
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [])
 
   // One range drives every widget here. The non-range widgets (silver rate, low
   // stock, aging, system status) are fetched alongside and don't change with it.
@@ -256,7 +275,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [period, customRange])
+  }, [period, customRange, refreshTick])
 
   // All three source splits and the previous-period comparison arrive in one
   // response, so the source buttons never wait on a second round-trip.
@@ -282,7 +301,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [period, customRange, salesInsightsRetry])
+  }, [period, customRange, salesInsightsRetry, refreshTick])
 
   // Rankings are platform-specific, so they follow the source buttons while
   // the rest of the dashboard keeps its own range-driven data.
@@ -309,7 +328,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [period, customRange, salesSource])
+  }, [period, customRange, salesSource, refreshTick])
 
   // Payment Status follows the source buttons too: All (default) reads
   // Shopify + ERP, each filter reads only its own invoices and orders. It has
@@ -334,7 +353,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [period, customRange, salesSource])
+  }, [period, customRange, salesSource, refreshTick])
 
   const range = rangeToQuery(period, customRange) as RangeQuery
 

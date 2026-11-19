@@ -82,6 +82,10 @@ test(
       { id: `${marker}-order-pending`, shopifyId: `MO-${marker}-pending`, internalId: `MO-${marker}-pending`, customer: `${marker} Buyer`, value: 200, payment: 'pending', invoice: null, status: 'confirmed', date: now, items: 1, lineItems: [] },
       { id: `${marker}-order-refunded`, shopifyId: `MO-${marker}-refunded`, internalId: `MO-${marker}-refunded`, customer: `${marker} Buyer`, value: 150, payment: 'refunded', invoice: null, status: 'confirmed', date: now, items: 1, lineItems: [] },
       { id: `${marker}-order-invoiced`, shopifyId: `MO-${marker}-invoiced`, internalId: `MO-${marker}-invoiced`, customer: `${marker} Buyer`, value: 900, payment: 'pending', invoice: `${marker}-PAID`, status: 'confirmed', date: now, items: 1, lineItems: [] },
+      // A deleted invoice's number left on the order: the order is the only
+      // remaining money record and must still appear, not disappear from the
+      // widget while Sales counts it.
+      { id: `${marker}-order-stale`, shopifyId: `MO-${marker}-stale`, internalId: `MO-${marker}-stale`, customer: `${marker} Buyer`, value: 333, payment: 'paid', invoice: `${marker}-MISSING`, status: 'confirmed', date: now, items: 1, lineItems: [] },
       { id: `${marker}-order-cancelled`, shopifyId: `MO-${marker}-cancelled`, internalId: `MO-${marker}-cancelled`, customer: `${marker} Buyer`, value: 400, payment: 'paid', invoice: null, status: 'cancelled', date: now, items: 1, lineItems: [] },
     ]
 
@@ -121,8 +125,8 @@ test(
       )
 
       // ── Each marker row lands in exactly one segment (All scope) ─────────
-      assert.equal(deltaSeg(before.all, after.all, 'paid'), 2650, 'paid = invoices collected (₹1600) + retained part-payment (₹250) + paid ERP order (₹800)')
-      assert.equal(delta(segment(after.all, 'paid').count, segment(before.all, 'paid').count), 4, 'three paid invoices + one paid ERP order')
+      assert.equal(deltaSeg(before.all, after.all, 'paid'), 2983, 'paid = invoices collected (₹1600) + retained part-payment (₹250) + paid ERP orders (₹800 + ₹333 stale-invoice order)')
+      assert.equal(delta(segment(after.all, 'paid').count, segment(before.all, 'paid').count), 5, 'three paid invoices + two paid ERP orders')
       assert.equal(deltaSeg(before.all, after.all, 'pending'), 1400, 'pending = open invoices (₹1200) + pending ERP order (₹200)')
       assert.equal(delta(segment(after.all, 'pending').count, segment(before.all, 'pending').count), 5)
       assert.equal(deltaSeg(before.all, after.all, 'failed'), 300, 'failed = the unpaid failed invoice only, never counted again as pending')
@@ -133,7 +137,7 @@ test(
       assert.equal(delta(segment(after.all, 'refunded').count, segment(before.all, 'refunded').count), 4)
 
       // ── Cancelled, out-of-window and already-invoiced rows change nothing ─
-      assert.equal(delta(after.all.total, before.all.total), 6250, 'total gains the ten live in-window invoices plus three uninvoiced ERP orders')
+      assert.equal(delta(after.all.total, before.all.total), 6583, 'total gains the ten live in-window invoices plus four orders whose money lives only on the order row')
 
       // ── The donut centre equals the sum of its rows ──────────────────────
       const sum = after.all.segments.reduce((acc: number, s: any) => acc + s.value, 0)
@@ -143,12 +147,12 @@ test(
       assert.equal(deltaSeg(before.shopify, after.shopify, 'paid'), 600, 'Shopify scope reads the Shopify invoice only')
       assert.equal(deltaSeg(before.shopify, after.shopify, 'pending'), 0, 'Shopify scope excludes ERP invoices')
       assert.equal(delta(after.shopify.total, before.shopify.total), 600, 'Shopify total excludes ERP orders and invoices')
-      assert.equal(deltaSeg(before.erp, after.erp, 'paid'), 2050, 'ERP scope reads ERP invoices and uninvoiced orders')
+      assert.equal(deltaSeg(before.erp, after.erp, 'paid'), 2383, 'ERP scope reads ERP invoices and orders without a live invoice')
       assert.equal(deltaSeg(before.erp, after.erp, 'pending'), 1400)
       assert.equal(deltaSeg(before.erp, after.erp, 'failed'), 300)
       assert.equal(deltaSeg(before.erp, after.erp, 'overdue'), 400)
       assert.equal(deltaSeg(before.erp, after.erp, 'refunded'), 1500)
-      assert.equal(delta(after.erp.total, before.erp.total), 5650, 'ERP total excludes the Shopify invoice')
+      assert.equal(delta(after.erp.total, before.erp.total), 5983, 'ERP total excludes the Shopify invoice')
       assert.equal(
         round2(delta(after.shopify.total, before.shopify.total) + delta(after.erp.total, before.erp.total)),
         delta(after.all.total, before.all.total),
@@ -165,8 +169,8 @@ test(
       // ── Reconciliation with Sales revenue ────────────────────────────────
       // Sales counts live invoices + uninvoiced ERP orders − returns; this
       // widget additionally shows fully-refunded invoices as Refunded.
-      assert.equal(delta(after.all.salesRevenue, before.all.salesRevenue), 5050, 'sales revenue delta = live invoices ₹3900 + ERP orders ₹1150')
-      assert.equal(delta(after.all.refundedInvoiceGross, before.all.refundedInvoiceGross), 1200, 'the two fully-refunded invoices')
+      assert.equal(delta(after.all.salesRevenue, before.all.salesRevenue), 5233, 'sales revenue delta = Shopify invoice ₹600 + ERP invoices ₹3300 + order-only sales ₹1333')
+      assert.equal(delta(after.all.refundedInvoiceGross, before.all.refundedInvoiceGross), 1350, 'two fully-refunded invoices ₹1200 + the refunded ERP order ₹150')
       assert.equal(delta(after.all.returns, before.all.returns), 0)
       assert.equal(
         delta(after.all.total, before.all.total),

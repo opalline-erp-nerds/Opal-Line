@@ -121,19 +121,46 @@ export function normalizeFulfillmentStatus(value: unknown): string | null {
   return text
 }
 
+/**
+ * ERP stage for a freshly imported Shopify order.
+ *
+ * This reads the SAME canonical snapshot that is written to `cancelled_at`, so
+ * the status and the cancellation timestamp can never disagree. Only a real
+ * Shopify cancellation timestamp cancels an order. Payment status (voided,
+ * refunded, pending) and fulfillment status are never cancellations. Shopify's
+ * `closed_at` means archived, not fulfilled, and archive is persisted in its
+ * own column without moving the ERP's manual processing stage.
+ */
+export function importedErpStatus(
+  snapshot: { cancelledAt?: string | null; fulfillmentStatus?: string | null } | null | undefined,
+): string {
+  if (String(snapshot?.cancelledAt ?? '').trim()) return 'cancelled'
+  const fulfillment = String(snapshot?.fulfillmentStatus ?? '').trim().toUpperCase()
+  if (fulfillment === 'FULFILLED') return 'fulfilled'
+  if (fulfillment === 'PARTIALLY_FULFILLED') return 'processing'
+  return 'imported'
+}
+
 /** ERP `payment` column: the coarse state the rest of the ERP already renders. */
 export function erpPaymentFor(financial: string | null | undefined): string | null {
   switch (String(financial ?? '').toUpperCase()) {
     case 'REFUNDED':
-    case 'VOIDED':
       return 'refunded'
+    // A voided/expired authorisation never collected money. Calling it
+    // "refunded" made the Payment Status card report cash that never existed.
+    case 'VOIDED':
+    case 'EXPIRED':
+      return 'failed'
     case 'PAID':
-    case 'PARTIALLY_PAID':
     case 'PARTIALLY_REFUNDED':
       return 'paid'
+    // A part-paid order is not fully settled. Flattening it to "paid" used to
+    // make both the invoice and the dashboard claim the whole balance was
+    // collected.
+    case 'PARTIALLY_PAID':
+      return 'partial'
     case 'PENDING':
     case 'AUTHORIZED':
-    case 'EXPIRED':
       return 'pending'
     default:
       return null
@@ -191,6 +218,38 @@ function cleanText(value: unknown): string {
   return typeof value === 'string' && value.trim() && value.trim() !== 'undefined' ? value.trim() : ''
 }
 
+/**
+ * A timestamp is written only when Shopify actually sent a date.
+ *
+ * Dev stores, proxies and partial payloads send literal "null"/"undefined"
+ * strings and booleans. `Date.parse` rejects every one of those, so a field that
+ * merely *looks* present can never be mistaken for a real cancellation.
+ */
+function timestampText(value: unknown): string | null {
+  const text = cleanText(value)
+  if (!text) return null
+  const ms = Date.parse(text)
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null
+}
+
+/**
+ * Compare a Postgres timestamp (`2026-11-19 04:12:30`) with a Shopify ISO one.
+ * Without this, the same instant in two formats looked different on every sync
+ * and rewrote the row (and emitted a timeline event) forever.
+ */
+function instantOf(value: unknown): number | null {
+  let text = String(value ?? '').trim()
+  if (!text || text.toLowerCase() === 'null' || text.toLowerCase() === 'undefined') return null
+  // Postgres `timestamp` strings carry no zone. They were written from UTC ISO
+  // values, so read the bare form as UTC; otherwise a non-UTC host parses the
+  // same instant differently and rewrites it (and emits an event) on every sync.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(text)) {
+    text = `${text.replace(' ', 'T')}Z`
+  }
+  const ms = Date.parse(text)
+  return Number.isFinite(ms) ? ms : null
+}
+
 function num(value: unknown): number | null {
   const n = Number(value)
   return Number.isFinite(n) ? n : null
@@ -236,9 +295,9 @@ export function snapshotFromRestOrder(raw: unknown): OrderSnapshot {
     financialStatus: normalizeFinancialStatus(o.financial_status),
     fulfillmentStatus: normalizeFulfillmentStatus(o.fulfillment_status ?? 'unfulfilled'),
     // Webhook order payloads are complete, so a null here means "not cancelled"
-    // / "not closed" — never "unknown".
-    cancelledAt: cleanText(o.cancelled_at) || null,
-    closedAt: cleanText(o.closed_at) || null,
+    // / "not closed" — never "unknown". Only a parseable date is a date.
+    cancelledAt: timestampText(o.cancelled_at),
+    closedAt: timestampText(o.closed_at),
     tracking: trackingFromFulfillments(fulfillments),
     fulfillmentIds: fulfillments
       .map((f) => gidFrom('Fulfillment', f?.admin_graphql_api_id, f?.id))
@@ -311,8 +370,8 @@ export function snapshotFromGraphqlOrder(node: unknown): OrderSnapshot | null {
     total: num(o.totalPriceSet?.shopMoney?.amount),
     financialStatus: normalizeFinancialStatus(o.displayFinancialStatus),
     fulfillmentStatus: normalizeFulfillmentStatus(o.displayFulfillmentStatus ?? 'UNFULFILLED'),
-    cancelledAt: cleanText(o.cancelledAt) || null,
-    closedAt: cleanText(o.closedAt) || null,
+    cancelledAt: timestampText(o.cancelledAt),
+    closedAt: timestampText(o.closedAt),
     tracking: trackingFromFulfillments(fulfillments),
     fulfillmentIds: fulfillments.map((f) => cleanText(f?.id)).filter(Boolean),
     lines,
@@ -320,7 +379,7 @@ export function snapshotFromGraphqlOrder(node: unknown): OrderSnapshot | null {
 }
 
 /** The selection used by every single-order / sweep query in this module. */
-export const ORDER_STATE_FIELDS = `#graphql
+const BASE_ORDER_STATE_FIELDS = `#graphql
   id
   name
   createdAt
@@ -340,6 +399,13 @@ export const ORDER_STATE_FIELDS = `#graphql
     status
     trackingInfo { number company url }
   }
+`
+
+/**
+ * Full state query fields. `fulfillmentOrders` is a separate permission from
+ * orders; a token without it must still be able to read/cancel/refresh an order.
+ */
+export const ORDER_STATE_FIELDS = `${BASE_ORDER_STATE_FIELDS}
   fulfillmentOrders(first: 20) {
     nodes {
       id
@@ -352,6 +418,9 @@ export const ORDER_STATE_FIELDS = `#graphql
     }
   }
 `
+
+/** Same order state minus the permission-gated fulfillment-order lines. */
+const BASIC_ORDER_STATE_FIELDS = BASE_ORDER_STATE_FIELDS
 
 // ─── Patch building (pure) ──────────────────────────────────────────────────
 
@@ -427,13 +496,29 @@ export function buildOrderPatch(local: LocalOrder, snap: OrderSnapshot, nowIso =
     }
   }
 
+  // A manual ERP cancellation, or one already backed by a timestamp, is not
+  // erased just because a Shopify payload has no cancellation date. This is
+  // what keeps an intentional ERP cancel (and a real Shopify one) intact.
+  const currentStatus = String(local.status ?? '').toLowerCase()
+  const isManualErpOrder =
+    String(local.internalId ?? '').toUpperCase().startsWith('MO-') ||
+    String(local.tags ?? '').toLowerCase().includes('manual-order')
+  const hasVerifiedCancellation = instantOf(local.cancelledAt) != null
+  const preserveLocalCancellation =
+    currentStatus === 'cancelled' &&
+    !snap.cancelledAt &&
+    (hasVerifiedCancellation || isManualErpOrder)
+
   // Lifecycle. Snapshot nulls are authoritative (an order can be reopened with
-  // orderOpen), so the column is cleared when Shopify says it is.
-  if (String(local.cancelledAt ?? '') !== String(snap.cancelledAt ?? '')) {
+  // orderOpen), so the column is cleared when Shopify says it is. Compare the
+  // instants, not the strings: Postgres returns `2026-11-19 04:12:30` while
+  // Shopify sends an ISO timestamp, and a string comparison rewrote the same
+  // value (with a timeline event) on every sync.
+  if (!preserveLocalCancellation && instantOf(local.cancelledAt) !== instantOf(snap.cancelledAt)) {
     patch.cancelledAt = snap.cancelledAt
     changes.push(snap.cancelledAt ? 'cancelled' : 'uncancelled')
   }
-  if (String(local.closedAt ?? '') !== String(snap.closedAt ?? '')) {
+  if (instantOf(local.closedAt) !== instantOf(snap.closedAt)) {
     patch.closedAt = snap.closedAt
     changes.push(snap.closedAt ? 'archived' : 'reopened')
   }
@@ -502,11 +587,22 @@ export function buildOrderPatch(local: LocalOrder, snap: OrderSnapshot, nowIso =
   }
 
   // ERP stage. Shopify may only move it for a genuine fulfilment/cancellation.
-  const erp = String(local.status ?? '').toLowerCase()
+  // A manual ERP order is allowed to be cancelled locally even if Shopify has
+  // not caught up yet. A Shopify-imported order, by contrast, is authoritative:
+  // if it has no cancellation instant, `cancelled` is stale state, not a
+  // cancellation. This is what kept re-used/legacy rows cancelled forever.
+  const erp = currentStatus
   let nextStatus: string | null = null
   if (snap.cancelledAt) nextStatus = 'cancelled'
-  else if (erp === 'cancelled') nextStatus = 'cancelled'
+  else if (erp === 'cancelled' && (hasVerifiedCancellation || isManualErpOrder)) nextStatus = 'cancelled'
   else if (snap.fulfillmentStatus === 'FULFILLED') nextStatus = 'fulfilled'
+  else if (erp === 'cancelled') {
+    // Shopify says this order is live and there is no cancellation timestamp:
+    // the flag came from stale data (the old voided mapping or an unverified
+    // local cancel). Put it back in the New/Processing pipeline.
+    nextStatus = snap.fulfillmentStatus === 'PARTIALLY_FULFILLED' ? 'processing' : 'imported'
+    changes.push('status-reopened')
+  }
   // A fulfilment cancelled in Shopify must recalculate the stage it set — but a
   // stage the operator set by hand is not ours to undo.
   else if (erp === 'fulfilled' && String(local.shopifyFulfillmentStatus ?? '').toUpperCase() === 'FULFILLED') nextStatus = 'processing'
@@ -548,6 +644,7 @@ export function describeChanges(changes: string[], snap: OrderSnapshot): Array<[
   if (changes.includes('archived')) out.push(['Archived', 'Order closed (archived) in Shopify'])
   if (changes.includes('reopened')) out.push(['Reopened', 'Order reopened in Shopify'])
   if (changes.includes('uncancelled')) out.push(['Reopened', 'Cancellation reversed in Shopify'])
+  if (changes.includes('status-reopened')) out.push(['Reopened', 'Shopify reports this order as live — the stale cancellation was cleared'])
   if (changes.includes('fulfilled')) out.push(['Fulfilled', `Shopify fulfilment complete${tracking}`])
   if (changes.includes('partial')) out.push(['Partially Fulfilled', `Part of the order was fulfilled in Shopify${tracking}`])
   if (changes.includes('unfulfilled')) out.push(['Fulfilment Cancelled', 'A Shopify fulfilment was cancelled — the order is open again'])
@@ -568,6 +665,19 @@ export async function applyOrderSnapshot(
   // fulfillments/create can arrive concurrently with two different webhook
   // delivery ids. Without this lock both would observe the same old row and
   // write duplicate timeline events (or overwrite partial quantities).
+  // A Shopify cancellation must release ERP stock BEFORE the patch marks the
+  // row cancelled. The webhook handler used to apply the cancellation first and
+  // then call cancelLocalOrderOnce, which saw status='cancelled' and skipped the
+  // restock entirely. Doing it here also covers reconciliation and edited
+  // payloads, not just the orders/cancelled topic.
+  if (snap.cancelledAt) {
+    try {
+      const { cancelLocalOrderOnce } = await import('./shopifyOrderActions')
+      await cancelLocalOrderOnce(local.id)
+    } catch (err) {
+      logger.warn({ err, orderId: local.id }, 'Order Pipeline: cancellation stock restore failed')
+    }
+  }
   const applied = await db.transaction(async (tx) => {
     const [current] = await tx.select().from(s.salesOrders).where(eq(s.salesOrders.id, local.id)).limit(1).for('update')
     if (!current) return { updated: false, changes: [] as string[] }
@@ -579,6 +689,16 @@ export async function applyOrderSnapshot(
   if (!applied.updated) return applied
   for (const [event, details] of describeChanges(applied.changes, snap)) {
     await insertEvent(local.id, event, details, opts.actor ?? 'shopify')
+  }
+  // The order row and its invoice are one sale. Keep the invoice's payment
+  // state level when Shopify reports PAID/PARTIALLY_PAID/REFUNDED.
+  if (applied.changes.includes('financial') || applied.changes.includes('cancelled')) {
+    try {
+      const { syncInvoicePaymentFromOrder } = await import('./orderEmailIngest')
+      await syncInvoicePaymentFromOrder(local.id)
+    } catch (err) {
+      logger.warn({ err, orderId: local.id }, 'Order Pipeline: linked invoice payment sync failed')
+    }
   }
   logger.info({ orderId: local.id, order: local.internalId ?? local.shopifyId, changes: applied.changes }, 'Order Pipeline: local order updated from Shopify')
   return applied
@@ -634,6 +754,8 @@ export interface ShopifyOrderState {
   closedAt?: string | null
   tracking?: { number: string | null; company: string | null; url: string | null }
   fulfillments?: Array<{ id: string; status: string; tracking: { number: string | null; company: string | null; url: string | null } | null }>
+  /** False when Shopify did not grant fulfillmentOrders access. */
+  fulfillmentDataAvailable?: boolean
   lines?: FulfillableLine[]
   snapshot?: OrderSnapshot
   raw?: unknown
@@ -645,13 +767,33 @@ const STATE_QUERY = `#graphql
   }
 `
 
+const BASIC_STATE_QUERY = `#graphql
+  query BasicOrderState($id: ID!) {
+    order(id: $id) { ${BASIC_ORDER_STATE_FIELDS} }
+  }
+`
+
 const STATE_BY_NAME_QUERY = `#graphql
   query OrderStateByName($q: String!) {
     orders(first: 1, query: $q) { nodes { ${ORDER_STATE_FIELDS} } }
   }
 `
 
-function stateFromNode(node: any): ShopifyOrderState {
+const BASIC_STATE_BY_NAME_QUERY = `#graphql
+  query BasicOrderStateByName($q: String!) {
+    orders(first: 1, query: $q) { nodes { ${BASIC_ORDER_STATE_FIELDS} } }
+  }
+`
+
+/**
+ * Shopify rejects the entire query when the app lacks fulfillmentOrders access.
+ * That one missing scope used to break cancellation, refresh and tracking too.
+ */
+function isFulfillmentScopeError(message: string | undefined): boolean {
+  return /access denied for fulfillmentOrders|fulfillmentOrders field|read_fulfillments|read_assigned_fulfillment_orders/i.test(String(message ?? ''))
+}
+
+function stateFromNode(node: any, fulfillmentDataAvailable = true): ShopifyOrderState {
   const snapshot = snapshotFromGraphqlOrder(node)
   if (!snapshot) return { ok: false, error: 'Shopify returned no order' }
   const lines: FulfillableLine[] = []
@@ -680,6 +822,7 @@ function stateFromNode(node: any): ShopifyOrderState {
     fulfillmentStatus: snapshot.fulfillmentStatus,
     cancelledAt: snapshot.cancelledAt,
     closedAt: snapshot.closedAt,
+    fulfillmentDataAvailable,
     tracking: snapshot.tracking,
     fulfillments: (Array.isArray(node?.fulfillments) ? node.fulfillments : node?.fulfillments?.nodes ?? []).map((f: any) => ({
       id: String(f?.id ?? ''),
@@ -708,21 +851,31 @@ export async function fetchShopifyOrderState(localOrderId: string): Promise<Shop
 
 export async function fetchShopifyOrderStateFor(local: LocalOrder): Promise<ShopifyOrderState> {
   if (local.shopifyGid) {
-    const res = await adminGraphQL<{ order: any }>(STATE_QUERY, { id: local.shopifyGid })
+    let res = await adminGraphQL<{ order: any }>(STATE_QUERY, { id: local.shopifyGid })
+    let fulfillmentDataAvailable = true
+    if (!res.ok && isFulfillmentScopeError(res.error)) {
+      res = await adminGraphQL<{ order: any }>(BASIC_STATE_QUERY, { id: local.shopifyGid })
+      fulfillmentDataAvailable = false
+    }
     if (!res.ok) return { ok: false, error: res.error ?? 'Shopify request failed' }
     const node = res.data?.order
     if (!node) return { ok: false, error: 'That order no longer exists in Shopify' }
-    return stateFromNode(node)
+    return stateFromNode(node, fulfillmentDataAvailable)
   }
   const name = cleanText(local.shopifyId)
   if (!name) return { ok: false, error: 'This order is not linked to a Shopify order' }
   // A legacy row imported before `shopify_gid` existed: find it by name once,
   // then the gid is persisted by the next apply.
-  const res = await adminGraphQL<{ orders: { nodes: any[] } }>(STATE_BY_NAME_QUERY, { q: `name:${name}` })
+  let res = await adminGraphQL<{ orders: { nodes: any[] } }>(STATE_BY_NAME_QUERY, { q: `name:${name}` })
+  let fulfillmentDataAvailable = true
+  if (!res.ok && isFulfillmentScopeError(res.error)) {
+    res = await adminGraphQL<{ orders: { nodes: any[] } }>(BASIC_STATE_BY_NAME_QUERY, { q: `name:${name}` })
+    fulfillmentDataAvailable = false
+  }
   if (!res.ok) return { ok: false, error: res.error ?? 'Shopify request failed' }
   const node = res.data?.orders?.nodes?.[0]
   if (!node) return { ok: false, error: `Order ${name} was not found in Shopify` }
-  return stateFromNode(node)
+  return stateFromNode(node, fulfillmentDataAvailable)
 }
 
 /** Re-read one order from Shopify and apply it locally. */
@@ -754,7 +907,10 @@ export async function applyFulfillmentWebhook(raw: unknown, opts: { actor?: stri
   // Legacy local rows may predate shopify_gid. Query the order by its stable gid
   // first; its returned name then lets us match the pre-existing display-name
   // key. No REST id → order-name assumption is made.
-  const res = await adminGraphQL<{ order: any }>(STATE_QUERY, { id: gid })
+  let res = await adminGraphQL<{ order: any }>(STATE_QUERY, { id: gid })
+  if (!res.ok && isFulfillmentScopeError(res.error)) {
+    res = await adminGraphQL<{ order: any }>(BASIC_STATE_QUERY, { id: gid })
+  }
   if (!res.ok) return { ok: false, found: false, updated: false, changed: [], error: res.error ?? 'Shopify request failed' }
   const snap = snapshotFromGraphqlOrder(res.data?.order)
   if (!snap) return { ok: true, found: false, updated: false, changed: [] }
@@ -781,6 +937,15 @@ const RECENT_ORDERS_QUERY = `#graphql
     orders(first: $first, after: $after, sortKey: UPDATED_AT, reverse: true, query: $q) {
       pageInfo { hasNextPage endCursor }
       nodes { ${ORDER_STATE_FIELDS} }
+    }
+  }
+`
+
+const BASIC_RECENT_ORDERS_QUERY = `#graphql
+  query BasicRecentOrders($first: Int!, $after: String, $q: String!) {
+    orders(first: $first, after: $after, sortKey: UPDATED_AT, reverse: true, query: $q) {
+      pageInfo { hasNextPage endCursor }
+      nodes { ${BASIC_ORDER_STATE_FIELDS} }
     }
   }
 `
@@ -825,11 +990,17 @@ export async function reconcileShopifyOrders(opts: { days?: number; limit?: numb
   while (result.checked < limit && pages < maxPages) {
     pages++
     const remaining = limit - result.checked
-    const res: ShopifyGraphQLResult<RecentOrdersPage> = await adminGraphQL<RecentOrdersPage>(RECENT_ORDERS_QUERY, {
+    const variables = {
       first: Math.min(RECONCILE_PAGE_SIZE, remaining),
       after,
       q: `status:any updated_at:>=${since}`,
-    })
+    }
+    let res: ShopifyGraphQLResult<RecentOrdersPage> = await adminGraphQL<RecentOrdersPage>(RECENT_ORDERS_QUERY, variables)
+    // Reconciliation still works without fulfillmentOrders access; the page is
+    // then updated from order-level status instead of per-line quantities.
+    if (!res.ok && isFulfillmentScopeError(res.error)) {
+      res = await adminGraphQL<RecentOrdersPage>(BASIC_RECENT_ORDERS_QUERY, variables)
+    }
     if (!res.ok) {
       result.errors.push(res.error ?? 'Shopify request failed')
       break

@@ -1,7 +1,7 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ColumnDef } from '@/lib/table'
-import { CheckCircle2, Loader2, Plus, Receipt, Search, Trash2, User, Wallet } from 'lucide-react'
+import { CheckCircle2, Loader2, Pencil, Plus, Receipt, Search, Trash2, User, Wallet, XCircle } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -20,6 +20,16 @@ import { formatCurrency, formatDateTime, todayIST } from '@/lib/format'
 const thisMonthKey = todayIST().slice(0, 7)
 const thisMonthLabel = new Date(`${thisMonthKey}-01T00:00:00`).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })
 
+/** A stored timestamp's IST calendar month, so a UTC date near midnight does
+ * not move an expense into the wrong monthly card. */
+function istMonthKey(value: string): string {
+  const time = new Date(value).getTime()
+  if (!Number.isFinite(time)) return ''
+  return new Date(time + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 7)
+}
+
+const amountOf = (expense: Expense) => Number(expense.amount) || 0
+
 const statusBadge: Record<Expense['status'], { label: string; variant: 'success' | 'warning' | 'muted' }> = {
   approved: { label: 'Approved', variant: 'success' },
   pending: { label: 'Pending', variant: 'warning' },
@@ -34,6 +44,8 @@ export default function ExpensesPage() {
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
   const [categoryFilter, setCategoryFilter] = useState('')
+  const [methodFilter, setMethodFilter] = useState('')
+  const [editing, setEditing] = useState<Expense | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -43,10 +55,14 @@ export default function ExpensesPage() {
 
   const load = useCallback(() => {
     setLoading(true)
+    setError('')
     dbApi.getExpenses().then((d) => {
       setExpenses(d)
       setLoading(false)
-    }).catch(() => setLoading(false))
+    }).catch((e) => {
+      setLoading(false)
+      setError(e instanceof Error ? e.message : 'Could not load expenses')
+    })
   }, [])
 
   useEffect(() => {
@@ -56,11 +72,26 @@ export default function ExpensesPage() {
 
   const openDialog = () => {
     const next = { category: '', description: '', amount: '', paymentMethod: 'UPI' }
+    setEditing(null)
     setForm(next)
     setBaseline(JSON.stringify(next))
     setError('')
     setDialogOpen(true)
   }
+
+  const startEdit = useCallback((expense: Expense) => {
+    const next = {
+      category: expense.category,
+      description: expense.description,
+      amount: String(expense.amount),
+      paymentMethod: expense.paymentMethod,
+    }
+    setEditing(expense)
+    setForm(next)
+    setBaseline(JSON.stringify(next))
+    setError('')
+    setDialogOpen(true)
+  }, [])
 
   const submit = async () => {
     const amount = parseFloat(form.amount)
@@ -71,16 +102,25 @@ export default function ExpensesPage() {
     setSaving(true)
     setError('')
     try {
-      await dbApi.create('expenses', {
-        category: form.category,
-        description: form.description.trim(),
-        amount,
-        paymentMethod: form.paymentMethod,
-        date: new Date().toISOString(),
-        status: 'pending',
-        by: 'System User',
-      })
+      if (editing) {
+        await dbApi.update('expenses', editing.id, {
+          category: form.category,
+          description: form.description.trim(),
+          amount,
+          paymentMethod: form.paymentMethod,
+        })
+      } else {
+        await dbApi.create('expenses', {
+          category: form.category,
+          description: form.description.trim(),
+          amount,
+          paymentMethod: form.paymentMethod,
+          date: new Date().toISOString(),
+          status: 'pending',
+        })
+      }
       setDialogOpen(false)
+      setEditing(null)
       load()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to add expense')
@@ -89,14 +129,18 @@ export default function ExpensesPage() {
     }
   }
 
-  const approve = useCallback(async (expense: Expense) => {
+  const decide = useCallback(async (expense: Expense, status: 'approved' | 'rejected') => {
     try {
-      await dbApi.update('expenses', expense.id, { status: 'approved' })
+      await dbApi.update('expenses', expense.id, { status })
+      toast.success(`Expense ${status}`)
       load()
-    } catch {
-      toast.error('Failed to approve expense')
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : `Failed to ${status === 'approved' ? 'approve' : 'reject'} expense`)
     }
   }, [load])
+
+  const approve = useCallback((expense: Expense) => decide(expense, 'approved'), [decide])
+  const reject = useCallback((expense: Expense) => decide(expense, 'rejected'), [decide])
 
   const remove = useCallback(async (expense: Expense) => {
     if (!(await confirmDialog({ title: `Delete this expense (${expense.category}, ${formatCurrency(expense.amount)})?`, danger: true, confirmLabel: 'Delete' }))) return
@@ -113,26 +157,35 @@ export default function ExpensesPage() {
           toast.error('Could not restore expense')
         }
       })
-    } catch {
-      toast.error('Failed to delete expense')
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to delete expense')
     }
   }, [load])
 
-  const categories = useMemo(() => [...new Set(expenses.map((e) => e.category))], [expenses])
+  const categories = useMemo(() => [...new Set(expenses.map((e) => e.category).filter(Boolean))], [expenses])
+  const methods = useMemo(() => [...new Set(expenses.map((e) => e.paymentMethod).filter(Boolean))], [expenses])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
     return expenses.filter((e) => {
-      const matchQ = !q || e.description.toLowerCase().includes(q) || e.category.toLowerCase().includes(q) || (e.by ?? '').toLowerCase().includes(q)
+      const matchQ = !q
+        || e.description.toLowerCase().includes(q)
+        || e.category.toLowerCase().includes(q)
+        || (e.by ?? '').toLowerCase().includes(q)
+        || (e.paymentMethod ?? '').toLowerCase().includes(q)
+        || e.status.toLowerCase().includes(q)
+        || String(e.amount).includes(q)
       const matchStatus = !statusFilter || e.status === statusFilter
       const matchCategory = !categoryFilter || e.category === categoryFilter
-      return matchQ && matchStatus && matchCategory
+      const matchMethod = !methodFilter || e.paymentMethod === methodFilter
+      return matchQ && matchStatus && matchCategory && matchMethod
     })
-  }, [expenses, query, statusFilter, categoryFilter])
+  }, [expenses, query, statusFilter, categoryFilter, methodFilter])
 
-  const totalAmount = expenses.reduce((a, e) => a + e.amount, 0)
-  const approvedAmount = expenses.filter((e) => e.status === 'approved').reduce((a, e) => a + e.amount, 0)
-  const pendingAmount = expenses.filter((e) => e.status === 'pending').reduce((a, e) => a + e.amount, 0)
+  const totalAmount = expenses.reduce((a, e) => a + amountOf(e), 0)
+  const approvedAmount = expenses.filter((e) => e.status === 'approved').reduce((a, e) => a + amountOf(e), 0)
+  const pendingAmount = expenses.filter((e) => e.status === 'pending').reduce((a, e) => a + amountOf(e), 0)
+  const thisMonthAmount = expenses.filter((e) => istMonthKey(e.date) === thisMonthKey).reduce((a, e) => a + amountOf(e), 0)
 
   const columns = useMemo<ColumnDef<Expense>[]>(
     () => [
@@ -178,7 +231,7 @@ export default function ExpensesPage() {
         cell: ({ row }) => <span className="text-muted-foreground">{formatDateTime(row.original.date)}</span>,
       },
       {
-        id: 'status',
+        accessorKey: 'status',
         header: 'Status',
         meta: { align: 'center' as const },
         cell: ({ row }) => {
@@ -193,6 +246,14 @@ export default function ExpensesPage() {
         cell: ({ row }) => (
           <div className="flex items-center justify-end gap-0.5">
             <TooltipProvider delayDuration={200}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="icon-sm" onClick={() => startEdit(row.original)}>
+                    <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Edit expense</TooltipContent>
+              </Tooltip>
               {row.original.status !== 'approved' && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -201,6 +262,16 @@ export default function ExpensesPage() {
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>Approve expense</TooltipContent>
+                </Tooltip>
+              )}
+              {row.original.status !== 'rejected' && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="ghost" size="icon-sm" onClick={() => reject(row.original)}>
+                      <XCircle className="h-3.5 w-3.5 text-warning-600" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Reject expense</TooltipContent>
                 </Tooltip>
               )}
               <Tooltip>
@@ -216,7 +287,7 @@ export default function ExpensesPage() {
         ),
       },
     ],
-    [approve, remove],
+    [approve, reject, remove, startEdit],
   )
 
   return (
@@ -237,7 +308,7 @@ export default function ExpensesPage() {
         <MiniCard icon={Receipt} label="Total Expenses" value={formatCurrency(totalAmount)} sub="All time" tint="bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300" />
         <MiniCard icon={CheckCircle2} label="Approved" value={formatCurrency(approvedAmount)} sub="Cleared expenses" tint="bg-success-50 text-success-700" />
         <MiniCard icon={Wallet} label="Pending" value={formatCurrency(pendingAmount)} sub="Awaiting approval" tint="bg-warning-50 text-warning-700" />
-        <MiniCard icon={Receipt} label="This Month" value={formatCurrency(expenses.filter((e) => e.date.startsWith(thisMonthKey)).reduce((a, e) => a + e.amount, 0))} sub={thisMonthLabel} tint="bg-info-50 text-info-700" />
+        <MiniCard icon={Receipt} label="This Month" value={formatCurrency(thisMonthAmount)} sub={thisMonthLabel} tint="bg-info-50 text-info-700" />
       </div>
 
       <Card>
@@ -263,6 +334,15 @@ export default function ExpensesPage() {
             />
             <Select
               options={[
+                { value: '', label: 'All Methods' },
+                ...methods.map((m) => ({ value: m, label: m })),
+              ]}
+              value={methodFilter}
+              onValueChange={setMethodFilter}
+              className="w-[150px]"
+            />
+            <Select
+              options={[
                 { value: '', label: 'All Status' },
                 { value: 'approved', label: 'Approved' },
                 { value: 'pending', label: 'Pending' },
@@ -276,6 +356,8 @@ export default function ExpensesPage() {
               <span className="font-semibold text-foreground">{filtered.length}</span> of {expenses.length} expenses
             </div>
           </div>
+
+          {error && !dialogOpen ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
 
           <DataTable
             columns={columns}
@@ -291,14 +373,14 @@ export default function ExpensesPage() {
         onOpenChange={setDialogOpen}
         size="sm"
         isDirty={dialogOpen && JSON.stringify(form) !== baseline}
-        title="Add Expense"
-        description="Record a new operating expense."
+        title={editing ? 'Edit Expense' : 'Add Expense'}
+        description={editing ? 'Update this operating expense.' : 'Record a new operating expense.'}
         footer={
           <DialogFooter>
             <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
             <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Add Expense
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : editing ? <Pencil className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+              {editing ? 'Save Changes' : 'Add Expense'}
             </Button>
           </DialogFooter>
         }
