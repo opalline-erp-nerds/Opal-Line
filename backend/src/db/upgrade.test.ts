@@ -60,6 +60,9 @@ const KEY_COLUMNS = [
   // fresh path creates proves nothing about the upgrade path.
   'sales_orders.location_id',
   'purchase_invoices.location_id',
+  // Shopify location mapping: ALTERed onto inventory_locations (the CREATE
+  // TABLE statement does not carry it), so the upgrade path must add it too.
+  'inventory_locations.shopify_location_id',
 ]
 
 test('upgrade restores the full purchase schema on a pre-purchase database', async (t) => {
@@ -100,6 +103,8 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
       // the table rather than by the ALTER; the column assertion below still
       // guards that it exists afterwards.
       await sql.unsafe('alter table sales_orders drop column if exists location_id')
+      // …and one that predates the Shopify location mapping column.
+      await sql.unsafe('alter table inventory_locations drop column if exists shopify_location_id')
       // Emulate an install whose products.created_at is still a DATE
       // (predates the timestamp upgrade): the upgrade must widen it back.
       await sql.unsafe('alter table products alter column created_at type date using created_at::date')
@@ -187,6 +192,20 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
         )
         assert.equal(rows.length, 1, `upgrade must produce ${col}`)
       }
+
+      // …including the PARTIAL unique index behind the mapping: without it two
+      // ERP locations could silently claim the same store location, and a
+      // non-partial version would reject the many unmapped (NULL) rows.
+      const [mapIndex] = await sql.unsafe(
+        `select indexdef from pg_indexes
+          where schemaname = 'public' and indexname = 'inventory_locations_shopify_location_id_idx'`,
+      )
+      assert.ok(mapIndex, 'upgrade must produce the Shopify mapping index')
+      assert.match(
+        String(mapIndex.indexdef),
+        /WHERE \(?shopify_location_id IS NOT NULL\)?$/i,
+        'the mapping index must stay partial so unmapped rows never collide',
+      )
 
       // …and the Shopify-style variant columns, with legacy colour/price data
       // migrated into them.

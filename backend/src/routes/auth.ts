@@ -277,7 +277,13 @@ authRouter.post('/login', async (req, res) => {
     }
 
     const permissions = await computeUserPermissions(user.id)
-    await destroyUserSessions(user.id)
+    // A sign-in issues its own token and deliberately leaves every other
+    // session alone. Revoking here logged the same user out of the other tabs
+    // and terminals using the account: they kept a cookie whose row had just
+    // been deleted, so their next request answered 401 and the UI bounced to
+    // /login — the "random logout" during normal use. Sessions are independent
+    // tokens; revocation happens only where it is meant to be (explicit
+    // logout, "log out other devices", password change/reset).
     const token = await createSession(user.id)
     setSessionCookie(res, token)
     res.json({

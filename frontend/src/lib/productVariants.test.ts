@@ -4,10 +4,13 @@ import type { Product } from '@/types'
 import {
   findVariantById,
   findVariantBySku,
+  hasRealOptions,
+  isDefaultVariantName,
   matchProductByCode,
   normalizeVariant,
   productHasVariants,
   productVariants,
+  variantFinalPrice,
   variantLabel,
   variantOptions,
 } from './productVariants'
@@ -133,4 +136,55 @@ test('scan resolution matches product SKU then variant SKU — never a barcode',
   assert.equal(matchProductByCode([plain, withVars], '8900000000117'), null)
   assert.equal(matchProductByCode([plain], 'nope'), null)
   assert.equal(matchProductByCode([plain], ''), null)
+})
+
+// ── Variant pricing: base + additional amount ────────────────────────────────
+// Mirrors backend/src/shopify.ts → variantPushPrice, which is what actually
+// reaches Shopify: the ERP selling price is the base, a real option row adds
+// its configured amount (618 + 200 → 818), and a "Default Title" mirror row
+// (every flat/legacy product) prices from the base alone.
+
+test('real option rows price as base + additional amount', () => {
+  assert.equal(variantFinalPrice(618, 200, 'S'), 818, 'base 618 + add-on 200 → 818')
+  assert.equal(variantFinalPrice(618, 400, 'M'), 1018, 'base 618 + add-on 400 → 1018')
+  assert.equal(variantFinalPrice(618, 0, 'S'), 618, 'no add-on → the base alone')
+  assert.equal(variantFinalPrice(618, null, 'S'), 618, 'unpriced row → the base alone')
+  assert.equal(variantFinalPrice(618.455, 200, 'S'), 818.46, 'the sum rounds to cents')
+})
+
+test('Default Title mirror rows price from the base — never base + stored value', () => {
+  // The live bug this pins: a legacy mirror row stored the ABSOLUTE 4800 on a
+  // base-4738 product; adding it pushed 9538 to the store.
+  assert.equal(variantFinalPrice(4738, 4800, 'Default Title'), 4738)
+  assert.equal(variantFinalPrice(500, 500, 'Default Title'), 500, 'base + mirror would wrongly be 1000')
+  assert.equal(variantFinalPrice(500, null, 'Default Title'), 500)
+  assert.equal(variantFinalPrice(500, 500, ''), 500, 'an unnamed row is a mirror too')
+})
+
+test('variantFinalPrice is stable across repeated reads (no double-adding)', () => {
+  const base = 618
+  const add = 200
+  const first = variantFinalPrice(base, add, 'S')
+  assert.equal(variantFinalPrice(base, add, 'S'), first, 'the same inputs always re-derive the same price')
+  assert.equal(base, 618, 'the stored base is never mutated')
+  assert.equal(add, 200, 'the stored add-on is never mutated')
+})
+
+test('isDefaultVariantName recognises only the Shopify placeholder', () => {
+  assert.equal(isDefaultVariantName('Default Title'), true)
+  assert.equal(isDefaultVariantName(' default title '), true)
+  assert.equal(isDefaultVariantName(''), true)
+  assert.equal(isDefaultVariantName(null), true)
+  assert.equal(isDefaultVariantName('S'), false)
+  assert.equal(isDefaultVariantName('18in'), false)
+})
+
+test('hasRealOptions ignores the single-variant placeholder', () => {
+  const placeholder = [{ name: 'Title', values: ['Default Title'] }]
+  assert.equal(hasRealOptions(placeholder), false, 'every flat legacy product carries this')
+  assert.equal(hasRealOptions([]), false)
+  assert.equal(hasRealOptions(null), false)
+  assert.equal(hasRealOptions(undefined), false)
+  assert.equal(hasRealOptions([{ name: 'Size', values: ['S', 'M'] }]), true)
+  assert.equal(hasRealOptions([...placeholder, { name: 'Size', values: ['S'] }]), true)
 })

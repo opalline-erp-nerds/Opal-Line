@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { desc, eq, inArray, isNotNull, isNull, like, or, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, isNotNull, isNull, like, notInArray, or, sql } from 'drizzle-orm'
 import { config, isConfigured, normalizeShopDomain } from './config'
 import { db, schema } from './db/client'
 import {
@@ -19,8 +19,8 @@ import type { SyncCustomer, SyncLogEntry, SyncOrder, SyncPrice, SyncProduct, Syn
 import { CONSTANTS } from './constants'
 import { logger } from './logger'
 import { recordAudit } from './activity'
-import { applyStockMovement } from './stock'
-
+import { listLocationMappings, resolveErpLocationForShopify } from './shopifyLocations'
+import { applyStockMovement, resolveMovementLocation, setStockTotalTo } from './stock'
 function escapeHtml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
@@ -867,10 +867,12 @@ export type ProductDbSyncMode = 'full' | 'auto'
 
 export interface SyncProductsToDbOptions {
   mode?: ProductDbSyncMode
+  /**
+   * Delete ERP products the store no longer lists. Off unless a caller asks
+   * for it explicitly (the manual "Remove missing from ERP" checkbox): an
+   * inbound pull never decides that ERP rows should disappear.
+   */
   allowRemovals?: boolean
-  preserveLocalPriceStock?: boolean
-  preserveErpPrices?: boolean
-  preserveLocalBarcodes?: boolean
   mergeVariants?: boolean
   updatedAtMin?: string | null
   /** When set, skips Shopify catalog fetch and applies only these rows. */
@@ -985,7 +987,13 @@ export interface CatalogPatch {
   barcode: string | null
   category: string
   collection: string | null
-  stock: number | null
+  /**
+   * Deliberately optional and deliberately not filled in by the pull: stock is
+   * never part of an inbound catalog patch. The ledger owns it, so an inbound
+   * run cannot overwrite a balance (not even with its own echo — a concurrent
+   * movement between read and write would be lost to that).
+   */
+  stock?: number | null
   shopifyId: string
   shopifyStatus: string
   status: string
@@ -1021,6 +1029,13 @@ export interface CatalogApplyIo {
     variants: SyncProduct['variants'],
     preserve: { price: boolean; stock: boolean; barcode: boolean },
   ): Promise<void>
+  /**
+   * Record which Shopify variant each existing ERP variant row corresponds to,
+   * matched by variant id then by SKU. Link bookkeeping only: it never writes
+   * an ERP field, never inserts a Shopify-only variant and never deletes an
+   * ERP-only one, because the option/variant set belongs to the ERP.
+   */
+  linkVariants?(productId: string, variants: NonNullable<SyncProduct['variants']>): Promise<void>
 }
 
 /**
@@ -1035,9 +1050,13 @@ export interface CatalogApplyIo {
  * existing row through the update path).
  */
 export interface ApplyLiveCatalogOptions {
-  preserveLocalPriceStock?: boolean
-  preserveErpPrices?: boolean
-  preserveLocalBarcodes?: boolean
+  /**
+   * Products with an outbound push still queued. Their link refresh is held
+   * back until the push has run (the push may create the listing variants
+   * this pull has not seen yet). The pull no longer needs this to protect
+   * ERP values: it never writes them, whatever this flag says.
+   */
+  pendingProductIds?: ReadonlySet<string>
 }
 
 export async function applyLiveCatalog(
@@ -1047,9 +1066,6 @@ export async function applyLiveCatalog(
   io: CatalogApplyIo,
   options: ApplyLiveCatalogOptions = {},
 ): Promise<{ created: number; updated: number }> {
-  const preserveLocalPriceStock = options.preserveLocalPriceStock === true
-  const preserveErpPrices = options.preserveErpPrices === true
-  const preserveLocalBarcodes = options.preserveLocalBarcodes === true
   const bySku = new Map<string, CatalogRow>()
   for (const r of rows) {
     const key = String(r.sku ?? '').trim().toLowerCase()
@@ -1079,12 +1095,12 @@ export async function applyLiveCatalog(
     // haven't been pushed yet.
     const hasLiveVariants = (p.options?.length ?? 0) > 0 && (p.variants?.length ?? 0) > 0
     const saveVariants = async (productId: string) => {
-      if (preserveLocalPriceStock && existing && !io.saveVariantsMerge) return
-      const preserve = {
-        price: preserveErpPrices || preserveLocalPriceStock,
-        stock: preserveLocalPriceStock,
-        barcode: preserveLocalBarcodes,
-      }
+      // Only ever reached for a row this pull just inserted: an existing ERP
+      // product keeps its own option/variant set (see linkVariants above).
+      if (existing) return
+      // Brand-new rows have nothing to preserve, but the merge helper still
+      // takes the flags — passing "keep the ERP values" is the safe default.
+      const preserve = { price: true, stock: true, barcode: true }
       if (hasLiveVariants && io.saveVariantsMerge) {
         await io.saveVariantsMerge(productId, p.options, p.variants, preserve)
         return
@@ -1092,48 +1108,50 @@ export async function applyLiveCatalog(
       if (hasLiveVariants && io.saveVariants) await io.saveVariants(productId, p.options, p.variants)
     }
     if (existing) {
-      const hasWeight = existing.netWeight != null && Number(existing.netWeight) > 0
-      const pricing = preserveLocalPriceStock || hasWeight ? null : backComputePricing(price, pricingRate)
-      // Products created through the product dialog are linked to a pricing
-      // collection and category; that grouping is local and stable, so the pull
-      // leaves the text alone (the ids would otherwise point at names Shopify
-      // overwrote). Rows without a link keep the original behaviour.
-      const linked =
-        String(existing.collectionId ?? '').trim() !== '' || String(existing.categoryId ?? '').trim() !== ''
+      // ERP is the source of truth for every catalogue field. An inbound pull
+      // may DISCOVER a product (the insert path below) and refresh the link to
+      // one it already knows, but it never writes the store's copy over the
+      // ERP row: the next push would export that stale value straight back and
+      // the edit would be gone for good. This is what "sync overwrote my
+      // product" looked like from the outside — the flags that used to guard
+      // price/stock were opt-in and defaulted off, and name, description,
+      // vendor, product type and images were never guarded at all.
+      const pendingOutbound = options.pendingProductIds?.has(existing.id) === true
       const patch: CatalogPatch = {
-        name: p.title || existing.name,
+        name: existing.name,
+        // A blank ERP barcode is a gap, not a value: filling it from the
+        // listing is not an overwrite, so that much still happens here.
         barcode:
-          preserveLocalBarcodes && String(existing.barcode ?? '').trim() !== ''
+          String(existing.barcode ?? '').trim() !== ''
             ? existing.barcode
             : p.barcode ?? existing.barcode,
-        category: linked ? existing.category : p.productType || existing.category,
-        collection: linked ? existing.collection : p.collection || p.productType || existing.collection,
-        stock: preserveLocalPriceStock
-          ? existing.stock
-          : Number.isFinite(p.inventoryQuantity)
-            ? p.inventoryQuantity
-            : existing.stock,
+        category: existing.category,
+        collection: existing.collection,
+        // No `stock` here on purpose: the pull never writes stock — not even
+        // back its own previous value (see CatalogPatch.stock).
         shopifyId: String(p.id),
         shopifyStatus: 'synced',
-        status: 'active',
-        vendor: p.vendor || existing.vendor,
-        productType: p.productType || existing.productType,
-        // Shopify body_html is authoritative for descriptions coming from
-        // the storefront; keep local text when Shopify has none.
-        description: p.description ? p.description : existing.description,
-        compareAtPrice: preserveLocalPriceStock ? existing.compareAtPrice : effectiveCompareAt ?? existing.compareAtPrice,
-        image: p.image ?? existing.image,
-        // Mirror Shopify's gallery; keep any local-only uploads that aren't
-        // yet on Shopify (they'll be pushed on the next product push).
-        images: mergeImages(existing.images as string[] | null, p.images),
-        netWeight: pricing ? pricing.netWeight : existing.netWeight,
-        makingCharge: pricing ? pricing.makingCharge : existing.makingCharge,
-        silverRate: pricing ? pricingRate : existing.silverRate,
-        // Preserve existing chargeOnTax value; do not overwrite from Shopify list endpoint
+        status: existing.status ?? 'active',
+        vendor: existing.vendor,
+        productType: existing.productType,
+        description: existing.description,
+        compareAtPrice: existing.compareAtPrice,
+        image: existing.image,
+        images: existing.images as string[] | null,
+        netWeight: existing.netWeight,
+        makingCharge: existing.makingCharge,
+        silverRate: existing.silverRate,
         chargeOnTax: existing.chargeOnTax,
       }
       await io.update(existing, patch)
-      await saveVariants(existing.id)
+      // The option/variant set is ERP-owned as well: the pull only records
+      // which listing variant each ERP row points at, so the outbound push can
+      // match it back. Nothing is rewritten, added or removed from here — and
+      // not while a push is queued either, since that push may create variants
+      // this listing does not have yet.
+      if (!pendingOutbound && (p.variants?.length ?? 0) > 0 && io.linkVariants) {
+        await io.linkVariants(existing.id, p.variants ?? [])
+      }
       updated++
     } else {
       const pricing = backComputePricing(price, pricingRate)
@@ -1159,7 +1177,11 @@ export async function applyLiveCatalog(
         silverRate: pricing ? pricingRate : null,
         sellingPrice: price,
         compareAtPrice: effectiveCompareAt,
-        stock: Number.isFinite(p.inventoryQuantity) ? p.inventoryQuantity : 0,
+        // Zero on purpose: the store's quantity arrives as an `opening`
+        // movement right after the variant set is saved (below), so a pulled
+        // product is born inside the ledger with per-variant balances and
+        // history instead of a bare column value nothing can explain.
+        stock: 0,
         reorderLevel: null,
         shopifyStatus: 'synced',
         shopifyId: String(p.id),
@@ -1181,6 +1203,30 @@ export async function applyLiveCatalog(
       if (inserted) {
         bySku.set(skuKey, inserted)
         await saveVariants(inserted.id)
+        // The store's quantity becomes this product's OPENING BALANCE, through
+        // the ledger: it lands as balances at the default store (split across
+        // the variants saveVariants just recorded, weighted by their counts),
+        // with `opening` movements that explain them — and products.stock plus
+        // every variant counter are recomputed from those balances instead of
+        // being left as column values nothing can account for. `shopify_sync`
+        // also stops the outbound worker from echoing the number straight back.
+        const pulled = Number(p.inventoryQuantity)
+        if (Number.isFinite(pulled) && pulled > 0) {
+          try {
+            await setStockTotalTo({
+              sku,
+              target: pulled,
+              type: 'shopify_sync',
+              refType: 'shopify_pull',
+              note: 'opening balance pulled from Shopify',
+            })
+          } catch (err) {
+            logger.warn(
+              { err: (err as Error)?.message, sku, pulled },
+              'Shopify pull: opening balance could not be posted to the ledger',
+            )
+          }
+        }
       }
     }
   }
@@ -1237,6 +1283,16 @@ export async function mergeProductVariantsFromShopify(
     .select()
     .from(schema.productVariants)
     .where(eq(schema.productVariants.productId, productId))
+  // A row inserted for a listing the ERP has never seen adopts the listing's
+  // variant prices as ADDITIONAL amounts over the parent's price (the parent
+  // itself was inserted from the listing's first variant), so the next push
+  // re-derives the store's own numbers instead of stacking them.
+  const [parentRow] = await database
+    .select({ sellingPrice: schema.products.sellingPrice })
+    .from(schema.products)
+    .where(eq(schema.products.id, productId))
+    .limit(1)
+  const basePrice = parentRow?.sellingPrice
   const byShopifyId = new Map<string, (typeof existingRows)[0]>()
   const bySkuLocal = new Map<string, (typeof existingRows)[0]>()
   for (const row of existingRows) {
@@ -1295,7 +1351,7 @@ export async function mergeProductVariantsFromShopify(
           sku,
           barcode,
           shopifyVariantId,
-          sellingPrice: Number(v.price) || null,
+          sellingPrice: adoptVariantAdditional(basePrice, v.price),
           compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
           costPrice: null,
           grossWeight: null,
@@ -1329,11 +1385,10 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
   if (!db) {
     return { ...empty(), errors: ['Database is not configured'], message: 'Database is not configured' }
   }
-  const mode = options.mode ?? 'full'
-  const allowRemovals = options.allowRemovals ?? mode === 'full'
-  const preserveLocalPriceStock = options.preserveLocalPriceStock ?? mode === 'auto'
-  const preserveErpPrices = options.preserveErpPrices ?? preserveLocalPriceStock
-  const preserveLocalBarcodes = options.preserveLocalBarcodes ?? mode !== 'full'
+  // Deleting ERP rows because the store does not list them is the store
+  // authoring the ERP catalogue. It only ever happens when a caller asks for
+  // it explicitly — never as a default of any mode.
+  const allowRemovals = options.allowRemovals === true
   const mergeVariants = options.mergeVariants !== false
   const fullCatalog = !options.updatedAtMin?.trim() && !options.liveProducts?.length
   const database = db
@@ -1386,6 +1441,10 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
     const liveShopifyIds = new Set(live.map((p) => String(p.id)).filter(Boolean))
 
     const rows = await db.select().from(schema.products)
+    // Outbound work still in flight: those rows keep their local values so the
+    // pull cannot undo an ERP edit before its queued push has run.
+    const { pendingShopifyProductIds } = await import('./shopifyOutbound')
+    const pendingProductIds = await pendingShopifyProductIds()
 
     const pricingRate = (await getLatestSilverRate())?.rate ?? 92.8
     // Variant SKUs are unique across the whole table, not per product. Track
@@ -1422,40 +1481,25 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
     const applied = await applyLiveCatalog(live, rows, pricingRate, {
       insert: async (values) => (await database.insert(schema.products).values(values).returning())[0],
       update: async (existing, patch) => {
-        const sku = String(existing.sku ?? '').trim()
-        const delta = Number(patch.stock) - Number(existing.stock ?? 0)
-        if (
-          !preserveLocalPriceStock &&
-          sku &&
-          patch.stock != null &&
-          Number.isFinite(delta) &&
-          delta !== 0
-        ) {
-          // Stock never lands as a raw column write on a pull: record the
-          // change as a `shopify_sync` ledger movement so stock_levels
-          // (availability), stock_movements (audit) and the products.stock
-          // rollup stay in agreement. The semantics are unchanged — it is
-          // still a SET: the movement delta is Shopify's count minus the
-          // current local value.
-          const { stock: _pulled, ...rest } = patch
-          await applyStockMovement({
-            sku,
-            qty: delta,
-            type: 'shopify_sync',
-            refType: 'shopify_pull',
-            note: `Inventory pull → ${Number(patch.stock)} on Shopify`,
-            createdBy: 'system',
-          })
-          await database.update(schema.products).set(rest).where(eq(schema.products.id, existing.id))
-        } else {
-          // No stock change (or unknown SKU / non-finite count): plain write.
-          await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
-        }
+        // The pull never changes stock, so this is always a plain write: no
+        // `shopify_sync` ledger movement is generated, and an inbound run can
+        // therefore never double-count or deduct inventory. (Stock only moves
+        // through applyStockMovement from an ERP document.)
+        await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
       },
       // Replace-all: the listing owns the option/variant set, exactly like
       // the push. Parent stock above already carries the summed count.
       saveVariants: async (productId, options, variants) => {
         const liveVariants = variants ?? []
+        // New-row adoption: variant prices are stored as additional amounts
+        // over the parent's price (taken from the listing's first variant),
+        // so a later push re-derives the listing's numbers exactly.
+        const [parentRow] = await database
+          .select({ sellingPrice: schema.products.sellingPrice })
+          .from(schema.products)
+          .where(eq(schema.products.id, productId))
+          .limit(1)
+        const basePrice = parentRow?.sellingPrice
         // This product's current rows are about to be replaced, so their SKUs
         // are free again. Other products' SKUs stay reserved. Copies survive
         // a rollback: the catch puts the maps back to these lists.
@@ -1500,7 +1544,7 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
                     .filter((x): x is string => Boolean(x) && String(x).trim() !== ''),
                   sku,
                   barcode,
-                  sellingPrice: Number(v.price) || null,
+                  sellingPrice: adoptVariantAdditional(basePrice, v.price),
                   compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
                   costPrice: null,
                   grossWeight: null,
@@ -1540,7 +1584,50 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
             )
           }
         : undefined,
-    }, { preserveLocalPriceStock, preserveErpPrices, preserveLocalBarcodes })
+      // ERP owns the variant set: this only writes product_variants.
+      // shopify_variant_id, matched by variant id first and by SKU second, so
+      // the outbound push (which matches by SKU) and the stock preview (which
+      // matches by id) can find the right row. A listing variant the ERP does
+      // not have is deliberately NOT adopted — importing it would make Shopify
+      // the author of the ERP's option/variant mapping, and an ERP row is
+      // never rewritten or deleted from here.
+      linkVariants: async (productId, liveVariants) => {
+        const rows = await database
+          .select()
+          .from(schema.productVariants)
+          .where(eq(schema.productVariants.productId, productId))
+        if (rows.length === 0 || liveVariants.length === 0) return
+        const bySid = new Map<string, (typeof rows)[0]>()
+        const bySku = new Map<string, (typeof rows)[0]>()
+        for (const row of rows) {
+          const sid = String(row.shopifyVariantId ?? '').trim()
+          if (sid && !bySid.has(sid)) bySid.set(sid, row)
+          const skuKey = String(row.sku ?? '').trim().toLowerCase()
+          if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, row)
+        }
+        // One ERP row can only carry one listing id (the partial unique index
+        // on shopify_variant_id enforces it), so an id match claims the row
+        // before any SKU match can reach it.
+        const claimed = new Set<string>()
+        for (const v of liveVariants) {
+          const row = bySid.get(String(v.id ?? '').trim())
+          if (row) claimed.add(row.id)
+        }
+        for (const v of liveVariants) {
+          const sid = String(v.id ?? '').trim()
+          if (!sid || bySid.has(sid)) continue
+          const skuKey = String(v.sku ?? '').trim().toLowerCase()
+          const row = skuKey ? bySku.get(skuKey) : undefined
+          if (!row || claimed.has(row.id)) continue
+          claimed.add(row.id)
+          await database
+            .update(schema.productVariants)
+            .set({ shopifyVariantId: sid })
+            .where(eq(schema.productVariants.id, row.id))
+          bySid.set(sid, row)
+        }
+      },
+    }, { pendingProductIds })
     created = applied.created
     updated = applied.updated
 
@@ -1623,6 +1710,14 @@ interface LocalCatalogEntry {
   barcode: string
   title: string
   sellingPrice: number
+  /** product_variants rows (stable order) for resolving a listing's variant. */
+  variants: Array<{
+    shopifyVariantId: string | null
+    sku: string
+    title: string
+    optionValues: string[]
+    additional: number
+  }>
 }
 
 async function getLocalCatalog(): Promise<LocalCatalogEntry[]> {
@@ -1630,21 +1725,68 @@ async function getLocalCatalog(): Promise<LocalCatalogEntry[]> {
   try {
     const rows = await db
       .select({
+        id: schema.products.id,
         sku: schema.products.sku,
         barcode: schema.products.barcode,
         title: schema.products.name,
         sellingPrice: schema.products.sellingPrice,
       })
       .from(schema.products)
+    const variantRows = await db
+      .select({
+        productId: schema.productVariants.productId,
+        sku: schema.productVariants.sku,
+        title: schema.productVariants.title,
+        optionValues: schema.productVariants.optionValues,
+        sellingPrice: schema.productVariants.sellingPrice,
+        shopifyVariantId: schema.productVariants.shopifyVariantId,
+      })
+      .from(schema.productVariants)
+      .orderBy(schema.productVariants.createdAt)
+    const variantsByProduct = new Map<string, LocalCatalogEntry['variants']>()
+    for (const v of variantRows) {
+      const list = variantsByProduct.get(v.productId) ?? []
+      list.push({
+        shopifyVariantId: v.shopifyVariantId ?? null,
+        sku: String(v.sku ?? '').trim(),
+        title: String(v.title ?? '').trim(),
+        optionValues: Array.isArray(v.optionValues) ? (v.optionValues as string[]).map((x) => String(x ?? '')) : [],
+        additional: Number(v.sellingPrice ?? 0) || 0,
+      })
+      variantsByProduct.set(v.productId, list)
+    }
     return rows.map((r) => ({
       sku: String(r.sku ?? '').trim(),
       barcode: String(r.barcode ?? '').trim().toLowerCase(),
       title: String(r.title ?? '').trim(),
       sellingPrice: Number(r.sellingPrice ?? 0),
+      variants: variantsByProduct.get(r.id) ?? [],
     }))
   } catch {
     return []
   }
+}
+
+/**
+ * Additional amount carried by the listing's FIRST variant (the only variant
+ * the price list models): matched back to its local row by Shopify variant id,
+ * then by SKU, then by row order — the same precedence the push uses. A
+ * Default-Title mirror row carries no add-on: its listing price is the base.
+ */
+function firstListingVariantAdditional(local: LocalCatalogEntry, p: { variantId?: number; sku?: string }): number {
+  if (local.variants.length === 0) return 0
+  const wantedId = Number(p.variantId ?? 0)
+  let hit: LocalCatalogEntry['variants'][number] | undefined
+  if (Number.isFinite(wantedId) && wantedId > 0) {
+    hit = local.variants.find((v) => Number(v.shopifyVariantId ?? 0) === wantedId)
+  }
+  if (!hit) {
+    const wantedSku = String(p.sku ?? '').trim().toLowerCase()
+    hit = wantedSku ? local.variants.find((v) => v.sku.toLowerCase() === wantedSku) : undefined
+  }
+  const row = hit ?? local.variants[0]
+  if (!row || isDefaultVariantRow(row.title, row.optionValues)) return 0
+  return row.additional
 }
 
 const STOP_WORDS = CONSTANTS.STOP_WORDS
@@ -1755,7 +1897,10 @@ async function syncPrices(): Promise<number> {
       list.push({ productId: p.id, variantId: p.variantId, title: p.title, sku: p.sku, handle: p.handle, currentPrice, targetPrice: 0, status: 'no-match' })
       continue
     }
-    const targetPrice = local.sellingPrice || 0
+    // The price list models a listing's first variant: its target is the ERP
+    // base plus that row's additional amount (0 for a Default-Title mirror).
+    const additional = firstListingVariantAdditional(local, p)
+    const targetPrice = finalVariantPrice(local.sellingPrice || 0, additional)
     const status: SyncPrice['status'] = Math.abs(currentPrice - targetPrice) > 0.005 ? 'update' : 'up-to-date'
     list.push({ productId: p.id, variantId: p.variantId, title: p.title, sku: p.sku, handle: p.handle, currentPrice, targetPrice, status })
   }
@@ -1796,6 +1941,80 @@ export const SHOPIFY_MAX_VARIANT_PRICE = 10000
 export function exceedsShopifyPriceCap(value: unknown): boolean {
   const n = Number(value)
   return Number.isFinite(n) && n > SHOPIFY_MAX_VARIANT_PRICE
+}
+
+/**
+ * Final price pushed for a variant of a priced product.
+ *
+ * The ERP-calculated selling price is the BASE for every variant and
+ * `product_variants.selling_price` stores only the additional amount
+ * configured for that row (base 618 + additional 200 → 818). The two stored
+ * numbers are recombined here at push time and the result is never written
+ * back, so a repeated edit or sync re-derives the same final price instead of
+ * adding the amount a second time. Invalid inputs degrade to whatever is
+ * valid (both invalid → 0), matching the "skip a price we cannot read" guards
+ * around each call site.
+ */
+export function finalVariantPrice(basePrice: unknown, additionalPrice: unknown): number {
+  const base = Number(basePrice)
+  const additional = Number(additionalPrice)
+  const b = Number.isFinite(base) ? base : 0
+  const a = Number.isFinite(additional) ? additional : 0
+  return Math.round((b + a) * 100) / 100
+}
+
+/**
+ * A listing adopted into the ERP for the FIRST time stores each variant price
+ * as the additional amount over the parent's price (the parent takes the
+ * listing's first-variant price), so the next push re-derives the store's own
+ * numbers instead of adding them on top of themselves.
+ */
+function adoptVariantAdditional(basePrice: unknown, listingPrice: unknown): number | null {
+  const listing = Number(listingPrice)
+  if (!Number.isFinite(listing) || listing <= 0) return null
+  const base = Number(basePrice)
+  if (!Number.isFinite(base) || base <= 0) return listing
+  return Math.round((listing - base) * 100) / 100
+}
+
+/**
+ * True when a variant row is the Shopify single-variant placeholder — every
+ * flat/legacy product carries exactly one such row ("Default Title", stored
+ * with an ABSOLUTE price under the old contract). Its stored value must never
+ * be added to the base: base 4738 + mirror 4800 would push 9538 for a product
+ * the ERP sells at 4738 (found by a live push during the pricing fix).
+ */
+export function isDefaultVariantRow(title: unknown, optionValues: unknown): boolean {
+  const t = String(title ?? '').trim().toLowerCase()
+  const values = Array.isArray(optionValues)
+    ? optionValues.map((v) => String(v ?? '').trim().toLowerCase()).filter(Boolean)
+    : []
+  if (values.some((v) => v !== 'default title')) return false
+  return t === '' || t === 'default title'
+}
+
+/**
+ * Price to send for ONE variant row (create, update and price pushes share
+ * this rule):
+ *   - Default-Title mirror row → the BASE alone (its stored value is a legacy
+ *     absolute price; adding it would double the product);
+ *   - real option row          → base + the row's configured additional amount.
+ * When the base itself is unusable the stored row value is the only price we
+ * have, so it is sent as-is (the old fallback).
+ */
+export function variantPushPrice(
+  basePrice: unknown,
+  variant: { title?: unknown; optionValues?: unknown; sellingPrice?: unknown },
+): number {
+  const base = Number(basePrice)
+  const b = Number.isFinite(base) ? base : 0
+  const additional = Number(variant.sellingPrice)
+  const a = Number.isFinite(additional) ? additional : 0
+  if (isDefaultVariantRow(variant.title, variant.optionValues)) {
+    if (b > 0) return Math.round(b * 100) / 100
+    return a > 0 ? Math.round(a * 100) / 100 : 0
+  }
+  return finalVariantPrice(b, a)
 }
 
 export async function applyPriceSync(onProgress?: (done: number, total: number) => void) {
@@ -1930,9 +2149,10 @@ export async function pushProductPriceToShopify(localProductId: string): Promise
     return null
   }
 
-  // Shopify-style product: push every local variant's price to its listing
-  // variant (matched back by SKU). Simple products keep the single-variant
-  // path below.
+  // Push every local variant's FINAL price to its listing variant (matched
+  // back by SKU): a real option row sends base + its additional amount, the
+  // Default-Title mirror row every flat/legacy product carries sends the base
+  // alone. Products with no variant rows keep the single-variant path below.
   const localVariants = await db.select().from(schema.productVariants).where(eq(schema.productVariants.productId, row.id))
   if (localVariants.length > 0) {
     const shopifyIdBySku = new Map<string, number>()
@@ -1941,12 +2161,23 @@ export async function pushProductPriceToShopify(localProductId: string): Promise
       if (key && v.id) shopifyIdBySku.set(key, Number(v.id))
     }
     let pushed = 0
+    let skipped = 0
     const variantErrors: string[] = []
     for (const v of localVariants) {
-      const vPrice = Number(v.sellingPrice)
+      const final = variantPushPrice(price, v)
       const target = shopifyIdBySku.get(String(v.sku ?? '').trim().toLowerCase())
-      if (!target || !Number.isFinite(vPrice) || vPrice <= 0) continue
-      const putError = await putVariantPrice(target, vPrice, Number(v.compareAtPrice))
+      if (!target || !Number.isFinite(final) || final <= 0) continue
+      // The base is already cap-checked above; the FINAL can still cross the
+      // $10,000 line once the add-on is on — skip that row, never fail it.
+      if (exceedsShopifyPriceCap(final)) {
+        skipped++
+        const label = String(v.sku ?? row.sku ?? '')
+        const message = `Skipped ${label}: price ${final.toFixed(2)} exceeds Shopify's $10,000 USD variant cap`
+        addLog('price', 'skipped', 1, message)
+        await persistLog({ entity: 'Price', shopifyId: label, direction: 'out', action: 'Price Update (skipped: over Shopify price cap)', status: 'skipped', error: message })
+        continue
+      }
+      const putError = await putVariantPrice(target, final, Number(v.compareAtPrice))
       if (putError) {
         variantErrors.push(`${v.sku}: ${putError}`)
       } else {
@@ -1964,10 +2195,10 @@ export async function pushProductPriceToShopify(localProductId: string): Promise
       store.lastError = message
       await persistLog({ entity: 'Price', shopifyId: row.sku, direction: 'out', action: 'Price Update', status: 'failed', error: message, retry: true })
     }
-    if (pushed === 0 && variantErrors.length === 0) {
+    if (pushed === 0 && skipped === 0 && variantErrors.length === 0) {
       return { ok: false, updated: 0, skipped: 0, errors: [`No Shopify variant matched a local variant of ${row.sku}`] }
     }
-    return { ok: variantErrors.length === 0, updated: pushed, skipped: 0, errors: variantErrors }
+    return { ok: variantErrors.length === 0, updated: pushed, skipped, errors: variantErrors }
   }
 
   const variantId = Number(listingVariants[0]?.id ?? 0)
@@ -2126,9 +2357,10 @@ async function createShopifyProduct(local: LocalProductForPush): Promise<{
   const variantPayloads: Array<Record<string, string | number | boolean>> = hasVariants
     ? (local.variants ?? []).map((v) => {
         const entry: Record<string, string | number | boolean> = {}
-        const vPrice = Number(v.sellingPrice)
-        if (Number.isFinite(vPrice) && vPrice > 0) entry.price = vPrice.toFixed(2)
-        else if (price > 0) entry.price = price.toFixed(2)
+        // Base + add-on for a real option row (618 + 200 → 818.00); the
+        // Default-Title mirror prices from the base alone.
+        const final = variantPushPrice(price, v)
+        if (final > 0) entry.price = final.toFixed(2)
         if (Number(v.compareAtPrice) > 0) entry.compare_at_price = Number(v.compareAtPrice).toFixed(2)
         if (v.sku) entry.sku = v.sku
         if (v.barcode) entry.barcode = v.barcode
@@ -2299,8 +2531,10 @@ async function updateShopifyProductContent(local: LocalProductForPush): Promise<
         sku: v.sku,
         taxable: local.chargeOnTax !== false,
       }
-      const vPrice = Number(v.sellingPrice)
-      if (Number.isFinite(vPrice) && vPrice > 0) entry.price = vPrice.toFixed(2)
+      // Base + add-on for a real option row; the Default-Title mirror prices
+      // from the base alone — same rule as the create path.
+      const final = variantPushPrice(local.sellingPrice, v)
+      if (final > 0) entry.price = final.toFixed(2)
       if (Number(v.compareAtPrice) > 0) entry.compare_at_price = Number(v.compareAtPrice).toFixed(2)
       if (v.barcode) entry.barcode = v.barcode
       if (local.trackInventory !== false) entry.inventory_management = 'shopify'
@@ -2850,30 +3084,90 @@ export async function pushInventoryToShopify(ids?: string[]): Promise<ShopifyInv
       if (key && v.inventoryItemId) liveVariantBySku.set(key, v.inventoryItemId)
     }
   }
-  let variantRows: Array<{ sku: string; stock: number | null }> = []
+  let variantRows: Array<{ id: string; productId: string; sku: string; title: string; stock: number | null }> = []
   try {
+    const columns = {
+      id: schema.productVariants.id,
+      productId: schema.productVariants.productId,
+      sku: schema.productVariants.sku,
+      title: schema.productVariants.title,
+      stock: schema.productVariants.stock,
+    }
     variantRows = ids && ids.length > 0
-      ? await db.select({ sku: schema.productVariants.sku, stock: schema.productVariants.stock })
+      ? await db.select(columns)
           .from(schema.productVariants)
           .where(inArray(schema.productVariants.productId, ids))
-      : await db.select({ sku: schema.productVariants.sku, stock: schema.productVariants.stock })
-          .from(schema.productVariants)
+      : await db.select(columns).from(schema.productVariants)
   } catch {
     // No variants table rows (older install mid-upgrade) — parent push only.
     variantRows = []
   }
-
-  let locations: { id: number; name: string }[]
-  try {
-    locations = await fetchLocations()
-  } catch (err) {
-    releaseSyncLock()
-    return { ok: false, updated: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Failed to fetch locations'] }
+  const variantById = new Map(variantRows.map((v) => [v.id, v]))
+  const variantsByProduct = new Map<string, typeof variantRows>()
+  for (const v of variantRows) {
+    const list = variantsByProduct.get(v.productId) ?? []
+    list.push(v)
+    variantsByProduct.set(v.productId, list)
   }
-  const locationId = locations[0]?.id
-  if (!locationId) {
-    releaseSyncLock()
-    return { ok: false, updated: 0, skipped: 0, errors: ['No inventory locations found on the store'] }
+
+  /**
+   * The Shopify inventory item a stock level should be written to.
+   *
+   * A variant's row goes to THAT variant's inventory item (matched by the
+   * variant's SKU); a legacy product with no variant rows keeps going to the
+   * product's item exactly as before. A balance that belongs to NO variant of
+   * a variant product has no correct destination — writing the product-wide
+   * number anywhere would overwrite a specific variant's count, so the caller
+   * skips it and says why.
+   */
+  const inventoryItemFor = (
+    level: { variantId: string | null; productId: string },
+    parentSku: string,
+  ): { inventoryItemId?: number; label: string; unattributed: boolean } => {
+    const parentKey = parentSku.trim().toLowerCase()
+    const parentItem = parentKey ? (bySku.get(parentKey) ?? bySkuCompact.get(normalizeKey(parentKey))) : undefined
+    if (level.variantId) {
+      const variant = variantById.get(level.variantId)
+      const variantKey = String(variant?.sku ?? '').trim().toLowerCase()
+      const byVariantSku = variantKey ? liveVariantBySku.get(variantKey) : undefined
+      const siblings = variantsByProduct.get(level.productId) ?? []
+      // A single-variant product's Shopify item is often the product's own
+      // (its default variant carries the product SKU, or none at all).
+      return {
+        inventoryItemId: byVariantSku ?? (siblings.length <= 1 ? parentItem?.inventoryItemId : undefined),
+        label: variant?.sku ?? parentSku,
+        unattributed: false,
+      }
+    }
+    const siblings = variantsByProduct.get(level.productId) ?? []
+    if (siblings.length === 0) {
+      return { inventoryItemId: parentItem?.inventoryItemId, label: parentSku, unattributed: false }
+    }
+    return { inventoryItemId: undefined, label: parentSku, unattributed: true }
+  }
+
+  // Where stock goes is decided by the ERP→Shopify location mappings. With no
+  // mapping configured the legacy first-location push stays (existing installs
+  // keep working unchanged); once ANY ERP location is mapped the push becomes
+  // location-wise and the first store location is never written blindly again
+  // — that overwrote its balance with the chain-wide total.
+  const mappings = await listLocationMappings()
+  const mappedMode = mappings.length > 0
+
+  let legacyLocationId: number | undefined
+  if (!mappedMode) {
+    let locations: { id: number; name: string }[]
+    try {
+      locations = await fetchLocations()
+    } catch (err) {
+      releaseSyncLock()
+      return { ok: false, updated: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Failed to fetch locations'] }
+    }
+    legacyLocationId = locations[0]?.id
+    if (!legacyLocationId) {
+      releaseSyncLock()
+      return { ok: false, updated: 0, skipped: 0, errors: ['No inventory locations found on the store'] }
+    }
   }
 
   let updated = 0
@@ -2881,52 +3175,167 @@ export async function pushInventoryToShopify(ids?: string[]): Promise<ShopifyInv
   const errors: string[] = []
 
   try {
-    for (const row of rows) {
-      const skuKey = String(row.sku ?? '').trim().toLowerCase()
-      if (!skuKey) {
-        skipped++
-        continue
+    if (mappedMode) {
+      // ── Location-wise push (mappings configured) ─────────────────────────
+      // Per-product balance AT each mapped location, mirrored to that
+      // location's Shopify id. Only locations the ERP actually records a
+      // balance for are written — a product with no level at a location is
+      // never pushed there, so no store-location balance is overwritten by a
+      // number that does not belong to it.
+      const productById = new Map(rows.map((r) => [r.id, r]))
+      const levelRows = await db!
+        .select({
+          locationId: schema.stockLevels.locationId,
+          productId: schema.stockLevels.productId,
+          variantId: schema.stockLevels.variantId,
+          qty: schema.stockLevels.qty,
+        })
+        .from(schema.stockLevels)
+        .where(ids && ids.length > 0 ? inArray(schema.stockLevels.productId, ids) : undefined)
+      const erpLocations = await db!.select().from(schema.inventoryLocations)
+      const nameById = new Map(erpLocations.map((l) => [l.id, l.name]))
+      const shopifyByErp = new Map(mappings.map((m) => [m.id, Number(m.shopifyLocationId)]))
+
+      const levelsByLocation = new Map<string, Array<{ productId: string; variantId: string | null; qty: number }>>()
+      for (const lv of levelRows) {
+        const list = levelsByLocation.get(lv.locationId) ?? []
+        list.push({ productId: lv.productId, variantId: lv.variantId, qty: Math.max(0, Math.floor(Number(lv.qty) || 0)) })
+        levelsByLocation.set(lv.locationId, list)
       }
-      const shop = bySku.get(skuKey) ?? bySkuCompact.get(normalizeKey(skuKey))
-      if (!shop || !shop.inventoryItemId) {
-        skipped++
-        continue
+
+      for (const [erpLocationId, levels] of levelsByLocation) {
+        const shopifyLocationId = shopifyByErp.get(erpLocationId)
+        if (!shopifyLocationId) {
+          // Clear, once per location: this stock is deliberately NOT pushed.
+          const where = nameById.get(erpLocationId) ?? 'Location unavailable'
+          const message = `${where}: not mapped to a Shopify location — its stock was not pushed`
+          errors.push(message)
+          addLog('inventory', 'skipped', 1, message)
+          await persistLog({
+            entity: 'Inventory',
+            direction: 'out',
+            action: 'Stock Update (skipped: unmapped location)',
+            status: 'skipped',
+            error: message,
+          })
+          continue
+        }
+        const where = nameById.get(erpLocationId) ?? 'Location unavailable'
+        for (const level of levels) {
+          const row = productById.get(level.productId)
+          const parentSku = String(row?.sku ?? '')
+          // Each row is one variant's balance, so it is written to THAT
+          // variant's inventory item — never the parent's rollup, which is the
+          // overwrite this mode exists to prevent.
+          const target = inventoryItemFor(level, parentSku)
+          if (target.unattributed) {
+            const message = `${parentSku || level.productId}: ${level.qty} pcs at ${where} are not attributed to a variant — not pushed (nothing on Shopify to write them to)`
+            skipped++
+            errors.push(message)
+            addLog('inventory', 'skipped', 1, message)
+            await persistLog({
+              entity: 'Inventory',
+              shopifyId: parentSku || undefined,
+              direction: 'out',
+              action: 'Stock Update (skipped: unattributed stock)',
+              status: 'skipped',
+              error: message,
+            })
+            continue
+          }
+          if (!target.inventoryItemId) {
+            skipped++
+            continue
+          }
+          try {
+            await setInventoryItemTracked(target.inventoryItemId)
+            await setInventoryLevel(target.inventoryItemId, shopifyLocationId, level.qty)
+            updated++
+            addLog('inventory', 'success', 1, `Stock set: ${target.label} = ${level.qty} @ ${where}`)
+            await persistLog({ entity: 'Inventory', shopifyId: target.label, direction: 'out', action: 'Stock Update', status: 'success' })
+          } catch (err) {
+            const message = err instanceof Error ? err.message : 'Unknown error'
+            errors.push(`${target.label} @ ${where}: ${message}`)
+            addLog('inventory', 'failed', 1, message)
+            await persistLog({ entity: 'Inventory', shopifyId: target.label, direction: 'out', action: 'Stock Update', status: 'failed', error: message, retry: true })
+          }
+        }
       }
-      const stock = Number(row.stock ?? 0)
-      try {
-        await setInventoryItemTracked(shop.inventoryItemId)
-        await setInventoryLevel(shop.inventoryItemId, locationId, stock)
-        updated++
-        addLog('inventory', 'success', 1, `Stock set: ${shop.sku} = ${stock}`)
-        await persistLog({ entity: 'Inventory', shopifyId: shop.sku, direction: 'out', action: 'Stock Update', status: 'success' })
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error'
-        errors.push(`${shop.sku}: ${message}`)
-        addLog('inventory', 'failed', 1, message)
-        await persistLog({ entity: 'Inventory', shopifyId: shop.sku, direction: 'out', action: 'Stock Update', status: 'failed', error: message, retry: true })
+      // Products with no per-location balance have nothing location-wise to
+      // push; counted so the result never silently claims a complete mirror.
+      // Their global rollup is deliberately NOT written anywhere — that is the
+      // overwrite this mode exists to prevent. Every number that IS written
+      // comes from a stock_levels row, i.e. from one variant at one location.
+      const withLevels = new Set(levelRows.map((l) => l.productId))
+      for (const r of rows) {
+        if (withLevels.has(r.id)) continue
+        const skuKey = String(r.sku ?? '').trim().toLowerCase()
+        if (skuKey && (bySku.get(skuKey) ?? bySkuCompact.get(normalizeKey(skuKey)))) skipped++
       }
-    }
-    // Per-variant stock: each local variant's count lands on its own Shopify
-    // inventory item (matched back by SKU). Parent rows above already covered
-    // simple products.
-    for (const v of variantRows) {
-      const key = String(v.sku ?? '').trim().toLowerCase()
-      const inventoryItemId = key ? liveVariantBySku.get(key) : undefined
-      if (!inventoryItemId) {
-        skipped++
-        continue
+    } else {
+      // ── Legacy push: no mappings configured (first store location) ───────
+      const rowById = new Map(rows.map((r) => [r.id, r]))
+      for (const row of rows) {
+        const skuKey = String(row.sku ?? '').trim().toLowerCase()
+        if (!skuKey) {
+          skipped++
+          continue
+        }
+        // A product that HAS variant rows is pushed by the variant loop below:
+        // its stock lives on the variants, and writing the product-wide rollup
+        // onto the first inventory item would overwrite that variant's count.
+        if (variantsByProduct.has(row.id)) continue
+        const shop = bySku.get(skuKey) ?? bySkuCompact.get(normalizeKey(skuKey))
+        if (!shop || !shop.inventoryItemId) {
+          skipped++
+          continue
+        }
+        const stock = Number(row.stock ?? 0)
+        try {
+          await setInventoryItemTracked(shop.inventoryItemId)
+          await setInventoryLevel(shop.inventoryItemId, legacyLocationId!, stock)
+          updated++
+          addLog('inventory', 'success', 1, `Stock set: ${shop.sku} = ${stock}`)
+          await persistLog({ entity: 'Inventory', shopifyId: shop.sku, direction: 'out', action: 'Stock Update', status: 'success' })
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Unknown error'
+          errors.push(`${shop.sku}: ${message}`)
+          addLog('inventory', 'failed', 1, message)
+          await persistLog({ entity: 'Inventory', shopifyId: shop.sku, direction: 'out', action: 'Stock Update', status: 'failed', error: message, retry: true })
+        }
       }
-      try {
-        await setInventoryItemTracked(inventoryItemId)
-        await setInventoryLevel(inventoryItemId, locationId, Math.max(0, Math.floor(Number(v.stock) || 0)))
-        updated++
-        addLog('inventory', 'success', 1, `Stock set: ${v.sku} = ${Math.max(0, Math.floor(Number(v.stock) || 0))}`)
-        await persistLog({ entity: 'Inventory', shopifyId: v.sku, direction: 'out', action: 'Stock Update', status: 'success' })
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error'
-        errors.push(`${v.sku}: ${message}`)
-        addLog('inventory', 'failed', 1, message)
-        await persistLog({ entity: 'Inventory', shopifyId: v.sku, direction: 'out', action: 'Stock Update', status: 'failed', error: message, retry: true })
+      // Per-variant stock: each local variant's count lands on its own Shopify
+      // inventory item (matched back by SKU). Products with NO variant row are
+      // covered by the parent loop above.
+      for (const v of variantRows) {
+        const key = String(v.sku ?? '').trim().toLowerCase()
+        let inventoryItemId = key ? liveVariantBySku.get(key) : undefined
+        // A single-variant product whose Shopify variant carries no SKU of its
+        // own: the product's inventory item IS that variant's item.
+        if (!inventoryItemId && (variantsByProduct.get(v.productId) ?? []).length <= 1) {
+          const parent = rowById.get(v.productId)
+          const parentKey = String(parent?.sku ?? '').trim().toLowerCase()
+          const parentShop = parentKey ? (bySku.get(parentKey) ?? bySkuCompact.get(normalizeKey(parentKey))) : undefined
+          inventoryItemId = parentShop?.inventoryItemId
+        }
+        if (!inventoryItemId) {
+          skipped++
+          continue
+        }
+        const label = String(v.sku ?? '') || String(v.title ?? '')
+        const qty = Math.max(0, Math.floor(Number(v.stock) || 0))
+        try {
+          await setInventoryItemTracked(inventoryItemId)
+          await setInventoryLevel(inventoryItemId, legacyLocationId!, qty)
+          updated++
+          addLog('inventory', 'success', 1, `Stock set: ${label} = ${qty}`)
+          await persistLog({ entity: 'Inventory', shopifyId: label, direction: 'out', action: 'Stock Update', status: 'success' })
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Unknown error'
+          errors.push(`${label}: ${message}`)
+          addLog('inventory', 'failed', 1, message)
+          await persistLog({ entity: 'Inventory', shopifyId: label, direction: 'out', action: 'Stock Update', status: 'failed', error: message, retry: true })
+        }
       }
     }
     if (updated > 0) {
@@ -3643,6 +4052,12 @@ export interface DraftOrderResult {
   draftId?: string
   name?: string
   completed?: boolean
+  /**
+   * `gid://shopify/Order/…` of the order the draft completed into. Returned so
+   * the caller can record the ERP row's Shopify identity even when the display
+   * name is already taken by another local order.
+   */
+  orderGid?: string
   customerId?: string
   errors: string[]
   message?: string
@@ -3740,6 +4155,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
     const draftId = result.draftOrder.id
     let completed = false
     let name = result.draftOrder.name ?? undefined
+    let orderGid: string | undefined
     let completionError: string | null = null
 
     try {
@@ -3775,6 +4191,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
       const completedOrder = completeResult?.draftOrder?.order
       if (completedOrder?.id || completedOrder?.name) {
         completed = true
+        orderGid = completedOrder.id ?? undefined
         name = completedOrder.name ?? completeResult?.draftOrder?.name ?? name
       } else if (!completeRes.ok || completeResult?.userErrors?.length || completeJson?.errors?.length) {
         const msg =
@@ -3822,7 +4239,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
       action: completed ? 'Order Created' : 'Draft Order Created',
       status: 'success',
     })
-    return { ok: true, draftId, name, completed, customerId: customerId || undefined, errors: [] }
+    return { ok: true, draftId, name, completed, orderGid, customerId: customerId || undefined, errors: [] }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     return { ok: false, errors: [msg], message: 'Shopify draft order creation failed' }
@@ -3957,11 +4374,13 @@ export interface ShopifyOrdersImportResult {
 function mapImportedPayment(status: string | null | undefined): string {
   switch (String(status ?? '').toLowerCase()) {
     case 'paid':
-    case 'partially_paid':
     case 'partially_refunded':
       // The coarse ERP payment field can only say paid/pending/refunded.
       // Preserve the exact Shopify enum in shopifyFinancialStatus below.
       return 'paid'
+    case 'partially_paid':
+      // Partly collected — the invoice must not be reported as fully paid.
+      return 'partial'
     case 'refunded':
     case 'voided':
       return 'refunded'
@@ -4001,8 +4420,23 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
 
   try {
     const raw = await paginate<any>('orders', 'status=any&fulfillment_status=any')
-    const existing = await db.select({ shopifyId: schema.salesOrders.shopifyId }).from(schema.salesOrders)
+    const existing = await db
+      .select({
+        id: schema.salesOrders.id,
+        shopifyId: schema.salesOrders.shopifyId,
+        shopifyGid: schema.salesOrders.shopifyGid,
+      })
+      .from(schema.salesOrders)
     const knownShopifyIds = new Set(existing.map((r) => r.shopifyId).filter((x): x is string => Boolean(x)))
+    // Orders the ERP pushed to Shopify keep their `MO-…` reference locally (the
+    // Shopify name is only claimed when it is free), so they are unknown to
+    // Shopify-import matching. Keyed by Shopify's immutable gid, those orders
+    // are recognised and linked instead of imported a second time.
+    const byGid = new Map(
+      existing
+        .filter((r) => r.shopifyGid)
+        .map((r) => [String(r.shopifyGid), r]),
+    )
     // In-batch guard: Shopify can return the same order twice across pages
     // (concurrent edits between page fetches). Without this, the second copy
     // would take the insert path and hit the unique index as an error.
@@ -4060,6 +4494,10 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             quantity: Math.max(0, Number(li.quantity ?? 0)),
             price: Math.round(Number(li.price ?? 0) * 100) / 100,
             fulfilledQuantity: Math.max(0, Number(li.quantity ?? 0) - Number(li.fulfillable_quantity ?? li.quantity ?? 0)),
+            // Where Shopify took the stock from. Mapped to an ERP location on
+            // insert so the deduction — and every later reversal — lands on the
+            // same balance; kept on the row for auditability.
+            locationId: li.location_id != null ? String(li.location_id) : null,
           }))
           .filter((li: { title: string }) => li.title) ?? []
       const tags = String(o.tags ?? '').trim() || null
@@ -4076,6 +4514,11 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
       const shippingAddress = o.shipping_address ? (() => {
         return parseOrderAddress(o.shipping_address)
       })() : null
+
+      // Set when this Shopify order was matched to an existing ERP order by
+      // gid: the sale is already recorded (and may already carry an invoice),
+      // so the auto-invoice step below must leave it alone.
+      let linkedFromGid = false
 
       if (knownShopifyIds.has(shopifyId)) {
         // Merge against the stored row: locally recovered addresses (repair /
@@ -4103,6 +4546,9 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             tags,
             currency,
             discount,
+            // Which shop these rows came from, so a later reconnection can tell
+            // a previous shop's orders apart from the connected one's.
+            shopifyStore: config.shop,
             // undefined from mergeAddress = nothing worth writing → drizzle
             // omits the column and the stored address is untouched.
             billingAddress: mergeAddress(cur?.billingAddress as OrderAddress | undefined, billingAddress),
@@ -4118,8 +4564,91 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           .set({ date })
           .where(eq(schema.salesInvoices.shopifyOrder, shopifyId))
         updated++
+      } else if (orderSnapshot.gid && byGid.has(orderSnapshot.gid)) {
+        // This Shopify order is the one this ERP created for a manual order: a
+        // local row already exists under its MO-… reference.
+        const linkedOrder = byGid.get(orderSnapshot.gid)!
+        const [cur] = await db
+          .select()
+          .from(schema.salesOrders)
+          .where(eq(schema.salesOrders.id, linkedOrder.id))
+          .limit(1)
+        const statePatch = cur ? buildOrderPatch(cur, orderSnapshot).patch : {}
+        await db
+          .update(schema.salesOrders)
+          .set({
+            ...statePatch,
+            // The row keeps its own MO-… reference (never the Shopify name): it
+            // is an ERP sale that happens to exist on Shopify, and the name is
+            // what the auto-invoice step keys on. Matching stays by gid.
+            ...(!apiNameIsEmail && customerName && customerName !== 'Guest' ? { customer: customerName } : {}),
+            ...(customerId ? { customerShopifyId: customerId } : {}),
+            date,
+            shopifyStore: config.shop,
+            value,
+            items,
+            tags,
+            currency,
+            discount,
+            billingAddress: mergeAddress(cur?.billingAddress as OrderAddress | undefined, billingAddress),
+            shippingAddress: mergeAddress(cur?.shippingAddress as OrderAddress | undefined, shippingAddress),
+          })
+          .where(eq(schema.salesOrders.id, linkedOrder.id))
+        linkedFromGid = true
+        updated++
       } else {
         try {
+          // The order's Shopify location, mapped to an ERP stock location by
+          // ID (never by name). Unmapped or absent → null, which resolves to
+          // the default store — where the old rollup-only deduction landed.
+          const storeLocationId =
+            o.line_items?.find((li: any) => li?.location_id != null)?.location_id ?? null
+          const erpLocationId =
+            storeLocationId != null ? await resolveErpLocationForShopify(storeLocationId) : null
+          // ONE location per order: the row records it and every reversal
+          // follows it, so movements and sales_orders.locationId can never
+          // disagree. The mapped location is used only when it exists AND
+          // every counted line already tracks balances — a product that has
+          // never been through the ledger owns its stock at the default store
+          // until its first movement, so deducting elsewhere would reset its
+          // rollup instead of decreasing it.
+          let deductionLocation: string | null = null
+          if (erpLocationId) {
+            deductionLocation = erpLocationId
+            for (const li of lineItems) {
+              const sku = String(li.sku ?? '').trim()
+              const qty = Math.floor(Number(li.quantity ?? 0))
+              if (!sku || qty <= 0) continue
+              const [p] = await db!
+                .select({ id: schema.products.id })
+                .from(schema.products)
+                .where(eq(schema.products.sku, sku))
+                .limit(1)
+              // Shopify sells VARIANTS, so the line SKU usually belongs to
+              // product_variants — resolve through it rather than treating a
+              // variant line as "no product" and keeping the mapped location.
+              let productId = p?.id ?? null
+              if (!productId) {
+                const [variant] = await db!
+                  .select({ productId: schema.productVariants.productId })
+                  .from(schema.productVariants)
+                  .where(eq(schema.productVariants.sku, sku))
+                  .limit(1)
+                productId = variant?.productId ?? null
+              }
+              if (!productId) continue
+              const [lvl] = await db!
+                .select({ locationId: schema.stockLevels.locationId })
+                .from(schema.stockLevels)
+                .where(eq(schema.stockLevels.productId, productId))
+                .limit(1)
+              if (!lvl) {
+                deductionLocation = null
+                break
+              }
+            }
+          }
+          let insertedRow = false
           await db.transaction(async (tx) => {
             const inserted = await tx
               .insert(schema.salesOrders)
@@ -4146,11 +4675,16 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
                 cancelledAt: orderSnapshot.cancelledAt,
                 closedAt: orderSnapshot.closedAt,
                 shopifySyncedAt: date,
+                shopifyStore: config.shop,
                 date,
                 items,
                 tags,
                 currency,
                 discount,
+                // The location stock actually leaves from, so cancellations
+                // and restores reuse the exact balance this deduction touched
+                // (NULL = the default store).
+                locationId: deductionLocation,
                 lineItems: lineItems.length > 0 ? lineItems : null,
                 billingAddress: billingAddress ?? undefined,
                 shippingAddress: shippingAddress ?? undefined,
@@ -4163,18 +4697,45 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             // actually inserted it may deduct stock, otherwise the same sale is
             // deducted twice.
             if (inserted.length === 0) return
+            insertedRow = true
 
+            const targetLocation = deductionLocation ?? (await resolveMovementLocation(null, tx))
             for (const li of lineItems) {
               const sku = String(li.sku ?? '').trim()
               const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
               if (!sku || qty <= 0) continue
-              const [product] = await tx.select({ stock: schema.products.stock }).from(schema.products).where(eq(schema.products.sku, sku)).limit(1).for('update')
+              const [product] = await tx.select({ id: schema.products.id, stock: schema.products.stock }).from(schema.products).where(eq(schema.products.sku, sku)).limit(1).for('update')
               if (!product) continue
               const current = Number(product.stock ?? 0)
               if (current - qty < 0) continue
-              await tx.update(schema.products).set({ stock: sql`${schema.products.stock} - ${qty}` }).where(eq(schema.products.sku, sku))
+              // Through the ledger now: the movement posts at the order's
+              // chosen location and recomputes the rollup from the levels —
+              // the same arithmetic the direct products.stock write performed,
+              // plus the per-location balance and the audit row. The insert
+              // guard above keeps it exactly-once for concurrent syncs and
+              // webhook retries.
+              await applyStockMovement({
+                sku,
+                qty: -qty,
+                type: 'sale_out',
+                refType: 'shopify_order',
+                refId: shopifyId,
+                locationId: targetLocation,
+                tx,
+              })
             }
           })
+          if (insertedRow && storeLocationId != null && !erpLocationId) {
+            const message = `Order ${shopifyId}: Shopify location ${storeLocationId} is not mapped to an ERP location — stock was deducted from the default store`
+            await persistLog({
+              entity: 'Inventory',
+              shopifyId,
+              direction: 'in',
+              action: 'Order Stock (unmapped Shopify location)',
+              status: 'skipped',
+              error: message,
+            })
+          }
           knownShopifyIds.add(shopifyId)
           imported++
         } catch (err) {
@@ -4283,14 +4844,17 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
         }
       }
 
-      // Raise a tax invoice for paid orders so the dashboard's invoice-derived
+      // Raise a tax invoice for every live Shopify order with a value — paid,
+      // partly paid or still pending — so the dashboard's invoice-derived
       // widgets (sales, invoices, top products/category, payment status) have
-      // data. Refunded and cancelled orders are skipped entirely, so a voided
-      // order never becomes revenue. This is idempotent: an order that already
-      // carries an invoice number is left alone, so re-syncing backfills the
-      // existing paid orders exactly once. The import already moved stock on
-      // insert, so the invoice must not move it again.
-      if (payment === 'paid' && mapImportedStatus(o) !== 'cancelled') {
+      // data. Invoicing only paid orders dropped unpaid Shopify sales from the
+      // dashboard and left Pending Amount with nothing to report. Cancelled and
+      // refunded orders are skipped entirely, so they never become revenue.
+      // This is idempotent: an order that already carries an invoice number is
+      // left alone (zero-amount invoices are repaired after the loop), and the
+      // import already moved stock on insert, so the invoice must not move it
+      // again.
+      if (!linkedFromGid && mapImportedStatus(o) !== 'cancelled' && payment !== 'refunded' && value > 0) {
         try {
           const [orderRow] = await db
             .select()
@@ -4325,6 +4889,55 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           logger.warn({ shopifyId, err: msg }, 'Shopify order import: auto-invoice failed')
         }
       }
+    }
+
+    // Orders the connected shop no longer returns were left behind by an
+    // earlier Shopify connection (or deleted in Shopify). Nothing is deleted:
+    // tag them so dashboards stop counting them as the connected shop's sales.
+    // Skip the tag when the fetch may have been truncated at the page cap — an
+    // order beyond the cap is not evidence of a different shop.
+    const fetchComplete = raw.length < CONSTANTS.SHOPIFY_MAX_PAGES * CONSTANTS.SHOPIFY_API_LIMIT
+    if (fetchComplete && seenInBatch.size > 0) {
+      try {
+        await db
+          .update(schema.salesOrders)
+          .set({ shopifyStore: 'not-in-store' })
+          .where(
+            and(
+              like(schema.salesOrders.shopifyId, '#%'),
+              sql`coalesce(${schema.salesOrders.shopifyStore}, '') <> 'not-in-store'`,
+              notInArray(schema.salesOrders.shopifyId, [...seenInBatch]),
+            ),
+          )
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Shopify order import: could not tag foreign-store orders',
+        )
+      }
+    }
+
+    // Backfill invoices written before the amount mapping was fixed: they are
+    // linked to their order but carry ₹0 (the total had been rebuilt from
+    // catalogue weights alone). The order's Shopify-sourced value is the truth.
+    try {
+      const { repairZeroValueShopifyInvoices } = await import('./orderEmailIngest')
+      const repair = await repairZeroValueShopifyInvoices()
+      if (repair.repaired > 0) {
+        await persistLog({
+          entity: 'Invoice',
+          direction: 'out',
+          action: 'Invoice Amount Repaired',
+          status: 'success',
+          error: `${repair.repaired} zero-value Shopify invoice(s) repaired from their order totals`,
+        })
+      }
+      invoiceFailures.push(...repair.failed)
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Shopify order import: zero-value invoice repair failed',
+      )
     }
 
     // Surface auto-invoice failures in Sync Logs (System → Shopify → Sync
@@ -4506,13 +5119,23 @@ export async function refreshShopifyOrder(localOrderId: string): Promise<{ ok: b
   const [local] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, localOrderId)).limit(1)
   if (!local) return { ok: false, message: 'Order not found locally' }
   const orderNumber = String(local.shopifyId ?? '').replace(/^#/, '')
-  if (!orderNumber) return { ok: false, message: 'Order is not linked to Shopify' }
+  // A manual order synced to Shopify keeps its ERP reference as `shopifyId`
+  // when the Shopify display name already belongs to another local order, so
+  // its gid is the only locator. Prefer it whenever it is present.
+  const gidRestId = String(local.shopifyGid ?? '').match(/\/Order\/(\d+)/)?.[1]
+  if (!orderNumber && !gidRestId) return { ok: false, message: 'Order is not linked to Shopify' }
 
   // Local shopifyId stores the order NAME (e.g. "#1053"), but the REST
   // single-order endpoint needs the numeric REST id. Look up by name first
-  // (name query requires status=any to include closed/cancelled orders).
-  const matches = await paginate<any>('orders', `status=any&name=${encodeURIComponent(`#${orderNumber}`)}`)
-  const restId = matches[0]?.id
+  // (name query requires status=any to include closed/cancelled orders) so the
+  // existing path is unchanged, and fall back to the gid for orders that could
+  // not claim their Shopify name locally.
+  let restId: string | number | undefined
+  if (orderNumber) {
+    const matches = await paginate<any>('orders', `status=any&name=${encodeURIComponent(`#${orderNumber}`)}`)
+    restId = matches[0]?.id
+  }
+  if (!restId) restId = gidRestId
   if (!restId) return { ok: false, message: `Order #${orderNumber} not found on Shopify` }
 
   // Single-order REST endpoint returns { order: {...} } — use shopifyRequest
@@ -4558,7 +5181,8 @@ export async function refreshShopifyOrder(localOrderId: string): Promise<{ ok: b
     })
     .where(eq(schema.salesOrders.id, localOrderId))
 
-  addLog('orders', 'success', 1, `Refreshed order #${orderNumber} from Shopify`)
-  await persistLog({ entity: 'Order', shopifyId: `#${orderNumber}`, direction: 'in', action: 'Order Refreshed', status: 'success' })
+  const orderRef = orderNumber ? `#${orderNumber}` : String(o.name ?? restId)
+  addLog('orders', 'success', 1, `Refreshed order ${orderRef} from Shopify`)
+  await persistLog({ entity: 'Order', shopifyId: orderRef, direction: 'in', action: 'Order Refreshed', status: 'success' })
   return { ok: true, updated: true }
 }

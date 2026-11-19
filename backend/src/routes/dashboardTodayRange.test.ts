@@ -62,6 +62,18 @@ test(
       { id: `${marker}-prev-day`, number: `${marker}-PREV-DAY`, date: localNaive(new Date(todayFrom.getTime() - 1000)), grandTotal: 9000, status: 'paid', paymentStatus: 'paid' },
       { id: `${marker}-prev-week`, number: `${marker}-PREV-WEEK`, date: localNaive(new Date(weekFrom.getTime() - 1000)), grandTotal: 90000, status: 'paid', paymentStatus: 'paid' },
     ]
+    // The chart's order count comes from sales_orders, not from invoices, so the
+    // fixture needs the order rows those invoices were raised from. `invoice`
+    // is set so the ledger does not also add their value as uninvoiced revenue.
+    const orders = invoices.map((inv, i) => ({
+      id: `${marker}-order-${i}`,
+      internalId: `${marker}-SO-${i}`,
+      status: 'confirmed',
+      date: inv.date,
+      value: inv.grandTotal,
+      invoice: inv.number,
+      items: 1,
+    }))
     const expenses = [
       { id: `${marker}-rent`, category: 'Rent', description: marker, amount: 500, date: localNaive(new Date()), status: 'paid' },
       { id: `${marker}-staff`, category: 'Staff', description: marker, amount: 700, date: localNaive(new Date(weekFrom.getTime() - 3600_000)), status: 'paid' },
@@ -82,6 +94,7 @@ test(
     let server: Server | null = null
     try {
       await db!.insert(schema.salesInvoices).values(invoices)
+      await db!.insert(schema.salesOrders).values(orders)
       await db!.insert(schema.expenses).values(expenses)
 
       // The dashboard router without the auth layer, so the test hits the real
@@ -146,6 +159,7 @@ test(
     } finally {
       const { inArray } = await import('drizzle-orm')
       await db!.delete(schema.salesInvoices).where(inArray(schema.salesInvoices.id, invoices.map((i) => i.id)))
+      await db!.delete(schema.salesOrders).where(inArray(schema.salesOrders.id, orders.map((o) => o.id)))
       await db!.delete(schema.expenses).where(inArray(schema.expenses.id, expenses.map((e) => e.id)))
       server?.close()
       await getRawClient()?.end({ timeout: 5 })

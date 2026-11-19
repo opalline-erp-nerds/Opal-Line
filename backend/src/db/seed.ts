@@ -31,6 +31,7 @@ import {
 } from './seedData'
 import { defaultRolePermissions } from '../rbac'
 import { describeDatabaseTarget, isDesktopAppDatabase } from '../lib/seedGuard'
+import { setStockTotalTo } from '../stock'
 import { sql } from 'drizzle-orm'
 
 const databaseUrl = process.env.DATABASE_URL
@@ -91,6 +92,9 @@ async function main() {
     schema.salesReturns,
     schema.purchaseReturns,
     schema.stockTransfers,
+    schema.stockLevels,
+    schema.stockMovements,
+    schema.productVariants,
     schema.inventoryLocations,
     schema.bankAccounts,
     schema.ledgerEntries,
@@ -127,7 +131,30 @@ async function main() {
       createdAt: new Date().toISOString(),
     })),
   )
-  await db.insert(schema.products).values(productSeed)
+  // Products go in with zero stock: the demo quantities are posted through the
+  // ledger right after (see below), so a seeded database is born with balances
+  // and movements instead of a products.stock value nothing can explain.
+  await db.insert(schema.products).values(productSeed.map((p) => ({ ...p, stock: 0 })))
+  // Every other stock write goes through applyStockMovement, and the seed is
+  // no exception: the demo quantities become real balances at the default store
+  // with `opening` movements behind them, so the rollup is derived from the
+  // ledger from the very first row rather than being a column nobody can trace.
+  let seededBalances = 0
+  for (const p of productSeed) {
+    const target = Math.floor(Number(p.stock ?? 0))
+    if (target <= 0) continue
+    const next = await setStockTotalTo({
+      sku: p.sku,
+      target,
+      type: 'opening',
+      refType: 'seed',
+      note: 'opening balance for the demo catalogue',
+      createdBy: 'seed',
+    })
+    if (next == null) console.warn(`  (seed) stock for ${p.sku} was NOT posted to the ledger — check that SKU`)
+    else seededBalances++
+  }
+  if (seededBalances > 0) console.log(`Seeded opening balances for ${seededBalances} product(s) into the stock ledger.`)
   await db.insert(schema.customers).values(customerSeed)
   await db.insert(schema.suppliers).values(supplierSeed)
   await db.insert(schema.inventoryLocations).values(locationSeed)
@@ -178,6 +205,10 @@ async function main() {
   console.log('Seed complete:', counts)
 
   await client.end()
+  // Exit explicitly: importing ../stock also opens the shared DB pool (drizzle
+  // client), and an open pool keeps the event loop alive forever — the seed
+  // finished but `npm run db:seed` never returned.
+  process.exit(0)
 }
 
 main().catch((err) => {

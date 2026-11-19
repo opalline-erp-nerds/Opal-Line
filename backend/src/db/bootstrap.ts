@@ -52,6 +52,47 @@ async function tableExists(sql: postgres.Sql, name: string): Promise<boolean> {
 }
 
 /**
+ * Durable outbound Shopify queue (ERP → Shopify), applied from both
+ * createSchema (fresh installs) and applyUpgrades (existing installs) — the
+ * same rule STOCK_LEDGER_DDL documents: never declare this DDL twice.
+ */
+const SHOPIFY_OUTBOUND_DDL: string[] = [
+  `CREATE TABLE IF NOT EXISTS shopify_sync_jobs (
+    id text PRIMARY KEY,
+    idempotency_key text NOT NULL,
+    kind text NOT NULL,
+    product_id text NOT NULL,
+    status text NOT NULL DEFAULT 'pending',
+    attempts integer NOT NULL DEFAULT 0,
+    next_attempt_at timestamp,
+    last_error text,
+    created_at timestamp,
+    updated_at timestamp
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS shopify_sync_jobs_key_idx ON shopify_sync_jobs (idempotency_key)`,
+  `CREATE INDEX IF NOT EXISTS shopify_sync_jobs_status_idx ON shopify_sync_jobs (status, next_attempt_at)`,
+  `CREATE INDEX IF NOT EXISTS shopify_sync_jobs_product_idx ON shopify_sync_jobs (product_id)`,
+]
+
+/**
+ * Shopify location mapping on stock locations: the column plus the partial
+ * unique index that keeps one ERP location per store location (NULLs exempt).
+ *
+ * Declared once and applied from BOTH createSchema (fresh installs) and
+ * applyUpgrades (existing installs) — the same rule STOCK_LEDGER_DDL documents.
+ * This is not theoretical: the ALTER was originally only in createSchema, and
+ * createSchema runs only when `users` is missing, so every EXISTING install
+ * took applyUpgrades and never gained the column. Drizzle lists every table
+ * column in its INSERT column list (columns absent from `values()` are emitted
+ * as `default`), so that one missing column broke every location insert with
+ * `42703: column "shopify_location_id" … does not exist`.
+ */
+const INVENTORY_LOCATION_SHOPIFY_DDL: string[] = [
+  `ALTER TABLE inventory_locations ADD COLUMN IF NOT EXISTS shopify_location_id text`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS inventory_locations_shopify_location_id_idx ON inventory_locations (shopify_location_id) WHERE shopify_location_id IS NOT NULL`,
+]
+
+/**
  * Per-location stock balances and the append-only movement ledger.
  *
  * Declared once and applied from both createSchema (fresh installs) and
@@ -62,14 +103,34 @@ async function tableExists(sql: postgres.Sql, name: string): Promise<boolean> {
 const STOCK_LEDGER_DDL: string[] = [
   `CREATE TABLE IF NOT EXISTS stock_levels (
     product_id text NOT NULL,
+    variant_id text,
     location_id text NOT NULL,
-    qty integer NOT NULL DEFAULT 0,
-    CONSTRAINT stock_levels_product_location_idx UNIQUE (product_id, location_id)
+    qty integer NOT NULL DEFAULT 0
   )`,
+  // ── Variant-aware balances ────────────────────────────────────────────────
+  // A balance is (product, variant, location), so the plain UNIQUE
+  // (product_id, location_id) this table was born with cannot express it: a
+  // product holds one row per location ONLY for an unattributed balance, and
+  // one row per variant per location otherwise. The old constraint is dropped
+  // and replaced by two partial uniques — for an EXISTING table right here
+  // (a fresh table is created without it above), idempotently, in the same
+  // statement list. Rows are untouched: a uniqueness rule is not data, and the
+  // two new indexes together cover every row the old one did. To revert:
+  //   re-aggregate stock_levels to (product_id, location_id), then
+  //   ALTER TABLE stock_levels ADD CONSTRAINT stock_levels_product_location_idx
+  //     UNIQUE (product_id, location_id);
+  // and drop the variant_id columns — no quantity ever needs to move.
+  `ALTER TABLE stock_levels ADD COLUMN IF NOT EXISTS variant_id text`,
+  `ALTER TABLE stock_levels DROP CONSTRAINT IF EXISTS stock_levels_product_location_idx`,
+  `DROP INDEX IF EXISTS stock_levels_product_location_idx`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS stock_levels_product_location_idx ON stock_levels (product_id, location_id) WHERE variant_id IS NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS stock_levels_product_variant_location_idx ON stock_levels (product_id, variant_id, location_id) WHERE variant_id IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS stock_levels_location_idx ON stock_levels (location_id)`,
+  `CREATE INDEX IF NOT EXISTS stock_levels_variant_idx ON stock_levels (variant_id) WHERE variant_id IS NOT NULL`,
   `CREATE TABLE IF NOT EXISTS stock_movements (
     id text PRIMARY KEY,
     product_id text,
+    variant_id text,
     sku text,
     location_id text,
     type text NOT NULL,
@@ -82,8 +143,10 @@ const STOCK_LEDGER_DDL: string[] = [
     created_by text,
     date timestamp
   )`,
+  `ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS variant_id text`,
   `CREATE INDEX IF NOT EXISTS stock_movements_sku_idx ON stock_movements (sku)`,
   `CREATE INDEX IF NOT EXISTS stock_movements_product_id_idx ON stock_movements (product_id)`,
+  `CREATE INDEX IF NOT EXISTS stock_movements_variant_id_idx ON stock_movements (variant_id) WHERE variant_id IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS stock_movements_location_id_idx ON stock_movements (location_id)`,
   `CREATE INDEX IF NOT EXISTS stock_movements_date_idx ON stock_movements (date)`,
   `CREATE INDEX IF NOT EXISTS stock_movements_ref_idx ON stock_movements (ref_type, ref_id)`,
@@ -92,6 +155,11 @@ const STOCK_LEDGER_DDL: string[] = [
   // idempotent, which keeps this array safe to run on every boot.
   `ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS received_qty integer`,
   `ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS variance integer`,
+  // Which variant a transfer moves: dispatch, receive and cancel must debit
+  // and credit the SAME one. NULL on transfers created before variant
+  // selection existed — those keep resolving through their stored SKU.
+  `ALTER TABLE stock_transfers ADD COLUMN IF NOT EXISTS variant_id text`,
+  `CREATE INDEX IF NOT EXISTS stock_transfers_variant_id_idx ON stock_transfers (variant_id) WHERE variant_id IS NOT NULL`,
   // Transfer routes used to store the location's display NAME in from/to and
   // pass it around the ledger by re-resolving it on every transition — a rename
   // orphaned the reference. New transfers store canonical inventory_locations
@@ -478,6 +546,10 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         manager text
       )`)
     await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS inventory_locations_name_idx ON inventory_locations (name)`)
+    // The CREATE TABLE above deliberately does not carry the mapping column;
+    // it is declared once in INVENTORY_LOCATION_SHOPIFY_DDL and applied here
+    // (fresh) and from applyUpgrades (existing) so the two paths cannot drift.
+    for (const stmt of INVENTORY_LOCATION_SHOPIFY_DDL) await tx.unsafe(stmt)
 
     // ── Sales ─────────────────────────────────────────────────────────────
     await tx.unsafe(`
@@ -515,6 +587,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         cancelled_at timestamp,
         closed_at timestamp,
         shopify_synced_at timestamp,
+        shopify_store text,
         created_at timestamp DEFAULT now(),
         updated_at timestamp
       )`)
@@ -863,6 +936,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
     await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS stock_transfers_number_idx ON stock_transfers (number)`)
 
     for (const stmt of STOCK_LEDGER_DDL) await tx.unsafe(stmt)
+    for (const stmt of SHOPIFY_OUTBOUND_DDL) await tx.unsafe(stmt)
     for (const stmt of COLLECTIONS_DDL) await tx.unsafe(stmt)
 
     // ── Finance ───────────────────────────────────────────────────────────
@@ -1127,6 +1201,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         reference text,
         reference_type text,
         reference_id text,
+        source text,
         is_auto boolean DEFAULT true,
         branch_id text,
         created_by text,
@@ -1531,7 +1606,43 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
  */
 async function applyUpgrades(sql: postgres.Sql): Promise<void> {
   const upgrades: string[] = [
+    // Location first: stock locations are written by seeding and by every
+    // route as soon as the server listens, so their columns must exist before
+    // anything else in this list (or any request) touches the table.
+    ...INVENTORY_LOCATION_SHOPIFY_DDL,
     ...STOCK_LEDGER_DDL,
+    ...SHOPIFY_OUTBOUND_DDL,
+      // Accounting: store the journal source so unified/Shopify filtering is exact.
+      `ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS source text`,
+      // Duplicate prevention at the database level: one journal per source record.
+      // Existing databases that already contain duplicates are left untouched
+      // (the app-level idempotent post still prevents new ones).
+      `DO $$ BEGIN
+         IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'journal_entries_ref_unique') THEN
+           IF NOT EXISTS (
+             SELECT 1 FROM journal_entries
+             WHERE reference_type IS NOT NULL AND reference_id IS NOT NULL
+             GROUP BY reference_type, reference_id
+             HAVING count(*) > 1
+           ) THEN
+             CREATE UNIQUE INDEX journal_entries_ref_unique
+               ON journal_entries (reference_type, reference_id)
+               WHERE reference_type IS NOT NULL AND reference_id IS NOT NULL;
+           END IF;
+         END IF;
+       END $$`,
+      // Expand COA for unified ERP+Shopify accounting (idempotent for existing installs)
+      `INSERT INTO accounts (id, code, name, type, sub_type, is_group, opening_balance, current_balance, currency, is_active, created_at)
+       VALUES
+         ('ACC1006','1006','GST Input Credit','asset','current_asset',false,0,0,'INR',true,now()),
+         ('ACC2004','2004','TCS Payable','liability','current_liability',false,0,0,'INR',true,now()),
+         ('ACC5002','5002','Purchase Expense','expense','cost_of_goods_sold',false,0,0,'INR',true,now()),
+         ('ACC5003','5003','Making Charges','expense','direct_expense',false,0,0,'INR',true,now()),
+         ('ACC5004','5004','Operating Expenses','expense','operating_expense',false,0,0,'INR',true,now()),
+         ('ACC5005','5005','Shopify Charges','expense','operating_expense',false,0,0,'INR',true,now()),
+         ('ACC5006','5006','Shipping Expense','expense','operating_expense',false,0,0,'INR',true,now()),
+         ('ACC5007','5007','Discounts Given','expense','operating_expense',false,0,0,'INR',true,now())
+       ON CONFLICT (code) DO NOTHING`,
     ...COLLECTIONS_DDL,
     // Login lockout became a per-install switch (Settings → Security → Login
     // lockout), off by default. Existing installs get the column as false,
@@ -1647,6 +1758,9 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS cancelled_at timestamp`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS closed_at timestamp`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS shopify_synced_at timestamp`,
+      // Which shop an order came from, so orders left behind by a previous
+      // Shopify connection can be told apart from the connected shop's.
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS shopify_store text`,
       `CREATE INDEX IF NOT EXISTS sales_orders_shopify_gid_idx ON sales_orders (shopify_gid)`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS is_booking boolean`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS advance_paid numeric`,
@@ -1778,6 +1892,7 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
         reference text,
         reference_type text,
         reference_id text,
+        source text,
         is_auto boolean DEFAULT true,
         branch_id text,
         created_by text,
@@ -2151,12 +2266,39 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
           AND o.currency IS NOT NULL AND btrim(o.currency) <> ''`,
     ]
     for (const stmt of upgrades) {
-      await sql.unsafe(stmt).catch(() => undefined)
+      // Failures are swallowed so one impossible-to-apply statement cannot
+      // stop a boot — but they are LOGGED now: silently dropping them is what
+      // let a missing column reach production looking like a healthy start.
+      await sql.unsafe(stmt).catch((err) =>
+        logger.warn(
+          { err: (err as Error)?.message, statement: stmt.trim().split('\n')[0] },
+          'Bootstrap: schema upgrade statement failed',
+        ),
+      )
     }
     await ensureSupplierUniqueIndexes(sql)
     await sql.unsafe(`ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS customer_shopify_id text`).catch(() => undefined)
     await sql.unsafe(`CREATE INDEX IF NOT EXISTS sales_orders_customer_shopify_id_idx ON sales_orders (customer_shopify_id)`).catch(() => undefined)
     await sql.unsafe(`CREATE INDEX IF NOT EXISTS sales_orders_customer_email_idx ON sales_orders (customer_email)`).catch(() => undefined)
+
+    // ── Variant attribution ───────────────────────────────────────────────
+    // Runs LAST, once the variant columns and indexes above exist: stock that
+    // predates the variant-aware ledger is named against its variants (and, per
+    // location, split by their recorded shares where that is unambiguous). A
+    // failure here must never stop a boot — unattributed balances still count
+    // towards the product — but it is logged loudly, because silently skipping
+    // this is how product/variant drift went unnoticed for so long.
+    await import('./variantStockBackfill')
+      .then((m) => m.attributeLegacyVariantStock(sql))
+      .then((r) => {
+        const touched = r.defaultVariantsCreated + r.levelsAttributed + r.movementsAttributed + r.transfersAttributed
+        if (touched > 0 || r.levelsUnattributed > 0) {
+          logger.info(r, 'Bootstrap: attributed existing stock to variants')
+        }
+      })
+      .catch((err) =>
+        logger.warn({ err: (err as Error)?.message }, 'Bootstrap: variant stock attribution failed'),
+      )
 }
 
 /**

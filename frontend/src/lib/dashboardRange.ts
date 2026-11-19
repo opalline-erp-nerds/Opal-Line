@@ -1,4 +1,4 @@
-﻿export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'month' | 'year' | 'custom'
+﻿export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'month' | 'lastMonth' | 'year' | 'custom'
 
 export interface DateRange {
   start: string
@@ -123,6 +123,20 @@ export function resolveClientRange(period: PeriodKey, customRange: DateRange | u
       to: toISO(to),
       days,
       bucket: days > 62 ? 'month' : 'day',
+    }
+  }
+  if (period === 'lastMonth') {
+    const from = new Date(today.getFullYear(), today.getMonth() - 1, 1)
+    const to = new Date(today.getFullYear(), today.getMonth(), 1)
+    const lastDay = addDays(to, -1)
+    return {
+      key: period,
+      label: 'Last Month',
+      rangeText: fmtFull(from) + ' – ' + fmtFull(lastDay),
+      from: toISO(from),
+      to: toISO(to),
+      days: daysBetween(from, to),
+      bucket: 'day',
     }
   }
   if (period === 'year') {

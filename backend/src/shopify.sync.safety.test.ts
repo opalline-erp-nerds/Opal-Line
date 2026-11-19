@@ -140,9 +140,6 @@ test(
       const shopify = await import('./shopify')
       const pull = await shopify.syncProductsToDb({
         mode: 'full',
-        preserveLocalPriceStock: true,
-        preserveErpPrices: true,
-        preserveLocalBarcodes: true,
         mergeVariants: true,
         allowRemovals: false,
       })

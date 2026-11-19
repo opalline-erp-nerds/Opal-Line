@@ -80,8 +80,11 @@ export const BACKUP_SCOPES: BackupScope[] = [
   {
     key: 'products',
     label: 'Products',
-    description: 'Product catalog, pricing and stock',
-    tables: ['products'],
+    description: 'Product catalog, pricing and stock (with the stock ledger it is counted in)',
+    // The ledger travels with the products: restoring products.stock without
+    // stock_levels leaves a rollup nothing can explain (and would silently
+    // overwrite balances the ledger still holds).
+    tables: ['products', 'stock_levels', 'stock_movements'],
   },
   {
     key: 'customers',
@@ -98,8 +101,8 @@ export const BACKUP_SCOPES: BackupScope[] = [
   {
     key: 'inventory',
     label: 'Inventory',
-    description: 'Stock, locations and transfers',
-    tables: ['products', 'inventory_locations', 'stock_transfers'],
+    description: 'Stock, locations and transfers (with the stock ledger)',
+    tables: ['products', 'stock_levels', 'stock_movements', 'inventory_locations', 'stock_transfers'],
   },
   {
     key: 'sales-reports',
@@ -118,7 +121,7 @@ export const BACKUP_SCOPES: BackupScope[] = [
     label: 'Dashboard',
     description: 'Source data behind dashboard KPIs, summary and charts',
     tables: [
-      'products', 'customers', 'suppliers', 'sales_orders', 'sales_invoices',
+      'products', 'stock_levels', 'stock_movements', 'customers', 'suppliers', 'sales_orders', 'sales_invoices',
       'sales_invoice_items', 'purchase_orders', 'purchase_invoices', 'sales_returns',
       'purchase_returns', 'inventory_locations', 'stock_transfers', 'expenses',
       'payments', 'ledger_entries', 'bank_accounts', 'silver_rates',
@@ -129,7 +132,8 @@ export const BACKUP_SCOPES: BackupScope[] = [
     label: 'Full Backup',
     description: 'All business, catalog and configuration data',
     tables: [
-      'products', 'customers', 'suppliers', 'sales_orders', 'sales_invoices',
+      'products', 'stock_levels', 'stock_movements',
+      'customers', 'suppliers', 'sales_orders', 'sales_invoices',
       'sales_invoice_items', 'purchase_orders', 'purchase_invoices', 'sales_returns',
       'purchase_returns', 'inventory_locations', 'stock_transfers', 'bank_accounts',
       'ledger_entries', 'expenses', 'payments', 'silver_rates', 'settings', 'users', 'roles',
@@ -658,7 +662,22 @@ async function executeRestore(
       }
 
       const ids = rows.map((r) => (r as Record<string, unknown>).id).filter((id) => id != null)
-      if (ids.length > 0) {
+      if (table === 'stock_levels') {
+        // stock_levels has no `id` — its identity is (product, variant,
+        // location). Restoring the file's balances means REPLACING whatever
+        // those products held, or the same units would be counted twice.
+        const productIds = [
+          ...new Set(
+            rows
+              .map((r) => (r as Record<string, unknown>).product_id)
+              .filter((id): id is string => typeof id === 'string' && id.length > 0),
+          ),
+        ]
+        if (productIds.length > 0) {
+          const placeholders = productIds.map((_, i) => `$${i + 1}`).join(',')
+          await tx.unsafe(`DELETE FROM "stock_levels" WHERE product_id IN (${placeholders})`, productIds)
+        }
+      } else if (ids.length > 0) {
         const placeholders = ids.map((_, i) => `$${i + 1}`).join(',')
         await tx.unsafe(`DELETE FROM "${table}" WHERE id IN (${placeholders})`, ids as any[])
       }
@@ -689,6 +708,24 @@ async function executeRestore(
         }
       }
       restored += rows.length
+    }
+
+    // The LEDGER is the source of truth for a restored product: wherever
+    // balances exist, the rollup and every variant mirror are recomputed from
+    // them. A restore therefore can never leave products.stock disagreeing with
+    // stock_levels — and it never overwrites a balance with a column from the
+    // file. A restored product with no balances at all keeps the file's number
+    // as a pre-ledger balance that the next boot materialises.
+    if (tables.includes('products')) {
+      await tx.unsafe(`
+        UPDATE products p
+           SET stock = sub.total
+          FROM (SELECT product_id, sum(qty)::int AS total FROM stock_levels GROUP BY product_id) sub
+         WHERE sub.product_id = p.id AND coalesce(p.stock, -1) <> sub.total`)
+      await tx.unsafe(`
+        UPDATE product_variants v
+           SET stock = coalesce((SELECT sum(l.qty) FROM stock_levels l WHERE l.variant_id = v.id), 0)
+         WHERE EXISTS (SELECT 1 FROM stock_levels l WHERE l.product_id = v.product_id)`)
     }
 
     return { restored, tables: tables.length }

@@ -6,7 +6,9 @@ import { pullLiveProducts, store } from './shopify'
 export type StockChangeSample = {
   sku: string
   field: 'stock' | 'variant_stock'
+  /** Shopify's current count — what the store holds before the push. */
   old: number
+  /** The ERP count — what the push will write to the store. */
   new: number
 }
 
@@ -28,7 +30,15 @@ function matchProduct(
   return rows.find((r) => String(r.sku ?? '').trim().toLowerCase() === key)
 }
 
-export async function previewStockChangesFromShopify(): Promise<StockSyncPreview> {
+/**
+ * What a catalogue push will change on the store, ERP → Shopify.
+ *
+ * The old direction was Shopify → ERP (it previewed the values a pull would
+ * have written over the ERP row). The pull no longer writes them, so the
+ * preview now answers the only question that is left: which listings will
+ * change, and from which count to which.
+ */
+export async function previewStockChangesToShopify(): Promise<StockSyncPreview> {
   if (!isConfigured()) {
     return { ok: false, parentChanges: 0, variantChanges: 0, samples: [], message: 'Shopify is not configured' }
   }
@@ -59,10 +69,10 @@ export async function previewStockChangesFromShopify(): Promise<StockSyncPreview
   for (const p of live) {
     const row = matchProduct(p, products)
     if (!row) continue
-    const newStock = Math.max(0, Math.floor(Number(p.inventoryQuantity) || 0))
-    const oldStock = Math.max(0, Math.floor(Number(row.stock) || 0))
-    if (newStock !== oldStock) {
-      changes.push({ sku: String(row.sku ?? ''), field: 'stock', old: oldStock, new: newStock })
+    const shopifyStock = Math.max(0, Math.floor(Number(p.inventoryQuantity) || 0))
+    const erpStock = Math.max(0, Math.floor(Number(row.stock) || 0))
+    if (erpStock !== shopifyStock) {
+      changes.push({ sku: String(row.sku ?? ''), field: 'stock', old: shopifyStock, new: erpStock })
     }
     const liveVariants = p.variants ?? []
     if (liveVariants.length === 0) continue
@@ -71,10 +81,10 @@ export async function previewStockChangesFromShopify(): Promise<StockSyncPreview
     for (const lv of liveVariants) {
       const local = bySid.get(String(lv.id))
       if (!local) continue
-      const n = Math.max(0, Math.floor(Number(lv.inventoryQuantity) || 0))
-      const o = Math.max(0, Math.floor(Number(local.stock) || 0))
-      if (n !== o) {
-        changes.push({ sku: String(local.sku ?? ''), field: 'variant_stock', old: o, new: n })
+      const shopifyQty = Math.max(0, Math.floor(Number(lv.inventoryQuantity) || 0))
+      const erpQty = Math.max(0, Math.floor(Number(local.stock) || 0))
+      if (erpQty !== shopifyQty) {
+        changes.push({ sku: String(local.sku ?? ''), field: 'variant_stock', old: shopifyQty, new: erpQty })
       }
     }
   }

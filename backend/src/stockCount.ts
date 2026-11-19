@@ -6,6 +6,15 @@
 export interface StockCountRow {
   id: string
   counted: number
+  /**
+   * Counts ONE variant of that product instead of the product as a whole.
+   * Optional: the shipped stock-count screen counts products, and a
+   * product-level count is split across its variants by what each holds (the
+   * location's total is exact either way). A caller that knows which variant
+   * it physically counted passes this and the balance moves on that variant
+   * alone.
+   */
+  variantId?: string | null
 }
 
 export interface StockCountParseResult {
@@ -28,11 +37,14 @@ export function buildStockCountRows(raw: unknown): StockCountParseResult {
   for (const c of list.slice(0, STOCK_COUNT_MAX_ITEMS)) {
     const id = String((c as { id?: unknown })?.id ?? '').trim()
     const counted = Number((c as { counted?: unknown })?.counted)
+    const variantId = String((c as { variantId?: unknown })?.variantId ?? '').trim()
     if (!id || !Number.isFinite(counted) || counted < 0) {
       errors.push(`${id || 'unknown'}: invalid counted value`)
       continue
     }
-    rows.push({ id, counted: Math.floor(counted) })
+    // The key only appears when the caller actually counted a variant, so the
+    // product-level shape the shipped screen sends stays exactly as it was.
+    rows.push(variantId ? { id, counted: Math.floor(counted), variantId } : { id, counted: Math.floor(counted) })
   }
   for (let i = STOCK_COUNT_MAX_ITEMS; i < list.length; i++) {
     errors.push(`item ${i + 1}: over the ${STOCK_COUNT_MAX_ITEMS}-item limit`)

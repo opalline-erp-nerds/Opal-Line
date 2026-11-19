@@ -478,10 +478,12 @@ test(
       assert.deepEqual(
         payload.variants.map((v: any) => [v.option1, v.sku, v.price]),
         [
-          ['S', 'MOCK-SYNC-001-S', '950.00'],
-          ['M', 'MOCK-SYNC-001-M', '1050.00'],
+          // Variant rows store ADDITIONAL amounts over the base selling price
+          // (1000): the push sends base + add-on, never the add-on alone.
+          ['S', 'MOCK-SYNC-001-S', '1950.00'],
+          ['M', 'MOCK-SYNC-001-M', '2050.00'],
         ],
-        'one variant per option value, with per-variant SKU and price',
+        'one variant per option value, with per-variant SKU and base + additional price',
       )
       assert.ok(
         payload.variants.every((v: any) => v.inventory_management === 'shopify'),
@@ -565,9 +567,9 @@ test(
       const putBySku = new Map<string, any>(variantPut.variants.map((v: any): [string, any] => [String(v.sku), v]))
       assert.equal(putBySku.get('MOCK-SYNC-001-S')?.id, idS, 'existing variant matched back by SKU')
       assert.equal(putBySku.get('MOCK-SYNC-001-M')?.id, idM)
-      assert.equal(putBySku.get('MOCK-SYNC-001-M')?.price, '1100.00', 'edited variant price pushed')
+      assert.equal(putBySku.get('MOCK-SYNC-001-M')?.price, '2100.00', 'edited variant additional pushed as base 1000 + 1100')
       assert.equal(putBySku.get('MOCK-SYNC-001-L')?.id, undefined, 'new combination arrives without an id')
-      assert.equal(mock.variantBySku('MOCK-SYNC-001-L').price, '1150.00', 'mock listing grew the L variant')
+      assert.equal(mock.variantBySku('MOCK-SYNC-001-L').price, '2150.00', 'mock listing grew the L variant (1000 + 1150)')
 
       const chainsId = mock.collectionIdByTitle('Chains')
       assert.deepEqual(
@@ -598,8 +600,8 @@ test(
       assert.equal(priceRes.updated, 2, 'both variants matched by SKU on the listing')
       const mPut = mock.calls.find((c) => c.method === 'PUT' && c.path === `variants/${idM}`)
       assert.ok(mPut, 'PUT /variants/:id sent for the M variant')
-      assert.equal(mPut.body.variant.price, '1200.00')
-      assert.equal(mock.variantBySku('MOCK-SYNC-001-M').price, '1200.00', 'listing carries the new price')
+      assert.equal(mPut.body.variant.price, '2200.00')
+      assert.equal(mock.variantBySku('MOCK-SYNC-001-M').price, '2200.00', 'listing carries the new price (base 1000 + 1200)')
 
       // ── Phase 6: INVENTORY push ────────────────────────────────────────
       await db.update(s.productVariants).set({ stock: 7 }).where(eq(s.productVariants.id, pulledM.id))

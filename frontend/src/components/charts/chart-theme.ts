@@ -19,6 +19,15 @@ export const SERIES_COLORS = ['#7C5CE6', '#2F5BE0', '#2FBF71', '#F5821F', '#1E2A
 /** Fixed order for slices/legends; repeats the series palette, then extras. */
 export const SLICE_COLORS = [...SERIES_COLORS, '#E5484D', '#9D7BE0']
 
+/** Payment Status colours shared by the donut and its legend. */
+export const PAYMENT_STATUS_COLORS = {
+  paid: '#16a34a',
+  pending: '#f59e0b',
+  failed: '#ef4444',
+  overdue: '#ea580c',
+  refunded: '#94a3b8',
+} as const
+
 /** Receivable aging ramp — current (healthy) through older (worst). */
 export const AGING_COLORS = ['#2FBF71', '#2F5BE0', '#F5821F', '#7C5CE6', '#E5484D', '#7F1D1D']
 

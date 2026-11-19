@@ -603,6 +603,7 @@ export function registerReturnRoutes(app: Express) {
         idempotencyKey: text(body.idempotencyKey),
       })
       if (!result.ok) { res.status(result.status).json({ error: result.error }); return }
+      void import('../accounting/hooks').then(({ queueSalesReturnJournal }) => queueSalesReturnJournal(result.id, actorOf(req))).catch((err) => logger.warn({ err, returnId: result.id }, 'Failed to sync sales return journal'))
       logger.info({ id: result.id, number: result.number, by: req.userId, replayed: result.replayed }, 'sales return created')
       res.status(result.replayed ? 200 : 201).json(result)
     } catch (err) {
@@ -623,6 +624,7 @@ export function registerReturnRoutes(app: Express) {
         actor: actorOf(req),
       })
       if (!result.ok) { res.status(result.status).json({ error: result.error }); return }
+      void import('../accounting/hooks').then(({ queueSalesReturnJournal }) => queueSalesReturnJournal(String(req.params.id), actorOf(req))).catch((err) => logger.warn({ err, returnId: req.params.id }, 'Failed to sync sales return journal'))
       logger.info({ id: req.params.id, status: result.status, restocked: result.restocked, by: req.userId }, 'return status changed')
       res.json(result)
     } catch (err) {

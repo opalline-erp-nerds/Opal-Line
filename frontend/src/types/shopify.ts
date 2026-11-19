@@ -93,7 +93,14 @@ export interface ShopifyStatus {
 export interface SyncResult {
   ok: boolean
   message?: string
-  results: Record<SyncResource, { ok: boolean; count: number; message?: string }>
+  /**
+   * Absent when the server refuses the sync: POST /api/v1/shopify/sync only
+   * spreads `results` into the body when `runSync` produced one (it returns
+   * `{ ok: false, message }` — e.g. "A sync is already in progress" — while a
+   * scheduled run holds the sync lock). Consumers must not read
+   * `res.results.<resource>` unguarded; use `describeSyncResult`.
+   */
+  results?: Record<SyncResource, { ok: boolean; count: number; message?: string }>
   db?: Record<string, string>
 }
 

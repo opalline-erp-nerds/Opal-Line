@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   FileSpreadsheet,
+  FileUp,
   Loader2,
   Upload,
   UserPlus,
@@ -21,6 +22,8 @@ export default function ImportDataPage() {
       <PageHeader
         title="Import Data"
         subtitle="Bulk import products and customers from CSV files"
+        icon={<FileUp className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />}
+        iconTileClassName="bg-[#7547F5] text-white ring-[#7547F5] dark:bg-[#7547F5] dark:text-white dark:ring-[#7547F5]"
       />
       <Tabs defaultValue="products">
         <TabsList>

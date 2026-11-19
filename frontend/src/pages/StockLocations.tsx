@@ -13,9 +13,10 @@ import { DataTable } from '@/components/ui/data-table'
 import { DialogFooter } from '@/components/ui/dialog'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
-import type { InventoryLocation, LocationStockSummary, Product } from '@/types'
+import type { InventoryLocation, LocationStockSummary, Product, ShopifyStoreLocation } from '@/types'
 import { exportTable } from '@/lib/export'
 import { formatCurrency, formatNumber } from '@/lib/format'
+import { locationTypeLabel } from '@/lib/locations'
 
 const LOCATION_TYPES = [
   { value: 'store', label: 'Store' },
@@ -36,6 +37,9 @@ const LOCATION_EXPORT_COLUMNS: Array<{ accessorKey: string; header: string }> = 
 
 export default function StockLocationsPage() {
   const [locations, setLocations] = useState<InventoryLocation[]>([])
+  // The store's EXISTING Shopify locations, for the mapping dropdown.
+  const [storeLocations, setStoreLocations] = useState<ShopifyStoreLocation[]>([])
+  const [storeLocationsError, setStoreLocationsError] = useState('')
   const [summary, setSummary] = useState<Record<string, LocationStockSummary>>({})
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
@@ -48,6 +52,15 @@ export default function StockLocationsPage() {
       })
       .catch(() => undefined)
       .finally(() => setLoading(false))
+    // The store's locations power the mapping dropdown. A failure (no store
+    // connection, revoked scope) must not take the page down — it degrades to
+    // an error line in the edit dialog instead.
+    dbApi.getShopifyStoreLocations()
+      .then((r) => {
+        setStoreLocations(r.locations ?? [])
+        setStoreLocationsError('')
+      })
+      .catch((e) => setStoreLocationsError(e instanceof Error ? e.message : 'Could not load Shopify locations'))
   }, [])
 
   // Deferred a microtask: setting state directly in an effect trips the
@@ -77,7 +90,7 @@ export default function StockLocationsPage() {
   // renaming never moves units.
   const [editTarget, setEditTarget] = useState<InventoryLocation | null>(null)
   const [editSaving, setEditSaving] = useState(false)
-  const [editForm, setEditForm] = useState({ name: '', type: 'store', city: '', manager: '' })
+  const [editForm, setEditForm] = useState({ name: '', type: 'store', city: '', manager: '', shopifyLocationId: '' })
   // Snapshot of the edit form as it opened, for the unsaved-changes close guard.
   const [editBaseline, setEditBaseline] = useState('')
 
@@ -87,6 +100,7 @@ export default function StockLocationsPage() {
       type: loc.type ?? 'store',
       city: loc.city ?? '',
       manager: loc.manager ?? '',
+      shopifyLocationId: loc.shopifyLocationId ?? '',
     }
     setEditTarget(loc)
     setEditForm(next)
@@ -108,12 +122,27 @@ export default function StockLocationsPage() {
         city: editForm.city.trim(),
         manager: editForm.manager.trim(),
       }
-      await dbApi.update('inventory/locations', editTarget.id, patch)
+      try {
+        await dbApi.update('inventory/locations', editTarget.id, patch)
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : 'Update failed — a location with that name may already exist')
+        return
+      }
+      // The mapping has its own validated endpoint (the server verifies the id
+      // against the store), so it is saved separately from the plain details.
+      const mappingChanged = (editForm.shopifyLocationId ?? '') !== (editTarget.shopifyLocationId ?? '')
+      if (mappingChanged) {
+        try {
+          await dbApi.setInventoryLocationShopifyMapping(editTarget.id, editForm.shopifyLocationId || null)
+        } catch (err) {
+          toast.error(err instanceof Error ? err.message : 'Could not save the Shopify location mapping')
+          load()
+          return
+        }
+      }
       toast.success('Location updated')
       setEditTarget(null)
       load()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Update failed — a location with that name may already exist')
     } finally {
       setEditSaving(false)
     }
@@ -140,7 +169,7 @@ export default function StockLocationsPage() {
       {
         accessorKey: 'type',
         header: 'Type',
-        cell: ({ row }) => <Badge variant="muted">{row.original.type || 'store'}</Badge>,
+        cell: ({ row }) => <Badge variant="muted">{locationTypeLabel(row.original.type) || 'Store'}</Badge>,
       },
       {
         accessorKey: 'city',
@@ -166,6 +195,26 @@ export default function StockLocationsPage() {
         cell: ({ row }) => <span className="tabular-nums text-foreground">{formatCurrency(summary[row.original.id]?.valueAtCost ?? 0)}</span>,
       },
       {
+        id: 'shopify',
+        header: 'Shopify location',
+        meta: { headerClassName: 'min-w-[160px]' },
+        cell: ({ row }) => {
+          const mappedId = row.original.shopifyLocationId
+          if (!mappedId) return <Badge variant="muted">Not mapped</Badge>
+          const mapped = storeLocations.find((l) => l.shopifyLocationId === mappedId)
+          if (mapped) {
+            return (
+              <span className="text-foreground" title={mapped.name}>
+                {mapped.name}
+              </span>
+            )
+          }
+          // Mapped, but the store no longer reports that location (or the
+          // list could not be fetched): say so without exposing the raw id.
+          return <span className="text-muted-foreground">Store location unavailable</span>
+        },
+      },
+      {
         id: 'actions',
         header: '',
         meta: { align: 'right' as const },
@@ -181,7 +230,7 @@ export default function StockLocationsPage() {
         ),
       },
     ],
-    [summary, openEdit],
+    [summary, openEdit, storeLocations],
   )
 
   return (
@@ -283,6 +332,28 @@ export default function StockLocationsPage() {
             <div className="space-y-1.5">
               <Label htmlFor="edit-loc-manager">Manager</Label>
               <Input id="edit-loc-manager" value={editForm.manager} onChange={(e) => setEditForm((f) => ({ ...f, manager: e.target.value }))} placeholder="Optional" />
+            </div>
+            <div className="col-span-2 space-y-1.5">
+              <Label htmlFor="edit-loc-shopify">Shopify location</Label>
+              <Select
+                id="edit-loc-shopify"
+                options={[
+                  { value: '', label: 'Not mapped' },
+                  ...storeLocations.map((l) => ({ value: l.shopifyLocationId, label: l.name })),
+                ]}
+                value={editForm.shopifyLocationId}
+                onValueChange={(v) => setEditForm((f) => ({ ...f, shopifyLocationId: v }))}
+                placeholder={storeLocationsError ? 'Shopify locations unavailable' : 'Not mapped'}
+                disabled={Boolean(storeLocationsError)}
+              />
+              {storeLocationsError ? (
+                <p className="text-[11px] text-destructive">{storeLocationsError}</p>
+              ) : (
+                <p className="text-[11px] text-muted-foreground">
+                  Stock here is mirrored to the chosen location on Shopify. Only locations that already
+                  exist on the store are listed — none are ever created.
+                </p>
+              )}
             </div>
           </div>
       </AppDialog>

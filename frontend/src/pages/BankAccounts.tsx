@@ -90,6 +90,8 @@ export default function BankAccountsPage() {
       <PageHeader
         title="Bank Accounts"
         subtitle="Bank and settlement accounts used for business transactions and reconciliation."
+        icon={<Landmark className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />}
+        iconTileClassName="bg-[#7547F5] text-white ring-[#7547F5] dark:bg-[#7547F5] dark:text-white dark:ring-[#7547F5]"
         actions={
           <Button size="sm" onClick={() => openDialog()}>
             <Plus className="h-4 w-4" /> Add Account

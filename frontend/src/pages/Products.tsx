@@ -651,7 +651,11 @@ export default function ProductsPage() {
                 setReorderSaving(true)
                 try {
                   const qty = Number(reorderQty)
-                  await dbApi.update('products', reorderFor.id, { stock: (reorderFor.stock ?? 0) + qty })
+                  // Through the ledger, not a column write: with no locationId
+                  // the endpoint sets the PRODUCT's total and posts only the
+                  // difference — a reduction is spread across the locations
+                  // that hold the stock, a growth joins them.
+                  await dbApi.setProductStock(reorderFor.id, (reorderFor.stock ?? 0) + qty)
                   setPushMessage({ ok: true, text: `Stock updated: ${reorderFor.name} +${qty} pcs.` })
                   setReorderFor(null)
                   load()

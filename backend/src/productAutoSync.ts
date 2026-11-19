@@ -39,6 +39,8 @@ export type ProductAutoSyncRunResult = {
   warnings?: string[]
   skippedRun?: boolean
   paused?: boolean
+  /** Manual runs only: what the ERP → Shopify push did after the pull. */
+  push?: string
 }
 
 type RunRecord = {
@@ -130,11 +132,7 @@ function toRunResult(result: Awaited<ReturnType<typeof syncProductsToDb>>): Prod
   }
 }
 
-async function runInternal(
-  manual: boolean,
-  allowRemovals: boolean,
-  overwriteStockFromShopify = false,
-): Promise<ProductAutoSyncRunResult> {
+async function runInternal(manual: boolean, allowRemovals: boolean): Promise<ProductAutoSyncRunResult> {
   if (isProductSyncInProgress()) {
     return { ok: true, skippedRun: true, skipped: 1, message: 'Product sync already in progress' }
   }
@@ -172,9 +170,6 @@ async function runInternal(
   const result = await syncProductsToDb({
     mode: manual ? 'full' : 'auto',
     allowRemovals: manual && allowRemovals,
-    preserveLocalPriceStock: manual ? !overwriteStockFromShopify : true,
-    preserveErpPrices: true,
-    preserveLocalBarcodes: true,
     mergeVariants: true,
     updatedAtMin,
     catalogGuard: (liveCount, isFull) => {
@@ -257,18 +252,27 @@ export async function runScheduledProductAutoSync(): Promise<ProductAutoSyncRunR
 }
 
 /** Manual Sync Now — full catalog; removals only when allowRemovals is true. */
-export async function runManualProductAutoSync(
-  allowRemovals = false,
-  overwriteStockFromShopify = false,
-): Promise<ProductAutoSyncRunResult> {
+export async function runManualProductAutoSync(allowRemovals = false): Promise<ProductAutoSyncRunResult> {
   try {
-    const out = await runInternal(true, allowRemovals, overwriteStockFromShopify)
+    const out = await runInternal(true, allowRemovals)
     if (out.ok && !out.skippedRun) {
       consecutiveFailures = 0
       paused = false
       pauseWarning = null
       await patchProductAutoSyncMeta({ paused: false })
       if (!timer) schedule()
+      // A manual "Full Sync Now" also ships the ERP catalogue to the store:
+      // the pull discovers and links, the push delivers. Scheduled runs stay
+      // pull-only — ordinary ERP edits already reach Shopify through the queue.
+      try {
+        const { queueCatalogOutbound, flushOutboundShopifyJobs } = await import('./shopifyOutbound')
+        const queued = await queueCatalogOutbound(['product', 'price', 'inventory'], 'Full Sync Now')
+        const flushed = await flushOutboundShopifyJobs()
+        out.push = `${queued.queued} queued, ${flushed.processed} pushed${flushed.failed > 0 ? `, ${flushed.failed} failed` : ''}`
+      } catch {
+        // The pull result is what the caller reports; a push problem is
+        // already recorded in Sync Logs by the worker.
+      }
     }
     return out
   } catch (err) {

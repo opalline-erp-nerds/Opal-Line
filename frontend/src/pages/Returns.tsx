@@ -8,6 +8,7 @@ import {
   ChevronRight,
   ClipboardCheck,
   CreditCard,
+  Eye,
   FileDown,
   Loader2,
   PackageCheck,
@@ -398,8 +399,37 @@ export default function ReturnsPage() {
           </span>
         ),
       },
+      {
+        id: 'actions',
+        header: 'Actions',
+        meta: { align: 'right' as const, headerClassName: 'w-10' },
+        cell: ({ row }) => (
+          <div className="flex items-center justify-end">
+            <TooltipProvider delayDuration={200}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={`View return ${row.original.number}`}
+                    onClick={(e) => {
+                      // Keep the click inside the button: it must not bubble to
+                      // the row (selection / row click handlers).
+                      e.stopPropagation()
+                      void openDetail(row.original.id)
+                    }}
+                  >
+                    <Eye className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>View return details</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </div>
+        ),
+      },
     ],
-    [],
+    [openDetail],
   )
 
   const refundColumns = useMemo<ColumnDef<RefundRow>[]>(

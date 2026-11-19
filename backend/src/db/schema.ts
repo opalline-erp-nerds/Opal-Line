@@ -292,6 +292,14 @@ export const salesOrders = pgTable('sales_orders', {
   closedAt: ts('closed_at'),
   /** Last time the local row was brought level with Shopify. */
   shopifySyncedAt: ts('shopify_synced_at'),
+  /**
+   * Which Shopify shop this order belongs to: the connected shop domain, or
+   * 'not-in-store' once a sync of the connected shop no longer returns it
+   * (a previous connection, or an order deleted in Shopify). Orders are never
+   * deleted here — dashboards use this to stop counting sales that the
+   * connected shop does not have.
+   */
+  shopifyStore: text('shopify_store'),
 }, (table) => ({
   shopifyIdIdx: uniqueIndex('sales_orders_shopify_id_idx').on(table.shopifyId),
   shopifyGidIdx: index('sales_orders_shopify_gid_idx').on(table.shopifyGid),
@@ -745,8 +753,19 @@ export const inventoryLocations = pgTable('inventory_locations', {
   type: text('type'),
   city: text('city'),
   manager: text('manager'),
+  /**
+   * The EXISTING Shopify location this ERP stock location maps to — stored as
+   * Shopify's numeric location id (what `inventory_levels/set` needs), never a
+   * display name: renaming either side must not break the mapping, and two
+   * ERP locations can never claim the same store location (partial unique
+   * index below). Null = not mapped; stock here is not pushed to Shopify.
+   */
+  shopifyLocationId: text('shopify_location_id'),
 }, (table) => ({
   nameIdx: uniqueIndex('inventory_locations_name_idx').on(table.name),
+  shopifyLocationIdx: uniqueIndex('inventory_locations_shopify_location_id_idx')
+    .on(table.shopifyLocationId)
+    .where(sql`${table.shopifyLocationId} is not null`),
 }))
 
 export const stockTransfers = pgTable('stock_transfers', {
@@ -755,6 +774,13 @@ export const stockTransfers = pgTable('stock_transfers', {
   from: text('from'),
   to: text('to'),
   product: text('product'),
+  /**
+   * The exact variant being moved: dispatch, receive and cancel all credit and
+   * debit THIS variant, never the parent product's total. NULL on transfers
+   * created before variant selection existed — those keep moving whatever the
+   * SKU resolved to when they were created.
+   */
+  variantId: text('variant_id'),
   sku: text('sku'),
   qty: integer('qty'),
   weight: numericNumber('weight'),
@@ -768,24 +794,48 @@ export const stockTransfers = pgTable('stock_transfers', {
 }, (table) => ({
   numberIdx: uniqueIndex('stock_transfers_number_idx').on(table.number),
   skuIdx: index('stock_transfers_sku_idx').on(table.sku),
+  variantIdx: index('stock_transfers_variant_id_idx').on(table.variantId).where(sql`${table.variantId} is not null`),
   dateIdx: index('stock_transfers_date_idx').on(table.date),
 }))
 
 /**
- * Per-location stock balance.
+ * Per-location, per-variant stock balance — the source of truth for stock.
  *
  * Stock used to live only on products.stock, which made it impossible to say
- * how much was in which store or why a balance changed. This holds the balance
- * per location; products.stock is kept as the rollup across all locations so
- * every existing query keeps working.
+ * how much was in which store or why a balance changed. It then grew a second,
+ * independent counter (product_variants.stock) that a different set of code
+ * paths updated, so the two drifted: Red 4 + White 4 = 8 while the product
+ * showed 7, because nothing tied a movement to a variant.
+ *
+ * A balance is now keyed by (product, variant, location):
+ *   - `productId`   the parent product, which products.stock rolls up from;
+ *   - `variantId`   the exact variant the units belong to;
+ *   - `locationId`  the store/warehouse holding them.
+ *
+ * `variantId` is NULL only for a product-level balance that cannot be
+ * attributed to a variant (a legacy row on a multi-variant product the
+ * backfill could not truthfully split, or a product with no variant rows at
+ * all). Those rows still count towards products.stock — no quantity is ever
+ * dropped — and are deliberately excluded from every variant's own total.
+ * Two partial unique indexes (rather than one plain unique) keep BOTH shapes
+ * legal: one row per location for an unattributed balance, one row per
+ * variant per location otherwise.
  */
 export const stockLevels = pgTable('stock_levels', {
   productId: text('product_id').notNull(),
+  /** NULL = unattributed product-level balance (see the doc comment above). */
+  variantId: text('variant_id'),
   locationId: text('location_id').notNull(),
   qty: integer('qty').notNull().default(0),
 }, (table) => ({
-  productLocationIdx: uniqueIndex('stock_levels_product_location_idx').on(table.productId, table.locationId),
+  productLocationIdx: uniqueIndex('stock_levels_product_location_idx')
+    .on(table.productId, table.locationId)
+    .where(sql`${table.variantId} is null`),
+  productVariantLocationIdx: uniqueIndex('stock_levels_product_variant_location_idx')
+    .on(table.productId, table.variantId, table.locationId)
+    .where(sql`${table.variantId} is not null`),
   locationIdx: index('stock_levels_location_idx').on(table.locationId),
+  variantIdx: index('stock_levels_variant_idx').on(table.variantId).where(sql`${table.variantId} is not null`),
 }))
 
 /**
@@ -798,6 +848,12 @@ export const stockLevels = pgTable('stock_levels', {
 export const stockMovements = pgTable('stock_movements', {
   id: text('id').primaryKey(),
   productId: text('product_id'),
+  /**
+   * The variant these units moved. NULL on movements written before the
+   * variant-aware ledger (and on ones for a product-level balance that has no
+   * variant to name) — history is annotated forward, never rewritten.
+   */
+  variantId: text('variant_id'),
   sku: text('sku'),
   locationId: text('location_id'),
   /** purchase_in, purchase_return_out, sale_out, sale_return_in, transfer_in, transfer_out, count_adjust, shopify_sync, manual */
@@ -815,6 +871,7 @@ export const stockMovements = pgTable('stock_movements', {
 }, (table) => ({
   skuIdx: index('stock_movements_sku_idx').on(table.sku),
   productIdx: index('stock_movements_product_id_idx').on(table.productId),
+  variantIdx: index('stock_movements_variant_id_idx').on(table.variantId).where(sql`${table.variantId} is not null`),
   locationIdx: index('stock_movements_location_id_idx').on(table.locationId),
   dateIdx: index('stock_movements_date_idx').on(table.date),
   refIdx: index('stock_movements_ref_idx').on(table.refType, table.refId),
@@ -924,6 +981,37 @@ export const syncLogs = pgTable('sync_logs', {
   timeIdx: index('sync_logs_time_idx').on(table.time),
   entityIdx: index('sync_logs_entity_idx').on(table.entity),
   shopifyIdIdx: index('sync_logs_shopify_id_idx').on(table.shopifyId),
+}))
+
+/**
+ * Durable outbound Shopify work queue (ERP → Shopify).
+ *
+ * Inbound sync (Shopify → ERP) is a pull; ERP-originated edits used to reach
+ * Shopify only when the user clicked a push button, and a failed push was
+ * forgotten. Every ERP write now records an intent here, and the worker in
+ * src/shopifyOutbound.ts drains it with retries. `idempotency_key` is
+ * `kind:productId`, so ten edits of one product coalesce into one job and a
+ * duplicate enqueue can never apply the same change twice.
+ */
+export const shopifySyncJobs = pgTable('shopify_sync_jobs', {
+  id: text('id').primaryKey(),
+  /** `kind:productId` — one open job per resource, enforced by the unique index. */
+  idempotencyKey: text('idempotency_key').notNull(),
+  /** product | price | inventory */
+  kind: text('kind').notNull(),
+  productId: text('product_id').notNull(),
+  /** pending | running | done | failed (failed = attempts exhausted, needs a human). */
+  status: text('status').notNull().default('pending'),
+  attempts: integer('attempts').notNull().default(0),
+  /** Earliest time the worker may pick this job up (retry backoff). */
+  nextAttemptAt: ts('next_attempt_at'),
+  lastError: text('last_error'),
+  createdAt: ts('created_at'),
+  updatedAt: ts('updated_at'),
+}, (table) => ({
+  keyIdx: uniqueIndex('shopify_sync_jobs_key_idx').on(table.idempotencyKey),
+  statusIdx: index('shopify_sync_jobs_status_idx').on(table.status, table.nextAttemptAt),
+  productIdx: index('shopify_sync_jobs_product_idx').on(table.productId),
 }))
 
 /** One step of a silver-rate apply run, stored with the rate row (step_log). */
@@ -1344,6 +1432,7 @@ export const journalEntries = pgTable('journal_entries', {
   reference: text('reference'),
   referenceType: text('reference_type'),
   referenceId: text('reference_id'),
+  source: text('source'),
   isAuto: boolean('is_auto').default(true),
   branchId: text('branch_id'),
   createdBy: text('created_by'),

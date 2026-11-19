@@ -6,9 +6,12 @@ import {
   FileSpreadsheet,
   Landmark,
   Loader2,
+  RefreshCw,
   Scale,
   TrendingDown,
   TrendingUp,
+  Wallet,
+  ListFilter,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
@@ -24,7 +27,9 @@ import type {
   TrialBalanceResult,
   ProfitAndLossResult,
   BalanceSheetResult,
-  JournalEntry,
+  AccountingDashboard,
+  UnifiedTransaction,
+  LedgerRow,
 } from '@/lib/api'
 import { formatCurrency } from '@/lib/format'
 
@@ -33,15 +38,21 @@ export default function AccountingPage() {
     <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
       <PageHeader
         title="Double-Entry Accounting"
-        subtitle="Profit & Loss, Balance Sheet, Trial Balance and Journal Entries"
+        subtitle="Unified Shopify + ERP accounting dashboard, ledger, transactions, and reports"
+        icon={<Calculator className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />}
+        iconTileClassName="bg-[#7547F5] text-white ring-[#7547F5] dark:bg-[#7547F5] dark:text-white dark:ring-[#7547F5]"
       />
-      <Tabs defaultValue="trial-balance">
-        <TabsList>
+      <Tabs defaultValue="dashboard">
+        <TabsList className="flex flex-wrap h-auto">
+          <TabsTrigger value="dashboard"><Wallet className="h-4 w-4" /> Dashboard</TabsTrigger>
+          <TabsTrigger value="transactions"><ListFilter className="h-4 w-4" /> Transactions</TabsTrigger>
           <TabsTrigger value="trial-balance"><Scale className="h-4 w-4" /> Trial Balance</TabsTrigger>
           <TabsTrigger value="profit-loss"><TrendingUp className="h-4 w-4" /> Profit & Loss</TabsTrigger>
           <TabsTrigger value="balance-sheet"><Landmark className="h-4 w-4" /> Balance Sheet</TabsTrigger>
-          <TabsTrigger value="journal"><BookOpen className="h-4 w-4" /> Journal Entries</TabsTrigger>
+          <TabsTrigger value="journal"><BookOpen className="h-4 w-4" /> Journal / Ledger</TabsTrigger>
         </TabsList>
+        <TabsContent value="dashboard"><DashboardTab /></TabsContent>
+        <TabsContent value="transactions"><TransactionsTab /></TabsContent>
         <TabsContent value="trial-balance"><TrialBalanceTab /></TabsContent>
         <TabsContent value="profit-loss"><ProfitLossTab /></TabsContent>
         <TabsContent value="balance-sheet"><BalanceSheetTab /></TabsContent>
@@ -54,6 +65,89 @@ export default function AccountingPage() {
 // ═══════════════════════════════════════════════════════════════════
 // TRIAL BALANCE
 // ═══════════════════════════════════════════════════════════════════
+
+function DashboardTab() {
+  const [data, setData] = useState<AccountingDashboard | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [reconciling, setReconciling] = useState(false)
+  const [reconcileMsg, setReconcileMsg] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try { setData(await accountingApi.getDashboard()) } catch { /* ignore */ } finally { setLoading(false) }
+  }, [])
+  useEffect(() => { queueMicrotask(load) }, [load])
+
+  const reconcile = async () => {
+    setReconciling(true); setReconcileMsg(null)
+    try {
+      const r = await accountingApi.reconcileShopify()
+      setReconcileMsg(`Shopify orders: ${r.totalShopifyOrders}, matched: ${r.matched}, missing invoice: ${r.missingInvoice}, missing journal: ${r.missingJournal}`)
+    } catch { setReconcileMsg('Reconciliation failed') } finally { setReconciling(false) }
+  }
+
+  if (loading) return <Card className="flex items-center justify-center gap-2 p-8 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Loading dashboard...</Card>
+  if (!data) return <Card className="p-8 text-center text-sm text-muted-foreground">No accounting dashboard data.</Card>
+  const cards = [
+    { label: 'Revenue', value: data.revenue, icon: TrendingUp, tone: 'text-emerald-400 bg-emerald-500/10' },
+    { label: 'Expenses', value: data.expenses, icon: TrendingDown, tone: 'text-red-400 bg-red-500/10' },
+    { label: 'Profit', value: data.profit, icon: DollarSign, tone: data.profit >= 0 ? 'text-emerald-400 bg-emerald-500/10' : 'text-red-400 bg-red-500/10' },
+    { label: 'Bank Balance', value: data.bankBalance, icon: Landmark, tone: 'text-sky-400 bg-sky-500/10' },
+    { label: 'Receivable', value: data.receivable, icon: Wallet, tone: 'text-amber-400 bg-amber-500/10' },
+    { label: 'Payable', value: data.payable, icon: FileSpreadsheet, tone: 'text-amber-400 bg-amber-500/10' },
+  ]
+  return (
+    <div className="space-y-4">
+      <Card><CardContent className="p-4 flex flex-wrap items-center gap-3">
+        <Button variant="outline" size="sm" onClick={load}><RefreshCw className="h-4 w-4" /> Refresh</Button>
+        <Button variant="outline" size="sm" onClick={reconcile} disabled={reconciling}>{reconciling ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Reconcile Shopify</Button>
+        {reconcileMsg && <span className="text-xs text-muted-foreground">{reconcileMsg}</span>}
+        <div className="ml-auto flex gap-2 text-xs text-muted-foreground">
+          <Badge variant="outline">Invoices: {data.counts.invoices}</Badge>
+          <Badge variant="outline">Expenses: {data.counts.expenses}</Badge>
+          <Badge variant="outline">Shopify Orders: {data.counts.shopifyOrders}</Badge>
+        </div>
+      </CardContent></Card>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {cards.map((c) => (
+          <Card key={c.label} className="p-4"><div className="flex items-center gap-3">
+            <div className={`flex h-10 w-10 items-center justify-center rounded-lg ${c.tone}`}><c.icon className="h-5 w-5" /></div>
+            <div><p className="text-[11px] uppercase tracking-wide text-muted-foreground">{c.label}</p><p className="text-lg font-bold text-foreground">{formatCurrency(c.value)}</p></div>
+          </div></Card>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function TransactionsTab() {
+  const [rows, setRows] = useState<UnifiedTransaction[]>([])
+  const [loading, setLoading] = useState(true)
+  const [source, setSource] = useState<'all'|'shopify'|'erp'>('all')
+  const load = useCallback(async () => {
+    setLoading(true)
+    try { setRows(await accountingApi.getUnifiedTransactions({ source, limit: 200 })) } catch { /* ignore */ } finally { setLoading(false) }
+  }, [source])
+  useEffect(() => { queueMicrotask(load) }, [load])
+  return (
+    <div className="space-y-4">
+      <Card><CardContent className="p-4 flex flex-wrap items-end gap-3">
+        <div className="space-y-1"><Label className="text-xs text-muted-foreground">Source</Label>
+          <select value={source} onChange={(e) => setSource(e.target.value as any)} className="h-9 rounded-md border border-input bg-background px-3 text-sm"><option value="all">All</option><option value="shopify">Shopify</option><option value="erp">ERP</option></select></div>
+        <Button variant="outline" size="sm" onClick={load}>Refresh</Button>
+        <div className="ml-auto text-xs text-muted-foreground">{rows.length} transactions</div>
+      </CardContent></Card>
+      {loading ? <Card className="flex items-center justify-center gap-2 p-8 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Loading transactions...</Card> :
+      rows.length === 0 ? <Card className="p-8 text-center text-sm text-muted-foreground">No transactions found.</Card> :
+      <Card><CardContent className="p-0"><Table>
+        <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Type</TableHead><TableHead>Ref</TableHead><TableHead>Party</TableHead><TableHead className="text-right">Amount</TableHead><TableHead>Status</TableHead><TableHead>Source</TableHead></TableRow></TableHeader>
+        <TableBody>{rows.map((r) => (
+          <TableRow key={`${r.type}-${r.id}`}><TableCell className="text-sm">{r.date ? String(r.date).slice(0,10) : '—'}</TableCell><TableCell className="text-sm">{r.type}</TableCell><TableCell className="font-mono text-xs">{r.ref || '—'}</TableCell><TableCell className="text-sm">{r.customer || '—'}</TableCell><TableCell className="text-right tabular-nums">{formatCurrency(Number(r.amount || 0))}</TableCell><TableCell><Badge variant="outline" className="text-[10px] capitalize">{r.status || '—'}</Badge></TableCell><TableCell><Badge variant={r.source === 'shopify' ? 'info' : 'outline'} className="text-[10px] uppercase">{r.source}</Badge></TableCell></TableRow>
+        ))}</TableBody>
+      </Table></CardContent></Card>}
+    </div>
+  )
+}
 function TrialBalanceTab() {
   const [data, setData] = useState<TrialBalanceResult | null>(null)
   const [loading, setLoading] = useState(true)
@@ -516,96 +610,47 @@ function BalanceSheetTab() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// JOURNAL ENTRIES
+// JOURNAL ENTRIES / LEDGER
 // ═══════════════════════════════════════════════════════════════════
 function JournalEntriesTab() {
-  const [entries, setEntries] = useState<JournalEntry[]>([])
+  const [entries, setEntries] = useState<LedgerRow[]>([])
   const [loading, setLoading] = useState(true)
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
-
+  const [source, setSource] = useState<'all'|'shopify'|'erp'|'manual'>('all')
+  const [search, setSearch] = useState('')
   const load = useCallback(async () => {
     setLoading(true)
-    try {
-      const res = await accountingApi.getJournalEntries({
-        dateFrom: dateFrom || undefined,
-        dateTo: dateTo || undefined,
-      })
-      setEntries(res)
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false)
-    }
-  }, [dateFrom, dateTo])
-
-  useEffect(() => {
-    // Defer: load() sets loading state synchronously (react/set-state-in-effect).
-    queueMicrotask(load)
-  }, [load])
-
+    try { setEntries(await accountingApi.getLedger({ dateFrom: dateFrom || undefined, dateTo: dateTo || undefined, source, search: search || undefined })) }
+    catch { try { setEntries((await accountingApi.getJournalEntries({ dateFrom: dateFrom || undefined, dateTo: dateTo || undefined })).map((e:any)=>({ ...e, source: e.isAuto ? 'erp' : 'manual' }))) } catch {} }
+    finally { setLoading(false) }
+  }, [dateFrom, dateTo, source, search])
+  useEffect(() => { queueMicrotask(load) }, [load])
   return (
     <div className="space-y-4">
-      <Card>
-        <CardContent className="p-4">
-          <div className="flex flex-wrap items-end gap-3">
-            <div className="space-y-1">
-              <Label className="text-xs text-muted-foreground">From</Label>
-              <Input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="w-[160px]" />
-            </div>
-            <div className="space-y-1">
-              <Label className="text-xs text-muted-foreground">To</Label>
-              <Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="w-[160px]" />
-            </div>
-            <Button variant="outline" size="sm" onClick={load}>Apply Filters</Button>
-            <div className="ml-auto text-xs text-muted-foreground">
-              {entries.length} entries
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {loading ? (
-        <Card className="flex items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" /> Loading journal entries...
-        </Card>
-      ) : entries.length === 0 ? (
-        <Card className="p-8 text-center text-sm text-muted-foreground">
-          <BookOpen className="mx-auto mb-2 h-8 w-8 opacity-40" />
-          <p>No journal entries found. Entries are auto-created when invoices are posted.</p>
-        </Card>
-      ) : (
-        <Card>
-          <CardContent className="p-0">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Entry #</TableHead>
-                  <TableHead>Date</TableHead>
-                  <TableHead>Description</TableHead>
-                  <TableHead>Reference</TableHead>
-                  <TableHead className="text-center">Type</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {entries.map((e) => (
-                  <TableRow key={e.id}>
-                    <TableCell className="font-mono text-xs font-medium">{e.entryNumber}</TableCell>
-                    <TableCell className="text-sm">{e.date}</TableCell>
-                    <TableCell className="text-sm text-muted-foreground">{e.description || '—'}</TableCell>
-                    <TableCell className="font-mono text-xs">{e.reference || '—'}</TableCell>
-                    <TableCell className="text-center">
-                      <Badge variant={e.isAuto ? 'info' : 'outline'} className="text-[10px]">
-                        {e.isAuto ? 'Auto' : 'Manual'}
-                      </Badge>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      )}
+      <Card><CardContent className="p-4"><div className="flex flex-wrap items-end gap-3">
+        <div className="space-y-1"><Label className="text-xs text-muted-foreground">From</Label><Input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="w-[160px]" /></div>
+        <div className="space-y-1"><Label className="text-xs text-muted-foreground">To</Label><Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="w-[160px]" /></div>
+        <div className="space-y-1"><Label className="text-xs text-muted-foreground">Source</Label><select value={source} onChange={(e)=>setSource(e.target.value as any)} className="h-9 rounded-md border border-input bg-background px-3 text-sm"><option value="all">All</option><option value="shopify">Shopify</option><option value="erp">ERP</option><option value="manual">Manual</option></select></div>
+        <div className="space-y-1"><Label className="text-xs text-muted-foreground">Search</Label><Input value={search} onChange={(e)=>setSearch(e.target.value)} placeholder="ref / entry / desc" className="w-[180px]" /></div>
+        <Button variant="outline" size="sm" onClick={load}>Apply</Button>
+        <div className="ml-auto text-xs text-muted-foreground">{entries.length} entries</div>
+      </div></CardContent></Card>
+      {loading ? <Card className="flex items-center justify-center gap-2 p-8 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Loading ledger...</Card> :
+      entries.length === 0 ? <Card className="p-8 text-center text-sm text-muted-foreground"><BookOpen className="mx-auto mb-2 h-8 w-8 opacity-40" /><p>No journal/ledger entries found.</p></Card> :
+      <Card><CardContent className="p-0"><Table>
+        <TableHeader><TableRow><TableHead>Entry #</TableHead><TableHead>Date</TableHead><TableHead>Description</TableHead><TableHead>Reference</TableHead><TableHead>Type</TableHead><TableHead>Source</TableHead></TableRow></TableHeader>
+        <TableBody>{entries.map((e) => (
+          <TableRow key={e.id}>
+            <TableCell className="font-mono text-xs font-medium">{e.entryNumber}</TableCell>
+            <TableCell className="text-sm">{e.date}</TableCell>
+            <TableCell className="text-sm text-muted-foreground">{e.description || '—'}</TableCell>
+            <TableCell className="font-mono text-xs">{e.reference || '—'}</TableCell>
+            <TableCell><Badge variant={e.isAuto ? 'info' : 'outline'} className="text-[10px]">{e.isAuto ? 'Auto' : 'Manual'}</Badge></TableCell>
+            <TableCell><Badge variant={e.source === 'shopify' ? 'info' : 'outline'} className="text-[10px] uppercase">{e.source}</Badge></TableCell>
+          </TableRow>
+        ))}</TableBody>
+      </Table></CardContent></Card>}
     </div>
   )
 }

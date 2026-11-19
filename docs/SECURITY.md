@@ -108,11 +108,21 @@ rather than a rotating /128 address.
   less than 12 hours left (`SESSION_REFRESH_THRESHOLD_MS`), so a busy dashboard
   does not write to the database on every request. The token itself never
   rotates, so concurrent requests cannot invalidate each other.
+- **Signing in again does not revoke other sessions.** Each sign-in creates
+  its own row, so several tabs, terminals or devices can use one account at
+  once — which is why `destroyUserSessions()` is *not* called at login (doing
+  so logged the other tabs out mid-use). Revocation is explicit:
+  `POST /api/v1/auth/logout`, `POST /api/v1/auth/sessions/logout-others`, and
+  a password change/reset.
 - The cookie is `httpOnly` and `SameSite=Strict`.
 - `secure` is **false**, deliberately: the desktop app serves over
   `http://localhost`, and a browser silently drops `Secure` cookies on plain
   HTTP. Behind a reverse proxy that terminates TLS, set it via the deployment
   (see [DEPLOYMENT.md](../DEPLOYMENT.md)).
+- `COOKIE_SAMESITE=none` (UI and API on different sites) **forces** `Secure`:
+  browsers drop a `SameSite=None` cookie that is not `Secure`, which shows up
+  as an immediate logout. The readable CSRF double-submit cookie follows the
+  same policy so it is actually stored and sent back.
 - The token is looked up by exact match on every request; expired rows are
   deleted on read and by a 5-minute sweeper.
 - **Sessions survive a backend restart** — that is the point of a database

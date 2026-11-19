@@ -1,6 +1,6 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Navigate, useLocation, useNavigate } from 'react-router-dom'
-import { ShieldAlert } from 'lucide-react'
+import { ShieldAlert, WifiOff } from 'lucide-react'
 import { useAuth } from '@/auth/auth-context'
 import { MODULES, moduleForPath, pathForModule } from '@/lib/permissions'
 import { navSections } from '@/config/navigation'
@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import ChangePasswordPage from '@/pages/ChangePassword'
 
 export function RequireAuth({ children }: { children: React.ReactNode }) {
-  const { currentUser, loading } = useAuth()
+  const { currentUser, loading, sessionUnavailable, refresh } = useAuth()
   const location = useLocation()
 
   useEffect(() => {
@@ -23,6 +23,12 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
         Loading workspace...
       </div>
     )
+  }
+  // The probe failed for a transient reason and there is no cached user yet:
+  // show a reconnect screen instead of the login form. Bouncing here is what
+  // turned a server hiccup on reload into "I was logged out".
+  if (!currentUser && sessionUnavailable) {
+    return <SessionUnavailable onRetry={refresh} />
   }
   if (!currentUser) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />
@@ -82,6 +88,40 @@ function NoModulesAccess() {
           }}
         >
           Sign out
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+/** Shown when the session probe could not reach the backend.
+ *
+ * A reload or a Render restart must not present the login form while the
+ * session cookie is still valid — that is the experience users reported as
+ * "being logged out". The cookie is untouched here; the user retries.
+ */
+function SessionUnavailable({ onRetry }: { onRetry: () => Promise<void> }) {
+  const [retrying, setRetrying] = useState(false)
+  const retry = async () => {
+    setRetrying(true)
+    try {
+      await onRetry()
+    } finally {
+      setRetrying(false)
+    }
+  }
+  return (
+    <div className="flex h-full min-h-[60vh] items-center justify-center px-4">
+      <div className="w-full max-w-md rounded-xl border bg-card p-6 text-center shadow-sm sm:p-8">
+        <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+          <WifiOff className="h-6 w-6 text-muted-foreground" />
+        </div>
+        <h1 className="text-lg font-semibold text-foreground">Can&apos;t reach the server</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          Your session is still signed in — this is a connection problem, not a logout. Retry once the server is reachable.
+        </p>
+        <Button className="mt-5" onClick={retry} disabled={retrying}>
+          {retrying ? 'Reconnecting…' : 'Retry'}
         </Button>
       </div>
     </div>

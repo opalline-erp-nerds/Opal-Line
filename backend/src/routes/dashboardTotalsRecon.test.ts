@@ -32,8 +32,10 @@ const localNaive = (d: Date) =>
   `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 
 const rupees = (v: string | undefined): number => {
-  const digits = (v ?? '').replace(/[^0-9]/g, '')
-  return digits === '' ? 0 : Number(digits)
+  // KPI money strings carry paise now (₹1,48,382.44) and a Unicode minus for
+  // negatives; parse the displayed amount, not just its digits.
+  const cleaned = (v ?? '').replace(/[₹,\s]/g, '').replace('−', '-')
+  return cleaned === '' ? 0 : Number(cleaned)
 }
 
 test(

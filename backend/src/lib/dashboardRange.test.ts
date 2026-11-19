@@ -60,6 +60,18 @@ test('month runs from the 1st', () => {
   assert.equal(r.bucket, 'day')
 })
 
+test('last month is the whole previous calendar month', () => {
+  const r = ok({ period: 'lastMonth' })
+  assert.equal(r.label, 'Last Month')
+  assert.equal(r.from, '2026-09-01T00:00:00')
+  assert.equal(r.to, '2026-10-01T00:00:00')
+  assert.equal(r.prevFrom, '2026-08-01T00:00:00')
+  assert.equal(r.prevTo, '2026-09-01T00:00:00')
+  assert.equal(r.prevLabel, 'vs previous month')
+  assert.equal(r.days, 30)
+  assert.equal(r.bucket, 'day')
+})
+
 test('year runs from 1 Jan and buckets monthly', () => {
   const r = ok({ period: 'year' })
   assert.equal(r.label, 'This Year')
