@@ -136,3 +136,95 @@ export function buildPricedOrder<T extends OrderItemInput>(
 
   return { lines, subtotal, gstAmount, grandTotal, itemCount }
 }
+
+/**
+ * A stored `sales_orders.line_items` row — everything the order form and the
+ * booking flow persist. Order-form lines are component-shaped (priced by
+ * buildPricedOrder above); booking lines carry only title/sku/quantity/price.
+ */
+export interface StoredOrderLine {
+  title?: string
+  sku?: string
+  quantity?: number
+  price?: number
+  weight?: number | null
+  silverRate?: number | null
+  makingCharge?: number | null
+  silverValue?: number | null
+  makingValue?: number | null
+  amount?: number | null
+}
+
+/** One `sales_invoice_items` row raised from a stored order line. */
+export interface ManualInvoiceLine {
+  product: string
+  sku: string
+  qty: number
+  weight: number
+  silverRate: number
+  makingCharge: number
+  /** Line GST at the invoice rate. */
+  tax: number
+  /** Taxable value (ex-GST). */
+  amount: number
+  silverValue: number
+  makingValue: number
+}
+
+/**
+ * Invoice lines for a MANUAL order — the `createInvoiceForOrderRow` branch
+ * that has no Shopify bill to mirror.
+ *
+ * Component-shaped lines (order-form rows) bill exactly as their stored
+ * components say: silverValue + makingValue is the taxable amount, and a
+ * stored `amount` wins — identical to the behaviour this replaces, so nothing
+ * changes for orders already carrying their components.
+ *
+ * A line carrying only a `price` — which is everything a booking stores — used
+ * to fall through to silverValue 0 / amount 0: a ₹0 invoice line, while its
+ * stock was still deducted. Such a line is now billed from its price. The
+ * table's own convention (module comment above) makes `price` PER-UNIT and
+ * GST-inclusive, so the taxable value is price × qty ÷ (1 + gstRate); adding
+ * GST back returns exactly the booked amount, which is what the booking's
+ * `value`, its advance clamp and the convert endpoint's balance all assume.
+ *
+ * The whole taxable amount sits in silverValue (making 0) — the same
+ * convention the zero-weight draft-order lines in index.ts already use — so an
+ * invoice keeps its silverValue + makingCharge = subtotal shape and the weekly
+ * margin sum (grandTotal − silverValue − makingCharge) cannot count the whole
+ * sale as margin.
+ */
+export function buildManualInvoiceLines(lines: StoredOrderLine[], gstRate: number): ManualInvoiceLine[] {
+  return lines.map((li) => {
+    const qty = Number(li.quantity ?? 0)
+    const price = Number(li.price ?? 0)
+    const weight = Number(li.weight ?? 0)
+    const itemSilverRate = Number(li.silverRate ?? 0)
+    const itemMakingCharge = Number(li.makingCharge ?? 0)
+    const componentSilver = li.silverValue != null
+      ? Number(li.silverValue)
+      : weight > 0 ? roundMoney(weight * itemSilverRate) : 0
+    const componentMaking = li.makingValue != null
+      ? Number(li.makingValue)
+      : weight > 0 ? roundMoney(weight * itemMakingCharge) : 0
+    const components = roundMoney(componentSilver + componentMaking)
+    const fromPrice = qty > 0 && Number.isFinite(price)
+      ? roundMoney((price * qty) / (1 + gstRate / 100))
+      : 0
+    const amount = li.amount != null ? Number(li.amount) : components > 0 ? components : fromPrice
+    const silverValue = components > 0 ? componentSilver : amount
+    const makingValue = componentMaking
+    return {
+      product: String(li.title ?? '').trim(),
+      sku: String(li.sku ?? ''),
+      qty,
+      weight,
+      silverRate: itemSilverRate,
+      makingCharge: itemMakingCharge,
+      tax: roundMoney((amount * gstRate) / 100),
+      amount,
+      silverValue,
+      makingValue,
+    }
+  })
+}

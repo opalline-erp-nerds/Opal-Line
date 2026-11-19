@@ -1051,6 +1051,12 @@ export interface SalesOrder {
   shippingAddress?: Record<string, string> | null
   isBooking?: boolean | null
   advancePaid?: number | null
+  /** Booking-form fields (nullable on rows that predate them). */
+  note?: string | null
+  /** When the customer expects the booking delivered (date-only). */
+  expectedDelivery?: string | null
+  /** GST rate (%) the booking was taken at; null = the store settings rate. */
+  gst?: number | null
   /** Authoritative Shopify state, kept separate from the ERP pipeline status. */
   shopifyGid?: string | null
   shopifyFinancialStatus?: string | null

@@ -577,6 +577,8 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         is_booking boolean,
         advance_paid numeric,
         note text,
+        expected_delivery timestamp,
+        gst numeric,
         shopify_gid text,
         shopify_financial_status text,
         shopify_fulfillment_status text,
@@ -1728,6 +1730,11 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `CREATE INDEX IF NOT EXISTS sales_orders_shopify_gid_idx ON sales_orders (shopify_gid)`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS is_booking boolean`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS advance_paid numeric`,
+      // Booking form: expected delivery date + the GST rate the booking was
+      // taken at (nullable — a NULL means "use the settings rate" so rows
+      // created before this column behave exactly as they always did).
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS expected_delivery timestamp`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS gst numeric`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS metal text DEFAULT 'silver'`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS purity_label text`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS diamond_weight numeric`,

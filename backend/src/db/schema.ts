@@ -264,6 +264,19 @@ export const salesOrders = pgTable('sales_orders', {
   isBooking: boolean('is_booking'),
   advancePaid: numericNumber('advance_paid'),
   /**
+   * Booking-form fields (also written by other local orders where set).
+   * `note` already existed as a column but was never exposed here; the
+   * booking workflow reads and writes all three.
+   */
+  note: text('note'),
+  /** When the customer expects the booking to be delivered. */
+  expectedDelivery: ts('expected_delivery'),
+  /**
+   * GST rate the document was booked at. NULL on legacy rows — conversion
+   * then falls back to the store-wide settings rate, exactly as before.
+   */
+  gst: numericNumber('gst'),
+  /**
    * Where this order was rung up, so its stock movements — and every reversal
    * of them — land on the same location's balance rather than the default one.
    */

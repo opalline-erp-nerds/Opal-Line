@@ -2659,18 +2659,66 @@ dbRouter.get('/invoices/:id/return-status', requirePermission('sales', 'view'), 
 })
 
 // ─── Booking orders: advance payment, convert to invoice on completion ──────
+// Contact/header/item parsing, the customer link and the convert workflow all
+// live in ../bookings so both the routes and the scratch-database tests share
+// one implementation.
+
+// The bookings list: ONLY booking rows. The page used to download every sales
+// order and filter in the browser; this serves the same predicate the UI used
+// (is_booking, plus legacy rows carrying the booking tag), newest first.
+dbRouter.get('/bookings', requirePermission('sales', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!
+      .select()
+      .from(s.salesOrders)
+      .where(or(eq(s.salesOrders.isBooking, true), ilike(s.salesOrders.tags, '%booking%')))
+      .orderBy(desc(s.salesOrders.date))
+    res.json({ data: rows.map(stripHash), total: rows.length })
+  } catch (err) {
+    logger.error({ err }, 'bookings list failed')
+    res.status(500).json({ error: 'Failed to load bookings' })
+  }
+})
+
+/** Store-wide GST rate — what a booking falls back to when it carries none. */
+async function settingsGstRate(): Promise<number> {
+  if (!db) return 3
+  const [row] = await db.select().from(s.settings).where(eq(s.settings.id, 'app')).limit(1)
+  return Number(row?.gstRate ?? 3)
+}
+
 dbRouter.post('/bookings', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
   try {
     const customer = String(req.body?.customer ?? '').trim()
-    const rawItems: Array<{ product?: unknown; sku?: unknown; qty?: unknown; price?: unknown }> = Array.isArray(req.body?.items) ? req.body.items : []
     if (!customer) return res.status(400).json({ error: 'customer is required' })
-    const items = rawItems
-      .map((it) => ({ title: String(it.product ?? ''), sku: String(it.sku ?? ''), quantity: Number(it.qty ?? 0), price: Number(it.price ?? 0) }))
-      .filter((it) => it.title && it.quantity > 0)
-    if (items.length === 0) return res.status(400).json({ error: 'at least one item with product + qty is required' })
-    const discount = toNum(req.body?.discount) ?? 0
-    const value = Math.round((items.reduce((a, it) => a + it.price * it.quantity, 0) - discount) * 100) / 100
+    const {
+      parseBookingContact,
+      parseBookingHeader,
+      normalizeBookingItems,
+      computeBookingTotals,
+      ensureBookingCustomer,
+    } = await import('../bookings')
+
+    const contact = parseBookingContact(req.body)
+    if ('error' in contact) return res.status(400).json({ error: contact.error })
+    const header = parseBookingHeader(req.body)
+    if ('error' in header) return res.status(400).json({ error: header.error })
+    const parsed = normalizeBookingItems(req.body?.items)
+    if ('error' in parsed) return res.status(400).json({ error: parsed.error })
+    const items = parsed.items
+
+    const discount = Math.max(toNum(req.body?.discount) ?? 0, 0)
+    // The rate the customer was shown is STORED with the booking (form value,
+    // else the store-wide rate) so the invoice later bills at exactly it.
+    const gstRate = header.gst !== undefined && header.gst !== null ? header.gst : await settingsGstRate()
+    const totals = computeBookingTotals(items, gstRate, discount)
+    const preDiscount = round2(totals.taxable + totals.gstAmount)
+    if (discount > preDiscount) return res.status(400).json({ error: 'discount cannot exceed the booking total' })
+    const value = totals.value
+    // A ₹0 booking would convert to a ₹0 invoice — refuse it at the door.
+    if (!(value > 0)) return res.status(400).json({ error: 'booking total must be greater than 0' })
     const advancePaid = Math.min(Math.max(toNum(req.body?.advanceAmount) ?? 0, 0), value)
 
     const now = new Date()
@@ -2680,11 +2728,16 @@ dbRouter.post('/bookings', requirePermission('sales', 'create'), async (req, res
       id: randomUUID(),
       internalId,
       customer,
+      ...(contact.email ? { customerEmail: contact.email } : {}),
+      ...(contact.phone ? { customerPhone: contact.phone } : {}),
       value,
       payment: advancePaid >= value && value > 0 ? 'paid' : 'pending',
       fulfillment: 'pending',
       status: 'confirmed',
-      date: now.toISOString(),
+      date: header.date ?? now.toISOString(),
+      expectedDelivery: header.expectedDate ?? null,
+      gst: gstRate,
+      note: header.note ?? null,
       items: items.reduce((a, it) => a + it.quantity, 0),
       tags: 'booking',
       currency: 'INR',
@@ -2693,6 +2746,23 @@ dbRouter.post('/bookings', requirePermission('sales', 'create'), async (req, res
       isBooking: true,
       advancePaid,
     }).returning()
+
+    // A real customer relationship, not just text on the row.
+    await ensureBookingCustomer({
+      name: customer,
+      email: contact.email,
+      phone: contact.phone,
+      customerId: String(req.body?.customerId ?? '').trim() || null,
+    })
+    // Best-effort: derived customer stats (orders / total spent), same as the
+    // manual-order flow — a failure must not undo a good booking.
+    try {
+      const { recountCustomerStats } = await import('../customerStats')
+      await recountCustomerStats('orders')
+    } catch (err) {
+      logger.warn({ err }, 'customer stats recount after booking create failed')
+    }
+
     recordCrud('sales-orders', 'Created', req, row)
     await insertOrderEvent(row.id, 'Booking Created', `Booking ${internalId} — ${items.reduce((a, it) => a + it.quantity, 0)} item(s), value ₹${value.toLocaleString('en-IN')}, advance ₹${advancePaid.toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
     res.json(row)
@@ -2715,6 +2785,13 @@ dbRouter.patch('/bookings/:id', requirePermission('sales', 'edit'), async (req, 
 
     const body = req.body ?? {}
     const patch: Partial<typeof s.salesOrders.$inferInsert> = {}
+    const {
+      parseBookingContact,
+      parseBookingHeader,
+      normalizeBookingItems,
+      computeBookingTotals,
+      ensureBookingCustomer,
+    } = await import('../bookings')
 
     if (body.customer !== undefined) {
       const customer = String(body.customer ?? '').trim()
@@ -2722,26 +2799,63 @@ dbRouter.patch('/bookings/:id', requirePermission('sales', 'edit'), async (req, 
       patch.customer = customer
     }
 
-    let items = (Array.isArray(booking.lineItems) ? booking.lineItems : []) as Array<{ title?: string; sku?: string; quantity?: number; price?: number }>
+    // Contact travels with the booking: an empty field clears the stored
+    // value (`null`), a filled one replaces it — same rules as create.
+    if (body.email !== undefined || body.phone !== undefined) {
+      const contact = parseBookingContact(body)
+      if ('error' in contact) return res.status(400).json({ error: contact.error })
+      if (body.email !== undefined) patch.customerEmail = contact.email || null
+      if (body.phone !== undefined) patch.customerPhone = contact.phone || null
+    }
+
+    // Booking form header: date, expected delivery, GST rate, note, and the
+    // only two status transitions a form may perform (`fulfilled` belongs to
+    // Convert, `cancelled` to the cancel action).
+    const header = parseBookingHeader(body)
+    if ('error' in header) return res.status(400).json({ error: header.error })
+    if (header.date !== undefined) patch.date = header.date
+    if (header.expectedDate !== undefined) patch.expectedDelivery = header.expectedDate
+    if (header.note !== undefined) patch.note = header.note
+    if (header.status !== undefined && header.status !== booking.status) patch.status = header.status
+
+    // The rate that shapes this booking's value: an explicit form value wins
+    // (an explicit null resets to the store rate); otherwise the booking keeps
+    // its own — and a legacy row that predates the column gets backfilled, so
+    // the rate is always on the row the invoice will be built from.
+    let gstRate: number
+    if (header.gst !== undefined) {
+      gstRate = header.gst ?? (await settingsGstRate())
+      patch.gst = gstRate
+    } else if (booking.gst != null) {
+      gstRate = Number(booking.gst)
+    } else {
+      gstRate = await settingsGstRate()
+      patch.gst = gstRate
+    }
+
+    let items = (Array.isArray(booking.lineItems) ? booking.lineItems : []) as Array<{ title?: string; sku?: string; quantity: number; price: number }>
     let discount = num(booking.discount, 0)
     if (body.items !== undefined) {
-      const rawItems: Array<{ product?: unknown; sku?: unknown; qty?: unknown; price?: unknown }> = Array.isArray(body.items) ? body.items : []
-      const parsed = rawItems
-        .map((it) => ({ title: String(it.product ?? ''), sku: String(it.sku ?? ''), quantity: Number(it.qty ?? 0), price: Number(it.price ?? 0) }))
-        .filter((it) => it.title && it.quantity > 0)
-      if (parsed.length === 0) return res.status(400).json({ error: 'at least one item with product + qty is required' })
-      items = parsed
-      patch.lineItems = parsed
-      patch.items = parsed.reduce((a, it) => a + it.quantity, 0)
+      const parsed = normalizeBookingItems(body.items)
+      if ('error' in parsed) return res.status(400).json({ error: parsed.error })
+      items = parsed.items
+      patch.lineItems = parsed.items
+      patch.items = parsed.items.reduce((a, it) => a + it.quantity, 0)
     }
     if (body.discount !== undefined) {
       discount = Math.max(toNum(body.discount) ?? 0, 0)
       patch.discount = discount
     }
 
-    if (body.items !== undefined || body.discount !== undefined) {
-      const value = Math.round((items.reduce((a, it) => a + Number(it.price ?? 0) * Number(it.quantity ?? 0), 0) - discount) * 100) / 100
-      const advancePaid = Math.min(Math.max(toNum(body.advanceAmount) ?? num(booking.advancePaid, 0), 0), Math.max(value, 0))
+    if (body.items !== undefined || body.discount !== undefined || body.gst !== undefined) {
+      // Recomputed with the SAME formula as create (and as the invoice the
+      // booking will become), so a rate edit moves the value with it.
+      const totals = computeBookingTotals(items, gstRate, discount)
+      const preDiscount = round2(totals.taxable + totals.gstAmount)
+      if (discount > preDiscount) return res.status(400).json({ error: 'discount cannot exceed the booking total' })
+      const value = totals.value
+      if (!(value > 0)) return res.status(400).json({ error: 'booking total must be greater than 0' })
+      const advancePaid = Math.min(Math.max(toNum(body.advanceAmount) ?? num(booking.advancePaid, 0), 0), value)
       patch.value = value
       patch.advancePaid = advancePaid
       patch.payment = advancePaid >= value && value > 0 ? 'paid' : 'pending'
@@ -2754,8 +2868,29 @@ dbRouter.patch('/bookings/:id', requirePermission('sales', 'edit'), async (req, 
 
     if (Object.keys(patch).length === 0) return res.json(booking)
     const [updated] = await db!.update(s.salesOrders).set(patch).where(eq(s.salesOrders.id, routeParam(req.params.id))).returning()
+
+    // Keep the customer relationship in step with what the form shows — the
+    // same identity rules as create (never a blind name merge).
+    if (body.customer !== undefined || body.email !== undefined || body.phone !== undefined || body.customerId !== undefined) {
+      await ensureBookingCustomer({
+        name: updated.customer ?? '',
+        email: patch.customerEmail !== undefined ? patch.customerEmail : (updated.customerEmail ?? null),
+        phone: patch.customerPhone !== undefined ? patch.customerPhone : (updated.customerPhone ?? null),
+        customerId: String(body.customerId ?? '').trim() || null,
+      })
+    }
+    // Best-effort derived customer stats (orders / total spent), same as the
+    // manual-order flow.
+    try {
+      const { recountCustomerStats } = await import('../customerStats')
+      await recountCustomerStats('orders')
+    } catch (err) {
+      logger.warn({ err }, 'customer stats recount after booking edit failed')
+    }
+
     recordCrud('sales-orders', 'Updated', req, updated)
-    await insertOrderEvent(updated.id, 'Booking Edited', `Booking ${updated.internalId ?? updated.id} — customer ${updated.customer}, value ₹${num(updated.value, 0).toLocaleString('en-IN')}, advance ₹${num(updated.advancePaid, 0).toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
+    const statusNote = patch.status ? `; status ${booking.status} → ${patch.status}` : ''
+    await insertOrderEvent(updated.id, 'Booking Edited', `Booking ${updated.internalId ?? updated.id} — customer ${updated.customer}, value ₹${num(updated.value, 0).toLocaleString('en-IN')}, advance ₹${num(updated.advancePaid, 0).toLocaleString('en-IN')}${statusNote}`, actorFromRequest(req).userId ?? 'system')
     res.json(updated)
   } catch (err) {
     logger.error({ err }, 'booking update failed')
@@ -2792,32 +2927,17 @@ dbRouter.post('/bookings/:id/payment-link', requirePermission('sales', 'edit'), 
 
 dbRouter.post('/bookings/:id/convert', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
-  try {
-    const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
-    if (!order) return res.status(404).json({ error: 'Booking not found' })
-    if (order.invoice) return res.status(400).json({ error: `Already converted to invoice ${order.invoice}` })
-    const value = Number(order.value ?? 0)
-    const advancePaid = Number(order.advancePaid ?? 0)
-    const fullyPaid = advancePaid >= value && value > 0
-    await db!.update(s.salesOrders).set({ payment: fullyPaid ? 'paid' : 'pending' }).where(eq(s.salesOrders.id, order.id))
-    const [fresh] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, order.id)).limit(1)
-    const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
-    const invoiceNumber = await createInvoiceForOrderRow(fresh!)
-    if (!invoiceNumber) return res.status(400).json({ error: 'Conversion failed: booking has no convertible line items' })
-    await db!.update(s.salesOrders).set({ invoice: invoiceNumber, status: 'fulfilled' }).where(eq(s.salesOrders.id, order.id))
-    if (advancePaid > 0) {
-      await db!.insert(s.payments).values({
-        id: randomUUID(), ref: order.internalId ?? order.id, invoice: invoiceNumber, customer: order.customer,
-        amount: advancePaid, method: 'Advance', gateway: 'booking', status: 'paid', date: new Date().toISOString(),
-      })
-    }
-    recordCrud('sales-orders', 'Updated', req, { id: order.id, invoice: invoiceNumber })
-    await insertOrderEvent(order.id, 'Booking Converted', `Converted to invoice ${invoiceNumber}; advance applied ₹${advancePaid.toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
-    res.json({ invoiceNumber, advanceApplied: advancePaid, balance: Math.round((value - advancePaid) * 100) / 100 })
-  } catch (err) {
-    logger.error({ err }, 'booking convert failed')
-    res.status(500).json({ error: 'Failed to convert booking' })
-  }
+  // The workflow itself (invoice claim, status/fulfillment transition, the
+  // advance payment row, the timeline event) lives in ../bookings so a
+  // scratch-database test can pin it; this handler keeps RBAC, the audit
+  // record and the HTTP mapping.
+  const { convertBookingToInvoice } = await import('../bookings')
+  const result = await convertBookingToInvoice(routeParam(req.params.id), {
+    actor: actorFromRequest(req).userId ?? 'system',
+  })
+  if (!result.ok) return res.status(result.status).json({ error: result.error })
+  recordCrud('sales-orders', 'Updated', req, { id: result.orderId, invoice: result.invoiceNumber })
+  res.json({ invoiceNumber: result.invoiceNumber, advanceApplied: result.advanceApplied, balance: result.balance })
 })
 
 // ─── Order events timeline ───────────────────────────────────────────────────

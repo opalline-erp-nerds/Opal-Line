@@ -5,6 +5,7 @@ import { and, eq, or, sql } from 'drizzle-orm'
 import { db } from './db/client'
 import * as schema from './db/schema'
 import { invoiceTotals } from './invoiceTotals'
+import { buildManualInvoiceLines } from './orderPricing'
 import { getLatestSilverRate } from './shopify'
 import { decryptSecret } from './lib/crypto'
 import { recountCustomerStatsBoth } from './customerStats'
@@ -773,6 +774,12 @@ export interface CreateInvoiceOptions {
    * inserted, so invoicing must not deduct it a second time.
    */
   deductStock?: boolean
+  /**
+   * GST rate to bill at instead of the store-wide settings rate. Bookings
+   * carry the rate they were taken at, so the invoice matches what the
+   * customer was shown; every other caller keeps the settings behaviour.
+   */
+  gstRate?: number
 }
 
 /**
@@ -794,7 +801,9 @@ export async function createInvoiceForOrderRow(
 
   // Settings: gst rate + invoice prefix
   const [settingsRow] = await db.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
-  const gstRate = Number(settingsRow?.gstRate ?? 3)
+  const gstRate = opts.gstRate != null && Number.isFinite(Number(opts.gstRate))
+    ? Number(opts.gstRate)
+    : Number(settingsRow?.gstRate ?? 3)
   const prefix = settingsRow?.invoicePrefix?.trim() || 'INV-'
   const payment = order.payment === 'paid' ? 'Online' : order.payment === 'cod' ? 'COD' : 'Pending'
 
@@ -850,29 +859,11 @@ export async function createInvoiceForOrderRow(
   const discount = Number(order.discount ?? 0)
 
   if (isManualOrder) {
-    // Manual orders: lineItems already contain ERP components (silverValue, makingValue, amount as subtotal, weight, silverRate, makingCharge)
-    // Use them directly to ensure invoice totals match order totals exactly.
-    items = lineItems.map((li) => {
-      const qty = Number(li.quantity ?? 0)
-      const weight = Number(li.weight ?? 0)
-      const itemSilverRate = Number(li.silverRate ?? 0)
-      const itemMakingCharge = Number(li.makingCharge ?? 0)
-      const silverValue = Number(li.silverValue ?? (weight > 0 ? round2(weight * itemSilverRate) : 0))
-      const makingValue = Number(li.makingValue ?? (weight > 0 ? round2(weight * itemMakingCharge) : 0))
-      const amount = Number(li.amount ?? round2(silverValue + makingValue))
-      return {
-        product: String(li.title ?? '').trim(),
-        sku: String(li.sku ?? ''),
-        qty,
-        weight,
-        silverRate: itemSilverRate,
-        makingCharge: itemMakingCharge,
-        tax: round2((amount * gstRate) / 100),
-        amount,      // Line subtotal (ex-GST)
-        silverValue,
-        makingValue,
-      }
-    })
+    // Manual orders: component-shaped lines (silverValue, makingValue, amount,
+    // weight, silverRate, makingCharge) bill from their stored components;
+    // price-only lines — bookings — are billed from their price. One path for
+    // both, so invoice totals always match the order's own value.
+    items = buildManualInvoiceLines(lineItems, gstRate)
     shopifySubtotal = round2(items.reduce((a, it) => a + it.amount, 0))
     // For manual orders, ERP components come directly from stored line items
     erpSilverValue = round2(items.reduce((a, it) => a + (it.silverValue ?? 0), 0))
