@@ -788,8 +788,15 @@ export async function createInvoiceForOrderRow(
   if (!db) return null
 
   const rawLineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
-  // Detect manual orders (created via ERP, not imported from Shopify)
-  const isManualOrder = (order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#')
+  // Detect manual orders (created via ERP, not imported from Shopify). A
+  // manual order that was pushed to Shopify and imported back keeps the
+  // `manual-order` tag but its imported lines no longer carry the ERP amount /
+  // weight fields. It is a Shopify order now: its Shopify total is
+  // authoritative, otherwise the manual branch recomputes ₹0 and never repairs
+  // the invoice.
+  const fromShopify = Boolean(order.shopifyGid) || (order.shopifyId ?? '').startsWith('#')
+  const isManualOrder = !fromShopify
+    && ((order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#'))
   const orderValue = round2(Number(order.value ?? 0))
 
   // An invoiced order is normally left alone. The one exception is an invoice
@@ -799,11 +806,23 @@ export async function createInvoiceForOrderRow(
   // the order they belong to instead of being skipped forever.
   if (order.invoice) {
     const [linked] = await db
-      .select({ grandTotal: schema.salesInvoices.grandTotal })
+      .select({ grandTotal: schema.salesInvoices.grandTotal, paymentStatus: schema.salesInvoices.paymentStatus })
       .from(schema.salesInvoices)
       .where(eq(schema.salesInvoices.number, order.invoice))
       .limit(1)
-    if (!linked || Number(linked.grandTotal ?? 0) > 0 || orderValue <= 0) return order.invoice
+    if (!linked) {
+      // The invoice was deleted but the order kept its number. Leaving the
+      // stale reference made every future "Create invoice" click return a
+      // non-existent invoice number forever. Clear it and raise a real one.
+      await db.update(schema.salesOrders).set({ invoice: null }).where(eq(schema.salesOrders.id, order.id))
+      order = { ...order, invoice: null }
+    } else if (
+      Number(linked.grandTotal ?? 0) > 0 &&
+      (orderValue <= 0 || Math.abs(Number(linked.grandTotal ?? 0) - orderValue) <= 0.01) &&
+      String(linked.paymentStatus ?? '').toLowerCase() === String(order.payment ?? '').toLowerCase()
+    ) {
+      return order.invoice
+    }
   }
 
   // Older Shopify rows were imported without line items. Their order total is
@@ -985,6 +1004,18 @@ export async function createInvoiceForOrderRow(
             gstAmount,
             discount: effectiveDiscount,
             grandTotal,
+            // The order is the authority for a linked invoice. This repairs
+            // old rows where the invoice amount/status had drifted from the
+            // Shopify order (e.g. an invoice marked paid for a pending order).
+            paymentStatus: order.payment,
+            status:
+              order.payment === 'refunded'
+                ? 'refunded'
+                : order.payment === 'paid'
+                  ? 'paid'
+                  : existing.status === 'paid'
+                    ? 'issued'
+                    : existing.status,
             currency: order.currency ?? existing.currency ?? 'INR',
           })
           .where(eq(schema.salesInvoices.id, existing.id))
@@ -1045,8 +1076,13 @@ export async function createInvoiceForOrderRow(
         discount: storedDiscount,
         grandTotal,
         paymentMethod: payment,
-        paymentStatus: order.payment,
-        status: order.payment === 'paid' ? 'paid' : 'issued',
+        paymentStatus: order.payment ?? 'pending',
+        status:
+          order.payment === 'paid'
+            ? 'paid'
+            : order.payment === 'refunded'
+              ? 'refunded'
+              : 'issued',
         currency: order.currency ?? 'INR',
         date: order.date ?? new Date().toISOString(),
       })
@@ -1104,6 +1140,43 @@ export async function createInvoiceForOrderRow(
 }
 
 /**
+ * Keep a linked invoice's payment state level with its order.
+ *
+ * Shopify is authoritative for a Shopify order: a webhook that moves PAID →
+ * PARTIALLY_REFUNDED/REFUNDED must not leave the invoice saying "paid" (which
+ * made Paid and Refunded both look true in the dashboard). Only the payment
+ * state is changed here; the invoice amount is repaired separately from the
+ * order total when it is next generated.
+ */
+export async function syncInvoicePaymentFromOrder(orderId: string): Promise<void> {
+  if (!db) return
+  const [order] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, orderId)).limit(1)
+  if (!order?.invoice) return
+  const [invoice] = await db
+    .select({ id: schema.salesInvoices.id, paymentStatus: schema.salesInvoices.paymentStatus, status: schema.salesInvoices.status })
+    .from(schema.salesInvoices)
+    .where(eq(schema.salesInvoices.number, order.invoice))
+    .limit(1)
+  if (!invoice) return
+
+  const paymentStatus = String(order.payment ?? '').toLowerCase()
+  if (!['paid', 'pending', 'partial', 'refunded', 'failed'].includes(paymentStatus)) return
+  const nextStatus =
+    paymentStatus === 'refunded'
+      ? 'refunded'
+      : paymentStatus === 'paid'
+        ? 'paid'
+        : invoice.status === 'paid'
+          ? 'issued'
+          : invoice.status
+  if (invoice.paymentStatus === paymentStatus && invoice.status === nextStatus) return
+  await db
+    .update(schema.salesInvoices)
+    .set({ paymentStatus, status: nextStatus })
+    .where(eq(schema.salesInvoices.id, invoice.id))
+}
+
+/**
  * Auto-raise a tax invoice when an email-synced order is created/updated.
  * Idempotent: skips orders that already have an invoice.
  */
@@ -1146,12 +1219,28 @@ export async function createInvoiceForOrderNumber(shopifyOrderNumber: string): P
  */
 export async function repairZeroValueShopifyInvoices(): Promise<{ repaired: number; failed: string[] }> {
   if (!db) return { repaired: 0, failed: [] }
-  const zeroInvoice = sql`exists (
-    select 1
-      from ${schema.salesInvoices} as repair_invoice
-     where (repair_invoice.number = ${schema.salesOrders.invoice}
-            or repair_invoice.shopify_order = ${schema.salesOrders.shopifyId})
-       and coalesce(repair_invoice.grand_total, 0) <= 0
+  // Repair any linked Shopify invoice whose amount disagrees with the order
+  // total, not only a ₹0 one. Old imports wrote catalogue-derived totals that
+  // differed from what Shopify actually billed; leaving those rows meant the
+  // invoice page and Payment Status disagreed about the same sale.
+  const needsRepair = sql`(
+    exists (
+      select 1
+        from ${schema.salesInvoices} as repair_invoice
+       where repair_invoice.number = ${schema.salesOrders.invoice}
+         and (
+           coalesce(repair_invoice.grand_total, 0) <= 0
+           or abs(coalesce(repair_invoice.grand_total, 0) - coalesce(${schema.salesOrders.value}, 0)) > 0.01
+           or lower(coalesce(repair_invoice.payment_status, '')) is distinct from lower(coalesce(${schema.salesOrders.payment}, ''))
+         )
+    )
+    or (
+      nullif(trim(${schema.salesOrders.invoice}), '') is not null
+      and not exists (
+        select 1 from ${schema.salesInvoices} as missing_invoice
+         where missing_invoice.number = ${schema.salesOrders.invoice}
+      )
+    )
   )`
   const rows = await db
     .select()
@@ -1159,9 +1248,9 @@ export async function repairZeroValueShopifyInvoices(): Promise<{ repaired: numb
     .where(and(
       sql`${schema.salesOrders.shopifyId} like '#%'`,
       sql`coalesce(${schema.salesOrders.value}, 0) > 0`,
-      sql`lower(coalesce(${schema.salesOrders.status}, '')) <> 'cancelled'`,
+      sql`(lower(coalesce(${schema.salesOrders.status}, '')) <> 'cancelled' or lower(coalesce(${schema.salesOrders.payment}, '')) = 'refunded')`,
       sql`coalesce(${schema.salesOrders.shopifyStore}, '') <> 'not-in-store'`,
-      zeroInvoice,
+      needsRepair,
     ))
 
   let repaired = 0
@@ -1170,21 +1259,21 @@ export async function repairZeroValueShopifyInvoices(): Promise<{ repaired: numb
     try {
       // A restore can leave the invoice pointing at the order while the order
       // no longer points back; re-link it before repairing so the normal
-      // single-invoice relationship holds afterwards.
+      // single-invoice relationship holds afterwards. A stale reference is
+      // cleared; if no invoice exists, leave it un-invoiced for the operator.
       let target = order
-      if (!target.invoice) {
-        const [invoice] = await db
+      if (target.invoice) {
+        const [linked] = await db
           .select({ number: schema.salesInvoices.number })
           .from(schema.salesInvoices)
-          .where(and(
-            eq(schema.salesInvoices.shopifyOrder, target.shopifyId ?? ''),
-            sql`coalesce(${schema.salesInvoices.grandTotal}, 0) <= 0`,
-          ))
+          .where(eq(schema.salesInvoices.number, target.invoice))
           .limit(1)
-        if (!invoice?.number) continue
-        await db.update(schema.salesOrders).set({ invoice: invoice.number }).where(eq(schema.salesOrders.id, target.id))
-        target = { ...target, invoice: invoice.number }
+        if (!linked) {
+          await db.update(schema.salesOrders).set({ invoice: null }).where(eq(schema.salesOrders.id, target.id))
+          target = { ...target, invoice: null }
+        }
       }
+      if (!target.invoice) continue
       const number = await createInvoiceForOrderRow(target, { deductStock: false })
       if (number) repaired++
     } catch (err) {

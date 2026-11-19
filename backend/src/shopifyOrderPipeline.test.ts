@@ -5,6 +5,7 @@ import {
   buildOrderPatch,
   deriveStage,
   erpPaymentFor,
+  importedErpStatus,
   normalizeFinancialStatus,
   normalizeFulfillmentStatus,
   snapshotFromRestOrder,
@@ -80,6 +81,15 @@ test('a partial refund stays shippable instead of becoming "refunded"', () => {
     deriveStage({ status: 'processing', shopifyFinancialStatus: 'PARTIALLY_REFUNDED', shopifyFulfillmentStatus: 'UNFULFILLED' }),
     'in_progress',
   )
+})
+
+test('part-paid is partial and a voided authorisation is not a refund', () => {
+  assert.equal(erpPaymentFor('PARTIALLY_PAID'), 'partial')
+  assert.equal(erpPaymentFor('PAID'), 'paid')
+  assert.equal(erpPaymentFor('PARTIALLY_REFUNDED'), 'paid')
+  assert.equal(erpPaymentFor('VOIDED'), 'failed')
+  assert.equal(erpPaymentFor('EXPIRED'), 'failed')
+  assert.equal(erpPaymentFor('REFUNDED'), 'refunded')
 })
 
 test('archiving an order is not fulfilment', () => {
@@ -197,4 +207,59 @@ test('normalizes REST and GraphQL fulfilment spellings', () => {
   assert.equal(normalizeFulfillmentStatus('partial'), 'PARTIALLY_FULFILLED')
   assert.equal(normalizeFulfillmentStatus('partially_fulfilled'), 'PARTIALLY_FULFILLED')
   assert.equal(normalizeFinancialStatus('partially-refunded'), 'PARTIALLY_REFUNDED')
+})
+
+test('a new Shopify order is never imported as cancelled', () => {
+  // A voided/refunded payment is a payment state, not an order cancellation.
+  // Brand-new orders with no cancellation timestamp land in the New pipeline.
+  for (const financial of ['voided', 'pending', 'paid', 'authorized', 'refunded']) {
+    const snap = snapshotFromRestOrder({ name: '#1', cancelled_at: null, financial_status: financial, fulfillment_status: null })
+    assert.equal(snap.cancelledAt, null)
+    assert.equal(importedErpStatus(snap), 'imported', `financial_status=${financial} must not cancel the order`)
+  }
+  // Only a parseable date is a cancellation. Literal sentinels from dev stores,
+  // proxies or partial payloads must never reach the status mapper.
+  for (const sentinel of ['null', 'undefined', '', false, 0, 'not-a-date']) {
+    const snap = snapshotFromRestOrder({ name: '#1', cancelled_at: sentinel, fulfillment_status: null })
+    assert.equal(snap.cancelledAt, null, `cancelled_at=${String(sentinel)} is not a cancellation`)
+    assert.equal(importedErpStatus(snap), 'imported')
+  }
+  // A genuine Shopify cancellation still cancels.
+  const cancelled = snapshotFromRestOrder({ name: '#1', cancelled_at: '2026-11-19T10:00:00Z', fulfillment_status: null })
+  assert.equal(importedErpStatus(cancelled), 'cancelled')
+  // Fulfilment still drives the stage it always did.
+  assert.equal(importedErpStatus({ cancelledAt: null, fulfillmentStatus: 'FULFILLED' }), 'fulfilled')
+  assert.equal(importedErpStatus({ cancelledAt: null, fulfillmentStatus: 'PARTIALLY_FULFILLED' }), 'processing')
+})
+
+test('a live Shopify order clears a stale cancellation but a verified one stays', () => {
+  // The incident shape: a row marked cancelled with no cancellation timestamp
+  // (old voided mapping / old UI cancel). Shopify says it is live, so the row
+  // must return to the New stage instead of staying cancelled forever.
+  const stale = localOrder({ status: 'cancelled', cancelledAt: null })
+  const reopened = buildOrderPatch(stale, snapshot({ financialStatus: 'PAID', cancelledAt: null }))
+  assert.equal(reopened.patch.status, 'imported')
+  assert.equal(reopened.patch.cancelledAt, undefined, 'there was no timestamp to clear')
+  assert.ok(reopened.changes.includes('status-reopened'))
+
+  // A cancellation backed by a real timestamp is intentional and survives.
+  const verified = localOrder({ status: 'cancelled', cancelledAt: '2026-11-18T10:00:00.000Z' })
+  const kept = buildOrderPatch(verified, snapshot({ cancelledAt: null }))
+  assert.equal(kept.patch.status, undefined)
+  assert.notEqual(kept.patch.cancelledAt, null, 'a verified cancellation is not cleared by a live payload')
+
+  // A manual ERP order cancelled locally (before Shopify caught up) also stays.
+  const manual = localOrder({ status: 'cancelled', cancelledAt: null, internalId: 'MO-1027', tags: 'manual-order' })
+  assert.equal(buildOrderPatch(manual, snapshot({ cancelledAt: null })).patch.status, undefined)
+
+  // And a genuine Shopify cancellation always wins, even over an open row.
+  const genuine = buildOrderPatch(localOrder({ status: 'imported' }), snapshot({ cancelledAt: '2026-11-19T10:00:00.000Z' }))
+  assert.equal(genuine.patch.status, 'cancelled')
+  assert.equal(genuine.patch.cancelledAt, '2026-11-19T10:00:00.000Z')
+})
+
+test('the same cancelled instant in Postgres and ISO format is not rewritten', () => {
+  const local = localOrder({ shopifyGid: 'gid://shopify/Order/1027', status: 'cancelled', cancelledAt: '2026-11-19 10:00:00' })
+  const again = buildOrderPatch(local, snapshot({ cancelledAt: '2026-11-19T10:00:00.000Z' }))
+  assert.deepEqual(again.changes, [], 'a retried webhook must not rewrite the same instant')
 })

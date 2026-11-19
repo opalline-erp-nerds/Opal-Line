@@ -399,6 +399,12 @@ test(
       assert.ok(order, 'the order exists in the ERP')
       assert.equal(Number(order.value), 3500, 'the order total came from Shopify')
       assert.equal(String(order.customer ?? ''), 'Asha Rao', 'the order customer came from Shopify')
+      // A brand-new Shopify order with no cancellation timestamp is New/Confirmed,
+      // never Cancelled — the incident this pipeline must not regress into.
+      assert.equal(order.status, 'imported', 'a new Shopify order imports as New')
+      assert.equal(order.cancelledAt, null, 'a new Shopify order has no cancellation timestamp')
+      assert.equal(order.shopifyFinancialStatus, 'PAID')
+      assert.equal(order.shopifyFulfillmentStatus, 'UNFULFILLED')
       // The catalogue pull that ran above must not have disturbed the ERP row.
       const afterOrder = await readErp()
       assert.equal(afterOrder.name, 'ERP After Restart', 'importing an order never touches the catalogue')

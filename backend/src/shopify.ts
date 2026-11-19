@@ -20,6 +20,7 @@ import { CONSTANTS } from './constants'
 import { logger } from './logger'
 import { recordAudit } from './activity'
 import { listLocationMappings, resolveErpLocationForShopify } from './shopifyLocations'
+import { importedErpStatus } from './shopifyOrderPipeline'
 import { applyStockMovement, resolveMovementLocation, setStockTotalTo } from './stock'
 function escapeHtml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -4401,15 +4402,6 @@ function mapImportedFulfillment(status: string | null | undefined): string {
   }
 }
 
-function mapImportedStatus(raw: any): string {
-  if (raw.cancelled_at || String(raw.financial_status ?? '') === 'voided') return 'cancelled'
-  if (raw.fulfillment_status === 'fulfilled') return 'fulfilled'
-  if (raw.fulfillment_status === 'partial') return 'processing'
-  // Shopify closed_at means archived, not fulfilled. Archive is persisted in
-  // its own column and does not change the ERP's manual processing stage.
-  return 'imported'
-}
-
 export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> {
   if (!isConfigured()) {
     return { ok: false, imported: 0, updated: 0, errors: ['Shopify is not configured. Set SHOPIFY_STORE_URL and SHOPIFY_ACCESS_TOKEN in server/.env'], message: 'Shopify is not configured' }
@@ -4664,7 +4656,10 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
                 payment,
                 fulfillment,
                 invoice: null,
-                status: mapImportedStatus(o),
+                // The same canonical snapshot as `cancelledAt` below: status
+                // and cancellation can never disagree, and only a parsed
+                // Shopify cancellation date cancels a new order.
+                status: importedErpStatus(orderSnapshot),
                 shopifyGid: orderSnapshot.gid,
                 shopifyFinancialStatus: orderSnapshot.financialStatus,
                 shopifyFulfillmentStatus: orderSnapshot.fulfillmentStatus,
@@ -4854,7 +4849,9 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
       // left alone (zero-amount invoices are repaired after the loop), and the
       // import already moved stock on insert, so the invoice must not move it
       // again.
-      if (!linkedFromGid && mapImportedStatus(o) !== 'cancelled' && payment !== 'refunded' && value > 0) {
+      // Same canonical cancellation check as the row status: only a parsed
+      // Shopify cancellation timestamp skips invoicing.
+      if (!linkedFromGid && !orderSnapshot.cancelledAt && payment !== 'refunded' && value > 0) {
         try {
           const [orderRow] = await db
             .select()
@@ -4929,7 +4926,7 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           direction: 'out',
           action: 'Invoice Amount Repaired',
           status: 'success',
-          error: `${repair.repaired} zero-value Shopify invoice(s) repaired from their order totals`,
+          error: `${repair.repaired} Shopify invoice(s) reconciled to their order totals`,
         })
       }
       invoiceFailures.push(...repair.failed)

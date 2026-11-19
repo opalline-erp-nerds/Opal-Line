@@ -1632,9 +1632,16 @@ app.patch('/api/v1/orders/pipeline/:id/tracking', requirePermission('sales', 'ed
 
 app.post('/api/v1/orders/pipeline/:id/cancel', requirePermission('sales', 'edit'), async (req, res) => {
   try {
-    const { cancelOrderInShopify } = await import('./shopifyOrderActions')
+    const { cancelOrderInShopify, isCancelReason, CANCEL_REASONS } = await import('./shopifyOrderActions')
+    const reason = String(req.body?.reason ?? 'OTHER').trim().toUpperCase()
+    if (!isCancelReason(reason)) {
+      return res.status(400).json({ ok: false, error: `reason must be one of: ${CANCEL_REASONS.join(', ')}` })
+    }
+    if (req.body?.restock !== undefined && typeof req.body.restock !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'restock must be a boolean' })
+    }
     const result = await cancelOrderInShopify(String(routeParam(req.params.id) ?? '').trim(), {
-      reason: typeof req.body?.reason === 'string' ? req.body.reason : 'OTHER',
+      reason,
       restock: req.body?.restock === true,
       refund: req.body?.refund === true,
       notifyCustomer: req.body?.notifyCustomer === true,
@@ -2136,7 +2143,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
           payment: payment ?? 'pending',
           fulfillment: fulfillment ?? 'unfulfilled',
           invoice: null,
-          status: status ?? 'confirmed',
+          status: String(status ?? '').trim() || 'confirmed',
           date: date ? new Date(date).toISOString() : now.toISOString(),
           items: itemCount,
           tags: 'manual-order',
@@ -2207,13 +2214,27 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     return res.status(400).json({ error: `Could not save the order: ${describeDbError(err)}` })
   }
 
+  // A manual order explicitly created as cancelled never becomes a Shopify
+  // order. Its stock was deducted a moment ago, so release it exactly once and
+  // stamp the cancellation instead of leaving an unmarked cancelled row.
+  const cancelledOnCreate = String((order as Record<string, unknown> | null)?.status ?? '').toLowerCase() === 'cancelled'
+  if (cancelledOnCreate) {
+    const id = String((order as Record<string, unknown> | null)?.id ?? '')
+    if (id) {
+      const { cancelLocalOrderOnce } = await import('./shopifyOrderActions')
+      await cancelLocalOrderOnce(id, { restoreEvenIfCancelled: true })
+      const [fresh] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, id)).limit(1)
+      if (fresh) order = fresh as unknown as Record<string, unknown>
+    }
+  }
+
   // ── Shopify sync (after the order is stored) ────────────────────────────
   // The local order is the source of truth. Only once it exists do we push it
   // to Shopify with the payment mode the operator picked (`payment` drives
   // draftOrderComplete's paymentPending), then record the Shopify identity on
   // the row. A sync failure is reported, never rolled back over the sale.
   let shopifySync: DraftOrderResult | null = null
-  if (syncToShopify) {
+  if (syncToShopify && !cancelledOnCreate) {
     const draft = await createShopifyDraftOrder({
       customerName: customer,
       customerEmail: email,
@@ -2255,6 +2276,38 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     }
   }
 
+  // The ERP sale owns its invoice: raise it in the same request through the
+  // same idempotent pipeline the Shopify import uses. Stock was already
+  // deducted above, so the invoice must not move it a second time. A cancelled
+  // (or booking) order is never invoiced; the order itself stays at the stage
+  // the operator chose.
+  let autoInvoice: string | null = null
+  let autoInvoiceError: string | null = null
+  {
+    const savedRow = order as typeof schema.salesOrders.$inferSelect | null
+    if (savedRow && String(savedRow.status ?? '').toLowerCase() !== 'cancelled' && !savedRow.isBooking) {
+      try {
+        if (savedRow.invoice) {
+          autoInvoice = savedRow.invoice
+        } else {
+          const { createInvoiceForOrderRow } = await import('./orderEmailIngest')
+          autoInvoice = await createInvoiceForOrderRow(savedRow, { deductStock: false })
+        }
+        if (autoInvoice) {
+          const [fresh] = await db
+            .select()
+            .from(schema.salesOrders)
+            .where(eq(schema.salesOrders.id, savedRow.id))
+            .limit(1)
+          if (fresh) order = fresh as unknown as Record<string, unknown>
+        }
+      } catch (err) {
+        autoInvoiceError = err instanceof Error ? err.message : 'Invoice generation failed'
+        logger.error({ err, orderId: savedRow.id }, 'ERP order auto-invoice failed')
+      }
+    }
+  }
+
   // Stats are derived, never accumulated: recount from real orders so the
   // numbers can never drift from the underlying data.
   try {
@@ -2279,7 +2332,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     ip: actor.ip,
   })
 
-  res.status(201).json({ order, shopifySync })
+  res.status(201).json({ order, shopifySync, autoInvoice, autoInvoiceError })
 })
 
 app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), validate(updateOrderSchema), async (req, res) => {
@@ -2300,11 +2353,26 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
     // Normalize payment and fulfillment values
     const payment = rawPayment === 'Online' || rawPayment === 'online' ? 'paid' : rawPayment
     const fulfillment = rawFulfillment === 'pending' ? 'unfulfilled' : rawFulfillment
+    const requestedStatus = status === undefined ? null : String(status).trim().toLowerCase()
+    const cancelling = requestedStatus === 'cancelled'
+    const wasCancelled = String(existing.status ?? '').toLowerCase() === 'cancelled'
+
+    // The edit dialog used to write status='cancelled' straight to the row:
+    // no Shopify cancellation, no stock restore and no cancelled_at. Route the
+    // transition through the same lifecycle as the dedicated Cancel action.
+    if (cancelling && !wasCancelled) {
+      const { cancelOrderLifecycle } = await import('./shopifyOrderActions')
+      const cancelled = await cancelOrderLifecycle(existing.id)
+      if (!cancelled.ok) return res.status(502).json({ error: cancelled.error ?? 'Order could not be cancelled' })
+    }
 
     let value = Number(existing.value ?? 0)
     let itemCount = Number(existing.items ?? 0)
     let mappedLineItems: Array<Record<string, unknown>> | null = null
-    if (items) {
+    // A cancellation restores the existing lines exactly once. Applying edited
+    // lines first would deduct the new basket and then restock it, leaving the
+    // cancelled order's stock wrong.
+    if (items && !cancelling) {
       // Lines carry their weight & pricing snapshot — the order→invoice
       // generator reads weight/silverValue/makingValue/amount straight off
       // manual orders, so an edit must keep that snapshot coherent instead of
@@ -2393,6 +2461,11 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       value,
       items: itemCount,
       ...(mappedLineItems ? { lineItems: mappedLineItems } : {}),
+      ...(cancelling
+        ? { cancelledAt: new Date().toISOString() }
+        : wasCancelled
+          ? { cancelledAt: null }
+          : {}),
     }
     if (date) updates.date = new Date(String(date)).toISOString()
     // Contact & address edits made in the order dialog must survive the save
@@ -2454,7 +2527,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
     }
 
     let shopifySync: DraftOrderResult | null = null
-    if (syncToShopify) {
+    if (syncToShopify && !cancelling) {
       const storedShopifyId = typeof updated.shopifyId === 'string' ? updated.shopifyId : ''
       if (storedShopifyId.startsWith('#')) {
         const result = await updateShopifyOrder({

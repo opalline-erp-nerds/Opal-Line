@@ -22,6 +22,7 @@
  */
 import { eq } from 'drizzle-orm'
 import { randomUUID } from 'node:crypto'
+import { isConfigured } from './config'
 import { db } from './db/client'
 import * as s from './db/schema'
 import { logger } from './logger'
@@ -34,8 +35,12 @@ import {
 } from './shopifyOrderPipeline'
 import { resolveMovementLocation, restoreOrderLineStock } from './stock'
 
-const CANCEL_REASONS = ['CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'STAFF', 'OTHER'] as const
+export const CANCEL_REASONS = ['CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'STAFF', 'OTHER'] as const
 export type CancelReason = (typeof CANCEL_REASONS)[number]
+
+export function isCancelReason(value: unknown): value is CancelReason {
+  return CANCEL_REASONS.includes(String(value ?? '').toUpperCase() as CancelReason)
+}
 
 export interface OrderActionResult {
   ok: boolean
@@ -71,8 +76,8 @@ const FULFILLMENT_TRACKING_UPDATE = `#graphql
   }
 `
 
-const ORDER_CANCEL = `#graphql
-  mutation OrderCancel($orderId: ID!, $reason: OrderCancelReason, $restock: Boolean, $notifyCustomer: Boolean, $staffNote: String, $refundMethod: OrderCancelRefundMethodInput) {
+export const ORDER_CANCEL_MUTATION = `#graphql
+  mutation OrderCancel($orderId: ID!, $reason: OrderCancelReason!, $restock: Boolean!, $notifyCustomer: Boolean, $staffNote: String, $refundMethod: OrderCancelRefundMethodInput) {
     orderCancel(orderId: $orderId, reason: $reason, restock: $restock, notifyCustomer: $notifyCustomer, staffNote: $staffNote, refundMethod: $refundMethod) {
       job { id done }
       orderCancelUserErrors { field message }
@@ -224,6 +229,12 @@ export async function createOrderFulfillment(orderId: string, req: FulfillReques
 
   const state = await fetchShopifyOrderState(orderId)
   if (!state.ok) return { ok: false, error: state.error ?? 'Shopify request failed' }
+  if (state.fulfillmentDataAvailable === false) {
+    return {
+      ok: false,
+      error: 'Shopify did not grant fulfillmentOrders access to this app. Add read_fulfillments (or read_assigned_fulfillment_orders) and write_fulfillments to the Shopify app, then retry.',
+    }
+  }
   if (state.cancelledAt) return { ok: false, error: 'A cancelled order cannot be fulfilled in Shopify' }
   if (state.closedAt) return { ok: false, error: 'This order is archived in Shopify — reopen it there before fulfilling' }
   if (!state.orderGid) return { ok: false, error: 'Shopify did not return the order id' }
@@ -356,24 +367,34 @@ export async function cancelOrderInShopify(
   orderId: string,
   req: { reason?: string; restock?: boolean; refund?: boolean; notifyCustomer?: boolean; note?: string },
 ): Promise<OrderActionResult> {
+  // Shopify declares both arguments as non-null. Validate and normalise before
+  // any Shopify call so a missing or stale client value can never make the
+  // mutation fail schema validation before the request is even executed.
+  const requestedReason = String(req.reason ?? 'OTHER').trim().toUpperCase()
+  if (!isCancelReason(requestedReason)) {
+    return { ok: false, error: `reason must be one of: ${CANCEL_REASONS.join(', ')}` }
+  }
+  if (req.restock !== undefined && typeof req.restock !== 'boolean') {
+    return { ok: false, error: 'restock must be a boolean' }
+  }
+  const reason: CancelReason = requestedReason
+  const restock = req.restock === true
+  const notifyCustomer = req.notifyCustomer === true
+
   const local = await loadLocal(orderId)
   if (!local) return { ok: false, error: 'Order not found' }
-  if (!local.shopifyId) return { ok: false, error: 'This order is not linked to Shopify' }
+  if (!local.shopifyGid && !local.shopifyId) return { ok: false, error: 'This order is not linked to Shopify' }
 
   const state = await fetchShopifyOrderState(orderId)
   if (!state.ok) return { ok: false, error: state.error ?? 'Shopify request failed' }
   if (state.cancelledAt) return { ok: false, error: 'This order is already cancelled in Shopify' }
   if (!state.orderGid) return { ok: false, error: 'Shopify did not return the order id' }
 
-  const reason = CANCEL_REASONS.includes(String(req.reason ?? '').toUpperCase() as CancelReason)
-    ? (String(req.reason).toUpperCase() as CancelReason)
-    : 'OTHER'
-
-  const res = await adminGraphQL<any>(ORDER_CANCEL, {
+  const res = await adminGraphQL<any>(ORDER_CANCEL_MUTATION, {
     orderId: state.orderGid,
     reason,
-    restock: Boolean(req.restock),
-    notifyCustomer: Boolean(req.notifyCustomer),
+    restock,
+    notifyCustomer,
     staffNote: String(req.note ?? '').trim() || null,
     refundMethod: req.refund ? { originalPaymentMethodsRefund: true } : null,
   })
@@ -387,17 +408,9 @@ export async function cancelOrderInShopify(
     return { ok: false, error: err }
   }
   const payload = res.data?.orderCancel
-  const jobId = String(payload?.job?.id ?? '')
-  if (!jobId) {
-    const message = 'Shopify returned no cancellation job — the order is unchanged'
-    await logSync(local, 'Order Cancel', 'failed', message)
-    return { ok: false, error: message }
-  }
-
-  // Shopify cancellation is asynchronous. The mutation's job id proves Shopify
-  // accepted it; read the order back until cancelledAt is authoritative (or
-  // Shopify reports the job done without applying it). Never infer success from
-  // a 200 response alone.
+  // Shopify may cancel synchronously (no job) or asynchronously (job id). In
+  // both cases the order's cancelledAt is the only proof that it happened; a
+  // 200 response or a job id alone is not enough.
   let verified: ShopifyOrderState | null = null
   for (let attempt = 0; attempt < 8; attempt++) {
     verified = await fetchShopifyOrderState(orderId)
@@ -418,8 +431,10 @@ export async function cancelOrderInShopify(
   const localCancel = await cancelLocalOrderOnce(orderId)
   const refreshed = await refreshOrderFromShopify(orderId, { actor: 'erp' })
   try {
-    const { handleShopifyOrderCancelled } = await import('./shopifyLoyalty')
-    await handleShopifyOrderCancelled(local.shopifyId)
+    if (local.shopifyId) {
+      const { handleShopifyOrderCancelled } = await import('./shopifyLoyalty')
+      await handleShopifyOrderCancelled(local.shopifyId)
+    }
   } catch (loyaltyErr) {
     logger.warn({ err: loyaltyErr, orderId }, 'Order Pipeline: loyalty reversal after cancellation failed')
   }
@@ -478,6 +493,42 @@ export async function archiveOrderInShopify(orderId: string): Promise<OrderActio
 }
 
 /**
+ * Intentional cancellation, used by the ERP status endpoints.
+ *
+ * Shopify-linked orders are cancelled in Shopify first — it is the authority —
+ * and the local row is brought level by that action. ERP-native orders only
+ * need the local cancellation, which restores stock exactly once. Calling this
+ * for an order that is already cancelled is a no-op (or verifies Shopify).
+ */
+export async function cancelOrderLifecycle(orderId: string): Promise<{ ok: boolean; error?: string }> {
+  const local = await loadLocal(orderId)
+  if (!local) return { ok: false, error: 'Order not found' }
+
+  // A legacy row may have a Shopify display name but no gid yet. It is still a
+  // Shopify order and must be cancelled there, not only locally. Manual ERP
+  // orders (MO-…) without a Shopify identity stay local. An unconfigured store
+  // has no Shopify order to update, even if a stale gid was left on the row.
+  const shopifyLinked = Boolean(local.shopifyGid || String(local.shopifyId ?? '').startsWith('#'))
+  if (!shopifyLinked || !isConfigured()) {
+    if (String(local.status ?? '').toLowerCase() === 'cancelled' || local.cancelledAt) return { ok: true }
+    await cancelLocalOrderOnce(orderId)
+    return { ok: true }
+  }
+
+  // The ERP cancellation path always restores stock locally. Ask Shopify to
+  // restock too so the two systems do not disagree about the returned units.
+  const result = await cancelOrderInShopify(orderId, { reason: 'OTHER', restock: true })
+  if (result.ok) return { ok: true }
+  // A webhook may already have cancelled it in Shopify while the local row
+  // still says otherwise; finish the local side instead of refusing.
+  if (/already cancelled in shopify/i.test(result.error ?? '')) {
+    await cancelLocalOrderOnce(orderId)
+    return { ok: true }
+  }
+  return { ok: false, error: result.error ?? 'Shopify cancellation failed' }
+}
+
+/**
  * Cancel an order locally, exactly once.
  *
  * The ERP server has always restored order stock when the `orders/cancelled`
@@ -485,7 +536,10 @@ export async function archiveOrderInShopify(orderId: string): Promise<OrderActio
  * both must not restock twice. The `status = 'cancelled'` transition inside a
  * row lock is the guard: whichever path gets there first does the restore.
  */
-export async function cancelLocalOrderOnce(orderId: string): Promise<{ skipped: boolean; itemsRestored: number }> {
+export async function cancelLocalOrderOnce(
+  orderId: string,
+  opts: { restoreEvenIfCancelled?: boolean } = {},
+): Promise<{ skipped: boolean; itemsRestored: number }> {
   if (!db) return { skipped: true, itemsRestored: 0 }
   return db.transaction(async (tx) => {
     const [row] = await tx
@@ -500,7 +554,10 @@ export async function cancelLocalOrderOnce(orderId: string): Promise<{ skipped: 
       .where(eq(s.salesOrders.id, orderId))
       .limit(1)
       .for('update')
-    if (!row || row.status === 'cancelled' || row.cancelledAt) return { skipped: true, itemsRestored: 0 }
+    if (!row) return { skipped: true, itemsRestored: 0 }
+    if (!opts.restoreEvenIfCancelled && (row.status === 'cancelled' || row.cancelledAt)) {
+      return { skipped: true, itemsRestored: 0 }
+    }
 
     const items = Array.isArray(row.lineItems) ? (row.lineItems as Array<{ sku?: string; quantity?: number }>) : []
     const locationId = await resolveMovementLocation(row.locationId as string | null, tx as never)
