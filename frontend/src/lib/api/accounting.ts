@@ -1,6 +1,6 @@
-import { request } from './core'
+﻿import { request } from './core'
 
-// ─── Double-entry Accounting API ─────────────────────────────────
+// â”€â”€â”€ Double-entry Accounting API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 export interface TrialBalanceRow {
   accountId: string
   accountCode: string
@@ -77,6 +77,12 @@ export interface Account {
   isActive: boolean
   createdAt: string
 }
+export interface LedgerRow { id: string; entryNumber: string; date: string; description: string | null; reference: string | null; referenceType: string | null; referenceId: string | null; isAuto: boolean; source: 'shopify' | 'erp' | 'manual' }
+export interface AccountingDashboard {
+  revenue: number; expenses: number; profit: number; bankBalance: number; receivable: number; payable: number
+  counts: { invoices: number; expenses: number; shopifyOrders: number }
+}
+export interface UnifiedTransaction { id: string; date: string; type: string; ref: string | null; customer: string | null; amount: number; status: string | null; source: 'shopify' | 'erp' }
 
 export const accountingApi = {
   getAccounts: () => request<Account[]>('/accounts'),
@@ -108,10 +114,40 @@ export const accountingApi = {
     const suffix = q.toString() ? `?${q.toString()}` : ''
     return request<JournalEntry[]>(`/accounts/journal-entries${suffix}`)
   },
-  createJournalEntry: (body: { date: string; description?: string; reference?: string; referenceType?: string; referenceId?: string; lines: Array<{ accountId: string; debit: number; credit: number; description?: string }> }) =>
+  createJournalEntry: (body: { date: string; description?: string; reference?: string; referenceType?: string; referenceId?: string; lines: Array<{ accountId?: string; accountCode?: string; debit: number; credit: number; description?: string }> }) =>
     request<{ id: string; entryNumber: string }>('/accounts/journal-entries', { method: 'POST', body: JSON.stringify(body) }),
   postInvoiceToJournal: (invoiceId: string) =>
     request<{ id: string; entryNumber: string; invoiceNumber: string }>(`/accounts/journal-entries/post/${invoiceId}`, { method: 'POST' }),
+  getLedger: (params?: { dateFrom?: string; dateTo?: string; source?: string; search?: string }) => {
+    const q = new URLSearchParams()
+    if (params?.dateFrom) q.set('dateFrom', params.dateFrom)
+    if (params?.dateTo) q.set('dateTo', params.dateTo)
+    if (params?.source && params.source !== 'all') q.set('source', params.source)
+    if (params?.search) q.set('search', params.search)
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return request<LedgerRow[]>(`/accounts/ledger${suffix}`)
+  },
+  getDashboard: (params?: { dateFrom?: string; dateTo?: string }) => {
+    const q = new URLSearchParams()
+    if (params?.dateFrom) q.set('dateFrom', params.dateFrom)
+    if (params?.dateTo) q.set('dateTo', params.dateTo)
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return request<AccountingDashboard>(`/accounts/dashboard${suffix}`)
+  },
+  getUnifiedTransactions: (params?: { source?: string; limit?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.source && params.source !== 'all') q.set('source', params.source)
+    if (params?.limit) q.set('limit', String(params.limit))
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return request<UnifiedTransaction[]>(`/accounts/unified-transactions${suffix}`)
+  },
+  reconcileShopify: (params?: { dateFrom?: string; dateTo?: string }) => {
+    const q = new URLSearchParams()
+    if (params?.dateFrom) q.set('dateFrom', params.dateFrom)
+    if (params?.dateTo) q.set('dateTo', params.dateTo)
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+    return request<{ totalShopifyOrders: number; matched: number; missingInvoice: number; mismatched: number; ordersWithRefunds: number; missingJournal: number; unmatchedRefunds: number }>(`/accounts/reconcile/shopify${suffix}`, { method: 'POST' })
+  },
   getHsnSummary: (params?: { month?: number; year?: number }) => {
     const q = new URLSearchParams()
     if (params?.month) q.set('month', String(params.month))

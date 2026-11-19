@@ -332,8 +332,9 @@ export async function convertBookingToInvoice(orderId: string, opts: ConvertBook
       .where(eq(s.salesOrders.id, order.id))
 
     if (advancePaid > 0) {
+      const advancePaymentId = randomUUID()
       await db.insert(s.payments).values({
-        id: randomUUID(),
+        id: advancePaymentId,
         ref: order.internalId ?? order.id,
         invoice: invoiceNumber,
         customer: order.customer,
@@ -343,6 +344,9 @@ export async function convertBookingToInvoice(orderId: string, opts: ConvertBook
         status: 'paid',
         date: new Date().toISOString(),
       })
+      void import('./accounting/postings')
+        .then(({ postPaymentJournal }) => postPaymentJournal(advancePaymentId, opts.actor ?? null))
+        .catch((err) => logger.warn({ err, paymentId: advancePaymentId }, 'Failed to auto-post booking advance payment journal'))
     }
 
     const { insertOrderEvent } = await import('./routes/db')

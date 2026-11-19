@@ -6,6 +6,7 @@ import { db } from './db/client'
 import * as schema from './db/schema'
 import { invoiceTotals } from './invoiceTotals'
 import { buildManualInvoiceLines } from './orderPricing'
+import { computeShopifyInvoiceAmounts } from './shopifyInvoiceAmounts'
 import { getLatestSilverRate } from './shopify'
 import { decryptSecret } from './lib/crypto'
 import { recountCustomerStatsBoth } from './customerStats'
@@ -792,12 +793,34 @@ export async function createInvoiceForOrderRow(
   opts: CreateInvoiceOptions = {},
 ): Promise<string | null> {
   if (!db) return null
-  if (order.invoice) return order.invoice
-  const lineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
-  if (lineItems.length === 0) return null
 
+  const rawLineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
   // Detect manual orders (created via ERP, not imported from Shopify)
   const isManualOrder = (order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#')
+  const orderValue = round2(Number(order.value ?? 0))
+
+  // An invoiced order is normally left alone. The one exception is an invoice
+  // that carries no amount for a real order — the Shopify import used to build
+  // the total from catalogue weights only, so a SKU missing from the catalogue
+  // produced a ₹0 invoice for a valid Shopify order. Those are repaired from
+  // the order they belong to instead of being skipped forever.
+  if (order.invoice) {
+    const [linked] = await db
+      .select({ grandTotal: schema.salesInvoices.grandTotal })
+      .from(schema.salesInvoices)
+      .where(eq(schema.salesInvoices.number, order.invoice))
+      .limit(1)
+    if (!linked || Number(linked.grandTotal ?? 0) > 0 || orderValue <= 0) return order.invoice
+  }
+
+  // Older Shopify rows were imported without line items. Their order total is
+  // still a real sale, so invoice it as one line rather than returning null.
+  const lineItems: OrderEmailData['items'] = rawLineItems.length > 0
+    ? rawLineItems
+    : !isManualOrder && orderValue > 0
+      ? [{ title: `Order ${order.shopifyId ?? ''}`.trim(), sku: '', quantity: 1, price: orderValue }]
+      : []
+  if (lineItems.length === 0) return null
 
   // Settings: gst rate + invoice prefix
   const [settingsRow] = await db.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
@@ -850,8 +873,8 @@ export async function createInvoiceForOrderRow(
   let erpSilverValue: number
   let erpMakingCharge: number
   let erpSubtotal: number
-  let silverValue: number
-  let makingCharge: number
+  let silverValue: number | null
+  let makingCharge: number | null
   let subtotal: number
   let effectiveDiscount: number
   let gstAmount: number
@@ -878,51 +901,50 @@ export async function createInvoiceForOrderRow(
     silverValue = erpSilverValue
     makingCharge = erpMakingCharge
   } else {
-    // Shopify orders: the customer has already paid a specific price (Shopify price).
-    // The invoice is a tax document for that transaction. The component breakdown MUST use
-    // the actual Silver Rate Management rate. If the ERP-calculated subtotal differs from
-    // the Shopify billed amount, the difference is reflected as a discount/adjustment.
-    // This ensures the displayed rate equals the actual Silver Rate Management rate.
-    items = lineItems.map((li) => {
-      const qty = Number(li.quantity ?? 0)
-      const price = Number(li.price ?? 0)
-      const amount = Math.round(price * qty * 100) / 100
-      // Product snapshot: net weight, making charge from catalogue.
-      // Silver rate comes from Silver Rate Management (authoritative source).
-      const product = productMap[String(li.sku ?? '')] ?? { netWeight: 0, makingCharge: 0 }
-      const weight = product.netWeight > 0 ? Math.round(product.netWeight * qty * 1000) / 1000 : 0
-      // Silver rate is the actual rate for items with weight > 0, 0 for zero-weight items
-      const itemSilverRate = weight > 0 ? silverRate : 0
+    // Shopify orders: the customer has already been billed a specific amount,
+    // so the Shopify order total is authoritative — never the ERP catalogue's
+    // weight × rate arithmetic (that is what produced ₹0 invoices when a SKU
+    // had no catalogue weight). computeShopifyInvoiceAmounts spreads the billed
+    // total across the Shopify lines and guarantees grandTotal === order total.
+    const amounts = computeShopifyInvoiceAmounts({
+      total: order.value,
+      discount,
+      gstRate,
+      lines: lineItems.map((li) => {
+        const qty = Number(li.quantity ?? 0)
+        // Product snapshot: net weight, making charge from catalogue.
+        // Silver rate comes from Silver Rate Management (authoritative source).
+        const product = productMap[String(li.sku ?? '')] ?? { netWeight: 0, makingCharge: 0 }
+        const weight = product.netWeight > 0 ? Math.round(product.netWeight * qty * 1000) / 1000 : 0
+        return {
+          price: Number(li.price ?? 0),
+          quantity: qty,
+          weight,
+          // Actual Silver Rate Management rate (0 for zero-weight items).
+          silverRate: weight > 0 ? silverRate : 0,
+          makingCharge: product.makingCharge,
+        }
+      }),
+    })
+    items = lineItems.map((li, index) => {
+      const priced = amounts.lines[index] ?? { amount: 0, tax: 0, weight: 0, silverRate: 0, makingCharge: 0 }
       return {
         product: String(li.title ?? '').trim(),
         sku: String(li.sku ?? ''),
-        qty,
-        weight,
-        silverRate: itemSilverRate,  // Actual Silver Rate Management rate (0 for zero-weight items)
-        makingCharge: product.makingCharge,
-        tax: Math.round(((amount * gstRate) / 100) * 100) / 100,
-        amount,      // Shopify billed amount per line
+        qty: Number(li.quantity ?? 0),
+        weight: priced.weight,
+        silverRate: priced.silverRate,
+        makingCharge: priced.makingCharge,
+        tax: priced.tax,
+        amount: priced.amount,
       }
     })
-    shopifySubtotal = Math.round(items.reduce((a, it) => a + it.amount, 0) * 100) / 100
-
-    // ERP-calculated components using ACTUAL Silver Rate Management rate
-    erpSilverValue = Math.round(items.reduce((a, it) => a + it.weight * it.silverRate, 0) * 100) / 100
-    erpMakingCharge = Math.round(items.reduce((a, it) => a + it.makingCharge * it.weight, 0) * 100) / 100
-    erpSubtotal = round2(erpSilverValue + erpMakingCharge)
-
-    // If ERP subtotal differs from Shopify billed amount, the difference is a discount/adjustment.
-    // The invoice subtotal for tax purposes is the ERP subtotal.
-    const adjustment = round2(erpSubtotal - shopifySubtotal)
-    effectiveDiscount = discount + (adjustment > 0 ? adjustment : 0)
-    subtotal = erpSubtotal
-    const totals = invoiceTotals(subtotal, gstRate, effectiveDiscount)
-    gstAmount = totals.gstAmount
-    grandTotal = totals.grandTotal
-
-    // Header totals use ERP-calculated components (no scaling)
-    silverValue = erpSilverValue
-    makingCharge = erpMakingCharge
+    subtotal = amounts.subtotal
+    gstAmount = amounts.gstAmount
+    effectiveDiscount = amounts.discount
+    grandTotal = amounts.grandTotal
+    silverValue = amounts.silverValue
+    makingCharge = amounts.makingCharge
   }
 
   // Customer snapshot: customer record first, then the order's addresses
@@ -934,6 +956,40 @@ export async function createInvoiceForOrderRow(
     : (order.billingAddress as Record<string, string> | null) ?? {}
   const address1 = String(addr.address1 ?? '')
   const address2 = String(addr.address2 ?? '')
+
+  // Repair path: the top guard only falls through when the linked invoice has
+  // no amount. Write the amounts derived from the order and rebuild its lines,
+  // keeping the same invoice number so every existing reference stays valid.
+  if (order.invoice) {
+    const [existing] = await db
+      .select()
+      .from(schema.salesInvoices)
+      .where(eq(schema.salesInvoices.number, order.invoice))
+      .limit(1)
+    if (existing && grandTotal > 0) {
+      await db.transaction(async (tx) => {
+        await tx
+          .update(schema.salesInvoices)
+          .set({
+            silverValue,
+            makingCharge,
+            subtotal,
+            gst: gstRate,
+            gstAmount,
+            discount: effectiveDiscount,
+            grandTotal,
+            currency: order.currency ?? existing.currency ?? 'INR',
+          })
+          .where(eq(schema.salesInvoices.id, existing.id))
+        await tx.delete(schema.salesInvoiceItems).where(eq(schema.salesInvoiceItems.invoiceId, existing.id))
+        for (const it of items) {
+          await tx.insert(schema.salesInvoiceItems).values({ ...it, id: crypto.randomUUID(), invoiceId: existing.id })
+        }
+      })
+      logger.info({ orderId: order.id, invoice: order.invoice, grandTotal }, 'Repaired zero-value invoice from its order total')
+    }
+    return order.invoice
+  }
 
   const number = await nextInvoiceNumber(prefix)
   const invoiceId = crypto.randomUUID()
@@ -984,6 +1040,7 @@ export async function createInvoiceForOrderRow(
         paymentMethod: payment,
         paymentStatus: order.payment,
         status: order.payment === 'paid' ? 'paid' : 'issued',
+        currency: order.currency ?? 'INR',
         date: order.date ?? new Date().toISOString(),
       })
       const orderLocationId = (order as { locationId?: string | null }).locationId ?? null
@@ -1035,6 +1092,7 @@ export async function createInvoiceForOrderRow(
       if (!result.ok) logger.error({ err: result.error, invoice: number }, 'automatic IRN generation failed for auto-raised invoice')
     })
     .catch(() => undefined)
+  void import('./accounting/postings').then(({ postSalesInvoiceJournal }) => postSalesInvoiceJournal(invoiceId)).catch((err) => logger.warn({ err, invoiceId }, 'Failed to auto-post auto-raised invoice journal'))
   return number
 }
 
@@ -1067,6 +1125,66 @@ export async function createInvoiceForOrderNumber(shopifyOrderNumber: string): P
   if (!order) return { created: false, invoiceNumber: null }
   const number = await createInvoiceForOrderRow(order)
   return { created: Boolean(number) && !order.invoice, invoiceNumber: number }
+}
+
+/**
+ * Repair Shopify invoices that carry no amount while their order does.
+ *
+ * This is the backfill for real data written by the old importer: an invoice
+ * exists and is linked to the order, but its grand_total is 0/null because the
+ * total was rebuilt from catalogue weights and the SKU had none. The order's
+ * own (Shopify-sourced) value is authoritative, so the invoice keeps its number
+ * and identity and only its money fields are recomputed. Idempotent: a repaired
+ * invoice no longer matches the zero-amount filter.
+ */
+export async function repairZeroValueShopifyInvoices(): Promise<{ repaired: number; failed: string[] }> {
+  if (!db) return { repaired: 0, failed: [] }
+  const zeroInvoice = sql`exists (
+    select 1
+      from ${schema.salesInvoices} as repair_invoice
+     where (repair_invoice.number = ${schema.salesOrders.invoice}
+            or repair_invoice.shopify_order = ${schema.salesOrders.shopifyId})
+       and coalesce(repair_invoice.grand_total, 0) <= 0
+  )`
+  const rows = await db
+    .select()
+    .from(schema.salesOrders)
+    .where(and(
+      sql`${schema.salesOrders.shopifyId} like '#%'`,
+      sql`coalesce(${schema.salesOrders.value}, 0) > 0`,
+      sql`lower(coalesce(${schema.salesOrders.status}, '')) <> 'cancelled'`,
+      sql`coalesce(${schema.salesOrders.shopifyStore}, '') <> 'not-in-store'`,
+      zeroInvoice,
+    ))
+
+  let repaired = 0
+  const failed: string[] = []
+  for (const order of rows) {
+    try {
+      // A restore can leave the invoice pointing at the order while the order
+      // no longer points back; re-link it before repairing so the normal
+      // single-invoice relationship holds afterwards.
+      let target = order
+      if (!target.invoice) {
+        const [invoice] = await db
+          .select({ number: schema.salesInvoices.number })
+          .from(schema.salesInvoices)
+          .where(and(
+            eq(schema.salesInvoices.shopifyOrder, target.shopifyId ?? ''),
+            sql`coalesce(${schema.salesInvoices.grandTotal}, 0) <= 0`,
+          ))
+          .limit(1)
+        if (!invoice?.number) continue
+        await db.update(schema.salesOrders).set({ invoice: invoice.number }).where(eq(schema.salesOrders.id, target.id))
+        target = { ...target, invoice: invoice.number }
+      }
+      const number = await createInvoiceForOrderRow(target, { deductStock: false })
+      if (number) repaired++
+    } catch (err) {
+      failed.push(`${order.shopifyId ?? order.id}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return { repaired, failed }
 }
 
 // ─── IMAP polling ───────────────────────────────────────────────────

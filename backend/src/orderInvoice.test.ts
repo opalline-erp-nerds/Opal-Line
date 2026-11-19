@@ -93,13 +93,13 @@ test(
       invoiceId = invoice.id
       assert.equal(invoice.number, number)
       assert.equal(invoice.customer, order.customer)
-      // ERP subtotal = 25g × 62 = 1550 (vs Shopify billed 2000).
-      // Difference (1550 - 2000 = -450) does not increase discount (negative adjustment not applied).
-      // ERP subtotal = 1550, GST = 46.5, discount = 0, grandTotal = 1596.5
-      assert.equal(Number(invoice.subtotal), 1550, 'invoice subtotal = ERP subtotal (actual rate × weight)')
-      assert.equal(Number(invoice.gstAmount), 46.5, 'invoice gstAmount = 3% of ERP subtotal')
-      assert.equal(Number(invoice.discount), 0, 'invoice discount = 0 (no positive adjustment)')
-      assert.equal(Number(invoice.grandTotal), 1596.5, 'invoice grandTotal = ERP subtotal + GST - discount')
+      // The Shopify order total is authoritative: ₹2,060. GST is its pre-tax
+      // portion (₹2,060 − ₹2,000) and the invoice must total the order.
+      assert.equal(Number(invoice.subtotal), 2000, 'invoice subtotal = Shopify billed value less GST')
+      assert.equal(Number(invoice.gstAmount), 60, 'invoice gstAmount = Shopify tax portion')
+      assert.equal(Number(invoice.discount), 0, 'invoice discount = Shopify total_discounts (0)')
+      assert.equal(Number(invoice.grandTotal), 2060, 'invoice grandTotal = Shopify order total')
+      assert.equal(Number(invoice.grandTotal), order.value, 'a real Shopify order is never invoiced at ₹0')
       assert.equal(invoice.paymentStatus, 'paid')
       assert.equal(invoice.status, 'paid')
       assert.equal(invoice.shopifyOrder, shopifyId)
@@ -134,13 +134,13 @@ test(
         .from(schema.salesInvoices)
         .where(eq(schema.salesInvoices.id, invoice.id))
         .limit(1)
-      assert.equal(Number(invoice2.silverValue), 1550, 'invoice silverValue = ERP silver value (actual rate × weight)')
+      // Components are the catalogue split scaled onto the billed value.
+      assert.equal(Number(invoice2.silverValue), 2000, 'invoice silverValue = catalogue metal share of the billed value')
       assert.equal(Number(invoice2.makingCharge), 0, 'invoice makingCharge = 0 (no making charge in product)')
-      // ERP subtotal = 1550, GST = 46.5, discount = 0, grandTotal = 1596.5
-      assert.equal(Number(invoice2.subtotal), 1550, 'invoice subtotal = ERP subtotal (actual rate × weight)')
-      assert.equal(Number(invoice2.gstAmount), 46.5, 'invoice gstAmount = 3% of ERP subtotal')
-      assert.equal(Number(invoice2.discount), 0, 'invoice discount = 0 (no positive adjustment)')
-      assert.equal(Number(invoice2.grandTotal), 1596.5, 'invoice grandTotal = ERP subtotal + GST - discount')
+      assert.equal(Number(invoice2.subtotal), 2000, 'invoice subtotal = Shopify billed value less GST')
+      assert.equal(Number(invoice2.gstAmount), 60, 'invoice gstAmount = Shopify tax portion')
+      assert.equal(Number(invoice2.discount), 0, 'invoice discount = 0 (no Shopify discount)')
+      assert.equal(Number(invoice2.grandTotal), 2060, 'invoice grandTotal = Shopify order total')
 
       // The order now points at its invoice.
       const [linked] = await db!
@@ -325,22 +325,22 @@ test(
         .where(eq(schema.salesInvoices.shopifyOrder, shopifyId))
         .limit(1)
       invoiceIds.push(invoice.id)
-      // ERP totals using authoritative silver rate (65) from Silver Rate Management:
-      //   Ring: 25g × 65 = 1625 silver, 25g × 150 = 3750 making
-      //   Chain: 20g × 65 = 1300 silver, 20g × 200 = 4000 making
-      //   Pendant: 0g × 65 = 0 silver, 0g × 300 = 0 making
-      // ERP subtotal = 2925 + 7750 = 10675
-      // Shopify billed subtotal = 2960, difference = 7715 added to discount
-      // Effective discount = 100 + 7715 = 7815
-      // GST = 3% of ERP subtotal = 320.25
-      // Grand total = ERP subtotal + GST - effective discount = 10675 + 320.25 - 7815 = 3180.25
-      assert.equal(Number(invoice.subtotal), 10675, 'invoice subtotal = ERP subtotal (actual rate × weight)')
-      assert.equal(Number(invoice.silverValue), 2925, 'invoice silverValue = ERP silver value (actual rate × weight)')
-      assert.equal(Number(invoice.makingCharge), 7750, 'invoice makingCharge = ERP making charge (per-gram × weight)')
-      assert.equal(Number(invoice.discount), 7815, 'invoice discount = original 100 + adjustment 7715')
-      assert.equal(Number(invoice.gstAmount), 320.25, 'invoice gstAmount = 3% of ERP subtotal')
-      assert.equal(Number(invoice.grandTotal), 3180.25, 'invoice grandTotal = ERP subtotal + GST - effective discount')
-      assert.equal(Number(invoice.silverValue) + Number(invoice.makingCharge), Number(invoice.subtotal), 'components must add up to ERP subtotal')
+      // The Shopify order total (₹2,860) is authoritative; the catalogue split
+      // (ring 25g × ₹65 + ₹150/g, chain 20g × ₹65 + ₹200/g) is scaled onto the
+      // taxable value. GST = ₹83.30, discount = the Shopify ₹100, subtotal =
+      // taxable ₹2,776.70 + ₹100, and the identity holds exactly.
+      assert.equal(Number(invoice.subtotal), 2876.7, 'invoice subtotal = taxable value + Shopify discount')
+      assert.equal(Number(invoice.silverValue), 760.83, 'invoice silverValue = catalogue metal share of the taxable value')
+      assert.equal(Number(invoice.makingCharge), 2015.87, 'invoice makingCharge = the remainder of the taxable value')
+      assert.equal(Number(invoice.discount), 100, 'invoice discount = Shopify total_discounts')
+      assert.equal(Number(invoice.gstAmount), 83.3, 'invoice gstAmount = Shopify tax portion')
+      assert.equal(Number(invoice.grandTotal), 2860, 'invoice grandTotal = Shopify order total')
+      assert.equal(Number(invoice.grandTotal), order.value, 'a real Shopify order is never invoiced at ₹0')
+      assert.equal(
+        Number(invoice.silverValue) + Number(invoice.makingCharge),
+        round2(Number(invoice.subtotal) - Number(invoice.discount)),
+        'components add up to the taxable value',
+      )
 
       const items = await db!
         .select()
@@ -352,28 +352,28 @@ test(
       const chain = bySku.get(skuChain)
       const pendant = bySku.get(skuPendant)
       assert.ok(ring && chain && pendant, 'every ordered SKU must appear exactly once')
-      // Each line keeps its own name, quantity, amount and per-line GST.
-      // Silver rate is the ACTUAL authoritative rate from Silver Rate Management.
-      // Components use actual rate; difference from Shopify billed amount is reflected in discount.
+      // Each line keeps its own name, quantity and weight; its amount and GST
+      // are the Shopify billed share of the order total (₹2,860 across three
+      // lines), so the invoice lines sum to the invoice grand total.
       const expectedRate = 65
       assert.equal(ring.product, 'Silver Ring')
       assert.equal(Number(ring.qty), 2)
-      assert.equal(Number(ring.amount), 1000)
-      assert.equal(Number(ring.tax), 30)
+      assert.equal(Number(ring.amount), 938.07)
+      assert.equal(Number(ring.tax), 28.14)
       assert.equal(Number(ring.weight), 25, 'weight snapshot = 12.5 g × 2')
       assert.equal(Number(ring.silverRate), expectedRate, 'ring uses actual Silver Rate Management rate')
       assert.equal(Number(ring.makingCharge), 150, 'ring making charge from product catalogue')
       assert.equal(chain.product, 'Silver Chain')
       assert.equal(Number(chain.qty), 1)
-      assert.equal(Number(chain.amount), 1000)
-      assert.equal(Number(chain.tax), 30)
+      assert.equal(Number(chain.amount), 938.07)
+      assert.equal(Number(chain.tax), 28.14)
       assert.equal(Number(chain.weight), 20)
       assert.equal(Number(chain.silverRate), expectedRate, 'chain uses actual Silver Rate Management rate')
       assert.equal(Number(chain.makingCharge), 200, 'chain making charge from product catalogue')
       assert.equal(pendant.product, 'Gold Pendant')
       assert.equal(Number(pendant.qty), 3)
-      assert.equal(Number(pendant.amount), 960)
-      assert.equal(Number(pendant.tax), 28.8)
+      assert.equal(Number(pendant.amount), 900.56)
+      assert.equal(Number(pendant.tax), 27.02)
       assert.equal(Number(pendant.weight), 0, 'zero catalogue weight stays unknown, never 0.00')
       assert.equal(Number(pendant.silverRate), 0, 'pendant has zero weight, silver rate is 0')
       assert.equal(Number(pendant.makingCharge), 300, 'pendant making charge from product catalogue')

@@ -46,6 +46,7 @@ import type {
   SupplierDuesDetail,
   SupplierDuesResponse,
   SalesOrder,
+  SalesInsights,
   SalesOverviewPoint,
   SalesReturn,
   SilverRate,
@@ -222,7 +223,10 @@ export const dbApi = {
       lastSyncAt: string | null
     }>(rangePath('/db/dashboard/summary', range)),
   getSalesOverview: (range: DashboardRangeInput | string = 'week'): Promise<SalesOverviewPoint[]> => request(rangePath('/db/dashboard/sales-overview', range)),
-  getTopProducts: (range?: DashboardRangeInput): Promise<TopProduct[]> => request(rangePath('/db/dashboard/top-products', range)),
+  getSalesInsights: (range?: DashboardRangeInput): Promise<SalesInsights> =>
+    request(rangePath('/db/dashboard/sales-insights', range)),
+  getTopProducts: (range?: DashboardRangeInput, source?: 'all' | 'shopify' | 'erp'): Promise<TopProduct[]> =>
+    request(filterPath(rangePath('/db/dashboard/top-products', range), { source })),
   getTopCategory: (range?: DashboardRangeInput): Promise<TopCategory[]> => request(rangePath('/db/dashboard/top-category', range)),
   getOrderSummary: (grain: 'week' | 'month' | 'year', month: string): Promise<OrderSummary> =>
     request(`/db/dashboard/order-summary?grain=${grain}&month=${encodeURIComponent(month)}`),
@@ -234,14 +238,14 @@ export const dbApi = {
     request(rangePath('/db/dashboard/purchase-orders', range)),
   getSalesOrdersWidget: (range?: DashboardRangeInput): Promise<SalesOrdersWidget> =>
     request(rangePath('/db/dashboard/sales-orders', range)),
-  getRecentInvoices: (range?: DashboardRangeInput): Promise<RecentInvoicesWidget> =>
-    request(rangePath('/db/dashboard/recent-invoices', range)),
+  getRecentInvoices: (range?: DashboardRangeInput, source?: 'all' | 'shopify' | 'erp'): Promise<RecentInvoicesWidget> =>
+    request(filterPath(rangePath('/db/dashboard/recent-invoices', range), { source })),
   getProductMargins: (months = 12): Promise<{ months: number; rows: Array<{ sku: string; name: string; qty: number; revenue: number; cost: number; profit: number; marginPct: number }>; totals: { revenue: number; cost: number; profit: number; marginPct: number } }> =>
     request(`/db/reports/product-margins?months=${months}`),
   getProfitAnalytics: (months = 12): Promise<ProfitAnalytics> =>
     request(`/db/dashboard/profit?months=${months}`),
-  getPaymentStatus: (range?: DashboardRangeInput): Promise<{ segments: PaymentStatusSegment[]; total: number }> =>
-    request(rangePath('/db/dashboard/payment-status', range)),
+  getPaymentStatus: (range?: DashboardRangeInput, source?: 'all' | 'shopify' | 'erp'): Promise<{ segments: PaymentStatusSegment[]; total: number }> =>
+    request(filterPath(rangePath('/db/dashboard/payment-status', range), { source })),
   getReceivablesAging: (): Promise<ReceivablesAging> => request('/db/dashboard/aging'),
   // The Financial Analytics section owns its range (defaults to Last 12
   // Months server-side when no period is passed) and is independent of the

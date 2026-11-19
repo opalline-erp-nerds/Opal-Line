@@ -89,9 +89,10 @@ function nativeBadge(value: string | null | undefined): { label: string; classNa
 }
 
 function isShopifyLinked(order: SalesOrder): boolean {
-  // Local/manual orders have no Shopify name; only `#1234` rows can be acted on
-  // in Shopify. Legacy rows without a gid still resolve by name.
-  return Boolean(order.shopifyId && /^#\d/.test(order.shopifyId))
+  // `#1234` rows act on Shopify by name. A manual order whose Shopify name is
+  // already used locally keeps its ERP reference but records the order gid, and
+  // is just as much on Shopify — the gid is what every action resolves.
+  return Boolean(order.shopifyId && /^#\d/.test(order.shopifyId)) || Boolean(order.shopifyGid)
 }
 
 function isOpenForActions(order: SalesOrder): boolean {

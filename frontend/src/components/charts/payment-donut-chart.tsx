@@ -2,23 +2,19 @@ import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts'
 import type { PaymentStatusSegment } from '@/types'
 import { compactCurrency } from '@/lib/format'
 import { ChartTooltipBox } from './chart-tooltip'
-
-const COLORS: Record<PaymentStatusSegment['status'], string> = {
-  paid: '#16a34a',
-  pending: '#f59e0b',
-  failed: '#ef4444',
-  refunded: '#94a3b8',
-}
+import { PAYMENT_STATUS_COLORS } from './chart-theme'
 
 export function PaymentDonutChart({
   data,
   centerTotal,
+  height = 210,
 }: {
   data: PaymentStatusSegment[]
   centerTotal: number
+  height?: number
 }) {
   return (
-    <div className="relative h-[210px] w-full">
+    <div className="relative w-full" style={{ height }}>
       <ResponsiveContainer width="100%" height="100%">
         <PieChart>
           <Tooltip
@@ -28,7 +24,7 @@ export function PaymentDonutChart({
               return (
                 <ChartTooltipBox
                   title={p.label}
-                  rows={[{ label: 'Value', value: compactCurrency(p.value), color: COLORS[p.status] }]}
+                  rows={[{ label: 'Value', value: compactCurrency(p.value), color: PAYMENT_STATUS_COLORS[p.status] }]}
                 />
               )
             }}
@@ -37,14 +33,14 @@ export function PaymentDonutChart({
             data={data}
             dataKey="value"
             nameKey="label"
-            innerRadius={60}
-            outerRadius={84}
+            innerRadius={68}
+            outerRadius={94}
             paddingAngle={3}
             cornerRadius={4}
             strokeWidth={0}
           >
             {data.map((entry) => (
-              <Cell key={entry.status} fill={COLORS[entry.status]} />
+              <Cell key={entry.status} fill={PAYMENT_STATUS_COLORS[entry.status]} />
             ))}
           </Pie>
         </PieChart>

@@ -1722,6 +1722,7 @@ dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), a
       return created
     })
     recordCrud('invoices', 'Created', req, row)
+    void import('../accounting/postings').then(({ postSalesInvoiceJournal }) => postSalesInvoiceJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, invoiceId: row.id }, 'Failed to auto-post sales invoice journal'))
     res.status(201).json(stripHash(row))
   } catch {
     res.status(400).json({ error: 'Failed to duplicate invoice' })
@@ -1810,6 +1811,7 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     })
 
     recordCrud('invoices', 'Created', req, row)
+    void import('../accounting/postings').then(({ postSalesInvoiceJournal }) => postSalesInvoiceJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, invoiceId: row.id }, 'Failed to auto-post sales invoice journal'))
     // Loyalty: award points on new invoices (fire-and-forget, never blocks billing)
     void import('../loyalty').then(({ earnForInvoice }) =>
       earnForInvoice({
@@ -1918,6 +1920,7 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
 
     if (!row) return res.status(404).json({ error: 'Not found' })
     recordCrud('invoices', 'Updated', req, row)
+    void import('../accounting/postings').then(({ postSalesInvoiceJournal }) => postSalesInvoiceJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, invoiceId: row.id }, 'Failed to sync sales invoice journal'))
 
     // Marking an invoice cancelled / refunded gives back the loyalty points it
     // earned (the earn entry is skipped when an invoice is voided up front).
@@ -1956,6 +1959,7 @@ dbRouter.delete('/invoices/:id', requirePermission('sales', 'delete'), async (re
       await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
       await tx.delete(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id)))
       recordCrud('invoices', 'Deleted', req, existing)
+      void import('../accounting/journal').then(({ removeJournalEntry }) => removeJournalEntry('invoice', existing.id, req.userId ?? null)).catch((err) => logger.warn({ err, invoiceId: existing.id }, 'Failed to remove sales invoice journal'))
       return existing
     })
     if (!removed) return res.status(404).json({ error: 'Not found' })
@@ -2057,6 +2061,7 @@ dbRouter.post('/sales-orders/by-invoice/:invoice/reinvoice', requirePermission('
     })
     if (!removed) return res.status(404).json({ error: `Invoice ${cancelledNumber} not found` })
     recordCrud('invoices', 'Deleted', req, removed)
+    void import('../accounting/journal').then(({ removeJournalEntry }) => removeJournalEntry('invoice', removed.id, req.userId ?? null)).catch((err) => logger.warn({ err, invoiceId: removed.id }, 'Failed to remove sales invoice journal'))
     void import('../loyalty')
       .then(({ reverseEarnedForInvoice }) =>
         reverseEarnedForInvoice({
@@ -2585,6 +2590,7 @@ dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), asyn
     if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error })
     const { result } = outcome
     recordCrud('sales-returns', 'Created', req, { id: result.returnId, number: result.creditNoteNumber, invoiceId: routeParam(req.params.id), amount: result.amount, quantity: result.quantity })
+    void import('../accounting/postings').then(({ postSalesReturnJournal }) => postSalesReturnJournal(result.returnId, req.userId ?? null)).catch((err) => logger.warn({ err, returnId: result.returnId }, 'Failed to auto-post sales return journal'))
     // Give back the points earned on the value being returned.
     void import('../loyalty')
       .then(({ reverseEarnedForInvoice }) =>
@@ -3559,9 +3565,10 @@ dbRouter.post('/purchase-invoices', requirePermission('purchase', 'create'), asy
     const result = await insertPurchaseInvoice(body)
 
     recordCrud('purchase-invoices', 'Created', req, result.row)
+    void import('../accounting/postings').then(({ postPurchaseInvoiceJournal }) => postPurchaseInvoiceJournal(result.row.id, req.userId ?? null)).catch((err) => logger.warn({ err, purchaseInvoiceId: result.row.id }, 'Failed to auto-post purchase invoice journal'))
     logger.info(
       { number, supplier: result.row.supplier, lines: result.saved.lines, stocked: result.saved.stocked, total: result.totals.total },
-      'Purchase invoice received — stock updated',
+      'Purchase invoice received - stock updated',
     )
     res.status(201).json({ ...stripHash(result.row), items: result.items, lines: result.saved.lines, stockedSkus: result.saved.stocked })
   } catch (err) {
@@ -3658,6 +3665,7 @@ dbRouter.patch('/purchase-invoices/:id', requirePermission('purchase', 'edit'), 
     })
 
     recordCrud('purchase-invoices', 'Updated', req, updated)
+    void import('../accounting/postings').then(({ postPurchaseInvoiceJournal }) => postPurchaseInvoiceJournal(updated.id, req.userId ?? null)).catch((err) => logger.warn({ err, purchaseInvoiceId: updated.id }, 'Failed to sync purchase invoice journal'))
     res.json({
       ...stripHash(updated),
       balance: balanceOf(updated),
@@ -3694,6 +3702,7 @@ dbRouter.delete('/purchase-invoices/:id', requirePermission('purchase', 'delete'
     })
     if (!removed) return res.status(404).json({ error: 'Purchase invoice not found' })
     recordCrud('purchase-invoices', 'Deleted', req, removed)
+    void import('../accounting/journal').then(({ removeJournalEntry }) => removeJournalEntry('purchase-invoice', removed.id, req.userId ?? null)).catch((err) => logger.warn({ err, purchaseInvoiceId: removed.id }, 'Failed to remove purchase invoice journal'))
     res.json({ ok: true, id: routeParam(req.params.id) })
   } catch (err) {
     logger.error({ err }, 'purchase invoice delete failed')
@@ -3758,6 +3767,7 @@ dbRouter.post('/purchase-invoices/:id/recreate', requirePermission('purchase', '
       return existing
     })
     recordCrud('purchase-invoices', 'Deleted', req, removed)
+    void import('../accounting/journal').then(({ removeJournalEntry }) => removeJournalEntry('purchase-invoice', removed.id, req.userId ?? null)).catch((err) => logger.warn({ err, purchaseInvoiceId: removed.id }, 'Failed to remove purchase invoice journal'))
 
     // Reuse the create helper so stock is applied exactly once and totals,
     // GST split and TCS are computed the same way as a manual entry.
@@ -3772,6 +3782,7 @@ dbRouter.post('/purchase-invoices/:id/recreate', requirePermission('purchase', '
       locationId: existing.locationId,
     })
     recordCrud('purchase-invoices', 'Created', req, created.row)
+    void import('../accounting/postings').then(({ postPurchaseInvoiceJournal }) => postPurchaseInvoiceJournal(created.row.id, req.userId ?? null)).catch((err) => logger.warn({ err, purchaseInvoiceId: created.row.id }, 'Failed to auto-post recreated purchase invoice journal'))
     res.status(201).json({
       ok: true,
       cancelled: number,
@@ -4098,6 +4109,7 @@ dbRouter.post('/purchase-returns', requirePermission('purchase', 'create'), asyn
     })
 
     recordCrud('purchase-returns', 'Created', req, result.row)
+    void import('../accounting/hooks').then(({ queuePurchaseReturnJournal }) => queuePurchaseReturnJournal(result.row.id, req.userId ?? null)).catch((err) => logger.warn({ err, returnId: result.row.id }, 'Failed to sync purchase return journal'))
     logger.info(
       { number, supplier, lines: result.saved.lines, reversed: result.saved.reversed },
       'Purchase return recorded',
@@ -4145,6 +4157,7 @@ dbRouter.patch('/purchase-returns/:id', requirePermission('purchase', 'edit'), a
     })
 
     recordCrud('purchase-returns', 'Updated', req, updated)
+    void import('../accounting/hooks').then(({ queuePurchaseReturnJournal }) => queuePurchaseReturnJournal(updated.id, req.userId ?? null)).catch((err) => logger.warn({ err, returnId: updated.id }, 'Failed to sync purchase return journal'))
     res.json({ ...stripHash(updated), stockMoved: moved })
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
@@ -6497,6 +6510,11 @@ for (const [name, table] of Object.entries(resources)) {
       if (!body.id) body.id = randomUUID()
       const [row] = await db!.insert(table).values(body).returning()
       recordCrud(name, 'Created', req, row)
+      if (name === 'expenses') {
+        void import('../accounting/postings').then(({ postExpenseJournal }) => postExpenseJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, expenseId: row.id }, 'Failed to auto-post expense journal'))
+      } else if (name === 'payments') {
+        void import('../accounting/postings').then(({ postPaymentJournal }) => postPaymentJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId: row.id }, 'Failed to auto-post payment journal'))
+      }
       res.status(201).json(stripHash(row))
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
@@ -6543,6 +6561,11 @@ for (const [name, table] of Object.entries(resources)) {
       const [row] = await db!.update(table).set(body).where(eq(table.id, routeParam(req.params.id))).returning()
       if (!row) return res.status(404).json({ error: 'Not found' })
       recordCrud(name, 'Updated', req, row)
+      if (name === 'expenses') {
+        void import('../accounting/postings').then(({ postExpenseJournal }) => postExpenseJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, expenseId: row.id }, 'Failed to sync expense journal'))
+      } else if (name === 'payments') {
+        void import('../accounting/postings').then(({ postPaymentJournal }) => postPaymentJournal(row.id, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId: row.id }, 'Failed to sync payment journal'))
+      }
       res.json(stripHash(row))
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
@@ -6567,6 +6590,15 @@ for (const [name, table] of Object.entries(resources)) {
       }
       await db!.delete(table).where(eq(table.id, routeParam(req.params.id)))
       recordCrud(name, 'Deleted', req, existing)
+      if (name === 'expenses') {
+        void import('../accounting/postings').then(({ removeExpenseJournal }) => removeExpenseJournal(existing.id, req.userId ?? null)).catch((err) => logger.warn({ err, expenseId: existing.id }, 'Failed to remove expense journal'))
+      } else if (name === 'payments') {
+        void import('../accounting/postings').then(({ removePaymentJournal }) => removePaymentJournal(existing.id, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId: existing.id }, 'Failed to remove payment journal'))
+      } else if (name === 'sales-returns') {
+        void import('../accounting/journal').then(({ removeJournalEntry }) => removeJournalEntry('sales-return', existing.id, req.userId ?? null)).catch((err) => logger.warn({ err, returnId: existing.id }, 'Failed to remove sales return journal'))
+      } else if (name === 'purchase-returns') {
+        void import('../accounting/journal').then(({ removeJournalEntry }) => removeJournalEntry('purchase-return', existing.id, req.userId ?? null)).catch((err) => logger.warn({ err, returnId: existing.id }, 'Failed to remove purchase return journal'))
+      }
       res.json({ ok: true, id: routeParam(req.params.id) })
     } catch {
       res.status(500).json({ error: 'Failed to delete resource' })
@@ -6664,8 +6696,9 @@ dbRouter.post('/dues/pay', requirePermission('sales', 'edit'), async (req, res) 
     }
 
     const ref = `PAY-${Date.now().toString(36).toUpperCase()}`
+    const paymentId = randomUUID()
     await db.insert(schema.payments).values({
-      id: randomUUID(),
+      id: paymentId,
       ref,
       invoice: touched[0]?.inv.number ?? null,
       customer,
@@ -6676,7 +6709,7 @@ dbRouter.post('/dues/pay', requirePermission('sales', 'edit'), async (req, res) 
       date: new Date().toISOString(),
       reconciled: true,
     } as any)
-
+    void import('../accounting/postings').then(({ postPaymentJournal }) => postPaymentJournal(paymentId, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId }, 'Failed to auto-post dues payment journal'))
     const actor = actorFromRequest(req)
     void recordActivity({
       action: 'Recorded Payment',
@@ -6921,6 +6954,7 @@ dbRouter.post('/supplier-dues/pay', requirePermission('purchase', 'edit'), async
     if (!result.ok) return res.status(400).json({ error: result.error })
 
     const actor = actorFromRequest(req)
+    void import('../accounting/hooks').then(({ queueSupplierPaymentJournal }) => queueSupplierPaymentJournal(result.paymentId, actor.userId ?? null)).catch((err) => logger.warn({ err, paymentId: result.paymentId }, 'Failed to sync supplier payment journal'))
     recordCrud('purchase-invoices', 'Payment recorded', req, {
       supplier: String(req.body?.supplier ?? ''),
       ref: result.ref,

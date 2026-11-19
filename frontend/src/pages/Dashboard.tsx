@@ -9,9 +9,11 @@ import {
   ChevronDown,
   Clock,
   CloudCog,
+  Database,
   FileText,
   Gem,
   IndianRupee,
+  LayoutGrid,
   Landmark,
   PackageX,
   Plus,
@@ -36,17 +38,16 @@ import { StatCard } from '@/components/ui/stat-card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
 import { FinancialAnalytics } from '@/components/dashboard/financial-analytics'
-import { SalesOverviewChart } from '@/components/charts/sales-overview-chart'
+import { SalesOrdersRevenueChart } from '@/components/charts/sales-orders-revenue-chart'
+import { SalesKpiCards } from '@/components/dashboard/sales-overview-analytics'
 import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
 import { PaymentDonutChart } from '@/components/charts/payment-donut-chart'
 import { StatusDonutChart } from '@/components/charts/dashboard-widget-charts'
-import { SERIES_COLORS } from '@/components/charts/chart-theme'
+import { PAYMENT_STATUS_COLORS, SERIES_COLORS } from '@/components/charts/chart-theme'
 import {
-  CustomerPaymentsCard,
   OrderSummaryCard,
   PurchaseOrdersCard,
   RecentInvoicesCard,
-  SalesOrdersCard,
   SupplierPaymentsCard,
 } from '@/components/dashboard/summary-widgets'
 import { productImageSrc } from '@/lib/product-image'
@@ -59,6 +60,7 @@ import type {
   LowStockItem,
   PaymentStatusSegment,
   SalesOverviewPoint,
+  SalesInsights,
   TopCategory,
   TopProduct,
   PeriodKey,
@@ -91,6 +93,14 @@ const activityIcons: Record<Activity['type'], { icon: LucideIcon; className: str
 
 const ListOrderedIcon = FileText
 
+type SalesSource = 'all' | 'shopify' | 'erp'
+
+const SALES_SOURCES: { key: SalesSource; label: string; icon: LucideIcon }[] = [
+  { key: 'all', label: 'All Sales', icon: LayoutGrid },
+  { key: 'shopify', label: 'Shopify Sales', icon: ShoppingBag },
+  { key: 'erp', label: 'ERP Sales', icon: Database },
+]
+
 const quickActions: { label: string; icon: LucideIcon; path: string; module: string }[] = [
   { label: 'Sales Invoice', icon: FileText, path: '/sales/invoices', module: 'sales' },
   { label: 'Sales Order', icon: ListOrderedIcon, path: '/sales/orders', module: 'sales' },
@@ -109,12 +119,19 @@ export default function DashboardPage() {
   const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [summary, setSummary] = useState<Record<string, string | number | null> | null>(null)
   const [salesData, setSalesData] = useState<SalesOverviewPoint[]>([])
+  const [salesSource, setSalesSource] = useState<SalesSource>('all')
+  const [salesInsights, setSalesInsights] = useState<SalesInsights | null>(null)
+  const [salesInsightsLoading, setSalesInsightsLoading] = useState(true)
+  const [salesInsightsError, setSalesInsightsError] = useState<string | null>(null)
+  const [salesInsightsRetry, setSalesInsightsRetry] = useState(0)
   const [topProducts, setTopProducts] = useState<TopProduct[]>([])
+  const [topProductsLoading, setTopProductsLoading] = useState(true)
   const [topProductsError, setTopProductsError] = useState<string | null>(null)
   const [topCategory, setTopCategory] = useState<TopCategory[]>([])
   const [topCategoryError, setTopCategoryError] = useState<string | null>(null)
   const [paymentStatus, setPaymentStatus] = useState<{ segments: PaymentStatusSegment[]; total: number } | null>(null)
   const [paymentStatusError, setPaymentStatusError] = useState<string | null>(null)
+  const [paymentStatusLoading, setPaymentStatusLoading] = useState(true)
   const [lowStock, setLowStock] = useState<LowStockItem[]>([])
   const [activities, setActivities] = useState<Activity[]>([])
   const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
@@ -145,9 +162,7 @@ export default function DashboardPage() {
       dbApi.getDashboardKpis(range),
       dbApi.getDashboardSummary(range),
       dbApi.getSalesOverview(range),
-      dbApi.getTopProducts(range),
       dbApi.getTopCategory(range),
-      dbApi.getPaymentStatus(range),
       dbApi.getLowStock(),
       dbApi.getRecentActivities(range, { latest: true }),
       dbApi.getAnalyticsStats(range),
@@ -157,13 +172,11 @@ export default function DashboardPage() {
       const kpisResult = results[0]
       const summaryResult = results[1]
       const salesOverviewResult = results[2]
-      const topProductsResult = results[3]
-      const topCategoryResult = results[4]
-      const paymentStatusResult = results[5]
-      const lowStockResult = results[6]
-      const activitiesResult = results[7]
-      const analyticsResult = results[8]
-      const shopifyStatusResult = results[9]
+      const topCategoryResult = results[3]
+      const lowStockResult = results[4]
+      const activitiesResult = results[5]
+      const analyticsResult = results[6]
+      const shopifyStatusResult = results[7]
 
       // Helper: if fulfilled, return value; if rejected, log error and return default
       const safe = (result: PromiseSettledResult<any>): any => {
@@ -199,17 +212,9 @@ export default function DashboardPage() {
       // Sales Overview
       const salesData = salesOverviewResult.status === 'fulfilled' ? salesOverviewResult.value : []
 
-      // Top Products
-      const topProducts = topProductsResult.status === 'fulfilled' ? topProductsResult.value : []
-      const topProductsError = topProductsResult.status === 'rejected' ? 'Couldn\'t load top products' : null
-
       // Top Category
       const topCategory = topCategoryResult.status === 'fulfilled' ? topCategoryResult.value : []
       const topCategoryError = topCategoryResult.status === 'rejected' ? 'Couldn\'t load category sales' : null
-
-      // Payment Status
-      const paymentStatus = paymentStatusResult.status === 'fulfilled' ? paymentStatusResult.value : { segments: [], total: 0 }
-      const paymentStatusError = paymentStatusResult.status === 'rejected' ? 'Couldn\'t load payment status' : null
 
       // Low Stock
       const lowStock = lowStockResult.status === 'fulfilled' ? lowStockResult.value : []
@@ -231,12 +236,8 @@ export default function DashboardPage() {
       setKpisError(kpisError ?? null)
       setSummary(safeSummary)
       setSalesData(salesData)
-      setTopProducts(topProducts)
-      setTopProductsError(topProductsError ?? null)
       setTopCategory(topCategory)
       setTopCategoryError(topCategoryError ?? null)
-      setPaymentStatus(paymentStatus)
-      setPaymentStatusError(paymentStatusError ?? null)
       setLowStock(lowStock)
       setActivities(activities)
       setAnalytics(analytics)
@@ -257,7 +258,95 @@ export default function DashboardPage() {
     }
   }, [period, customRange])
 
+  // All three source splits and the previous-period comparison arrive in one
+  // response, so the source buttons never wait on a second round-trip.
+  useEffect(() => {
+    let cancelled = false
+    // A new range replaces every figure in these cards, so show the skeleton
+    // instead of last range's totals while the request is in flight.
+    setSalesInsightsLoading(true)
+    dbApi
+      .getSalesInsights(rangeToQuery(period, customRange))
+      .then((data) => {
+        if (!cancelled) {
+          setSalesInsights(data)
+          setSalesInsightsError(null)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSalesInsightsError("Couldn't load sales insights")
+      })
+      .finally(() => {
+        if (!cancelled) setSalesInsightsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [period, customRange, salesInsightsRetry])
+
+  // Rankings are platform-specific, so they follow the source buttons while
+  // the rest of the dashboard keeps its own range-driven data.
+  useEffect(() => {
+    let cancelled = false
+    // Rankings belong to one platform and one range. Clearing the loading flag
+    // keeps the previous selection's best sellers off the screen while the new
+    // ranking is fetched, so a Shopify card can never show ERP numbers.
+    setTopProductsLoading(true)
+    dbApi
+      .getTopProducts(rangeToQuery(period, customRange), salesSource)
+      .then((data) => {
+        if (!cancelled) {
+          setTopProducts(data)
+          setTopProductsError(null)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setTopProductsError("Couldn't load top products")
+      })
+      .finally(() => {
+        if (!cancelled) setTopProductsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [period, customRange, salesSource])
+
+  // Payment Status follows the source buttons too: All (default) reads
+  // Shopify + ERP, each filter reads only its own invoices and orders. It has
+  // its own effect so switching a source refetches just this card.
+  useEffect(() => {
+    let cancelled = false
+    setPaymentStatusLoading(true)
+    dbApi
+      .getPaymentStatus(rangeToQuery(period, customRange), salesSource)
+      .then((data) => {
+        if (!cancelled) {
+          setPaymentStatus(data)
+          setPaymentStatusError(null)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setPaymentStatusError("Couldn't load payment status")
+      })
+      .finally(() => {
+        if (!cancelled) setPaymentStatusLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [period, customRange, salesSource])
+
   const range = rangeToQuery(period, customRange) as RangeQuery
+
+  // The API sends every platform in one payload, so switching filters is
+  // instant and the chart, tooltip and summary cards share one dataset.
+  const visibleSales = salesData.map((point) => ({
+    ...point,
+    orders: salesSource === 'all' ? point.orders : salesSource === 'shopify' ? (point.shopifyOrders ?? 0) : (point.erpOrders ?? 0),
+    revenue: salesSource === 'all' ? point.revenue : salesSource === 'shopify' ? (point.shopifyRevenue ?? 0) : (point.erpRevenue ?? 0),
+  }))
+  const hasVisibleSales = visibleSales.some((point) => Number(point.orders ?? 0) > 0 || Math.abs(Number(point.revenue ?? 0)) > 0.005)
+  const sourceLabel = SALES_SOURCES.find((source) => source.key === salesSource)?.label ?? 'All Sales'
 
   return (
     <div className="print-area mx-auto w-full max-w-[1600px] space-y-6 px-4 py-4 sm:py-6 lg:px-6">
@@ -365,19 +454,66 @@ export default function DashboardPage() {
             />
           ) : null}
 
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-            <Card className="lg:col-span-2">
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="flex items-center gap-2 text-sm">
-                    <TrendingUp className="h-4 w-4 text-primary-700" /> Sales Overview
-                  </CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">{resolveClientRange(period, customRange).rangeText}</p>
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+            <Card className="xl:col-span-2">
+            <CardHeader className="flex-col gap-3 space-y-0 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <CardTitle className="flex items-center gap-2 text-sm">
+                  <TrendingUp className="h-4 w-4 text-[#7C5CE6]" /> Sales Overview
+                </CardTitle>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  {resolveClientRange(period, customRange).rangeText} · {sourceLabel}
+                </p>
+              </div>
+              <div className="no-print flex w-fit flex-wrap items-center gap-1 rounded-xl border border-border/70 bg-muted/30 p-1">
+                {SALES_SOURCES.map((source) => {
+                  const Icon = source.icon
+                  return (
+                    <button
+                      key={source.key}
+                      type="button"
+                      aria-pressed={salesSource === source.key}
+                      onClick={() => setSalesSource(source.key)}
+                      className={cn(
+                        'flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-all sm:px-3 sm:text-[11.5px]',
+                        salesSource === source.key
+                          ? 'border-[#7C5CE6] bg-[#7C5CE6] text-white shadow-sm'
+                          : 'border-border bg-card text-foreground shadow-sm hover:border-[#7C5CE6]/40 hover:bg-muted',
+                      )}
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      {source.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {salesInsightsLoading ? (
+                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                  {Array.from({ length: 3 }).map((_, index) => <Skeleton key={index} className="h-[108px] rounded-xl" />)}
                 </div>
-              </CardHeader>
-              <CardContent>
-                {salesData.length > 0 ? (
-                  <SalesOverviewChart data={salesData} />
+              ) : salesInsights ? (
+                <SalesKpiCards insights={salesInsights} source={salesSource} />
+              ) : null}
+              {salesInsightsError ? (
+                <div className="flex items-center justify-between gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[11px] text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-300">
+                  <span>{salesInsightsError}. The chart still shows invoiced sales.</span>
+                  <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => setSalesInsightsRetry((n) => n + 1)}>
+                    Retry
+                  </Button>
+                </div>
+              ) : null}
+
+              <div className="min-w-0 rounded-xl border border-border/70 bg-card p-3 shadow-sm sm:p-4">
+                {hasVisibleSales ? (
+                  <SalesOrdersRevenueChart data={visibleSales} />
+                ) : salesSource !== 'all' ? (
+                  <EmptyState
+                    icon={TrendingUp}
+                    title={`No ${salesSource === 'shopify' ? 'Shopify' : 'ERP'} sales in this period`}
+                    description={`There were no ${salesSource === 'shopify' ? 'Shopify' : 'ERP'} sales in the selected range. Try another source or a wider date range.`}
+                  />
                 ) : summary && Number(summary.totalOrders ?? 0) === 0 ? (
                   <EmptyState
                     icon={ShoppingBag}
@@ -396,86 +532,38 @@ export default function DashboardPage() {
                     description="There were no sales in the selected period. Try a wider date range."
                   />
                 )}
-              </CardContent>
+              </div>
+            </CardContent>
             </Card>
+            <div className="h-full xl:col-span-1">
+              <PaymentStatusPanel
+                data={paymentStatus}
+                error={paymentStatusError}
+                loading={paymentStatusLoading}
+                onViewDetails={() => navigate('/accounts/payments')}
+              />
+            </div>
+          </div>
 
-            <Card className="lg:col-span-1">
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+            <Card className="h-full xl:col-span-5">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="flex items-center gap-2 text-sm">
-                    <IndianRupee className="h-4 w-4 text-primary-700" /> Payment Status
+                    <Gem className="h-4 w-4 text-[#7C5CE6]" /> Top Selling Products
                   </CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Invoices grouped by payment state</p>
-                </div>
-                <Badge variant="muted" className="text-[10px]">{formatCurrency(paymentStatus?.total ?? 0, { compact: true })}</Badge>
-              </CardHeader>
-              <CardContent>
-                  {paymentStatusError ? (
-                    <Card>
-                      <CardContent>
-                        <EmptyState
-                          icon={ShieldAlert}
-                          title="Couldn't load payment status"
-                          description="There was an error fetching payment status data. Please try again."
-                          action={
-                            <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
-                              Retry
-                            </Button>
-                          }
-                        />
-                      </CardContent>
-                    </Card>
-                  ) : (paymentStatus && paymentStatus.total > 0 ? (
-                    <>
-                      <PaymentDonutChart data={paymentStatus.segments} centerTotal={paymentStatus.total} />
-                      <div className="mt-2 space-y-1.5">
-                        {paymentStatus.segments.map((s) => (
-                          <div key={s.status} className="flex items-center gap-2 text-[12px]">
-                            <span
-                              className={cn(
-                                'h-2 w-2 rounded-full',
-                                s.status === 'paid' && 'bg-success',
-                                s.status === 'pending' && 'bg-warning',
-                                s.status === 'failed' && 'bg-destructive',
-                                s.status === 'refunded' && 'bg-muted-foreground',
-                              )}
-                            />
-                            <span className="text-muted-foreground">{s.label}</span>
-                            <span className="ml-auto font-semibold tabular-nums text-foreground">{compactCurrency(s.value)}</span>
-                            <span className="w-9 text-right tabular-nums text-muted-foreground">
-                              {paymentStatus.total > 0 ? `${Math.round((s.value / paymentStatus.total) * 100)}%` : '0%'}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                      <Button variant="soft-primary" className="mt-4 w-full" size="sm" onClick={() => navigate('/accounts/payments')}>
-                        View Details
-                      </Button>
-                    </>
-                  ) : (paymentStatus ? (
-                    <EmptyState
-                      icon={IndianRupee}
-                      title="No payments yet"
-                      description="Once you record invoices, their paid and pending amounts break down here."
-                    />
-                  ) : null))}
-                </CardContent>
-            </Card>
-          </div>
-
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-            <Card className="lg:col-span-5 lg:row-span-2">
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="text-sm">Top Selling Products</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue · {sourceLabel}</p>
                 </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
               </CardHeader>
               <CardContent>
-                {topProductsError ? (
+                {topProductsLoading ? (
+                  <div className="grid h-[347px] grid-cols-1 gap-2.5 overflow-hidden sm:grid-cols-2">
+                    {Array.from({ length: 6 }).map((_, index) => <Skeleton key={index} className="h-[92px] rounded-xl" />)}
+                  </div>
+                ) : topProductsError ? (
                   <Card>
                     <CardContent>
                       <EmptyState
@@ -491,55 +579,67 @@ export default function DashboardPage() {
                     </CardContent>
                   </Card>
                 ) : topProducts.length > 0 ? (
-                  <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-                    {topProducts.map((p, index) => {
-                      const max = topProducts[0]?.revenue || 1
-                      const image = productImageSrc(p)
-                      return (
-                        <div
-                          key={p.id}
-                          className="rounded-xl border border-border/70 bg-muted/20 p-2.5 transition-colors hover:bg-muted/40"
-                        >
-                          <div className="flex items-center gap-2">
-                            <div className="relative flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                              {image ? (
-                                <img src={image} alt={p.name} className="h-full w-full object-cover" loading="lazy" />
-                              ) : (
-                                <Gem className="h-4 w-4" />
-                              )}
-                              <span className="absolute left-0 top-0 rounded-br-md bg-foreground/70 px-1 text-[9px] font-bold leading-4 text-background">
-                                {index + 1}
+                  <div
+                    tabIndex={0}
+                    aria-label="Top selling products list"
+                    className="h-[347px] overflow-y-auto overscroll-contain scroll-smooth pr-1.5 [scrollbar-width:thin] [scrollbar-color:hsl(var(--border))_transparent] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-0 [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-thumb:hover]:bg-muted-foreground/40"
+                  >
+                    <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                      {topProducts.map((p, index) => {
+                        const max = topProducts[0]?.revenue || 1
+                        const image = productImageSrc(p)
+                        return (
+                          <div
+                            key={p.id}
+                            className="rounded-xl border border-border/70 bg-muted/20 p-2.5 transition-colors hover:bg-muted/40"
+                          >
+                            <div className="flex items-center gap-2">
+                              <div className="relative flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                                {image ? (
+                                  <img src={image} alt={p.name} className="h-full w-full object-cover" loading="lazy" />
+                                ) : (
+                                  <Gem className="h-4 w-4" />
+                                )}
+                                <span className="absolute left-0 top-0 rounded-br-md bg-foreground/70 px-1 text-[9px] font-bold leading-4 text-background">
+                                  {index + 1}
+                                </span>
+                              </div>
+                              <div className="min-w-0">
+                                <p className="truncate text-[12px] font-medium text-foreground">{p.name}</p>
+                                <p className="truncate text-[10px] text-muted-foreground">{p.sku}</p>
+                              </div>
+                            </div>
+                            <div className="mt-2 flex items-baseline justify-between gap-2">
+                              <span className="text-[12.5px] font-semibold tabular-nums text-foreground">
+                                {compactCurrency(p.revenue)}
+                              </span>
+                              <span className="text-[10px] text-muted-foreground">{formatNumber(p.qty)} pcs</span>
+                            </div>
+                            <div className="mt-1.5 flex items-center gap-2">
+                              <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+                                <div
+                                  className="h-full rounded-full"
+                                  style={{
+                                    width: `${Math.max(4, Math.round((p.revenue / max) * 100))}%`,
+                                    background: SERIES_COLORS[0],
+                                  }}
+                                />
+                              </div>
+                              <span className="shrink-0 text-[9.5px] tabular-nums text-muted-foreground">
+                                {formatWeight(p.weight)}
                               </span>
                             </div>
-                            <div className="min-w-0">
-                              <p className="truncate text-[12px] font-medium text-foreground">{p.name}</p>
-                              <p className="truncate text-[10px] text-muted-foreground">{p.sku}</p>
-                            </div>
                           </div>
-                          <div className="mt-2 flex items-baseline justify-between gap-2">
-                            <span className="text-[12.5px] font-semibold tabular-nums text-foreground">
-                              {compactCurrency(p.revenue)}
-                            </span>
-                            <span className="text-[10px] text-muted-foreground">{formatNumber(p.qty)} pcs</span>
-                          </div>
-                          <div className="mt-1.5 flex items-center gap-2">
-                            <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
-                              <div
-                                className="h-full rounded-full"
-                                style={{
-                                  width: `${Math.max(4, Math.round((p.revenue / max) * 100))}%`,
-                                  background: SERIES_COLORS[0],
-                                }}
-                              />
-                            </div>
-                            <span className="shrink-0 text-[9.5px] tabular-nums text-muted-foreground">
-                              {formatWeight(p.weight)}
-                            </span>
-                          </div>
-                        </div>
-                      )
-                    })}
+                        )
+                      })}
+                    </div>
                   </div>
+                ) : salesSource !== 'all' ? (
+                  <EmptyState
+                    icon={ShoppingBag}
+                    title={`No ${salesSource === 'shopify' ? 'Shopify' : 'ERP'} sales in this period`}
+                    description={`No ${salesSource === 'shopify' ? 'Shopify' : 'ERP'} sales in the selected range, so there is nothing to rank. Try another source or a wider date range.`}
+                  />
                 ) : (
                   <EmptyState
                     icon={ShoppingBag}
@@ -555,22 +655,14 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
-            <div className="grid grid-cols-1 gap-4 lg:col-span-7 lg:row-span-2 lg:grid-cols-7">
-              <div className="lg:col-span-4">
-                <SupplierPaymentsCard range={range} />
-              </div>
-              <div className="lg:col-span-3">
-                <PurchaseOrdersCard range={range} />
-              </div>
-              <div className="lg:col-span-4">
-                <CustomerPaymentsCard range={range} />
-              </div>
-              <div className="lg:col-span-3">
-                <SalesOrdersCard range={range} />
-              </div>
+            <div className="h-full xl:col-span-4">
+              <SupplierPaymentsCard range={range} />
+            </div>
+            <div className="h-full xl:col-span-3">
+              <PurchaseOrdersCard range={range} />
             </div>
 
-            <Card className="lg:col-span-4">
+            <Card className="xl:col-span-4">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
                   <CardTitle className="text-sm">Top Selling Category</CardTitle>
@@ -642,7 +734,7 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
-            <div className="lg:col-span-8">
+            <div className="xl:col-span-8">
               <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
             </div>
           </div>
@@ -723,7 +815,7 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
-            <RecentInvoicesCard range={range} />
+            <RecentInvoicesCard range={range} source={salesSource} />
           </div>
 
           <Card>
@@ -793,7 +885,7 @@ function loadStoredRange(): { period: PeriodKey; range: DateRange } | null {
       if (!s || !e || e < s) return null
       return { period: parsed.period, range: { start: parsed.range.start, end: parsed.range.end } }
     }
-    const ok = ['today', 'week', 'month', 'year'].includes(parsed.period)
+    const ok = ['today', 'week', 'last7', 'last30', 'month', 'lastMonth', 'year'].includes(parsed.period)
     return ok ? { period: parsed.period as PeriodKey, range: parsed.range } : null
   } catch {
     return null
@@ -802,8 +894,11 @@ function loadStoredRange(): { period: PeriodKey; range: DateRange } | null {
 
 const PERIODS: { key: PeriodKey; label: string }[] = [
   { key: 'today', label: 'Today' },
+  { key: 'last7', label: 'Last 7 Days' },
+  { key: 'last30', label: 'Last 30 Days' },
   { key: 'week', label: 'This Week' },
   { key: 'month', label: 'This Month' },
+  { key: 'lastMonth', label: 'Last Month' },
   { key: 'year', label: 'This Year' },
 ]
 
@@ -835,15 +930,28 @@ function periodRangeLabel(key: PeriodKey, range?: DateRange) {
   const end = new Date()
   const start = new Date(end)
   if (key === 'today') return fmt(end)
-  if (key === 'week') {
+  if (key === 'last7') {
     start.setDate(end.getDate() - 6)
+    return `${fmt(start)} - ${fmt(end)}`
+  }
+  if (key === 'last30') {
+    start.setDate(end.getDate() - 29)
+    return `${fmt(start)} - ${fmt(end)}`
+  }
+  if (key === 'week') {
+    const back = (end.getDay() + 6) % 7
+    start.setDate(end.getDate() - back)
     return `${fmt(start)} - ${fmt(end)}`
   }
   if (key === 'month') {
     start.setDate(1)
     return `${fmt(start)} - ${fmt(end)}`
   }
-  start.setMonth(end.getMonth() - 11, 1)
+  if (key === 'lastMonth') {
+    const first = new Date(end.getFullYear(), end.getMonth() - 1, 1)
+    const last = new Date(end.getFullYear(), end.getMonth(), 0)
+    return `${fmt(first)} - ${fmt(last)}`
+  }
   start.setTime(new Date(end.getFullYear(), 0, 1).getTime())
   return `${fmt(start)} - ${fmt(end)}`
 }
@@ -989,6 +1097,88 @@ function PeriodSelect({
         </>
       ) : null}
     </div>
+  )
+}
+
+function PaymentStatusPanel({
+  data,
+  error,
+  loading,
+  onViewDetails,
+}: {
+  data: { segments: PaymentStatusSegment[]; total: number } | null
+  error: string | null
+  loading: boolean
+  onViewDetails: () => void
+}) {
+  const total = data?.total ?? 0
+  return (
+    <Card className="flex h-full flex-col">
+      <CardHeader className="flex-row items-center justify-between space-y-0">
+        <div>
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <IndianRupee className="h-4 w-4 text-[#2F5BE0]" /> Payment Status
+          </CardTitle>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">Sales grouped by payment state</p>
+        </div>
+        <Badge variant="muted" className="text-[10px]">{formatCurrency(total, { compact: true })}</Badge>
+      </CardHeader>
+      <CardContent className="flex flex-1 flex-col">
+        {loading ? (
+          <div className="flex flex-1 flex-col justify-center gap-3">
+            <Skeleton className="mx-auto h-[200px] w-[200px] rounded-full" />
+            <div className="space-y-1.5">
+              {Array.from({ length: 5 }).map((_, index) => (
+                <Skeleton key={index} className="h-3.5 w-full rounded" />
+              ))}
+            </div>
+          </div>
+        ) : error ? (
+          <EmptyState
+            icon={ShieldAlert}
+            title="Couldn't load payment status"
+            description="There was an error fetching payment status data. Please try again."
+            action={
+              <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
+                Retry
+              </Button>
+            }
+          />
+        ) : data && total > 0 ? (
+          <>
+            <div className="flex flex-1 flex-col justify-center">
+              <PaymentDonutChart data={data.segments} centerTotal={total} height={220} />
+              <div className="mt-1 space-y-1.5">
+                {data.segments.map((s) => (
+                  <div key={s.status} className="flex items-center gap-2 text-[11.5px]">
+                    <span
+                      className="h-2 w-2 shrink-0 rounded-full"
+                      style={{ background: PAYMENT_STATUS_COLORS[s.status] }}
+                    />
+                    <span className="truncate text-muted-foreground">{s.label}</span>
+                    <span className="ml-auto font-semibold tabular-nums text-foreground">{compactCurrency(s.value)}</span>
+                    <span className="w-8 text-right tabular-nums text-muted-foreground">
+                      {total > 0 ? `${Math.round((s.value / total) * 100)}%` : '0%'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="mt-auto pt-3">
+              <Button variant="soft-primary" className="w-full" size="sm" onClick={onViewDetails}>
+                View Details
+              </Button>
+            </div>
+          </>
+        ) : data ? (
+          <EmptyState
+            icon={IndianRupee}
+            title="No payments yet"
+            description="Once you record invoices, their paid and pending amounts break down here."
+          />
+        ) : null}
+      </CardContent>
+    </Card>
   )
 }
 

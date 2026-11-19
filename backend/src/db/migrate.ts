@@ -39,6 +39,9 @@ async function main() {
   await client.unsafe(`ALTER TABLE "sales_invoices" ADD COLUMN IF NOT EXISTS "customer_state" text;`)
   await client.unsafe(`ALTER TABLE "sales_invoices" ADD COLUMN IF NOT EXISTS "customer_pincode" text;`)
 
+  // Accounting: exact source tagging for unified ERP + Shopify journals
+  await client.unsafe(`ALTER TABLE "journal_entries" ADD COLUMN IF NOT EXISTS "source" text;`)
+
   // Silver rate audit fields + staff rate-change approval workflow
   console.log('Ensuring silver rate audit columns and rate request table...')
   await client.unsafe(`ALTER TABLE "silver_rates" ADD COLUMN IF NOT EXISTS "updated_by" text;`)
@@ -259,6 +262,9 @@ async function main() {
        AND l.name = t."to"
        AND NOT EXISTS (SELECT 1 FROM inventory_locations i WHERE i.id = t."to");`)
   await client.unsafe(`ALTER TABLE "sales_orders" ADD COLUMN IF NOT EXISTS "location_id" text;`)
+  // Shopify shop an order belongs to (a previous connection's rows must not be
+  // counted as the connected shop's orders).
+  await client.unsafe(`ALTER TABLE "sales_orders" ADD COLUMN IF NOT EXISTS "shopify_store" text;`)
   await client.unsafe(`ALTER TABLE "purchase_invoices" ADD COLUMN IF NOT EXISTS "location_id" text;`)
 
   console.log('Seeding default roles (idempotent)...')

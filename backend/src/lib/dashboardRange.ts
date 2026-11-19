@@ -11,7 +11,7 @@
  * business-day reporting the rest of the app uses.
  */
 
-export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'last3m' | 'last6m' | 'last12m' | 'month' | 'year' | 'custom'
+export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'last3m' | 'last6m' | 'last12m' | 'month' | 'lastMonth' | 'year' | 'custom'
 
 export interface DashboardRange {
   key: PeriodKey
@@ -34,7 +34,7 @@ export type RangeResult =
   | { ok: true; range: DashboardRange }
   | { ok: false; status: number; error: string }
 
-const PERIODS: readonly PeriodKey[] = ['today', 'week', 'last7', 'last30', 'last3m', 'last6m', 'last12m', 'month', 'year', 'custom']
+const PERIODS: readonly PeriodKey[] = ['today', 'week', 'last7', 'last30', 'last3m', 'last6m', 'last12m', 'month', 'lastMonth', 'year', 'custom']
 
 const pad = (n: number) => String(n).padStart(2, '0')
 
@@ -183,6 +183,22 @@ export function resolveDashboardRange(query: Record<string, unknown>, now: Date 
         prevFrom: naive(prevFrom), prevTo: naive(prevTo),
         prevLabel: 'vs last month',
         days, bucket: days > 62 ? 'month' : 'day',
+      },
+    }
+  }
+
+  if (key === 'lastMonth') {
+    const from = new Date(today.getFullYear(), today.getMonth() - 1, 1)
+    const to = new Date(today.getFullYear(), today.getMonth(), 1)
+    const prevFrom = new Date(today.getFullYear(), today.getMonth() - 2, 1)
+    return {
+      ok: true,
+      range: {
+        key, label: 'Last Month',
+        from: naive(from), to: naive(to),
+        prevFrom: naive(prevFrom), prevTo: naive(from),
+        prevLabel: 'vs previous month',
+        days: daysBetween(from, to), bucket: 'day',
       },
     }
   }

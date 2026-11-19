@@ -1,7 +1,7 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ColumnDef } from '@/lib/table'
-import { ArrowDownRight, ArrowUpRight, Download, Loader2, Pencil, Plus, Trash2 } from 'lucide-react'
+import { ArrowDownRight, ArrowUpRight, BookOpen, Download, Loader2, Pencil, Plus, Trash2 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -193,6 +193,8 @@ export default function LedgerPage() {
       <PageHeader
         title="General Ledger"
         subtitle="All debit and credit entries across accounts."
+        icon={<BookOpen className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />}
+        iconTileClassName="bg-[#7547F5] text-white ring-[#7547F5] dark:bg-[#7547F5] dark:text-white dark:ring-[#7547F5]"
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => exportTable('ledger-entries', columns.filter(c => 'accessorKey' in c && typeof c.accessorKey === 'string'), filtered)}>

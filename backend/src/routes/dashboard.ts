@@ -22,7 +22,9 @@ function requireDb(res: Response) {
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 
-const inr = (n: number) => `₹${Math.round(n).toLocaleString('en-IN')}`
+// Paise are kept so the KPI reads exactly the same figure as the Sales
+// Overview card (which formats the raw amount), not a rounded look-alike.
+const inr = (n: number) => `${n < 0 ? '−' : ''}₹${Math.abs(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 
 function pad(n: number) {
   return String(n).padStart(2, '0')
@@ -44,10 +46,41 @@ const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(mi
 // the string-format quirks ('T' vs ' ') that JS-side string compares had.
 const OUTSTANDING_WHERE = sql`(payment_status in ('pending','partial') or status = 'overdue')`
 
-// One receivable definition everywhere: the unpaid part of open invoices,
-// after successful payments. Shared by the Outstanding KPI, the summary strip
-// and the Receivable Summary so their totals and counts always agree.
-const UNPAID_INVOICE = sql`greatest(coalesce(${schema.salesInvoices.grandTotal}, 0) - coalesce((select sum(coalesce(${schema.payments.amount}, 0)) from ${schema.payments} where ${schema.payments.invoice} = ${schema.salesInvoices.number} and ${schema.payments.status} = 'success'), 0), 0)`
+// One receivable definition everywhere: the actual unpaid balance of an open
+// invoice. An invoice already marked paid is fully collected even when the
+// imported row carries no payment entry; otherwise the money received is the
+// sum of successful payments (the app writes 'success', the seed/imports write
+// 'settled' and 'paid' — all three settle money). Failed and refunded entries
+// never reduce a balance. Shared by the Outstanding KPI, the summary strip, the
+// aging widget and the Receivable Summary so their totals always agree.
+const COLLECTED_ON_INVOICE = sql`case
+  when lower(coalesce(${schema.salesInvoices.paymentStatus}, '')) = 'paid'
+    or lower(coalesce(${schema.salesInvoices.status}, '')) = 'paid'
+    then coalesce(${schema.salesInvoices.grandTotal}, 0)
+  else least(
+    coalesce(${schema.salesInvoices.grandTotal}, 0),
+    coalesce((
+      select sum(coalesce(${schema.payments.amount}, 0))
+        from ${schema.payments}
+       where ${schema.payments.invoice} = ${schema.salesInvoices.number}
+         and coalesce(${schema.payments.amount}, 0) > 0
+         and lower(coalesce(${schema.payments.status}, '')) in ('success', 'settled', 'paid')
+    ), 0)
+  )
+end`
+
+const UNPAID_INVOICE = sql`greatest(coalesce(${schema.salesInvoices.grandTotal}, 0) - (${COLLECTED_ON_INVOICE}), 0)`
+
+/** JS mirror of COLLECTED_ON_INVOICE for endpoints that age open invoices. */
+function collectedAmount(
+  row: { grandTotal?: unknown; paymentStatus?: string | null; status?: string | null; number?: string | null },
+  paidByInvoice: Map<string, number>,
+): number {
+  const gross = num(row.grandTotal)
+  const paidFlag = String(row.paymentStatus ?? '').toLowerCase() === 'paid'
+    || String(row.status ?? '').toLowerCase() === 'paid'
+  return paidFlag ? gross : Math.min(gross, paidByInvoice.get(row.number ?? '') ?? 0)
+}
 
 // B2B vs B2C GST split heuristic. The JS pattern is the original matcher; the
 // string form runs the same alternation in Postgres via case-insensitive ~*.
@@ -61,6 +94,36 @@ const BUSINESS_NAME_RE = 'house|jewels|llp|pvt|ltd|exports|trading|industries|fi
 // drop it too or the widgets totals disagree (money reported as refunded and
 // as sales at the same time).
 const NOT_VOIDED = sql`coalesce(${schema.salesInvoices.status}, '') not in ('cancelled', 'refunded') and coalesce(${schema.salesInvoices.paymentStatus}, '') <> 'refunded'`
+
+// An invoice whose Shopify order was left behind by a previous Shopify
+// connection (the importer tags it 'not-in-store') is history, not a sale of
+// the connected shop: the dashboard must not count it as today's orders or
+// revenue. The row itself is kept; this only scopes sales figures to the shop
+// the app is actually connected to.
+const NOT_FOREIGN_SHOPIFY = sql`not exists (select 1 from ${schema.salesOrders} as foreign_order where foreign_order.shopify_id = ${schema.salesInvoices.shopifyOrder} and foreign_order.shopify_store = 'not-in-store')`
+
+// A credit note belongs to the platform of the sale it credits. When that sale
+// is a foreign-store invoice, the invoice is excluded from the connected
+// shop's sales — so its return must be excluded too, or the dashboard reports
+// a return on money it never counted as revenue (which understated This Year
+// by the full value of every foreign return). The link may come from the
+// invoice row or, for older returns, from the `#order` text alone.
+const FOREIGN_RETURN = sql`(
+  exists (
+    select 1
+      from ${schema.salesInvoices} as return_invoice
+      join ${schema.salesOrders} as return_invoice_order
+        on return_invoice_order.shopify_id = return_invoice.shopify_order
+     where return_invoice.id = ${schema.salesReturns.invoiceId}
+       and return_invoice_order.shopify_store = 'not-in-store'
+  )
+  or exists (
+    select 1
+      from ${schema.salesOrders} as return_order
+     where return_order.shopify_id = ${schema.salesReturns.order}
+       and return_order.shopify_store = 'not-in-store'
+  )
+)`
 
 /** Resolve the page-wide range from the request, or send a 400 and return null. */
 function rangeFromQuery(req: { query: unknown }, res: Response, defaultPeriod?: string): DashboardRange | null {
@@ -95,20 +158,6 @@ function compare(cur: number, prev: number): { trend: 'up' | 'down' | 'flat'; de
   return { trend: cur > prev ? 'up' : cur < prev ? 'down' : 'flat', delta: `${pct}%` }
 }
 
-/** Value of sales returns (credit notes) booked in [from, to), excluding cancelled ones. */
-async function returnsTotal(from: string, to: string): Promise<number> {
-  const rows = await db!
-    .select({ amount: sql<number>`coalesce(sum(coalesce(${schema.salesReturns.amount}, 0)), 0)` })
-    .from(schema.salesReturns)
-    .where(and(
-      gte(schema.salesReturns.date, from),
-      sql`${schema.salesReturns.date} < ${to}`,
-      sql`coalesce(${schema.salesReturns.status}, '') <> 'cancelled'`,
-    ))
-  return num(rows[0]?.amount)
-}
-
-
 const iconFor = (name: string, category: string | null): string => {
   const n = `${name} ${category ?? ''}`.toLowerCase()
   if (/ring|band/.test(n)) return 'ring'
@@ -139,39 +188,29 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
           costedCount: sql<number>`count(*) filter (where silver_value is not null and making_charge is not null)`,
         })
         .from(schema.salesInvoices)
-        .where(and(gte(schema.salesInvoices.date, from), sql`${schema.salesInvoices.date} < ${to}`, NOT_VOIDED))
+        .where(and(gte(schema.salesInvoices.date, from), sql`${schema.salesInvoices.date} < ${to}`, NOT_VOIDED, NOT_FOREIGN_SHOPIFY))
       const r = rows[0]
       return { total: num(r.total), count: Number(r.count), profit: num(r.profit), cost: num(r.cost), costedCount: Number(r.costedCount) }
     }
-    const ordersAgg = async (from: string, to: string) => {
-      const rows = await db!
-        .select({ count: sql<number>`count(*)` })
-        .from(schema.salesOrders)
-        .where(and(gte(schema.salesOrders.date, from), sql`${schema.salesOrders.date} < ${to}`, sql`coalesce(${schema.salesOrders.status}, '') <> 'cancelled'`))
-      return Number(rows[0]?.count ?? 0)
-    }
-
-    const [cur, prev, curOrders, prevOrders, curReturns, prevReturns, lowStockRows, outstandingRows] = await Promise.all([
+    const [cur, prev, curTotals, prevTotals, lowStockRows, outstandingRows] = await Promise.all([
       invAgg(range.from, range.to),
       invAgg(range.prevFrom, range.prevTo),
-      ordersAgg(range.from, range.to),
-      ordersAgg(range.prevFrom, range.prevTo),
-      returnsTotal(range.from, range.to),
-      returnsTotal(range.prevFrom, range.prevTo),
+      salesTotals(range),
+      salesTotals({ ...range, from: range.prevFrom, to: range.prevTo }),
       db!.select({ n: sql<number>`count(*)` }).from(schema.products).where(lowStockWhere()),
       db!.select({
         total: sql<number>`coalesce(sum(${UNPAID_INVOICE}), 0)`,
         count: sql<number>`count(*) filter (where ${UNPAID_INVOICE} > 0)`,
-      }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED, NOT_FOREIGN_SHOPIFY)),
     ])
 
-    // Returns (credit notes) reduce the period's sales, so a returned sale
-    // lowers the totals consistently with the invoice list.
-    const curSales = Math.max(0, cur.total - curReturns)
-    const prevSales = Math.max(0, prev.total - prevReturns)
+    // Sales, orders and invoice count all come from the shared ledger — the
+    // exact figures the Sales Overview cards and graph render for this range.
+    const curSales = curTotals.revenue
+    const prevSales = prevTotals.revenue
     const salesCompare = compare(curSales, prevSales)
-    const orderCompare = compare(curOrders, prevOrders)
-    const invoiceCompare = compare(cur.count, prev.count)
+    const orderCompare = compare(curTotals.orders, prevTotals.orders)
+    const invoiceCompare = compare(curTotals.invoiceCount, prevTotals.invoiceCount)
     // Gross profit uses metal + making (the app's cost basis), counted only
     // over invoices that carry both components. With no costed invoice in the
     // window it reads N/A instead of a misleading 100% margin, and the caption
@@ -179,15 +218,15 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
     const hasCost = cur.costedCount > 0
     const profitCompare = hasCost ? compare(cur.profit, prev.costedCount > 0 ? prev.profit : 0) : { trend: 'flat' as const, delta: '—' }
     const profitCaption = hasCost
-      ? `based on ${cur.costedCount} of ${cur.count} invoices`
+      ? `based on ${cur.costedCount} of ${curTotals.invoiceCount} invoices`
       : 'no cost basis in range'
     const outstanding = num(outstandingRows[0]?.total)
     const outstandingCount = Number(outstandingRows[0]?.count ?? 0)
 
     res.json([
       { key: 'sales', label: 'Sales', value: inr(curSales), trend: salesCompare.trend, delta: salesCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'indian-rupee', accent: 'purple' },
-      { key: 'orders', label: 'Orders', value: String(curOrders), trend: orderCompare.trend, delta: orderCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'shopping-bag', accent: 'blue' },
-      { key: 'invoices', label: 'Invoices', value: String(cur.count), trend: invoiceCompare.trend, delta: invoiceCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'file-text', accent: 'green' },
+      { key: 'orders', label: 'Orders', value: String(curTotals.orders), trend: orderCompare.trend, delta: orderCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'shopping-bag', accent: 'blue' },
+      { key: 'invoices', label: 'Invoices', value: String(curTotals.invoiceCount), trend: invoiceCompare.trend, delta: invoiceCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'file-text', accent: 'green' },
       { key: 'grossProfit', label: 'Gross Profit', value: hasCost ? inr(cur.profit) : 'N/A', trend: profitCompare.trend, delta: profitCompare.delta, deltaLabel: profitCaption, rangeLabel: range.label, icon: 'trending-up', accent: 'orange' },
       { key: 'outstanding', label: 'Outstanding', value: inr(outstanding), trend: 'flat', delta: '—', deltaLabel: `${outstandingCount} invoices`, rangeLabel: 'As of now', icon: 'clock', accent: 'red' },
       { key: 'lowStock', label: 'Low Stock Items', value: String(Number(lowStockRows[0]?.n ?? 0)), trend: 'flat', delta: '—', deltaLabel: 'Needs Reorder', rangeLabel: 'As of now', icon: 'package-x', accent: 'slate' },
@@ -225,7 +264,7 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
         today: sql<number>`coalesce(sum(coalesce(amount, 0)) filter (where date >= ${todayStart} and date < ${todayEnd}), 0)`,
         ranged: sql<number>`coalesce(sum(coalesce(amount, 0)) filter (where date >= ${range.from} and date < ${range.to}), 0)`,
       }).from(schema.expenses),
-      db!.select({ total: sql<number>`coalesce(sum(${UNPAID_INVOICE}), 0)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      db!.select({ total: sql<number>`coalesce(sum(${UNPAID_INVOICE}), 0)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED, NOT_FOREIGN_SHOPIFY)),
       db!.select({ total: sql<number>`count(*)` }).from(schema.salesOrders),
       db!.select({ total: sql<number>`count(*)` }).from(schema.salesInvoices),
       db!.select({ at: sql<string | null>`max(${schema.syncLogs.time})` }).from(schema.syncLogs),
@@ -272,10 +311,320 @@ export async function salesBuckets(format: string, range: { from: string; to: st
       gte(schema.salesInvoices.date, range.from),
       sql`${schema.salesInvoices.date} < ${range.to}`,
       NOT_VOIDED,
+      // Same revenue scope as the Sales KPI and the chart: without this the
+      // Financial income series counted foreign-store invoices the headline
+      // (netRevenue) excludes, so the bars never summed to the tile.
+      NOT_FOREIGN_SHOPIFY,
     ))
     .groupBy(sql`1`)
   const map = new Map<string, { revenue: number; orders: number }>()
   for (const r of rows) map.set(String(r.bucket ?? ''), { revenue: num(r.revenue), orders: Number(r.orders) })
+  return map
+}
+
+// A sale belongs to Shopify when its invoice carries a Shopify order reference
+// (`#1027`). An invoice raised for an order that exists only in the ERP carries
+// the ERP reference (`MO-…`, `SO…`) and must stay an ERP sale — keying on
+// "any non-empty reference" silently moved those to Shopify.
+// The invoice row is the revenue record, so counting it once prevents a Shopify
+// order and its return/refund rows from being added as extra sales.
+const SHOPIFY_INVOICE = sql`coalesce(trim(${schema.salesInvoices.shopifyOrder}), '') like '#%'`
+const ERP_INVOICE = sql`not (${SHOPIFY_INVOICE})`
+
+/**
+ * ERP sales that exist only as an order row. Manual orders (and orders
+ * converted from quotations) are saved in `sales_orders`; an invoice is only
+ * raised when someone asks for one. Reading invoices alone therefore reported
+ * zero ERP sales while the Sales Orders page listed those orders.
+ *
+ * An order is counted here when it is a live sale (confirmed or further down
+ * the pipeline, never cancelled/booked), is not a Shopify-imported order, and
+ * has no invoice of its own — the invoice already carries its revenue. A synced
+ * ERP order whose Shopify copy was imported back as its own invoiced order is
+ * skipped too, so All Sales counts that sale once.
+ */
+const ERP_ORDER_SALE = sql`(
+  lower(coalesce(${schema.salesOrders.status}, '')) in ('confirmed', 'processing', 'fulfilled')
+  and coalesce(${schema.salesOrders.isBooking}, false) = false
+  and ${schema.salesOrders.cancelledAt} is null
+  and coalesce(nullif(trim(${schema.salesOrders.invoice}), ''), '') = ''
+  -- ERP origin: a manual order must stay an ERP sale even after it claimed the
+  -- Shopify display name (#1027) when it was synced.
+  and (coalesce(${schema.salesOrders.shopifyId}, '') not like '#%' or ${schema.salesOrders.internalId} like 'MO-%')
+  and not exists (
+    select 1
+      from ${schema.salesOrders} as twin
+     where twin.id <> ${schema.salesOrders.id}
+       and nullif(trim(twin.invoice), '') is not null
+       and (
+         (${schema.salesOrders.shopifyGid} is not null and twin.shopify_gid = ${schema.salesOrders.shopifyGid})
+         or (${schema.salesOrders.internalId} is not null and twin.shopify_id = ${schema.salesOrders.shopifyId})
+       )
+  )
+)`
+
+/**
+ * A live Shopify order that has no invoice yet. Its revenue lives only on the
+ * order row, exactly like an uninvoiced ERP order, so the Shopify split of the
+ * ledger adds it instead of silently dropping the sale. An order that owns an
+ * invoice is excluded, so the invoice remains the single money record and no
+ * sale is counted twice.
+ */
+const SHOPIFY_ORDER_SALE = sql`(
+  coalesce(${schema.salesOrders.shopifyId}, '') like '#%'
+  and lower(coalesce(${schema.salesOrders.status}, '')) not in ('cancelled', 'draft')
+  and coalesce(${schema.salesOrders.isBooking}, false) = false
+  and ${schema.salesOrders.cancelledAt} is null
+  and lower(coalesce(${schema.salesOrders.payment}, '')) <> 'refunded'
+  and coalesce(nullif(trim(${schema.salesOrders.invoice}), ''), '') = ''
+  and coalesce(${schema.salesOrders.shopifyStore}, '') <> 'not-in-store'
+)`
+
+/**
+ * A manual (ERP) order that was pushed to Shopify and imported back as its own
+ * Shopify order row is the SAME sale represented twice. The Orders KPI and the
+ * Order Summary counted both rows, so a synced order inflated the order count
+ * (and showed up as one online + one in-store order) even though the Sales
+ * Overview already collapses the pair. Identify the ERP half of the pair by its
+ * non-`#` shopify id and the Shopify half by the shared gid (or by the twin's
+ * `#` id matching this row's internal id).
+ */
+const SYNCED_ERP_TWIN = sql`(
+  coalesce(${schema.salesOrders.shopifyId}, '') not like '#%'
+  and exists (
+    select 1
+      from ${schema.salesOrders} as order_twin
+     where order_twin.id <> ${schema.salesOrders.id}
+       and coalesce(order_twin.shopify_id, '') like '#%'
+       and (
+         (${schema.salesOrders.shopifyGid} is not null and order_twin.shopify_gid = ${schema.salesOrders.shopifyGid})
+         or (${schema.salesOrders.internalId} is not null and order_twin.shopify_id = ${schema.salesOrders.internalId})
+       )
+  )
+)`
+
+/** A Shopify-imported order; manual ERP orders carry their `MO-…` id in the
+ * same column, so a non-null id alone does not mean the sale came from Shopify. */
+const SHOPIFY_ORDER = sql`coalesce(${schema.salesOrders.shopifyId}, '') like '#%'`
+
+type SourceKey = 'all' | 'shopify' | 'erp'
+
+function sourceFilter(value: unknown): SourceKey | null {
+  const source = String(value ?? 'all')
+  return source === 'all' || source === 'shopify' || source === 'erp' ? source : null
+}
+
+const sourceWhere = (source: SourceKey) => source === 'shopify' ? SHOPIFY_INVOICE : source === 'erp' ? ERP_INVOICE : sql`true`
+
+/**
+ * THE sales calculation. Every dashboard surface — the Sales KPI, the Sales
+ * Overview cards and graph, Financial Net Revenue and Analytics Total Sales —
+ * reads revenue from this one ledger, so no two widgets can drift apart.
+ *
+ * Revenue definition (per bucket):
+ *   eligible invoices (not cancelled/refunded, not foreign-store)
+ * + uninvoiced live ERP orders (their value exists only on the order row)
+ * − sales returns / credit notes
+ * The Shopify and ERP splits use the same invoice rows: an invoice with a
+ * Shopify `#order` reference is Shopify revenue, anything else is ERP. An ERP
+ * order that already owns an invoice is not added again (ERP_ORDER_SALE), so
+ * `All` is exactly Shopify + ERP with every sale counted once.
+ */
+export type SalesLedgerBucket = {
+  gross: number
+  erpOrderRevenue: number
+  shopifyOrderRevenue: number
+  returns: number
+  revenue: number
+  orders: number
+  invoiceCount: number
+  shopifyRevenue: number
+  shopifyOrders: number
+  shopifyReturns: number
+  erpRevenue: number
+  erpOrders: number
+  erpReturns: number
+}
+
+export async function salesLedgerBuckets(format: string, range: { from: string; to: string }): Promise<Map<string, SalesLedgerBucket>> {
+  const [invoiceRows, orderRows, erpOrderRows, returnRows] = await Promise.all([
+    // Gross invoiced value by platform comes from the invoice (the money
+    // record). Returns are netted off below, not here.
+    db!
+      .select({
+        bucket: sql`to_char(${schema.salesInvoices.date}, ${format})`,
+        shopifyGross: sql<number>`coalesce(sum(case when ${SHOPIFY_INVOICE} then grand_total else 0 end), 0)`,
+        erpGross: sql<number>`coalesce(sum(case when ${ERP_INVOICE} then grand_total else 0 end), 0)`,
+        invoiceCount: sql<number>`count(*)`,
+      })
+      .from(schema.salesInvoices)
+      .where(and(
+        sql`${schema.salesInvoices.date} is not null`,
+        gte(schema.salesInvoices.date, range.from),
+        sql`${schema.salesInvoices.date} < ${range.to}`,
+        NOT_VOIDED,
+        NOT_FOREIGN_SHOPIFY,
+      ))
+      .groupBy(sql`1`),
+    // Order counts come from the order rows, not from invoices: one order can
+    // carry several invoices (a reissue, a split bill) and a manual invoice can
+    // exist without an order, so counting invoices as orders reported 50
+    // "orders" where the Orders KPI (and the Orders page) counted 31. The same
+    // live scope as the KPI applies here.
+    db!
+      .select({
+        bucket: sql`to_char(${schema.salesOrders.date}, ${format})`,
+        orders: sql<number>`count(*)`,
+        shopifyOrders: sql<number>`count(*) filter (where ${SHOPIFY_ORDER})`,
+        erpOrders: sql<number>`count(*) filter (where not (${SHOPIFY_ORDER}))`,
+      })
+      .from(schema.salesOrders)
+      .where(and(
+        gte(schema.salesOrders.date, range.from),
+        sql`${schema.salesOrders.date} < ${range.to}`,
+        sql`coalesce(${schema.salesOrders.status}, '') <> 'cancelled'`,
+        // A booking/quotation and a draft are not completed sales; they must
+        // not inflate Total Orders or the order-summary bars.
+        sql`lower(coalesce(${schema.salesOrders.status}, '')) <> 'draft'`,
+        sql`coalesce(${schema.salesOrders.isBooking}, false) = false`,
+        sql`coalesce(${schema.salesOrders.shopifyStore}, '') <> 'not-in-store'`,
+        sql`not (${SYNCED_ERP_TWIN})`,
+      ))
+      .groupBy(sql`1`),
+    // Uninvoiced orders hold revenue no invoice carries. Their order count is
+    // already in `orderRows`; only their value is added here, split by platform
+    // with the same open-order definitions the order counts use.
+    db!
+      .select({
+        bucket: sql`to_char(${schema.salesOrders.date}, ${format})`,
+        shopifyRevenue: sql<number>`coalesce(sum(case when ${SHOPIFY_ORDER_SALE} then coalesce(${schema.salesOrders.value}, 0) else 0 end), 0)`,
+        erpRevenue: sql<number>`coalesce(sum(case when ${ERP_ORDER_SALE} then coalesce(${schema.salesOrders.value}, 0) else 0 end), 0)`,
+      })
+      .from(schema.salesOrders)
+      .where(and(
+        gte(schema.salesOrders.date, range.from),
+        sql`${schema.salesOrders.date} < ${range.to}`,
+        or(ERP_ORDER_SALE, SHOPIFY_ORDER_SALE),
+      ))
+      .groupBy(sql`1`),
+    returnSourceBuckets(format, range),
+  ])
+  const map = new Map<string, SalesLedgerBucket>()
+  const bucketFor = (key: string) => {
+    const existing = map.get(key)
+    if (existing) return existing
+    const created: SalesLedgerBucket = {
+      gross: 0, erpOrderRevenue: 0, shopifyOrderRevenue: 0, returns: 0, revenue: 0, orders: 0, invoiceCount: 0,
+      shopifyRevenue: 0, shopifyOrders: 0, shopifyReturns: 0,
+      erpRevenue: 0, erpOrders: 0, erpReturns: 0,
+    }
+    map.set(key, created)
+    return created
+  }
+  for (const r of invoiceRows) {
+    const bucket = bucketFor(String(r.bucket ?? ''))
+    bucket.shopifyRevenue = num(r.shopifyGross)
+    bucket.erpRevenue = num(r.erpGross)
+    bucket.gross = round2(bucket.shopifyRevenue + bucket.erpRevenue)
+    bucket.invoiceCount = Number(r.invoiceCount ?? 0)
+  }
+  for (const r of orderRows) {
+    const bucket = bucketFor(String(r.bucket ?? ''))
+    bucket.orders = Number(r.orders)
+    bucket.shopifyOrders = Number(r.shopifyOrders)
+    bucket.erpOrders = Number(r.erpOrders)
+  }
+  for (const r of erpOrderRows) {
+    const bucket = bucketFor(String(r.bucket ?? ''))
+    bucket.erpOrderRevenue = num(r.erpRevenue)
+    bucket.shopifyOrderRevenue = num(r.shopifyRevenue)
+  }
+  for (const [key, value] of returnRows) {
+    const bucket = bucketFor(key)
+    bucket.shopifyReturns = num(value.shopify)
+    bucket.erpReturns = num(value.erp)
+    bucket.returns = round2(bucket.shopifyReturns + bucket.erpReturns)
+  }
+  for (const bucket of map.values()) {
+    bucket.revenue = round2(bucket.gross + bucket.erpOrderRevenue + bucket.shopifyOrderRevenue - bucket.returns)
+    // Gross by platform plus that platform's uninvoiced orders, less its
+    // returns. An order with an invoice is never added again.
+    bucket.shopifyRevenue = round2(bucket.shopifyRevenue + bucket.shopifyOrderRevenue - bucket.shopifyReturns)
+    bucket.erpRevenue = round2(bucket.erpRevenue + bucket.erpOrderRevenue - bucket.erpReturns)
+  }
+  return map
+}
+
+export type SalesTotals = Omit<SalesLedgerBucket, 'gross'> & { gross: number }
+
+/** Period totals, derived from the same buckets the charts render, so the KPI
+ * and the graph sums are the same numbers by construction. */
+export async function salesTotals(range: DashboardRange): Promise<SalesTotals> {
+  const buckets = await salesLedgerBuckets(bucketFormat(range), range)
+  const totals: SalesTotals = {
+    gross: 0, erpOrderRevenue: 0, shopifyOrderRevenue: 0, returns: 0, revenue: 0, orders: 0, invoiceCount: 0,
+    shopifyRevenue: 0, shopifyOrders: 0, shopifyReturns: 0,
+    erpRevenue: 0, erpOrders: 0, erpReturns: 0,
+  }
+  for (const bucket of buckets.values()) {
+    totals.gross += bucket.gross
+    totals.erpOrderRevenue += bucket.erpOrderRevenue
+    totals.shopifyOrderRevenue += bucket.shopifyOrderRevenue
+    totals.returns += bucket.returns
+    totals.revenue += bucket.revenue
+    totals.orders += bucket.orders
+    totals.invoiceCount += bucket.invoiceCount
+    totals.shopifyRevenue += bucket.shopifyRevenue
+    totals.shopifyOrders += bucket.shopifyOrders
+    totals.shopifyReturns += bucket.shopifyReturns
+    totals.erpRevenue += bucket.erpRevenue
+    totals.erpOrders += bucket.erpOrders
+    totals.erpReturns += bucket.erpReturns
+  }
+  for (const key of Object.keys(totals) as Array<keyof SalesTotals>) {
+    totals[key] = round2(totals[key])
+  }
+  return totals
+}
+
+/**
+ * Returns split by the platform of the invoice they credit. A return linked to
+ * a Shopify invoice reduces Shopify revenue even if it was entered in the ERP;
+ * unlinked rows fall back to their own source/order marker. Every return is
+ * attributed to exactly one platform, so combined revenue remains the old
+ * invoice-minus-return figure.
+ */
+export async function returnSourceBuckets(format: string, range: { from: string; to: string }) {
+  const bucketSql = sql`to_char(${schema.salesReturns.date}, ${format})`
+  const shopifyReturn = sql<boolean>`case
+    when ${schema.salesReturns.invoiceId} is not null and ${schema.salesInvoices.id} is not null
+      then (${SHOPIFY_INVOICE})
+    else (
+      lower(coalesce(${schema.salesReturns.source}, '')) = 'shopify'
+      or nullif(${schema.salesReturns.shopifyReturnId}, '') is not null
+      or coalesce(${schema.salesReturns.order}, '') like '#%'
+    )
+  end`
+  const rows = await db!
+    .select({
+      bucket: bucketSql,
+      amount: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)`,
+      shopifyAmount: sql<number>`coalesce(sum(case when ${shopifyReturn} then coalesce(amount, 0) else 0 end), 0)`,
+    })
+    .from(schema.salesReturns)    .leftJoin(schema.salesInvoices, eq(schema.salesInvoices.id, schema.salesReturns.invoiceId))
+    .where(and(
+      gte(schema.salesReturns.date, range.from),
+      sql`${schema.salesReturns.date} < ${range.to}`,
+      sql`coalesce(${schema.salesReturns.status}, '') <> 'cancelled'`,
+      sql`not (${FOREIGN_RETURN})`,
+    ))
+    .groupBy(sql`1`)
+  const map = new Map<string, { shopify: number; erp: number }>()
+  for (const r of rows) {
+    const total = num(r.amount)
+    const shopify = num(r.shopifyAmount)
+    map.set(String(r.bucket ?? ''), { shopify, erp: total - shopify })
+  }
   return map
 }
 
@@ -288,6 +637,7 @@ export async function returnBuckets(format: string, range: { from: string; to: s
       gte(schema.salesReturns.date, range.from),
       sql`${schema.salesReturns.date} < ${range.to}`,
       sql`coalesce(${schema.salesReturns.status}, '') <> 'cancelled'`,
+      sql`not (${FOREIGN_RETURN})`,
     ))
     .groupBy(sql`1`)
   const map = new Map<string, number>()
@@ -309,27 +659,289 @@ async function expenseBuckets(format: string, range: { from: string; to: string 
   return map
 }
 
+type SalesPoint = {
+  key: string; date: string; label: string; revenue: number; orders: number
+  shopifyRevenue: number; shopifyOrders: number
+  erpRevenue: number; erpOrders: number
+}
+
+/** Current-period chart points, straight from the shared sales ledger. The
+ * ledger already nets returns and adds uninvoiced ERP orders, so a point's
+ * revenue is the same definition the KPI uses. */
+async function buildSalesPoints(range: Pick<DashboardRange, 'from' | 'to' | 'days' | 'bucket'>): Promise<SalesPoint[]> {
+  const format = range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD'
+  const ledger = await salesLedgerBuckets(format, range)
+  return enumerateBuckets(range).map((b) => {
+    const bucket = ledger.get(b.key)
+    return {
+      key: b.key,
+      date: b.date,
+      label: b.label,
+      revenue: round2(num(bucket?.revenue)),
+      orders: Number(bucket?.orders ?? 0),
+      shopifyRevenue: round2(num(bucket?.shopifyRevenue)),
+      shopifyOrders: Number(bucket?.shopifyOrders ?? 0),
+      erpRevenue: round2(num(bucket?.erpRevenue)),
+      erpOrders: Number(bucket?.erpOrders ?? 0),
+    }
+  })
+}
+
 dashboardRouter.get('/dashboard/sales-overview', async (req, res) => {
   if (!requireDb(res)) return
   const range = rangeFromQuery(req, res)
   if (!range) return
   try {
-    const format = range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD'
-    const [sales, returns] = await Promise.all([salesBuckets(format, range), returnBuckets(format, range)])
-    const points: { date: string; label: string; revenue: number; orders: number }[] = []
-    const point = (key: string, label: string, date: string) => {
-      const b = sales.get(key)
-      points.push({
-        date,
-        label,
-        revenue: round2(num(b?.revenue) - (returns.get(key) ?? 0)),
-        orders: Number(b?.orders ?? 0),
-      })
-    }
+    res.json(await buildSalesPoints(range))
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
 
-    const { enumerateBuckets } = await import('../lib/dashboardRange')
-    for (const b of enumerateBuckets(range)) point(b.key, b.label, b.date)
-    res.json(points)
+// Per-platform customers and paid orders, used by the KPI/insight cards. The
+// invoice is the transaction boundary for invoiced sales; uninvoiced ERP orders
+// are counted through the order row that holds them. The unique invoice number
+// prevents a retry from adding another row.
+async function customerTotals(range: { from: string; to: string }) {
+  const [rows, erpOrderRows, allCustomers, erpCustomers] = await Promise.all([
+    db!
+      .select({
+        customersShopify: sql<number>`count(distinct case when ${SHOPIFY_INVOICE} then lower(nullif(trim(customer), '')) end)`,
+        paidAll: sql<number>`coalesce(sum(case when lower(coalesce(payment_status, '')) = 'paid' then 1 else 0 end), 0)`,
+        paidShopify: sql<number>`coalesce(sum(case when ${SHOPIFY_INVOICE} and lower(coalesce(payment_status, '')) = 'paid' then 1 else 0 end), 0)`,
+        paidErp: sql<number>`coalesce(sum(case when ${ERP_INVOICE} and lower(coalesce(payment_status, '')) = 'paid' then 1 else 0 end), 0)`,
+      })
+      .from(schema.salesInvoices)
+      .where(and(
+        sql`${schema.salesInvoices.date} is not null`,
+        gte(schema.salesInvoices.date, range.from),
+        sql`${schema.salesInvoices.date} < ${range.to}`,
+        NOT_VOIDED,
+        NOT_FOREIGN_SHOPIFY,
+      )),
+    db!
+      .select({
+        paid: sql<number>`coalesce(sum(case when lower(coalesce(${schema.salesOrders.payment}, '')) = 'paid' then 1 else 0 end), 0)`,
+      })
+      .from(schema.salesOrders)
+      .where(and(
+        gte(schema.salesOrders.date, range.from),
+        sql`${schema.salesOrders.date} < ${range.to}`,
+        ERP_ORDER_SALE,
+      )),
+    countDistinctCustomers(range, 'all'),
+    countDistinctCustomers(range, 'erp'),
+  ])
+  const r = rows[0]
+  const paidErpOrders = num(erpOrderRows[0]?.paid)
+  return {
+    customersAll: allCustomers,
+    customersShopify: Number(r?.customersShopify ?? 0),
+    customersErp: erpCustomers,
+    paidAll: num(r?.paidAll) + paidErpOrders,
+    paidShopify: num(r?.paidShopify),
+    paidErp: num(r?.paidErp) + paidErpOrders,
+  }
+}
+
+/**
+ * Distinct customers over every row the Sales Overview counts: invoices (all
+ * sales, or ERP only) plus the uninvoiced ERP orders. Counting the two sets
+ * separately and adding them would double a customer who has both an invoice
+ * and a manual order in the same period.
+ */
+async function countDistinctCustomers(range: { from: string; to: string }, source: 'all' | 'erp'): Promise<number> {
+  const invoiceWhere = source === 'erp' ? ERP_INVOICE : sql`true`
+  const rows = (await db!.execute(sql`
+    select count(distinct c)::int as n
+      from (
+        select lower(nullif(trim(customer), '')) as c
+          from ${schema.salesInvoices}
+         where ${schema.salesInvoices.date} is not null
+           and ${schema.salesInvoices.date} >= ${range.from}
+           and ${schema.salesInvoices.date} < ${range.to}
+           and ${NOT_VOIDED}
+           and ${NOT_FOREIGN_SHOPIFY}
+           and ${invoiceWhere}
+        union all
+        select lower(nullif(trim(${schema.salesOrders.customer}), '')) as c
+          from ${schema.salesOrders}
+         where ${schema.salesOrders.date} >= ${range.from}
+           and ${schema.salesOrders.date} < ${range.to}
+           and ${ERP_ORDER_SALE}
+      ) counted
+     where c is not null
+  `)) as unknown as Array<{ n: number | string }>
+  return Number(rows[0]?.n ?? 0)
+}
+
+async function customerBuckets(format: string, range: { from: string; to: string }) {
+  const bucketSql = sql`to_char(${schema.salesInvoices.date}, ${format})`
+  const [rows, erpPaidRows, allCustomers, erpCustomers] = await Promise.all([
+    db!
+      .select({
+        bucket: bucketSql,
+        customersShopify: sql<number>`count(distinct case when ${SHOPIFY_INVOICE} then lower(nullif(trim(customer), '')) end)`,
+        paidAll: sql<number>`coalesce(sum(case when lower(coalesce(payment_status, '')) = 'paid' then 1 else 0 end), 0)`,
+        paidShopify: sql<number>`coalesce(sum(case when ${SHOPIFY_INVOICE} and lower(coalesce(payment_status, '')) = 'paid' then 1 else 0 end), 0)`,
+        paidErp: sql<number>`coalesce(sum(case when ${ERP_INVOICE} and lower(coalesce(payment_status, '')) = 'paid' then 1 else 0 end), 0)`,
+      })
+      .from(schema.salesInvoices)
+      .where(and(
+        sql`${schema.salesInvoices.date} is not null`,
+        gte(schema.salesInvoices.date, range.from),
+        sql`${schema.salesInvoices.date} < ${range.to}`,
+        NOT_VOIDED,
+        NOT_FOREIGN_SHOPIFY,
+      ))
+      .groupBy(sql`1`),
+    db!
+      .select({
+        bucket: sql`to_char(${schema.salesOrders.date}, ${format})`,
+        paid: sql<number>`coalesce(sum(case when lower(coalesce(${schema.salesOrders.payment}, '')) = 'paid' then 1 else 0 end), 0)`,
+      })
+      .from(schema.salesOrders)
+      .where(and(
+        gte(schema.salesOrders.date, range.from),
+        sql`${schema.salesOrders.date} < ${range.to}`,
+        ERP_ORDER_SALE,
+      ))
+      .groupBy(sql`1`),
+    distinctCustomersByBucket(format, range, 'all'),
+    distinctCustomersByBucket(format, range, 'erp'),
+  ])
+  const invoiceByBucket = new Map(rows.map((r) => [String(r.bucket ?? ''), r]))
+  const erpPaidByBucket = new Map(erpPaidRows.map((r) => [String(r.bucket ?? ''), num(r.paid)]))
+  const map = new Map<string, {
+    customersAll: number; customersShopify: number; customersErp: number
+    paidAll: number; paidShopify: number; paidErp: number
+  }>()
+  const keys = new Set([
+    ...invoiceByBucket.keys(),
+    ...allCustomers.keys(),
+    ...erpPaidByBucket.keys(),
+  ])
+  for (const key of keys) {
+    const inv = invoiceByBucket.get(key)
+    const erpPaid = erpPaidByBucket.get(key) ?? 0
+    map.set(key, {
+      customersAll: allCustomers.get(key) ?? 0,
+      customersShopify: Number(inv?.customersShopify ?? 0),
+      customersErp: erpCustomers.get(key) ?? 0,
+      paidAll: num(inv?.paidAll) + erpPaid,
+      paidShopify: num(inv?.paidShopify),
+      paidErp: num(inv?.paidErp) + erpPaid,
+    })
+  }
+  return map
+}
+
+/** Per-bucket distinct customers, including the uninvoiced ERP orders. */
+async function distinctCustomersByBucket(
+  format: string,
+  range: { from: string; to: string },
+  source: 'all' | 'erp',
+): Promise<Map<string, number>> {
+  const invoiceWhere = source === 'erp' ? ERP_INVOICE : sql`true`
+  const rows = (await db!.execute(sql`
+    select bucket, count(distinct c)::int as n
+      from (
+        select to_char(${schema.salesInvoices.date}, ${format}) as bucket,
+               lower(nullif(trim(customer), '')) as c
+          from ${schema.salesInvoices}
+         where ${schema.salesInvoices.date} is not null
+           and ${schema.salesInvoices.date} >= ${range.from}
+           and ${schema.salesInvoices.date} < ${range.to}
+           and ${NOT_VOIDED}
+           and ${NOT_FOREIGN_SHOPIFY}
+           and ${invoiceWhere}
+        union all
+        select to_char(${schema.salesOrders.date}, ${format}) as bucket,
+               lower(nullif(trim(${schema.salesOrders.customer}), '')) as c
+          from ${schema.salesOrders}
+         where ${schema.salesOrders.date} >= ${range.from}
+           and ${schema.salesOrders.date} < ${range.to}
+           and ${ERP_ORDER_SALE}
+      ) counted
+     where c is not null
+     group by 1
+  `)) as unknown as Array<{ bucket: string | null; n: number | string }>
+  return new Map(rows.map((r) => [String(r.bucket ?? ''), Number(r.n)]))
+}
+
+type CustomerSummary = {
+  customersAll: number; customersShopify: number; customersErp: number
+  paidAll: number; paidShopify: number; paidErp: number
+}
+
+function sourceMetrics(points: SalesPoint[], customers: CustomerSummary, source: SourceKey) {
+  const orders = points.reduce((sum, point) => sum + (source === 'all' ? point.orders : source === 'shopify' ? point.shopifyOrders : point.erpOrders), 0)
+  const revenue = points.reduce((sum, point) => sum + (source === 'all' ? point.revenue : source === 'shopify' ? point.shopifyRevenue : point.erpRevenue), 0)
+  const customerCount = source === 'all' ? customers.customersAll : source === 'shopify' ? customers.customersShopify : customers.customersErp
+  const paidOrders = source === 'all' ? customers.paidAll : source === 'shopify' ? customers.paidShopify : customers.paidErp
+  return {
+    orders,
+    revenue: round2(revenue),
+    aov: orders > 0 ? round2(revenue / orders) : 0,
+    customers: Number(customerCount),
+    paidOrders: Number(paidOrders),
+    conversionRate: orders > 0 ? round2((Number(paidOrders) / orders) * 100) : 0,
+  }
+}
+
+// Every metric the Sales Overview needs, for all three filters at once. The
+// client switches filters without another request, and previous-period values
+// use the same invoice/return basis so growth is comparable.
+dashboardRouter.get('/dashboard/sales-insights', async (req, res) => {
+  if (!requireDb(res)) return
+  const range = rangeFromQuery(req, res)
+  if (!range) return
+  try {
+    const previousRange = { from: range.prevFrom, to: range.prevTo, days: range.days, bucket: range.bucket }
+    const [currentPoints, previousPoints, currentCustomers, previousCustomers, buckets] = await Promise.all([
+      buildSalesPoints(range),
+      buildSalesPoints(previousRange),
+      customerTotals(range),
+      customerTotals(previousRange),
+      customerBuckets(bucketFormat(range), range),
+    ])
+    const current = {
+      all: sourceMetrics(currentPoints, currentCustomers, 'all'),
+      shopify: sourceMetrics(currentPoints, currentCustomers, 'shopify'),
+      erp: sourceMetrics(currentPoints, currentCustomers, 'erp'),
+    }
+    const previous = {
+      all: sourceMetrics(previousPoints, previousCustomers, 'all'),
+      shopify: sourceMetrics(previousPoints, previousCustomers, 'shopify'),
+      erp: sourceMetrics(previousPoints, previousCustomers, 'erp'),
+    }
+    const trends = Object.fromEntries((['all', 'shopify', 'erp'] as const).map((source) => {
+      const orders = currentPoints.map((point) => source === 'all' ? point.orders : source === 'shopify' ? point.shopifyOrders : point.erpOrders)
+      const revenue = currentPoints.map((point) => source === 'all' ? point.revenue : source === 'shopify' ? point.shopifyRevenue : point.erpRevenue)
+      const customers = currentPoints.map((point) => {
+        const bucket = buckets.get(point.key)
+        return source === 'all' ? (bucket?.customersAll ?? 0) : source === 'shopify' ? (bucket?.customersShopify ?? 0) : (bucket?.customersErp ?? 0)
+      })
+      const paid = currentPoints.map((point) => {
+        const bucket = buckets.get(point.key)
+        return source === 'all' ? (bucket?.paidAll ?? 0) : source === 'shopify' ? (bucket?.paidShopify ?? 0) : (bucket?.paidErp ?? 0)
+      })
+      return [source, {
+        orders,
+        revenue,
+        aov: orders.map((count, i) => count > 0 ? round2(revenue[i] / count) : 0),
+        customers,
+        conversion: orders.map((count, i) => count > 0 ? round2((paid[i] / count) * 100) : 0),
+      }]
+    }))
+    res.json({
+      label: range.label,
+      previousLabel: range.prevLabel,
+      labels: currentPoints.map((point) => point.label),
+      current,
+      previous,
+      trends,
+    })
   } catch {
     res.status(500).json({ error: 'Internal server error' })
   }
@@ -339,6 +951,8 @@ dashboardRouter.get('/dashboard/top-products', async (req, res) => {
   if (!requireDb(res)) return
   const range = rangeFromQuery(req, res)
   if (!range) return
+  const source = sourceFilter(req.query.source)
+  if (!source) { res.status(400).json({ error: 'Unknown sales source' }); return }
   try {
     // Grouped and joined in SQL; the old version loaded every invoice item AND
     // every product row and aggregated in JS.
@@ -361,20 +975,112 @@ dashboardRouter.get('/dashboard/top-products', async (req, res) => {
         gte(schema.salesInvoices.date, range.from),
         sql`${schema.salesInvoices.date} < ${range.to}`,
         NOT_VOIDED,
+        NOT_FOREIGN_SHOPIFY,
+        sourceWhere(source),
       ))
       .groupBy(sql`lower(${schema.salesInvoiceItems.sku})`)
       .orderBy(sql`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0)), 0) desc`)
-      .limit(8)
+      // More than the rows returned: a SKU that also appears on an uninvoiced
+      // ERP order may move up once that order's lines are merged in below.
+      .limit(100)
 
-    res.json(
-      rows.map((r) => ({
+    // Uninvoiced orders are sales the Sales Overview counts (and the matching
+    // filter shows) but they have no invoice items, so ranking from invoices
+    // alone reported "No sales recorded yet" for an order-only period. Both
+    // open-order definitions already exclude orders that have an invoice or a
+    // Shopify twin, so nothing is counted twice.
+    const orderSaleScope = source === 'shopify'
+      ? SHOPIFY_ORDER_SALE
+      : source === 'erp'
+        ? ERP_ORDER_SALE
+        : sql`(${ERP_ORDER_SALE} or ${SHOPIFY_ORDER_SALE})`
+    const orderLines = await db!
+      .select({ lineItems: schema.salesOrders.lineItems })
+      .from(schema.salesOrders)
+      .where(and(
+        gte(schema.salesOrders.date, range.from),
+        sql`${schema.salesOrders.date} < ${range.to}`,
+        orderSaleScope,
+      ))
+
+    const merged = new Map<string, {
+      id: string; name: string; sku: string; category: string | null
+      qty: number; weight: number; revenue: number; image: string | null
+    }>()
+    const keyOf = (sku: string) => sku.trim().toLowerCase()
+    for (const r of rows) {
+      const sku = r.sku ?? ''
+      merged.set(keyOf(sku), {
         id: r.id,
         name: r.name,
-        sku: r.sku ?? '',
+        sku,
+        category: r.category,
         qty: num(r.qty),
-        weight: round2(num(r.weight)),
-        revenue: round2(num(r.revenue)),
+        weight: num(r.weight),
+        revenue: num(r.revenue),
         image: r.image ?? null,
+      })
+    }
+    for (const order of orderLines) {
+      const items = Array.isArray(order.lineItems) ? order.lineItems : []
+      for (const raw of items) {
+        const line = raw as Record<string, unknown>
+        const sku = String(line.sku ?? '').trim()
+        if (!sku) continue
+        const entry = merged.get(keyOf(sku)) ?? {
+          id: sku,
+          name: String(line.title ?? sku),
+          sku,
+          category: null,
+          qty: 0,
+          weight: 0,
+          revenue: 0,
+          image: null,
+        }
+        entry.qty += num(line.quantity)
+        entry.weight += num(line.weight)
+        entry.revenue += num(line.amount)
+        merged.set(keyOf(sku), entry)
+      }
+    }
+
+    // Twelve rows of two cards: the card shows three rows and scrolls through
+    // the rest, so a busy period lists more than one extra row.
+    const top = [...merged.values()].sort((a, b) => b.revenue - a.revenue).slice(0, 24)
+    // ERP-only SKUs have no invoice->product join, so resolve their catalogue
+    // fields (name / photo / category) in one lookup.
+    const missing = top.filter((r) => r.category == null && r.image == null).map((r) => r.sku)
+    if (missing.length > 0) {
+      const productsForSkus = await db!
+        .select({
+          id: schema.products.id,
+          sku: schema.products.sku,
+          name: schema.products.name,
+          category: schema.products.category,
+          image: schema.products.image,
+        })
+        .from(schema.products)
+        .where(inArray(schema.products.sku, missing))
+      const bySku = new Map(productsForSkus.map((p) => [keyOf(p.sku ?? ''), p]))
+      for (const row of top) {
+        const product = bySku.get(keyOf(row.sku))
+        if (!product) continue
+        row.id = product.id
+        row.name = product.name ?? row.name
+        row.category = product.category
+        row.image = product.image ?? null
+      }
+    }
+
+    res.json(
+      top.map((r) => ({
+        id: r.id,
+        name: r.name,
+        sku: r.sku,
+        qty: r.qty,
+        weight: round2(r.weight),
+        revenue: round2(r.revenue),
+        image: r.image,
         icon: iconFor(r.name, r.category),
       })),
     )
@@ -403,6 +1109,7 @@ dashboardRouter.get('/dashboard/top-category', async (req, res) => {
         gte(schema.salesInvoices.date, range.from),
         sql`${schema.salesInvoices.date} < ${range.to}`,
         NOT_VOIDED,
+        NOT_FOREIGN_SHOPIFY,
       ))
       .groupBy(sql`coalesce(nullif(${schema.products.category}, ''), 'Uncategorized')`)
       .orderBy(sql`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0)), 0) desc`)
@@ -447,7 +1154,11 @@ dashboardRouter.get('/dashboard/order-summary', async (req, res) => {
   const grain = rawGrain === 'month' || rawGrain === 'year' ? rawGrain : 'week'
   const requestedMonth = req.query.month ? parseMonthParam(req.query.month) : null
   if (req.query.month && !requestedMonth) return res.status(400).json({ error: 'month must be YYYY-MM' })
-  const anchor = requestedMonth ?? parseMonthParam(new Date().toISOString().slice(0, 7))
+  // Current month in the server's local (IST) calendar, not UTC: on the 1st
+  // before 05:30 IST, toISOString() still reports the previous month.
+  const now = new Date()
+  const localMonth = `${now.getFullYear()}-${pad(now.getMonth() + 1)}`
+  const anchor = requestedMonth ?? parseMonthParam(localMonth)
   if (!anchor) return res.status(400).json({ error: 'month must be YYYY-MM' })
 
   let from: string
@@ -461,7 +1172,9 @@ dashboardRouter.get('/dashboard/order-summary', async (req, res) => {
     const end = new Date(anchor.year, anchor.month, 1)
     from = `${anchor.year}-${pad(anchor.month)}-01T00:00:00`
     to = `${end.getFullYear()}-${pad(end.getMonth() + 1)}-01T00:00:00`
-    labels = ['01–07', '08–15', '16–23', '24–end']
+    // Four equal 7-day buckets; the labels must match the SQL split exactly
+    // (days 8–14, 15–21, 22–end) or a bar shows under the wrong week.
+    labels = ['01–07', '08–14', '15–21', '22–end']
     bucketSql = sql<number>`least(3, floor((extract(day from ${schema.salesOrders.date}) - 1) / 7))::int`
     label = `${MONTH_LABELS[anchor.month - 1]} ${start.getFullYear()}`
   } else if (grain === 'month') {
@@ -479,15 +1192,25 @@ dashboardRouter.get('/dashboard/order-summary', async (req, res) => {
   }
 
   try {
+    // Same live-order scope as the Orders KPI: cancellations, orders left by a
+    // previous Shopify connection and the ERP half of a synced pair are out.
     const rows = await db!
       .select({
         bucket: bucketSql,
-        online: sql<number>`count(*) filter (where ${schema.salesOrders.shopifyId} is not null)`,
-        inStore: sql<number>`count(*) filter (where ${schema.salesOrders.shopifyId} is null)`,
+        online: sql<number>`count(*) filter (where ${SHOPIFY_ORDER})`,
+        inStore: sql<number>`count(*) filter (where not (${SHOPIFY_ORDER}))`,
         revenue: sql<number>`coalesce(sum(coalesce(${schema.salesOrders.value}, 0)), 0)`,
       })
       .from(schema.salesOrders)
-      .where(and(gte(schema.salesOrders.date, from), lt(schema.salesOrders.date, to)))
+      .where(and(
+        gte(schema.salesOrders.date, from),
+        lt(schema.salesOrders.date, to),
+        sql`coalesce(${schema.salesOrders.status}, '') <> 'cancelled'`,
+        sql`lower(coalesce(${schema.salesOrders.status}, '')) <> 'draft'`,
+        sql`coalesce(${schema.salesOrders.isBooking}, false) = false`,
+        sql`coalesce(${schema.salesOrders.shopifyStore}, '') <> 'not-in-store'`,
+        sql`not (${SYNCED_ERP_TWIN})`,
+      ))
       .groupBy(sql`1`)
       .orderBy(sql`1`)
 
@@ -495,7 +1218,10 @@ dashboardRouter.get('/dashboard/order-summary', async (req, res) => {
     for (const r of rows) byBucket.set(Number(r.bucket), { online: Number(r.online), inStore: Number(r.inStore), revenue: num(r.revenue) })
 
     const points = labels.map((l, i) => {
-      const bucket = grain === 'year' ? anchor.year - 4 + i : i + 1
+      // The week buckets are 0-based (0–3); month buckets are 1-based, and the
+      // year buckets are actual years. Using i+1 for week put every bar one
+      // bucket early and dropped the last week entirely.
+      const bucket = grain === 'year' ? anchor.year - 4 + i : grain === 'week' ? i : i + 1
       const row = byBucket.get(bucket)
       return {
         label: l,
@@ -790,6 +1516,8 @@ dashboardRouter.get('/dashboard/recent-invoices', async (req, res) => {
   if (!requireDb(res)) return
   const range = rangeFromQuery(req, res, 'last30')
   if (!range) return
+  const source = sourceFilter(req.query.source)
+  if (!source) { res.status(400).json({ error: 'Unknown sales source' }); return }
   try {
     const [seriesRows, rows] = await Promise.all([
       db!
@@ -802,6 +1530,8 @@ dashboardRouter.get('/dashboard/recent-invoices', async (req, res) => {
           gte(schema.salesInvoices.date, range.from),
           lt(schema.salesInvoices.date, range.to),
           NOT_VOIDED,
+          NOT_FOREIGN_SHOPIFY,
+          sourceWhere(source),
         ))
         .groupBy(sql`1`),
       db!
@@ -813,12 +1543,15 @@ dashboardRouter.get('/dashboard/recent-invoices', async (req, res) => {
           paymentStatus: schema.salesInvoices.paymentStatus,
           status: schema.salesInvoices.status,
           date: schema.salesInvoices.date,
+          platform: sql<string>`case when ${SHOPIFY_INVOICE} then 'shopify' else 'erp' end`,
         })
         .from(schema.salesInvoices)
         .where(and(
           gte(schema.salesInvoices.date, range.from),
           lt(schema.salesInvoices.date, range.to),
           NOT_VOIDED,
+          NOT_FOREIGN_SHOPIFY,
+          sourceWhere(source),
         ))
         .orderBy(desc(schema.salesInvoices.date))
         .limit(6),
@@ -833,6 +1566,7 @@ dashboardRouter.get('/dashboard/recent-invoices', async (req, res) => {
       paymentStatus: r.paymentStatus ?? 'pending',
       status: r.status ?? 'issued',
       date: r.date,
+      platform: r.platform === 'shopify' ? 'shopify' : 'erp',
     }))
     res.json({
       points: seriesPoints(range, values),
@@ -854,45 +1588,168 @@ dashboardRouter.get('/dashboard/payment-status', async (req, res) => {
   if (!requireDb(res)) return
   const range = rangeFromQuery(req, res)
   if (!range) return
+  // The widget follows the Sales Overview source buttons: All (the default)
+  // reads Shopify invoices, ERP invoices and uninvoiced ERP orders; each
+  // platform filter reads only its own rows, from the same scope the sales
+  // ledger uses.
+  const source = sourceFilter(req.query.source)
+  if (source === null) return res.status(400).json({ error: 'source must be all, shopify or erp' })
   try {
-    // Four mutually exclusive segments covering every live invoice for the
-    // window, so the rows always add up to the total shown in the donut centre.
-    // Precedence: refunded → failed/overdue → paid → pending (the catch-all).
-    // Cancelled invoices are void and count nowhere; `total` is the sum of the
-    // four segments rather than a separate aggregate, so the two can never
-    // disagree.
-    const live = sql`coalesce(status, '') <> 'cancelled'`
-    const refundedCond = sql`(coalesce(status, '') = 'refunded' or coalesce(payment_status, '') = 'refunded')`
-    const notRefunded = sql`not (${refundedCond})`
-    const isOverdue = sql`coalesce(status, '') = 'overdue'`
-    const notOverdue = sql`not (${isOverdue})`
-    const rows = await db!
-      .select({
-        paid: sql<number>`coalesce(sum(grand_total) filter (where ${live} and ${notRefunded} and ${notOverdue} and coalesce(payment_status, '') = 'paid'), 0)`,
-        paidCount: sql<number>`count(*) filter (where ${live} and ${notRefunded} and ${notOverdue} and coalesce(payment_status, '') = 'paid')`,
-        pending: sql<number>`coalesce(sum(grand_total) filter (where ${live} and ${notRefunded} and ${notOverdue} and coalesce(payment_status, '') not in ('paid', 'failed')), 0)`,
-        pendingCount: sql<number>`count(*) filter (where ${live} and ${notRefunded} and ${notOverdue} and coalesce(payment_status, '') not in ('paid', 'failed'))`,
-        failed: sql<number>`coalesce(sum(grand_total) filter (where ${live} and ${notRefunded} and (coalesce(payment_status, '') = 'failed' or ${isOverdue})), 0)`,
-        failedCount: sql<number>`count(*) filter (where ${live} and ${notRefunded} and (coalesce(payment_status, '') = 'failed' or ${isOverdue}))`,
-        refunded: sql<number>`coalesce(sum(grand_total) filter (where ${live} and ${refundedCond}), 0)`,
-        refundedCount: sql<number>`count(*) filter (where ${live} and ${refundedCond})`,
-      })
-      .from(schema.salesInvoices)
-      .where(and(gte(schema.salesInvoices.date, range.from), sql`${schema.salesInvoices.date} < ${range.to}`))
-    const r = rows[0]
+    // Five mutually exclusive segments over the same eligible sales the ledger
+    // counts, with accounting meanings rather than invoice labels:
+    //   Paid    = money actually collected, net of refunds
+    //   Pending = unpaid balance not yet due
+    //   Failed  = unpaid balance whose payment attempt failed (not added again)
+    //   Overdue = unpaid balance past its due date
+    //   Refunded = money actually refunded (credit notes + completed refunds)
+    // An invoice marked fully refunded contributes its full value to Refunded
+    // and nothing to Paid, so no amount is counted twice.
+    //
+    // ERP sales raised without an invoice live only on the order row; reading
+    // sales_invoices alone dropped them from the widget (₹14,988.42 on one day
+    // where Sales showed ₹1,48,382.44 and this card showed only Shopify's
+    // ₹1,33,394.02). The order rows are the same ERP_ORDER_SALE set the sales
+    // ledger adds, so an invoiced ERP order is never counted twice.
+    const collectedSub = sql`(
+      select ${schema.payments.invoice} as invoice,
+             sum(coalesce(${schema.payments.amount}, 0)) as paid
+        from ${schema.payments}
+       where coalesce(${schema.payments.amount}, 0) > 0
+         and lower(coalesce(${schema.payments.status}, '')) in ('success', 'settled', 'paid')
+       group by ${schema.payments.invoice}
+    )`
+    // Refunds come from the two places the app records them: negative payment
+    // entries (ERP credit notes) and completed Shopify refunds. They never
+    // overlap for one refund, and a full-refund invoice is handled separately.
+    const refundSub = sql`(
+      select invoice, sum(amount) as refunded
+        from (
+          select ${schema.payments.invoice} as invoice,
+                 -coalesce(${schema.payments.amount}, 0) as amount
+            from ${schema.payments}
+           where coalesce(${schema.payments.amount}, 0) < 0
+             and lower(coalesce(${schema.payments.status}, '')) = 'refunded'
+             and ${schema.payments.invoice} is not null
+          union all
+          select ${schema.refunds.invoiceNumber} as invoice,
+                 coalesce(nullif(${schema.refunds.refundedAmount}, 0), ${schema.refunds.amount}, 0) as amount
+            from ${schema.refunds}
+           where lower(coalesce(${schema.refunds.status}, '')) = 'completed'
+             and ${schema.refunds.invoiceNumber} is not null
+        ) refund_rows
+       group by invoice
+    )`
+    const today = localDayStart(0)
+    const [rows, ledger] = await Promise.all([
+      db!.execute(sql`
+        with invoice_rows as (
+          select
+            'invoice'::text as row_kind,
+            coalesce(${schema.salesInvoices.grandTotal}, 0) as grand_total,
+            (lower(coalesce(${schema.salesInvoices.status}, '')) = 'refunded'
+              or lower(coalesce(${schema.salesInvoices.paymentStatus}, '')) = 'refunded') as is_refunded,
+            (lower(coalesce(${schema.salesInvoices.paymentStatus}, '')) in ('failed', 'declined', 'error')
+              or exists (
+                select 1
+                  from ${schema.payments} as failed_payment
+                 where failed_payment.invoice = ${schema.salesInvoices.number}
+                   and lower(coalesce(failed_payment.status, '')) in ('failed', 'error', 'declined')
+              )) as is_failed,
+            (lower(coalesce(${schema.salesInvoices.status}, '')) = 'overdue'
+              or lower(coalesce(${schema.salesInvoices.paymentStatus}, '')) = 'overdue'
+              or (${schema.salesInvoices.dueDate} is not null and ${schema.salesInvoices.dueDate} < ${today})) as is_overdue,
+            case
+              when lower(coalesce(${schema.salesInvoices.paymentStatus}, '')) = 'paid'
+                or lower(coalesce(${schema.salesInvoices.status}, '')) = 'paid'
+                then coalesce(${schema.salesInvoices.grandTotal}, 0)
+              else least(
+                coalesce(${schema.salesInvoices.grandTotal}, 0),
+                coalesce(p.paid, 0)
+              )
+            end as collected,
+            coalesce(r.refunded, 0) as recorded_refund
+          from ${schema.salesInvoices}
+          left join ${collectedSub} p on p.invoice = ${schema.salesInvoices.number}
+          left join ${refundSub} r on r.invoice = ${schema.salesInvoices.number}
+          where ${schema.salesInvoices.date} >= ${range.from}
+            and ${schema.salesInvoices.date} < ${range.to}
+            and coalesce(${schema.salesInvoices.status}, '') <> 'cancelled'
+            and ${NOT_FOREIGN_SHOPIFY}
+            and ${sourceWhere(source)}
+        ), order_rows as (
+          select
+            'order'::text as row_kind,
+            coalesce(${schema.salesOrders.value}, 0) as grand_total,
+            (lower(coalesce(${schema.salesOrders.payment}, '')) = 'refunded') as is_refunded,
+            (lower(coalesce(${schema.salesOrders.payment}, '')) in ('failed', 'declined', 'error')) as is_failed,
+            (lower(coalesce(${schema.salesOrders.payment}, '')) = 'overdue') as is_overdue,
+            case
+              when lower(coalesce(${schema.salesOrders.payment}, '')) in ('paid', 'settled', 'completed', 'success')
+                then coalesce(${schema.salesOrders.value}, 0)
+              else 0
+            end as collected,
+            0::numeric as recorded_refund
+          from ${schema.salesOrders}
+          where ${schema.salesOrders.date} >= ${range.from}
+            and ${schema.salesOrders.date} < ${range.to}
+            and (
+              (${ERP_ORDER_SALE} and ${source === 'shopify' ? sql`false` : sql`true`})
+              or (${SHOPIFY_ORDER_SALE} and ${source === 'erp' ? sql`false` : sql`true`})
+            )
+        ), calc as (
+          select row_kind, grand_total, is_refunded, is_failed, is_overdue, collected,
+                 least(recorded_refund, collected) as refund_amount
+            from invoice_rows
+          union all
+          select row_kind, grand_total, is_refunded, is_failed, is_overdue, collected,
+                 least(recorded_refund, collected) as refund_amount
+            from order_rows
+        )
+        select
+          coalesce(sum(case when is_refunded then 0 else greatest(collected - refund_amount, 0) end), 0) as paid,
+          count(*) filter (where not is_refunded and greatest(collected - refund_amount, 0) > 0) as paid_count,
+          coalesce(sum(case when is_refunded then grand_total else refund_amount end), 0) as refunded,
+          count(*) filter (where is_refunded or refund_amount > 0) as refunded_count,
+          coalesce(sum(case when not is_refunded and grand_total > collected and is_failed then grand_total - collected else 0 end), 0) as failed,
+          count(*) filter (where not is_refunded and grand_total > collected and is_failed) as failed_count,
+          coalesce(sum(case when not is_refunded and grand_total > collected and not is_failed and is_overdue then grand_total - collected else 0 end), 0) as overdue,
+          count(*) filter (where not is_refunded and grand_total > collected and not is_failed and is_overdue) as overdue_count,
+          coalesce(sum(case when not is_refunded and grand_total > collected and not is_failed and not is_overdue then grand_total - collected else 0 end), 0) as pending,
+          count(*) filter (where not is_refunded and grand_total > collected and not is_failed and not is_overdue) as pending_count,
+          coalesce(sum(case when row_kind = 'invoice' and is_refunded then grand_total else 0 end), 0) as refunded_invoice_gross
+        from calc
+      `) as unknown as Promise<Array<Record<string, unknown>>>,
+      salesTotals(range),
+    ])
+    const r = rows[0] ?? {}
 
     const segments = [
-      { status: 'paid' as const, label: 'Paid', value: round2(num(r.paid)), count: Number(r.paidCount) },
-      { status: 'pending' as const, label: 'Pending', value: round2(num(r.pending)), count: Number(r.pendingCount) },
-      { status: 'failed' as const, label: 'Failed / Overdue', value: round2(num(r.failed)), count: Number(r.failedCount) },
-      { status: 'refunded' as const, label: 'Refunded', value: round2(num(r.refunded)), count: Number(r.refundedCount) },
+      { status: 'paid' as const, label: 'Paid', value: round2(num(r.paid)), count: Number(r.paid_count ?? 0) },
+      { status: 'pending' as const, label: 'Pending', value: round2(num(r.pending)), count: Number(r.pending_count ?? 0) },
+      { status: 'failed' as const, label: 'Failed', value: round2(num(r.failed)), count: Number(r.failed_count ?? 0) },
+      { status: 'overdue' as const, label: 'Overdue', value: round2(num(r.overdue)), count: Number(r.overdue_count ?? 0) },
+      { status: 'refunded' as const, label: 'Refunded', value: round2(num(r.refunded)), count: Number(r.refunded_count ?? 0) },
     ]
+    const total = round2(segments.reduce((sum, s) => sum + s.value, 0))
+    // The widget's own total is the sales value it scopes (invoices plus
+    // uninvoiced ERP orders). Sales revenue nets sales returns and drops
+    // fully-refunded invoices, so it reconciles as
+    //   total = salesRevenue + returns + refundedInvoiceGross,
+    // which is exactly what the reconciliation test pins.
+    const salesRevenue = source === 'shopify' ? ledger.shopifyRevenue : source === 'erp' ? ledger.erpRevenue : ledger.revenue
 
     res.json({
       segments,
-      total: round2(segments.reduce((sum, s) => sum + s.value, 0)),
+      total,
+      source,
+      salesRevenue: round2(salesRevenue),
+      invoiceGross: round2(ledger.gross),
+      erpOrderRevenue: round2(ledger.erpOrderRevenue),
+      returns: round2(ledger.returns),
+      refundedInvoiceGross: round2(num(r.refunded_invoice_gross)),
     })
-  } catch {
+  } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : 'Unknown error' }, 'dashboard payment status failed')
     res.status(500).json({ error: 'Internal server error' })
   }
 })
@@ -1291,25 +2148,30 @@ dashboardRouter.get('/dashboard/analytics', async (req, res) => {
           costedCount: sql<number>`count(*) filter (where silver_value is not null and making_charge is not null)`,
         })
         .from(schema.salesInvoices)
-        .where(and(gte(schema.salesInvoices.date, from), sql`${schema.salesInvoices.date} < ${to}`, NOT_VOIDED))
+        .where(and(gte(schema.salesInvoices.date, from), sql`${schema.salesInvoices.date} < ${to}`, NOT_VOIDED, NOT_FOREIGN_SHOPIFY))
       const r = rows[0]
       return { sales: num(r.sales), count: Number(r.count), cost: num(r.cost), costedSales: num(r.costedSales), costedCount: Number(r.costedCount) }
     }
 
-    const [cur, prev, curReturns, prevReturns, invRows] = await Promise.all([
+    const [cur, prev, curTotals, prevTotals, invRows] = await Promise.all([
       agg(range.from, range.to),
       agg(range.prevFrom, range.prevTo),
-      returnsTotal(range.from, range.to),
-      returnsTotal(range.prevFrom, range.prevTo),
+      salesTotals(range),
+      salesTotals({ ...range, from: range.prevFrom, to: range.prevTo }),
       db!.select({ value: sql<number>`coalesce(sum(coalesce(stock, 0) * coalesce(selling_price, 0)), 0)` }).from(schema.products),
     ])
 
-    const curSales = Math.max(0, cur.sales - curReturns)
-    const prevSales = Math.max(0, prev.sales - prevReturns)
+    // Same sales ledger as the KPI and the Sales Overview: net revenue, the
+    // order rows behind it, and the same return figure.
+    const curSales = curTotals.revenue
+    const prevSales = prevTotals.revenue
     const inventoryValue = num(invRows[0]?.value)
-    const returnRate = cur.sales > 0 ? (curReturns / cur.sales) * 100 : 0
-    const aov = cur.count > 0 ? curSales / cur.count : 0
-    const prevAov = prev.count > 0 ? prevSales / prev.count : 0
+    // Return rate is returns over gross sales (net + returns), so it can never
+    // exceed 100% just because returns exceeded the net figure.
+    const grossSales = round2(curTotals.revenue + curTotals.returns)
+    const returnRate = grossSales > 0 ? (curTotals.returns / grossSales) * 100 : 0
+    const aov = curTotals.orders > 0 ? curSales / curTotals.orders : 0
+    const prevAov = prevTotals.orders > 0 ? prevSales / prevTotals.orders : 0
     // Margin needs a cost basis; without one it reads N/A, never 100%.
     // Both sides come from the costed invoice subset (returns are reported by
     // the separate Return Rate card), so the ratio stays internally consistent.
@@ -1317,7 +2179,7 @@ dashboardRouter.get('/dashboard/analytics', async (req, res) => {
     const prevMargin = prev.costedCount > 0 && prev.costedSales > 0 ? (prev.costedSales - prev.cost) / prev.costedSales : null
 
     const salesCmp = compare(curSales, prevSales)
-    const orderCmp = compare(cur.count, prev.count)
+    const orderCmp = compare(curTotals.orders, prevTotals.orders)
     const aovCmp = compare(aov, prevAov)
     const marginCmp =
       curMargin == null || prevMargin == null
@@ -1326,7 +2188,7 @@ dashboardRouter.get('/dashboard/analytics', async (req, res) => {
 
     res.json([
       { label: 'Total Sales', value: inr(curSales), delta: salesCmp.delta, trend: salesCmp.trend, rangeLabel: range.label, prevLabel: range.prevLabel },
-      { label: 'Total Orders', value: String(cur.count), delta: orderCmp.delta, trend: orderCmp.trend, rangeLabel: range.label, prevLabel: range.prevLabel },
+      { label: 'Total Orders', value: String(curTotals.orders), delta: orderCmp.delta, trend: orderCmp.trend, rangeLabel: range.label, prevLabel: range.prevLabel },
       { label: 'Average Order Value', value: inr(aov), delta: aovCmp.delta, trend: aovCmp.trend, rangeLabel: range.label, prevLabel: range.prevLabel },
       { label: 'Return Rate', value: `${round2(returnRate)}%`, rangeLabel: range.label },
       { label: 'Gross Profit Margin', value: curMargin == null ? 'N/A' : `${round2(curMargin * 100)}%`, delta: marginCmp.delta, trend: marginCmp.trend, rangeLabel: range.label, prevLabel: range.prevLabel },
@@ -1365,17 +2227,6 @@ dashboardRouter.get('/dashboard/financial', async (req, res) => {
   const range = rangeFromQuery(req, res, 'last12m')
   if (!range) return
   try {
-    const invAgg = async (from: string, to: string) => {
-      const rows = await db!
-        .select({
-          total: sql<number>`coalesce(sum(grand_total), 0)`,
-          count: sql<number>`count(*)`,
-        })
-        .from(schema.salesInvoices)
-        .where(and(gte(schema.salesInvoices.date, from), sql`${schema.salesInvoices.date} < ${to}`, NOT_VOIDED))
-      const r = rows[0]
-      return { total: num(r.total), count: Number(r.count) }
-    }
     // Expenses grouped by category for the window: total/count for the
     // income-vs-expense tile, top categories for the "Top Expense" tile.
     // One extra row beyond the display cap lets us fold the remainder into
@@ -1401,47 +2252,53 @@ dashboardRouter.get('/dashboard/financial', async (req, res) => {
       return { total: num(agg[0]?.total), count: Number(agg[0]?.count ?? 0), cats }
     }
 
-    const [cur, prev, curReturns, prevReturns, curExp, prevExp, salesMap, retMap, expMap, invTotals, openRows, paidRows] = await Promise.all([
-      invAgg(range.from, range.to),
-      invAgg(range.prevFrom, range.prevTo),
-      returnsTotal(range.from, range.to),
-      returnsTotal(range.prevFrom, range.prevTo),
+    const bucketFmt = range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD'
+    const [curTotals, prevTotals, curExp, prevExp, ledger, expMap, invTotals, openRows, paidRows] = await Promise.all([
+      salesTotals(range),
+      salesTotals({ ...range, from: range.prevFrom, to: range.prevTo }),
       expenseAgg(range.from, range.to),
       expenseAgg(range.prevFrom, range.prevTo),
-      salesBuckets(range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD', range),
-      returnBuckets(range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD', range),
-      expenseBuckets(range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD', range),
+      salesLedgerBuckets(bucketFmt, range),
+      expenseBuckets(bucketFmt, range),
       // Point-in-time receivables below: no range predicates on purpose.
       db!.select({ total: sql<number>`coalesce(sum(grand_total), 0)`, count: sql<number>`count(*)` })
         .from(schema.salesInvoices)
-        .where(NOT_VOIDED),
+        .where(and(NOT_VOIDED, NOT_FOREIGN_SHOPIFY)),
       db!
-        .select({ number: schema.salesInvoices.number, grandTotal: schema.salesInvoices.grandTotal, dueDate: schema.salesInvoices.dueDate, date: schema.salesInvoices.date })
+        .select({
+          number: schema.salesInvoices.number,
+          grandTotal: schema.salesInvoices.grandTotal,
+          dueDate: schema.salesInvoices.dueDate,
+          date: schema.salesInvoices.date,
+          status: schema.salesInvoices.status,
+          paymentStatus: schema.salesInvoices.paymentStatus,
+        })
         .from(schema.salesInvoices)
-        .where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+        .where(and(OUTSTANDING_WHERE, NOT_VOIDED, NOT_FOREIGN_SHOPIFY)),
       db!
         .select({ invoice: schema.payments.invoice, paid: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)` })
         .from(schema.payments)
-        .where(eq(schema.payments.status, 'success'))
+        .where(and(
+          sql`coalesce(${schema.payments.amount}, 0) > 0`,
+          sql`lower(coalesce(${schema.payments.status}, '')) in ('success', 'settled', 'paid')`,
+        ))
         .groupBy(schema.payments.invoice),
     ])
 
-    // Net revenue uses the same basis as the Sales KPI: gross invoiced less
-    // approved returns with voided invoices excluded, floored at zero.
-    const netRevenue = Math.max(0, cur.total - curReturns)
-    const prevNetRevenue = Math.max(0, prev.total - prevReturns)
+    // Net revenue is the shared ledger figure — the same number the Sales KPI,
+    // the Sales Overview cards and its graph show for this range.
+    const netRevenue = curTotals.revenue
+    const prevNetRevenue = prevTotals.revenue
     const netCmp = compare(netRevenue, prevNetRevenue)
     const expCmp = compare(curExp.total, prevExp.total)
 
-    // Per-bucket series for the charts, aligned to the same buckets the Sales
-    // Overview chart uses. Income per bucket is invoiced less returns *without*
-    // a per-bucket floor so the points always sum back to the headline figure
-    // (the headline itself is floored at zero).
+    // Per-bucket series for the charts: each point is the ledger's net revenue
+    // for that bucket, so the points always sum back to the headline figure.
     const points = enumerateBuckets(range).map((b) => ({
       key: b.key,
       label: b.label,
       date: b.date,
-      income: round2((salesMap.get(b.key)?.revenue ?? 0) - (retMap.get(b.key) ?? 0)),
+      income: round2(num(ledger.get(b.key)?.revenue)),
       expense: round2(expMap.get(b.key) ?? 0),
     }))
 
@@ -1479,8 +2336,7 @@ dashboardRouter.get('/dashboard/financial', async (req, res) => {
     const aging = AGING_BANDS.map((b) => ({ key: b.key, label: b.label, value: 0, count: 0 }))
     let outstanding = 0
     for (const row of openRows) {
-      const paid = paidByInvoice.get(row.number ?? '') ?? 0
-      const unpaid = Math.max(0, num(row.grandTotal) - paid)
+      const unpaid = Math.max(0, num(row.grandTotal) - collectedAmount(row, paidByInvoice))
       outstanding += unpaid
       // Effective due date: real due date, else invoice date + 30 days (the
       // settings table has no payment-terms field), else today = not overdue.
@@ -1503,9 +2359,11 @@ dashboardRouter.get('/dashboard/financial', async (req, res) => {
     res.json({
       label: range.label,
       prevLabel: range.prevLabel,
-      sales: round2(cur.total),
-      returns: round2(curReturns),
-      invoiceCount: cur.count,
+      // Gross sales = net revenue + returns, so the tile caption reconciles
+      // with the headline even when uninvoiced ERP orders add revenue.
+      sales: round2(curTotals.revenue + curTotals.returns),
+      returns: round2(curTotals.returns),
+      invoiceCount: curTotals.invoiceCount,
       netRevenue: round2(netRevenue),
       netRevenueDelta: netCmp.delta,
       netRevenueTrend: netCmp.trend,
@@ -1556,13 +2414,22 @@ dashboardRouter.get('/dashboard/aging', async (_req, res) => {
     // Summary; bucket membership still comes from the due date.
     const [openRows, paidRows] = await Promise.all([
       db!
-        .select({ number: schema.salesInvoices.number, grandTotal: schema.salesInvoices.grandTotal, dueDate: schema.salesInvoices.dueDate })
+        .select({
+          number: schema.salesInvoices.number,
+          grandTotal: schema.salesInvoices.grandTotal,
+          dueDate: schema.salesInvoices.dueDate,
+          status: schema.salesInvoices.status,
+          paymentStatus: schema.salesInvoices.paymentStatus,
+        })
         .from(schema.salesInvoices)
-        .where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+        .where(and(OUTSTANDING_WHERE, NOT_VOIDED, NOT_FOREIGN_SHOPIFY)),
       db!
         .select({ invoice: schema.payments.invoice, paid: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)` })
         .from(schema.payments)
-        .where(eq(schema.payments.status, 'success'))
+        .where(and(
+          sql`coalesce(${schema.payments.amount}, 0) > 0`,
+          sql`lower(coalesce(${schema.payments.status}, '')) in ('success', 'settled', 'paid')`,
+        ))
         .groupBy(schema.payments.invoice),
     ])
     const paidByInvoice = new Map(paidRows.map((r) => [r.invoice ?? '', num(r.paid)]))
@@ -1580,7 +2447,7 @@ dashboardRouter.get('/dashboard/aging', async (_req, res) => {
     let overdueTotal = 0
     let overdueCount = 0
     for (const row of openRows) {
-      const unpaid = Math.max(0, num(row.grandTotal) - (paidByInvoice.get(row.number ?? '') ?? 0))
+      const unpaid = Math.max(0, num(row.grandTotal) - collectedAmount(row, paidByInvoice))
       total += unpaid
       const due = parseNaive(row.dueDate)
       if (!due || due > todayDate) {
@@ -1638,7 +2505,7 @@ dashboardRouter.get('/dashboard/aging/invoices', async (req, res) => {
           daysOverdue: sql<number>`greatest(0, floor(extract(epoch from (${today}::timestamp - ${schema.salesInvoices.dueDate})) / 86400))::int`,
         })
         .from(schema.salesInvoices)
-        .where(and(OUTSTANDING_WHERE, NOT_VOIDED, predicate))
+        .where(and(OUTSTANDING_WHERE, NOT_VOIDED, NOT_FOREIGN_SHOPIFY, predicate))
         .orderBy(sql`${schema.salesInvoices.dueDate} asc nulls last`, sql`${schema.salesInvoices.number} asc`)
         .limit(50),
       // Same paid basis as the bucket totals, so a row's amount always adds
@@ -1646,7 +2513,10 @@ dashboardRouter.get('/dashboard/aging/invoices', async (req, res) => {
       db!
         .select({ invoice: schema.payments.invoice, paid: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)` })
         .from(schema.payments)
-        .where(eq(schema.payments.status, 'success'))
+        .where(and(
+          sql`coalesce(${schema.payments.amount}, 0) > 0`,
+          sql`lower(coalesce(${schema.payments.status}, '')) in ('success', 'settled', 'paid')`,
+        ))
         .groupBy(schema.payments.invoice),
     ])
     const paidByInvoice = new Map(paidRows.map((r) => [r.invoice ?? '', num(r.paid)]))
@@ -1660,7 +2530,7 @@ dashboardRouter.get('/dashboard/aging/invoices', async (req, res) => {
         date: r.date,
         dueDate: r.dueDate,
         grandTotal: round2(num(r.grandTotal)),
-        outstanding: round2(Math.max(0, num(r.grandTotal) - (paidByInvoice.get(r.number ?? '') ?? 0))),
+        outstanding: round2(Math.max(0, num(r.grandTotal) - collectedAmount(r, paidByInvoice))),
         paymentStatus: r.paymentStatus ?? '',
         status: r.status ?? '',
         daysOverdue: r.dueDate ? Number(r.daysOverdue ?? 0) : 0,

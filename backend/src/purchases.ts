@@ -730,7 +730,7 @@ export async function recordSupplierPayment(input: {
       note: input.note ?? null,
       date: now,
       createdBy: input.createdBy ?? null,
-    })
+    } as any)
     for (const a of allocations) {
       await tx.insert(schema.supplierPaymentAllocations).values({
         id: randomUUID(),
