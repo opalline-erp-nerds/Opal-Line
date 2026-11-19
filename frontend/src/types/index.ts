@@ -120,7 +120,7 @@ export interface GstReportResult {
   gstin: string
 }
 
-export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'month' | 'year' | 'custom'
+export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'month' | 'lastMonth' | 'year' | 'custom'
 
 /** The custom window chosen for the `custom` period (inclusive `YYYY-MM-DD`). */
 export interface DateRange {
@@ -163,6 +163,39 @@ export interface SalesOverviewPoint {
   label: string
   revenue: number
   orders: number
+  /** Combined revenue/orders above, split by where the sale was made. */
+  shopifyRevenue?: number
+  shopifyOrders?: number
+  erpRevenue?: number
+  erpOrders?: number
+}
+
+export type SalesSourceKey = 'all' | 'shopify' | 'erp'
+
+export interface SalesSourceMetrics {
+  orders: number
+  revenue: number
+  aov: number
+  customers: number
+  paidOrders: number
+  conversionRate: number
+}
+
+export interface SalesInsightTrend {
+  orders: number[]
+  revenue: number[]
+  aov: number[]
+  customers: number[]
+  conversion: number[]
+}
+
+export interface SalesInsights {
+  label: string
+  previousLabel: string
+  labels: string[]
+  current: Record<SalesSourceKey, SalesSourceMetrics>
+  previous: Record<SalesSourceKey, SalesSourceMetrics>
+  trends: Record<SalesSourceKey, SalesInsightTrend>
 }
 
 export interface TopProduct {
@@ -276,6 +309,7 @@ export interface RecentInvoiceRow {
   paymentStatus: string
   status: string
   date: string | null
+  platform: 'shopify' | 'erp'
 }
 
 export interface RecentInvoicesWidget {
@@ -312,7 +346,7 @@ export interface ProfitAnalytics {
 }
 
 export interface PaymentStatusSegment {
-  status: 'paid' | 'pending' | 'failed' | 'refunded'
+  status: 'paid' | 'pending' | 'failed' | 'overdue' | 'refunded'
   label: string
   value: number
   count: number

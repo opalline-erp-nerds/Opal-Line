@@ -587,6 +587,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         cancelled_at timestamp,
         closed_at timestamp,
         shopify_synced_at timestamp,
+        shopify_store text,
         created_at timestamp DEFAULT now(),
         updated_at timestamp
       )`)
@@ -1200,6 +1201,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         reference text,
         reference_type text,
         reference_id text,
+        source text,
         is_auto boolean DEFAULT true,
         branch_id text,
         created_by text,
@@ -1610,6 +1612,37 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
     ...INVENTORY_LOCATION_SHOPIFY_DDL,
     ...STOCK_LEDGER_DDL,
     ...SHOPIFY_OUTBOUND_DDL,
+      // Accounting: store the journal source so unified/Shopify filtering is exact.
+      `ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS source text`,
+      // Duplicate prevention at the database level: one journal per source record.
+      // Existing databases that already contain duplicates are left untouched
+      // (the app-level idempotent post still prevents new ones).
+      `DO $$ BEGIN
+         IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'journal_entries_ref_unique') THEN
+           IF NOT EXISTS (
+             SELECT 1 FROM journal_entries
+             WHERE reference_type IS NOT NULL AND reference_id IS NOT NULL
+             GROUP BY reference_type, reference_id
+             HAVING count(*) > 1
+           ) THEN
+             CREATE UNIQUE INDEX journal_entries_ref_unique
+               ON journal_entries (reference_type, reference_id)
+               WHERE reference_type IS NOT NULL AND reference_id IS NOT NULL;
+           END IF;
+         END IF;
+       END $$`,
+      // Expand COA for unified ERP+Shopify accounting (idempotent for existing installs)
+      `INSERT INTO accounts (id, code, name, type, sub_type, is_group, opening_balance, current_balance, currency, is_active, created_at)
+       VALUES
+         ('ACC1006','1006','GST Input Credit','asset','current_asset',false,0,0,'INR',true,now()),
+         ('ACC2004','2004','TCS Payable','liability','current_liability',false,0,0,'INR',true,now()),
+         ('ACC5002','5002','Purchase Expense','expense','cost_of_goods_sold',false,0,0,'INR',true,now()),
+         ('ACC5003','5003','Making Charges','expense','direct_expense',false,0,0,'INR',true,now()),
+         ('ACC5004','5004','Operating Expenses','expense','operating_expense',false,0,0,'INR',true,now()),
+         ('ACC5005','5005','Shopify Charges','expense','operating_expense',false,0,0,'INR',true,now()),
+         ('ACC5006','5006','Shipping Expense','expense','operating_expense',false,0,0,'INR',true,now()),
+         ('ACC5007','5007','Discounts Given','expense','operating_expense',false,0,0,'INR',true,now())
+       ON CONFLICT (code) DO NOTHING`,
     ...COLLECTIONS_DDL,
     // Login lockout became a per-install switch (Settings → Security → Login
     // lockout), off by default. Existing installs get the column as false,
@@ -1725,6 +1758,9 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS cancelled_at timestamp`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS closed_at timestamp`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS shopify_synced_at timestamp`,
+      // Which shop an order came from, so orders left behind by a previous
+      // Shopify connection can be told apart from the connected shop's.
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS shopify_store text`,
       `CREATE INDEX IF NOT EXISTS sales_orders_shopify_gid_idx ON sales_orders (shopify_gid)`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS is_booking boolean`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS advance_paid numeric`,
@@ -1856,6 +1892,7 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
         reference text,
         reference_type text,
         reference_id text,
+        source text,
         is_auto boolean DEFAULT true,
         branch_id text,
         created_by text,

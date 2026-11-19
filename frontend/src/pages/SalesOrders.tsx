@@ -532,7 +532,13 @@ export default function SalesOrdersPage() {
         return
       }
       const base = `https://${s.store}.myshopify.com/admin`
-      const query = encodeURIComponent(o.shopifyId.replace(/^#/, ''))
+      // A manual order can be linked by gid while keeping its ERP reference
+      // (its Shopify name belongs to another local order), so fall back to the
+      // numeric id inside the gid. `#1234` orders keep searching by name.
+      const gidId = o.shopifyGid?.match(/\/Order\/(\d+)/)?.[1]
+      const query = /^#\d/.test(o.shopifyId)
+        ? encodeURIComponent(o.shopifyId.replace(/^#/, ''))
+        : encodeURIComponent(gidId ?? o.shopifyId.replace(/^#/, ''))
       window.open(`${base}/orders?query=${query}`, '_blank', 'noopener')
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Could not open Shopify')
@@ -1555,11 +1561,16 @@ export default function SalesOrdersPage() {
                 created.shopifySync.ok ? (
                   <div className="flex items-center gap-2 rounded-lg bg-success-50 px-3 py-2 text-xs font-medium text-success-700">
                     <CheckCircle2 className="h-3.5 w-3.5" />
-                    {editing
-                      ? `Order updated on Shopify (${created.order.shopifyId})`
-                      : created.shopifySync.completed
-                        ? `Order created on Shopify as ${created.shopifySync.name}`
-                        : `Synced to Shopify as draft ${created.shopifySync.name}`}
+                    {/* The server explains the rare cases (e.g. the Shopify name
+                        is already used by an imported order, so this order kept
+                        its ERP reference) in `message`. */}
+                    {created.shopifySync.message
+                      ? created.shopifySync.message
+                      : editing
+                        ? `Order updated on Shopify (${created.order.shopifyId})`
+                        : created.shopifySync.completed
+                          ? `Order created on Shopify as ${created.shopifySync.name}`
+                          : `Synced to Shopify as draft ${created.shopifySync.name}`}
                   </div>
                 ) : (
                   <div className="flex w-full max-w-sm items-start gap-2 rounded-lg border border-warning-100 bg-warning-50/70 px-3 py-2 text-left text-xs text-warning-700">

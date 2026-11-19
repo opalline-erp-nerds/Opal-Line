@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { desc, eq, inArray, isNotNull, isNull, like, or, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, isNotNull, isNull, like, notInArray, or, sql } from 'drizzle-orm'
 import { config, isConfigured, normalizeShopDomain } from './config'
 import { db, schema } from './db/client'
 import {
@@ -4052,6 +4052,12 @@ export interface DraftOrderResult {
   draftId?: string
   name?: string
   completed?: boolean
+  /**
+   * `gid://shopify/Order/…` of the order the draft completed into. Returned so
+   * the caller can record the ERP row's Shopify identity even when the display
+   * name is already taken by another local order.
+   */
+  orderGid?: string
   customerId?: string
   errors: string[]
   message?: string
@@ -4149,6 +4155,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
     const draftId = result.draftOrder.id
     let completed = false
     let name = result.draftOrder.name ?? undefined
+    let orderGid: string | undefined
     let completionError: string | null = null
 
     try {
@@ -4184,6 +4191,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
       const completedOrder = completeResult?.draftOrder?.order
       if (completedOrder?.id || completedOrder?.name) {
         completed = true
+        orderGid = completedOrder.id ?? undefined
         name = completedOrder.name ?? completeResult?.draftOrder?.name ?? name
       } else if (!completeRes.ok || completeResult?.userErrors?.length || completeJson?.errors?.length) {
         const msg =
@@ -4231,7 +4239,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
       action: completed ? 'Order Created' : 'Draft Order Created',
       status: 'success',
     })
-    return { ok: true, draftId, name, completed, customerId: customerId || undefined, errors: [] }
+    return { ok: true, draftId, name, completed, orderGid, customerId: customerId || undefined, errors: [] }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     return { ok: false, errors: [msg], message: 'Shopify draft order creation failed' }
@@ -4366,11 +4374,13 @@ export interface ShopifyOrdersImportResult {
 function mapImportedPayment(status: string | null | undefined): string {
   switch (String(status ?? '').toLowerCase()) {
     case 'paid':
-    case 'partially_paid':
     case 'partially_refunded':
       // The coarse ERP payment field can only say paid/pending/refunded.
       // Preserve the exact Shopify enum in shopifyFinancialStatus below.
       return 'paid'
+    case 'partially_paid':
+      // Partly collected — the invoice must not be reported as fully paid.
+      return 'partial'
     case 'refunded':
     case 'voided':
       return 'refunded'
@@ -4410,8 +4420,23 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
 
   try {
     const raw = await paginate<any>('orders', 'status=any&fulfillment_status=any')
-    const existing = await db.select({ shopifyId: schema.salesOrders.shopifyId }).from(schema.salesOrders)
+    const existing = await db
+      .select({
+        id: schema.salesOrders.id,
+        shopifyId: schema.salesOrders.shopifyId,
+        shopifyGid: schema.salesOrders.shopifyGid,
+      })
+      .from(schema.salesOrders)
     const knownShopifyIds = new Set(existing.map((r) => r.shopifyId).filter((x): x is string => Boolean(x)))
+    // Orders the ERP pushed to Shopify keep their `MO-…` reference locally (the
+    // Shopify name is only claimed when it is free), so they are unknown to
+    // Shopify-import matching. Keyed by Shopify's immutable gid, those orders
+    // are recognised and linked instead of imported a second time.
+    const byGid = new Map(
+      existing
+        .filter((r) => r.shopifyGid)
+        .map((r) => [String(r.shopifyGid), r]),
+    )
     // In-batch guard: Shopify can return the same order twice across pages
     // (concurrent edits between page fetches). Without this, the second copy
     // would take the insert path and hit the unique index as an error.
@@ -4490,6 +4515,11 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
         return parseOrderAddress(o.shipping_address)
       })() : null
 
+      // Set when this Shopify order was matched to an existing ERP order by
+      // gid: the sale is already recorded (and may already carry an invoice),
+      // so the auto-invoice step below must leave it alone.
+      let linkedFromGid = false
+
       if (knownShopifyIds.has(shopifyId)) {
         // Merge against the stored row: locally recovered addresses (repair /
         // webhook) must survive a redacted or partial payload — a whole-address
@@ -4516,6 +4546,9 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             tags,
             currency,
             discount,
+            // Which shop these rows came from, so a later reconnection can tell
+            // a previous shop's orders apart from the connected one's.
+            shopifyStore: config.shop,
             // undefined from mergeAddress = nothing worth writing → drizzle
             // omits the column and the stored address is untouched.
             billingAddress: mergeAddress(cur?.billingAddress as OrderAddress | undefined, billingAddress),
@@ -4530,6 +4563,38 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           .update(schema.salesInvoices)
           .set({ date })
           .where(eq(schema.salesInvoices.shopifyOrder, shopifyId))
+        updated++
+      } else if (orderSnapshot.gid && byGid.has(orderSnapshot.gid)) {
+        // This Shopify order is the one this ERP created for a manual order: a
+        // local row already exists under its MO-… reference.
+        const linkedOrder = byGid.get(orderSnapshot.gid)!
+        const [cur] = await db
+          .select()
+          .from(schema.salesOrders)
+          .where(eq(schema.salesOrders.id, linkedOrder.id))
+          .limit(1)
+        const statePatch = cur ? buildOrderPatch(cur, orderSnapshot).patch : {}
+        await db
+          .update(schema.salesOrders)
+          .set({
+            ...statePatch,
+            // The row keeps its own MO-… reference (never the Shopify name): it
+            // is an ERP sale that happens to exist on Shopify, and the name is
+            // what the auto-invoice step keys on. Matching stays by gid.
+            ...(!apiNameIsEmail && customerName && customerName !== 'Guest' ? { customer: customerName } : {}),
+            ...(customerId ? { customerShopifyId: customerId } : {}),
+            date,
+            shopifyStore: config.shop,
+            value,
+            items,
+            tags,
+            currency,
+            discount,
+            billingAddress: mergeAddress(cur?.billingAddress as OrderAddress | undefined, billingAddress),
+            shippingAddress: mergeAddress(cur?.shippingAddress as OrderAddress | undefined, shippingAddress),
+          })
+          .where(eq(schema.salesOrders.id, linkedOrder.id))
+        linkedFromGid = true
         updated++
       } else {
         try {
@@ -4610,6 +4675,7 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
                 cancelledAt: orderSnapshot.cancelledAt,
                 closedAt: orderSnapshot.closedAt,
                 shopifySyncedAt: date,
+                shopifyStore: config.shop,
                 date,
                 items,
                 tags,
@@ -4778,14 +4844,17 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
         }
       }
 
-      // Raise a tax invoice for paid orders so the dashboard's invoice-derived
+      // Raise a tax invoice for every live Shopify order with a value — paid,
+      // partly paid or still pending — so the dashboard's invoice-derived
       // widgets (sales, invoices, top products/category, payment status) have
-      // data. Refunded and cancelled orders are skipped entirely, so a voided
-      // order never becomes revenue. This is idempotent: an order that already
-      // carries an invoice number is left alone, so re-syncing backfills the
-      // existing paid orders exactly once. The import already moved stock on
-      // insert, so the invoice must not move it again.
-      if (payment === 'paid' && mapImportedStatus(o) !== 'cancelled') {
+      // data. Invoicing only paid orders dropped unpaid Shopify sales from the
+      // dashboard and left Pending Amount with nothing to report. Cancelled and
+      // refunded orders are skipped entirely, so they never become revenue.
+      // This is idempotent: an order that already carries an invoice number is
+      // left alone (zero-amount invoices are repaired after the loop), and the
+      // import already moved stock on insert, so the invoice must not move it
+      // again.
+      if (!linkedFromGid && mapImportedStatus(o) !== 'cancelled' && payment !== 'refunded' && value > 0) {
         try {
           const [orderRow] = await db
             .select()
@@ -4820,6 +4889,55 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           logger.warn({ shopifyId, err: msg }, 'Shopify order import: auto-invoice failed')
         }
       }
+    }
+
+    // Orders the connected shop no longer returns were left behind by an
+    // earlier Shopify connection (or deleted in Shopify). Nothing is deleted:
+    // tag them so dashboards stop counting them as the connected shop's sales.
+    // Skip the tag when the fetch may have been truncated at the page cap — an
+    // order beyond the cap is not evidence of a different shop.
+    const fetchComplete = raw.length < CONSTANTS.SHOPIFY_MAX_PAGES * CONSTANTS.SHOPIFY_API_LIMIT
+    if (fetchComplete && seenInBatch.size > 0) {
+      try {
+        await db
+          .update(schema.salesOrders)
+          .set({ shopifyStore: 'not-in-store' })
+          .where(
+            and(
+              like(schema.salesOrders.shopifyId, '#%'),
+              sql`coalesce(${schema.salesOrders.shopifyStore}, '') <> 'not-in-store'`,
+              notInArray(schema.salesOrders.shopifyId, [...seenInBatch]),
+            ),
+          )
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Shopify order import: could not tag foreign-store orders',
+        )
+      }
+    }
+
+    // Backfill invoices written before the amount mapping was fixed: they are
+    // linked to their order but carry ₹0 (the total had been rebuilt from
+    // catalogue weights alone). The order's Shopify-sourced value is the truth.
+    try {
+      const { repairZeroValueShopifyInvoices } = await import('./orderEmailIngest')
+      const repair = await repairZeroValueShopifyInvoices()
+      if (repair.repaired > 0) {
+        await persistLog({
+          entity: 'Invoice',
+          direction: 'out',
+          action: 'Invoice Amount Repaired',
+          status: 'success',
+          error: `${repair.repaired} zero-value Shopify invoice(s) repaired from their order totals`,
+        })
+      }
+      invoiceFailures.push(...repair.failed)
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Shopify order import: zero-value invoice repair failed',
+      )
     }
 
     // Surface auto-invoice failures in Sync Logs (System → Shopify → Sync
@@ -5001,13 +5119,23 @@ export async function refreshShopifyOrder(localOrderId: string): Promise<{ ok: b
   const [local] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, localOrderId)).limit(1)
   if (!local) return { ok: false, message: 'Order not found locally' }
   const orderNumber = String(local.shopifyId ?? '').replace(/^#/, '')
-  if (!orderNumber) return { ok: false, message: 'Order is not linked to Shopify' }
+  // A manual order synced to Shopify keeps its ERP reference as `shopifyId`
+  // when the Shopify display name already belongs to another local order, so
+  // its gid is the only locator. Prefer it whenever it is present.
+  const gidRestId = String(local.shopifyGid ?? '').match(/\/Order\/(\d+)/)?.[1]
+  if (!orderNumber && !gidRestId) return { ok: false, message: 'Order is not linked to Shopify' }
 
   // Local shopifyId stores the order NAME (e.g. "#1053"), but the REST
   // single-order endpoint needs the numeric REST id. Look up by name first
-  // (name query requires status=any to include closed/cancelled orders).
-  const matches = await paginate<any>('orders', `status=any&name=${encodeURIComponent(`#${orderNumber}`)}`)
-  const restId = matches[0]?.id
+  // (name query requires status=any to include closed/cancelled orders) so the
+  // existing path is unchanged, and fall back to the gid for orders that could
+  // not claim their Shopify name locally.
+  let restId: string | number | undefined
+  if (orderNumber) {
+    const matches = await paginate<any>('orders', `status=any&name=${encodeURIComponent(`#${orderNumber}`)}`)
+    restId = matches[0]?.id
+  }
+  if (!restId) restId = gidRestId
   if (!restId) return { ok: false, message: `Order #${orderNumber} not found on Shopify` }
 
   // Single-order REST endpoint returns { order: {...} } — use shopifyRequest
@@ -5053,7 +5181,8 @@ export async function refreshShopifyOrder(localOrderId: string): Promise<{ ok: b
     })
     .where(eq(schema.salesOrders.id, localOrderId))
 
-  addLog('orders', 'success', 1, `Refreshed order #${orderNumber} from Shopify`)
-  await persistLog({ entity: 'Order', shopifyId: `#${orderNumber}`, direction: 'in', action: 'Order Refreshed', status: 'success' })
+  const orderRef = orderNumber ? `#${orderNumber}` : String(o.name ?? restId)
+  addLog('orders', 'success', 1, `Refreshed order ${orderRef} from Shopify`)
+  await persistLog({ entity: 'Order', shopifyId: orderRef, direction: 'in', action: 'Order Refreshed', status: 'success' })
   return { ok: true, updated: true }
 }

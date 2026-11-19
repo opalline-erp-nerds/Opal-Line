@@ -135,7 +135,7 @@ export function FinancialAnalytics() {
                   </div>
                 </div>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  {compactCurrency(data.sales)} invoiced
+                  {compactCurrency(data.sales)} sales
                   {data.returns > 0 ? ` − ${compactCurrency(data.returns)} returns` : ''}
                 </p>
                 <div className="mt-3 flex items-center gap-4 text-[11px]">

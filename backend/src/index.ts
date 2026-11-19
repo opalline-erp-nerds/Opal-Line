@@ -6,9 +6,9 @@ import cookieParser from 'cookie-parser'
 import { randomBytes, randomUUID, createHmac, timingSafeEqual } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { and, desc, eq, inArray, or, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
-import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
+import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, DraftOrderResult, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
 import { buildPricedOrder, ORDER_GST_RATE, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
@@ -47,6 +47,7 @@ import { ensureUploadsDir, UPLOADS_DIR, uploadImageHandler } from './uploads'
 import { mountFrontend, resolveFrontendDist } from './frontendStatic'
 import { HostedConfigError, isPublicHost, publicHostStartupError } from './hostedMode'
 import { routeParam } from './lib/routeParams'
+import { dbErrorInfo, describeDbError } from './lib/dbErrors'
 
 const app = express()
 
@@ -207,7 +208,10 @@ const jsonBodyParser = express.json({
 // Image-upload routes carry up to 25mb data-URL bodies and register their own
 // express.json({ limit: '25mb' }); the global 1mb parser must not reject them
 // first (it runs before route middleware and would 413 real product photos).
-const LARGE_JSON_PATHS = new Set(['/api/v1/uploads/image', '/api/v1/db/products/bulk-images'])
+const LARGE_JSON_PATHS = new Set([
+  '/api/v1/uploads/image',
+  '/api/v1/db/products/bulk-images',
+])
 app.use((req, res, next) => {
   if (LARGE_JSON_PATHS.has(req.path)) return next()
   return jsonBodyParser(req, res, next)
@@ -1973,6 +1977,70 @@ app.post('/api/v1/shopify/enrich', requirePermission('shopify', 'view'), async (
   }
 })
 
+/**
+ * Attach a Shopify order to its local sales_orders row.
+ *
+ * `sales_orders.shopify_id` is UNIQUE and imported Shopify orders already own
+ * their display name (`#1019`, …). Claiming a name another row holds is exactly
+ * what made `insert into "sales_orders"` fail with 23505, so the name is only
+ * written when it is free. The gid is always recorded: it is the identity every
+ * Admin GraphQL action uses and the marker that stops a sync retry from
+ * creating a second Shopify order.
+ */
+async function linkShopifyOrderToRow(input: {
+  orderId: string
+  result: Pick<DraftOrderResult, 'name' | 'orderGid'>
+}): Promise<{ order: Record<string, unknown> | null; warning: string | null }> {
+  if (!db) return { order: null, warning: null }
+  const name = input.result.name?.trim()
+  let takenByAnotherRow = false
+  if (name) {
+    const [clash] = await db
+      .select({ id: schema.salesOrders.id })
+      .from(schema.salesOrders)
+      .where(and(eq(schema.salesOrders.shopifyId, name), ne(schema.salesOrders.id, input.orderId)))
+      .limit(1)
+    takenByAnotherRow = Boolean(clash)
+  }
+
+  const write = async (claimName: boolean) => {
+    const [row] = await db!
+      .update(schema.salesOrders)
+      .set({
+        ...(claimName && name ? { shopifyId: name } : {}),
+        ...(input.result.orderGid ? { shopifyGid: input.result.orderGid } : {}),
+        shopifySyncedAt: new Date().toISOString(),
+      })
+      .where(eq(schema.salesOrders.id, input.orderId))
+      .returning()
+    return (row ?? null) as Record<string, unknown> | null
+  }
+
+  try {
+    const order = await write(!takenByAnotherRow)
+    return {
+      order,
+      warning: takenByAnotherRow
+        ? `Shopify named the order "${name}", but another local order already uses that reference; this order keeps its ERP reference (its Shopify gid is stored).`
+        : null,
+    }
+  } catch (err) {
+    // A concurrent Shopify import can claim the name between the check and the
+    // write. The sale is already saved and the Shopify order exists, so keep the
+    // ERP reference instead of failing the request.
+    const info = dbErrorInfo(err)
+    logger.warn(
+      { err: { code: info.code, constraint: info.constraint, message: info.message }, orderId: input.orderId },
+      'Could not claim the Shopify order name; keeping the ERP reference',
+    )
+    const order = await write(false)
+    return {
+      order,
+      warning: `Shopify named the order "${name ?? 'unknown'}", but that reference is already used locally; this order keeps its ERP reference.`,
+    }
+  }
+}
+
 // Shopify Flow webhook — receives full order + customer data from a Shopify Flow
 // This bypasses the Admin API PII limitations on development stores.
 // The Flow sends: order name, customer name, email, phone, billing/shipping addresses
@@ -2023,24 +2091,6 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
   // total per unit, so a qty-3 manual order arrived on Shopify at ~3× its value.)
   const shopifyLineItems = draftOrderInputLines(itemsWithCalculatedPrice)
 
-  let draft: { ok: boolean; draftId?: string; name?: string; customerId?: string; errors: string[]; message?: string } | null = null
-  let shopifyId = internalId
-
-  if (syncToShopify) {
-    draft = await createShopifyDraftOrder({
-      customerName: customer,
-      customerEmail: email,
-      customerPhone: phone,
-      payment,
-      billingAddress,
-      shippingAddress,
-      note: note ?? `Manual order created from Opal Line ERP (${internalId})`,
-      tags: 'manual-order',
-      lineItems: shopifyLineItems,
-    })
-    if (draft.ok && draft.name) shopifyId = draft.name
-  }
-
   if (!db) {
     return res.status(503).json({ error: 'Service temporarily unavailable' })
   }
@@ -2048,6 +2098,9 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
   const customerCity = billingAddress?.city ? String(billingAddress.city).trim() : undefined
 
   let order: Record<string, unknown> | null = null
+  // Which customer row this order belongs to, so the Shopify customer id from
+  // the (now post-save) sync can still be recorded against it.
+  let orderCustomerId: string | null = null
   const affectedProductIds: string[] = []
   try {
     await db.transaction(async (tx) => {
@@ -2071,7 +2124,12 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
         .insert(schema.salesOrders)
         .values({
           id: randomUUID(),
-          shopifyId,
+          // The ERP row is saved under its own MO-… reference. The Shopify
+          // order (draft completion) is synced afterwards, when this order is
+          // already safely stored: a Shopify-assigned name that is already used
+          // locally can no longer abort the sale, and a failed save can no
+          // longer leave an orphan Shopify order that a retry duplicates.
+          shopifyId: internalId,
           internalId,
           customer,
           value: Math.round(value * 100) / 100,
@@ -2103,17 +2161,14 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       // Accept any id form (bare numeric or gid://shopify/Customer/…) and
       // store/match only the bare numeric form — mixed formats defeat the
       // shopifyId identity match and duplicate customers.
-      const draftCustomerShopifyId = draft?.customerId
-        ? normalizeShopifyCustomerId(draft.customerId) || null
-        : null
       const identityConditions = []
       if (email) identityConditions.push(eq(schema.customers.email, email))
       if (phone) identityConditions.push(eq(schema.customers.phone, phone))
-      if (draftCustomerShopifyId) identityConditions.push(eq(schema.customers.shopifyId, draftCustomerShopifyId))
       const [existing] = identityConditions.length
         ? await tx.select().from(schema.customers).where(or(...identityConditions)).limit(1)
         : []
       if (existing) {
+        orderCustomerId = existing.id
         await tx
           .update(schema.customers)
           .set({
@@ -2121,18 +2176,18 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
             ...(email ? { email } : {}),
             ...(phone ? { phone } : {}),
             ...(customerCity ? { city: customerCity } : {}),
-            ...(draftCustomerShopifyId ? { shopifyId: draftCustomerShopifyId } : {}),
             status: existing.status ?? 'active',
           })
           .where(eq(schema.customers.id, existing.id))
       } else {
+        orderCustomerId = randomUUID()
         await tx.insert(schema.customers).values({
-          id: randomUUID(),
+          id: orderCustomerId,
           name: customer,
           email: email ?? null,
           phone: phone ?? null,
           city: customerCity ?? null,
-          shopifyId: draft?.customerId ?? null,
+          shopifyId: null,
           orders: 0,
           totalSpent: 0,
           status: 'active',
@@ -2141,8 +2196,63 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       }
     })
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Failed to create order'
-    return res.status(400).json({ error: msg })
+    // Log the driver error whole (code, constraint, column, detail) and give the
+    // operator the cause instead of Drizzle's "Failed query: insert into …"
+    // wrapper. A database error must never be hidden.
+    const info = dbErrorInfo(err)
+    logger.error(
+      { err: { code: info.code, constraint: info.constraint, column: info.column, table: info.table, detail: info.detail, message: info.message, stack: err instanceof Error ? err.stack : undefined }, internalId },
+      'Manual order save failed',
+    )
+    return res.status(400).json({ error: `Could not save the order: ${describeDbError(err)}` })
+  }
+
+  // ── Shopify sync (after the order is stored) ────────────────────────────
+  // The local order is the source of truth. Only once it exists do we push it
+  // to Shopify with the payment mode the operator picked (`payment` drives
+  // draftOrderComplete's paymentPending), then record the Shopify identity on
+  // the row. A sync failure is reported, never rolled back over the sale.
+  let shopifySync: DraftOrderResult | null = null
+  if (syncToShopify) {
+    const draft = await createShopifyDraftOrder({
+      customerName: customer,
+      customerEmail: email,
+      customerPhone: phone,
+      payment,
+      billingAddress,
+      shippingAddress,
+      note: note ?? `Manual order created from Opal Line ERP (${internalId})`,
+      tags: 'manual-order',
+      lineItems: shopifyLineItems,
+    })
+    shopifySync = draft
+    // (the transaction callback above is invisible to control-flow analysis, so
+    // the row is read through an explicit cast rather than narrowed to null)
+    const savedOrder = order as Record<string, unknown> | null
+    if (draft.ok && savedOrder?.id) {
+      const link = await linkShopifyOrderToRow({ orderId: String(savedOrder.id), result: draft })
+      if (link.order) order = link.order
+      if (link.warning) {
+        shopifySync = {
+          ...draft,
+          message: [draft.message, link.warning].filter(Boolean).join(' '),
+        }
+      }
+    }
+    // The draft order resolved (or created) a Shopify customer. Store its id on
+    // the local customer row, normalised to the bare numeric form the identity
+    // match expects. Best-effort: the order is already saved.
+    const linkedCustomerId = draft.customerId ? normalizeShopifyCustomerId(draft.customerId) : null
+    if (linkedCustomerId && orderCustomerId) {
+      try {
+        await db
+          .update(schema.customers)
+          .set({ shopifyId: linkedCustomerId })
+          .where(eq(schema.customers.id, orderCustomerId))
+      } catch (err) {
+        logger.warn({ err: { message: err instanceof Error ? err.message : String(err) }, orderCustomerId }, 'Could not store the Shopify customer id after order sync')
+      }
+    }
   }
 
   // Stats are derived, never accumulated: recount from real orders so the
@@ -2163,13 +2273,13 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
   void recordActivity({
     action: 'Created Sales Order',
     module: 'sales',
-    entity: `Sales Order ${shopifyId}`,
+    entity: `Sales Order ${String(order?.shopifyId ?? internalId)}`,
     details: `${customer} - ${itemCount} item(s), Rs${value.toFixed(2)}${syncToShopify ? ' (synced to Shopify)' : ''}`,
     userId: actor.userId,
     ip: actor.ip,
   })
 
-  res.status(201).json({ order, shopifySync: draft })
+  res.status(201).json({ order, shopifySync })
 })
 
 app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), validate(updateOrderSchema), async (req, res) => {
@@ -2343,24 +2453,43 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       updated = u
     }
 
-    let shopifySync: { ok: boolean; errors: string[]; message?: string; name?: string; draftId?: string } | null = null
+    let shopifySync: DraftOrderResult | null = null
     if (syncToShopify) {
       const storedShopifyId = typeof updated.shopifyId === 'string' ? updated.shopifyId : ''
       if (storedShopifyId.startsWith('#')) {
-        shopifySync = await updateShopifyOrder({
+        const result = await updateShopifyOrder({
           orderName: storedShopifyId,
           email: email ? String(email).trim() : undefined,
           note: note ? String(note).trim() : undefined,
           tags: 'manual-order',
           shippingAddress,
         })
+        shopifySync = result
+        if (result.ok) {
+          const [fresh] = await db
+            .update(schema.salesOrders)
+            .set({ shopifySyncedAt: new Date().toISOString() })
+            .where(eq(schema.salesOrders.id, routeParam(req.params.id)))
+            .returning()
+          if (fresh) updated = fresh
+        }
+      } else if (updated.shopifyGid) {
+        // Already on Shopify, but under a gid whose display name belongs to
+        // another local order. Creating a draft here would put a second order
+        // on Shopify, so say what is already there instead.
+        shopifySync = {
+          ok: true,
+          errors: [],
+          message: `This order is already linked to Shopify (${String(updated.shopifyGid)}); no new Shopify order was created.`,
+        }
       } else if (storedShopifyId) {
         // First-time sync retry: an ERP-native order (shopifyId is the internal
         // "MO-…" reference) that was saved while Shopify was down, unconfigured,
         // or when its first draft attempt failed. The old code only updated '#'
         // orders, so such an order could never reach Shopify — creating the draft
-        // now from the stored order; its returned name becomes the canonical id.
-        shopifySync = await createShopifyDraftOrder({
+        // now from the stored order; its returned identity is recorded on the row
+        // (the display name only when no other local order already owns it).
+        const draft = await createShopifyDraftOrder({
           customerName: String(updated.customer ?? '').trim() || undefined,
           customerEmail: email ? String(email).trim() : (updated.customerEmail ?? undefined) || undefined,
           customerPhone: phone ? String(phone).trim() : (updated.customerPhone ?? undefined) || undefined,
@@ -2371,11 +2500,13 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
           tags: 'manual-order',
           lineItems: draftOrderInputLines(updated.lineItems as ReadonlyArray<unknown> | null),
         })
-        if (shopifySync.ok && shopifySync.name) {
-          await db
-            .update(schema.salesOrders)
-            .set({ shopifyId: shopifySync.name })
-            .where(eq(schema.salesOrders.id, routeParam(req.params.id)))
+        shopifySync = draft
+        if (draft.ok) {
+          const link = await linkShopifyOrderToRow({ orderId: routeParam(req.params.id), result: draft })
+          if (link.order) updated = link.order
+          if (link.warning) {
+            shopifySync = { ...draft, message: [draft.message, link.warning].filter(Boolean).join(' ') }
+          }
         }
       }
     }
@@ -2399,8 +2530,17 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
     res.json({ order: updated, shopifySync })
   } catch (err) {
     // Keep the transaction's own message (e.g. the per-SKU insufficient-stock
-    // detail) so the modal can show it under the offending line.
-    const msg = err instanceof Error ? err.message : 'Failed to update order'
+    // detail) so the modal can show it under the offending line; unpack Drizzle's
+    // query wrapper so a real database error is never hidden.
+    const info = dbErrorInfo(err)
+    const isDbError = Boolean(info.code)
+    if (isDbError) {
+      logger.error(
+        { err: { code: info.code, constraint: info.constraint, column: info.column, table: info.table, detail: info.detail, message: info.message }, orderId: routeParam(req.params.id) },
+        'Sales order update failed',
+      )
+    }
+    const msg = isDbError ? `Could not update the order: ${describeDbError(err)}` : err instanceof Error ? err.message : 'Failed to update order'
     res.status(400).json({ error: msg })
   }
 })

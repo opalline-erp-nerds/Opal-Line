@@ -224,6 +224,8 @@ export default function ExpensesPage() {
       <PageHeader
         title="Expenses"
         subtitle="Operating expenses across marketing, packaging, shipping, labour and more."
+        icon={<Receipt className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />}
+        iconTileClassName="bg-[#7547F5] text-white ring-[#7547F5] dark:bg-[#7547F5] dark:text-white dark:ring-[#7547F5]"
         actions={
           <Button size="sm" onClick={openDialog}>
             <Plus className="h-4 w-4" /> Add Expense

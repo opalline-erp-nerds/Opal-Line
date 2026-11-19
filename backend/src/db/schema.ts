@@ -292,6 +292,14 @@ export const salesOrders = pgTable('sales_orders', {
   closedAt: ts('closed_at'),
   /** Last time the local row was brought level with Shopify. */
   shopifySyncedAt: ts('shopify_synced_at'),
+  /**
+   * Which Shopify shop this order belongs to: the connected shop domain, or
+   * 'not-in-store' once a sync of the connected shop no longer returns it
+   * (a previous connection, or an order deleted in Shopify). Orders are never
+   * deleted here — dashboards use this to stop counting sales that the
+   * connected shop does not have.
+   */
+  shopifyStore: text('shopify_store'),
 }, (table) => ({
   shopifyIdIdx: uniqueIndex('sales_orders_shopify_id_idx').on(table.shopifyId),
   shopifyGidIdx: index('sales_orders_shopify_gid_idx').on(table.shopifyGid),
@@ -1424,6 +1432,7 @@ export const journalEntries = pgTable('journal_entries', {
   reference: text('reference'),
   referenceType: text('reference_type'),
   referenceId: text('reference_id'),
+  source: text('source'),
   isAuto: boolean('is_auto').default(true),
   branchId: text('branch_id'),
   createdBy: text('created_by'),

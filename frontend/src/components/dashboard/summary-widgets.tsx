@@ -5,6 +5,7 @@ import {
   Calendar,
   ChevronLeft,
   ChevronRight,
+  Inbox,
   IndianRupee,
   Search,
   ShoppingBag,
@@ -29,17 +30,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { OrderSummaryBarChart, StatusDonutChart, WidgetBarChart } from '@/components/charts/dashboard-widget-charts'
 import { SERIES_COLORS } from '@/components/charts/chart-theme'
 import { StatusPill } from '@/components/ui/status-pill'
-import { humanizeStatus, statusTone } from '@/lib/status'
-import { compactCurrency, formatDate, formatNumber } from '@/lib/format'
+import { humanizeStatus } from '@/lib/status'
+import { compactCurrency, formatDate, formatDateTime, formatNumber } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-const STATUS_BAR_COLORS = {
-  success: SERIES_COLORS[2],
-  warning: SERIES_COLORS[3],
-  danger: '#E5484D',
-  info: SERIES_COLORS[1],
-  neutral: '#94A3B8',
-} as const
 
 function WidgetAction({ label, onClick }: { label: string; onClick: () => void }) {
   return (
@@ -54,7 +48,14 @@ function ErrorRow({ message }: { message: string }) {
 }
 
 function EmptyRow({ message }: { message: string }) {
-  return <p className="py-8 text-center text-xs text-muted-foreground">{message}</p>
+  return (
+    <div className="flex flex-col items-center justify-center gap-1.5 py-8 text-center">
+      <span className="flex h-9 w-9 items-center justify-center rounded-full bg-muted text-muted-foreground">
+        <Inbox className="h-4 w-4" />
+      </span>
+      <p className="text-xs text-muted-foreground">{message}</p>
+    </div>
+  )
 }
 
 function LoadingRows({ rows = 4 }: { rows?: number }) {
@@ -378,9 +379,11 @@ export function PurchaseOrdersCard({ range }: { range: RangeQuery }) {
           <EmptyRow message="No purchase orders in this period" />
         ) : (
           <>
-            <div className="grid grid-cols-2 items-center gap-2">
-              <StatusDonutChart data={slices} centerLabel="Orders" centerValue={formatNumber(totalOrders)} height={150} />
-              <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <div className="w-[148px] shrink-0">
+                <StatusDonutChart data={slices} centerLabel="Orders" centerValue={formatNumber(totalOrders)} height={150} />
+              </div>
+              <div className="min-w-0 flex-1 space-y-1.5">
                 {slices.map((slice) => (
                   <div key={slice.name} className="flex items-center gap-1.5 text-[11px]">
                     <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: slice.color }} />
@@ -603,9 +606,11 @@ export function SalesOrdersCard({ range }: { range: RangeQuery }) {
           <EmptyRow message="No sales orders in this period" />
         ) : (
           <>
-            <div className="grid grid-cols-2 items-center gap-2">
-              <StatusDonutChart data={slices} centerLabel="Orders" centerValue={formatNumber(totalOrders)} height={150} />
-              <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <div className="w-[148px] shrink-0">
+                <StatusDonutChart data={slices} centerLabel="Orders" centerValue={formatNumber(totalOrders)} height={150} />
+              </div>
+              <div className="min-w-0 flex-1 space-y-1.5">
                 {slices.map((slice) => (
                   <div key={slice.name} className="flex items-center gap-1.5 text-[11px]">
                     <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: slice.color }} />
@@ -642,8 +647,8 @@ export function SalesOrdersCard({ range }: { range: RangeQuery }) {
   )
 }
 
-/** Recent invoices: six latest, click a row to open the invoice. */
-export function RecentInvoicesCard({ range }: { range: RangeQuery }) {
+/** Recent sales: latest Shopify and ERP transactions, click to open the invoice. */
+export function RecentInvoicesCard({ range, source }: { range: RangeQuery; source: 'all' | 'shopify' | 'erp' }) {
   const { period, start, end } = range
   const navigate = useNavigate()
   const [data, setData] = useState<RecentInvoicesWidget | null>(null)
@@ -655,12 +660,12 @@ export function RecentInvoicesCard({ range }: { range: RangeQuery }) {
     setLoading(true)
     setError(null)
     dbApi
-      .getRecentInvoices({ period, start, end })
+      .getRecentInvoices({ period, start, end }, source)
       .then((res) => {
         if (!cancelled) setData(res)
       })
       .catch(() => {
-        if (!cancelled) setError("Couldn't load recent invoices")
+        if (!cancelled) setError("Couldn't load recent sales")
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -668,56 +673,66 @@ export function RecentInvoicesCard({ range }: { range: RangeQuery }) {
     return () => {
       cancelled = true
     }
-  }, [period, start, end])
+  }, [period, start, end, source])
 
   return (
     <Card>
       <CardHeader className="flex-row items-center justify-between space-y-0">
         <div>
           <CardTitle className="flex items-center gap-2 text-sm">
-            <Calendar className="h-4 w-4 text-primary-700" /> Recent Invoices
+            <Calendar className="h-4 w-4 text-primary-700" /> Recent Sales
           </CardTitle>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoices raised</p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">Latest Shopify and ERP transactions</p>
         </div>
         <WidgetAction label="View all" onClick={() => navigate('/sales/invoices')} />
       </CardHeader>
-      <CardContent>
+      <CardContent className="p-0">
         {loading ? (
-          <LoadingRows rows={6} />
+          <div className="px-5 pb-5"><LoadingRows rows={6} /></div>
         ) : error ? (
           <ErrorRow message={error} />
         ) : (data?.rows.length ?? 0) === 0 ? (
-          <EmptyRow message="No invoices in this period" />
+          <EmptyRow message={`No ${source === 'shopify' ? 'Shopify' : source === 'erp' ? 'ERP' : ''} sales in this period`} />
         ) : (
-          <>
-            <WidgetBarChart
-              data={data?.statusPoints ?? []}
-              getBarColor={(point) => STATUS_BAR_COLORS[statusTone(point.status ?? '')]}
-              height={62}
-              tooltipLabel="Invoiced"
-              emptyMessage="No invoices in this period"
-            />
-            <div className="mt-2 divide-y">
-              {data?.rows.map((row) => (
-                <button
-                  key={row.id}
-                  onClick={() => navigate(`/sales/invoices/${row.id}`)}
-                  className="flex w-full items-center gap-2 py-2 text-left transition-colors hover:bg-muted/40"
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-[11.5px] font-medium text-foreground">{row.number}</p>
-                    <p className="truncate text-[10.5px] text-muted-foreground">
-                      {row.customer} · {formatDate(row.date)}
-                    </p>
-                  </div>
-                  <StatusPill status={row.paymentStatus} />
-                  <span className="w-16 text-right text-[11px] font-semibold tabular-nums text-foreground">
-                    {compactCurrency(row.total)}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </>
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Order</TableHead>
+                  <TableHead>Platform</TableHead>
+                  <TableHead className="hidden sm:table-cell">Customer</TableHead>
+                  <TableHead className="text-right">Amount</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead className="hidden md:table-cell">Date</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {data?.rows.map((row) => (
+                  <TableRow
+                    key={row.id}
+                    onClick={() => navigate(`/sales/invoices/${row.id}`)}
+                    className="cursor-pointer"
+                  >
+                    <TableCell className="font-medium text-foreground">{row.number}</TableCell>
+                    <TableCell>
+                      <span className={cn(
+                        'inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold',
+                        row.platform === 'shopify'
+                          ? 'bg-info-50 text-info-700 dark:bg-info-50/60 dark:text-info-300'
+                          : 'bg-warning-50 text-warning-700 dark:bg-warning-50/60 dark:text-warning-300',
+                      )}>
+                        {row.platform === 'shopify' ? 'Shopify' : 'ERP'}
+                      </span>
+                    </TableCell>
+                    <TableCell className="hidden max-w-[140px] truncate sm:table-cell">{row.customer}</TableCell>
+                    <TableCell className="text-right font-semibold tabular-nums text-foreground">{compactCurrency(row.total)}</TableCell>
+                    <TableCell><StatusPill status={row.paymentStatus} /></TableCell>
+                    <TableCell className="hidden whitespace-nowrap text-[11px] text-muted-foreground md:table-cell">{formatDateTime(row.date)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
         )}
       </CardContent>
     </Card>

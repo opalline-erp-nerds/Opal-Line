@@ -853,7 +853,7 @@ export async function recordRefund(input: RecordRefundInput): Promise<RecordRefu
   const now = new Date().toISOString()
 
   try {
-    return await db.transaction(async (tx) => {
+    const saved = await db.transaction(async (tx) => {
       // Resolve the ERP order/invoice/customer from the Shopify order name —
       // refunds can arrive for orders that predate this feature.
       let orderId: string | null = null
@@ -994,6 +994,8 @@ export async function recordRefund(input: RecordRefundInput): Promise<RecordRefu
       })
       return { id, number, created: true, status }
     })
+    void import('./accounting/hooks').then(({ queueRefundJournal }) => queueRefundJournal(saved.id, input.createdBy ?? null)).catch((err) => logger.warn({ err, refundId: saved.id }, 'Failed to sync refund journal'))
+    return saved
   } catch (err) {
     logger.error({ err, externalId, orderRef }, 'recordRefund failed')
     return null
