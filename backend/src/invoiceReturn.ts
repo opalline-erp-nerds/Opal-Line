@@ -124,15 +124,140 @@ export function addReturnedQty(returned: Map<string, number>, sku: string, qty: 
 }
 
 /**
+ * Where the parts of ONE returned SKU line should be restocked (Phase 4).
+ *
+ * The original invoice item's location is the primary source of truth:
+ *   • an explicit operator choice (`explicitLocationId`, RMA receipt) wins;
+ *   • otherwise the returned quantity is distributed across that SKU's
+ *     invoice items IN ORDER, each leg returning to its own fulfilment
+ *     store — cumulative across repeated returns, so a 5@Main + 5@Counter
+ *     line sends the first 5 back to Main and the next 5 to Counter;
+ *   • items with no stored location (every historical invoice) and SKUs with
+ *     no invoice items at all fall back to `fallbackLocationId` (the order's
+ *     own store) — and finally to nothing, which is exactly the legacy
+ *     default-store behaviour. Nothing is ever guessed: a NULL here has the
+ *     same meaning it always had.
+ *
+ * Pure — shared by the credit-note flow and the RMA flow so both reverse to
+ * the same stores.
+ */
+export function planReturnRestock(
+  invoiceItems: Array<{ sku?: string | null; qty?: number | null; locationId?: string | null }>,
+  sku: string,
+  qty: number,
+  opts: {
+    explicitLocationId?: string | null
+    fallbackLocationId?: string | null
+    /**
+     * What EARLIER returns on this invoice already put back, per store
+     * (`priorRestockLegs`). Distribution continues where they left off, so a
+     * second partial return can never re-fill the first store past what that
+     * store actually sold.
+     */
+    prior?: Array<{ locationId?: string | null; qty: number }>
+  } = {},
+): Array<{ qty: number; locationId?: string | null }> {
+  const amount = Math.max(0, Math.floor(Number(qty) || 0))
+  if (amount === 0) return []
+  if (opts.explicitLocationId) return [{ qty: amount, locationId: opts.explicitLocationId }]
+  const fallback = opts.fallbackLocationId ?? null
+  const key = lineKey(sku)
+  const skuItems = invoiceItems
+    .filter((row) => lineKey(String(row.sku ?? '')) === key)
+    // Deterministic order (by store id): the first return fills the first
+    // store and every later return continues in the same order — combined
+    // with the prior-capacity check below, each store stays within what it
+    // actually sold, run after run. The stable sort keeps legacy
+    // NULL-location rows in their original order.
+    .sort((a, b) => String(a.locationId ?? '').localeCompare(String(b.locationId ?? '')))
+  if (skuItems.length === 0) return [{ qty: amount, locationId: fallback }]
+  const prior = opts.prior ?? []
+  const priorAt = (bucket: string | null) =>
+    prior.filter((p) => (p.locationId ?? null) === bucket).reduce((a, p) => a + Math.max(0, Math.floor(Number(p.qty) || 0)), 0)
+  const legs: Array<{ qty: number; locationId?: string | null }> = []
+  let remaining = amount
+  for (const row of skuItems) {
+    if (remaining <= 0) break
+    const soldHere = Math.max(0, Math.floor(Number(row.qty ?? 0)))
+    if (soldHere <= 0) continue
+    const bucket = row.locationId ?? fallback
+    const capacity = Math.max(0, soldHere - priorAt(bucket))
+    const take = Math.min(remaining, capacity)
+    if (take <= 0) continue
+    legs.push({ qty: take, locationId: bucket })
+    remaining -= take
+  }
+  // Validation upstream caps a return at sold − already-returned, so this
+  // only fires on a plan-less legacy row whose earlier returns were booked
+  // against a different bucket: send the remainder the legacy way rather
+  // than silently dropping it.
+  if (remaining > 0) legs.push({ qty: remaining, locationId: fallback })
+  return legs
+}
+
+/**
+ * What earlier returns on an invoice actually restocked, per SKU and store —
+ * the input `planReturnRestock` needs so repeated partial returns continue
+ * where the last one left off.
+ *
+ * Reads each prior return's stored `restockPlan` (written by the credit-note
+ * flow and by RMA receipts since Phase 4). Rows without a plan are booked
+ * against `unplannedLocationId` — exactly where those legacy returns put
+ * their stock (default store for credit notes, the order's own store for
+ * RMAs). Cancelled credit notes are skipped, matching `aggregateReturnedBySku`.
+ * RMA rows only count once received (their `receivedItems`); rejected-after-
+ * receipt rows have had their restock undone and carry none.
+ */
+export function priorRestockLegs(
+  rows: Array<{ id?: string; status?: string | null; restocked?: boolean | null; returnItems?: unknown; receivedItems?: unknown }>,
+  unplannedLocationId: string | null,
+  opts: { excludeId?: string } = {},
+): Map<string, Array<{ locationId?: string | null; qty: number }>> {
+  const out = new Map<string, Array<{ locationId?: string | null; qty: number }>>()
+  for (const row of rows) {
+    if (!row || RETURN_STATUSES_EXCLUDED.has(String(row.status ?? '').toLowerCase())) continue
+    if (opts.excludeId && row.id === opts.excludeId) continue
+    // Only a return that ACTUALLY restocked stock contributes: an RMA still
+    // in transit (restocked null) or a credit note raised with restock:false
+    // moved nothing, so it consumes no store capacity.
+    if (row.restocked !== true) continue
+    const received = Array.isArray(row.receivedItems) ? (row.receivedItems as Array<Record<string, unknown>>) : []
+    const entries = received.length > 0
+      ? received
+      : Array.isArray(row.returnItems) ? (row.returnItems as Array<Record<string, unknown>>) : []
+    for (const entry of entries) {
+      const key = lineKey(String(entry?.sku ?? ''))
+      const qty = Math.max(0, Math.floor(num(entry?.qty)))
+      if (!key || qty <= 0) continue
+      const planned = Array.isArray(entry?.restockPlan)
+        ? (entry.restockPlan as Array<Record<string, unknown>>)
+            .filter((l) => Number(l?.qty) > 0)
+            .map((l) => ({ locationId: (l?.locationId as string | null | undefined) ?? null, qty: Math.floor(Number(l.qty)) }))
+        : []
+      const legs = planned.length > 0 ? planned : [{ locationId: unplannedLocationId, qty }]
+      const list = out.get(key)
+      if (list) list.push(...legs)
+      else out.set(key, legs)
+    }
+  }
+  return out
+}
+
+/**
  * Per-line summaries: sold, previously returned, remaining. Every consumer
  * (return endpoint, return-status endpoint, UI) shares these, so the numbers
  * can never drift between what was validated and what is shown.
+ *
+ * Rows are grouped BY SKU first (Phase 4): a fulfilment split stores the same
+ * SKU as one invoice item per store, and returnable quantity is per SKU ACROSS
+ * the invoice — never the last row's share of it. Distinct-SKU invoices
+ * (every historical one) produce exactly the same summaries as before.
  */
 export function summarizeReturnLines(
   invoiceLines: Array<InvoiceLineLike | null | undefined>,
   returnedBySku: Map<string, number>,
 ): ReturnLineSummary[] {
-  const out: ReturnLineSummary[] = []
+  const grouped = new Map<string, { sku: string; product: string; sold: number; amount: number }>()
   for (const line of invoiceLines) {
     if (!line) continue
     const sku = String(line.sku ?? '').trim()
@@ -140,14 +265,25 @@ export function summarizeReturnLines(
     if (!sku) continue
     const sold = Math.max(1, Math.floor(num(line.qty, 1)))
     const amount = num(line.amount, 0)
-    const prev = returnedBySku.get(lineKey(sku)) ?? 0
+    const key = lineKey(sku)
+    const existing = grouped.get(key)
+    if (existing) {
+      existing.sold += sold
+      existing.amount += amount
+    } else {
+      grouped.set(key, { sku, product: String(line.product ?? '').trim(), sold, amount })
+    }
+  }
+  const out: ReturnLineSummary[] = []
+  for (const g of grouped.values()) {
+    const prev = returnedBySku.get(lineKey(g.sku)) ?? 0
     out.push({
-      sku,
-      product: String(line.product ?? '').trim(),
-      sold,
-      returned: Math.min(prev, sold),
-      remaining: Math.max(0, sold - prev),
-      unitAmount: sold > 0 ? round2(amount / sold) : 0,
+      sku: g.sku,
+      product: g.product,
+      sold: g.sold,
+      returned: Math.min(prev, g.sold),
+      remaining: Math.max(0, g.sold - prev),
+      unitAmount: g.sold > 0 ? round2(g.amount / g.sold) : 0,
     })
   }
   return out
@@ -305,7 +441,13 @@ export async function applyInvoiceReturn(
   // partial return can be resumed later without over-returning — and a
   // duplicate submission is rejected instead of restocking inventory twice.
   const priorRows = await tx
-    .select({ status: schema.salesReturns.status, returnItems: schema.salesReturns.returnItems })
+    .select({
+      id: schema.salesReturns.id,
+      status: schema.salesReturns.status,
+      restocked: schema.salesReturns.restocked,
+      returnItems: schema.salesReturns.returnItems,
+      receivedItems: schema.salesReturns.receivedItems,
+    })
     .from(schema.salesReturns)
     .where(eq(schema.salesReturns.invoiceId, invoice.id as string))
   const alreadyReturned = aggregateReturnedBySku(priorRows)
@@ -356,15 +498,46 @@ export async function applyInvoiceReturn(
   if (!returnItems) return { ok: false, status: 400, error: 'No matching items to return (SKU + qty required)' }
 
   const restock = payload?.restock !== false
+  // PHASE 4: plan the restock ONCE per SKU, then both execute it and store it
+  // on the credit note. Each returned part goes back to THE STORE ITS UNITS
+  // WERE FULFILLED FROM (the original invoice item's location), continuing
+  // where earlier restocked returns left off — so a second partial return
+  // cannot re-fill the first store past what that store actually sold.
+  // Historical items (NULL location) fall back exactly as before: no
+  // location argument → the legacy default store.
+  const priorBySku = priorRestockLegs(priorRows, null)
+  const plansBySku = new Map<string, Array<{ qty: number; locationId?: string | null }>>()
+  for (const it of returnItems) {
+    plansBySku.set(
+      lineKey(it.sku),
+      planReturnRestock(invItems, it.sku, it.qty, { prior: priorBySku.get(lineKey(it.sku)) ?? [] }),
+    )
+  }
   if (restock) {
     // Ledger-correct restock: applyStockMovement writes the stock_movements
     // audit row and the stock_levels balance, and products.stock stays a
     // consistent rollup — the old direct UPDATE drifted the ledger.
     const { applyStockMovement } = await import('./stock')
     for (const it of returnItems) {
-      await applyStockMovement({ sku: it.sku, qty: it.qty, type: 'sale_return_in', refType: 'invoice', refId: invoice.id as string, tx })
+      for (const leg of plansBySku.get(lineKey(it.sku)) ?? []) {
+        await applyStockMovement({
+          sku: it.sku,
+          qty: leg.qty,
+          type: 'sale_return_in',
+          refType: 'invoice',
+          refId: invoice.id as string,
+          ...(leg.locationId ? { locationId: leg.locationId } : {}),
+          tx,
+        })
+      }
     }
   }
+  // The executed plan travels with the credit note so the NEXT return on this
+  // invoice can account for it. With restock:false nothing moved, so no plan
+  // is recorded (and none is counted as prior stock later).
+  const storedReturnItems = restock
+    ? returnItems.map((it) => ({ ...it, restockPlan: plansBySku.get(lineKey(it.sku)) ?? [] }))
+    : returnItems
 
   const amount = round2(returnItems.reduce((a, it) => a + it.amount, 0))
   const now = new Date()
@@ -382,7 +555,7 @@ export async function applyInvoiceReturn(
     invoiceId: invoice.id as string,
     creditNoteNumber: number,
     restocked: restock,
-    returnItems,
+    returnItems: storedReturnItems,
     order: invoice.shopifyOrder ?? null,
     customer: invoice.customer ?? null,
     items: returnItems.reduce((a, it) => a + it.qty, 0),

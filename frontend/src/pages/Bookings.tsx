@@ -1,5 +1,5 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '@/auth/auth-context'
 import { useSilverRate } from '@/lib/silver-rate-context'
@@ -7,6 +7,7 @@ import {
   Ban,
   Download,
   Eye,
+  Layers,
   Link2,
   Loader2,
   Pencil,
@@ -16,6 +17,7 @@ import {
   Search,
   ShoppingBag,
   Trash2,
+  Undo2,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
@@ -34,8 +36,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { CustomerPicker, type CustomerHit } from '@/components/customer-picker'
 import type { ColumnDef } from '@/lib/table'
 import { dbApi } from '@/lib/api'
+import { ApiError, formatApiError } from '@/lib/api/core'
+import { allocationDraftIssues, allocationStatusFor, trackedQuantity, type AllocationDraft } from '@/lib/bookingAllocations'
+import { bookingBalance, bookingStats } from '@/lib/bookingStats'
 import { exportTable } from '@/lib/export'
 import { bookingPricing } from '@/lib/bookingPricing'
+import { locationLabel } from '@/lib/locations'
 import { perUnitLinePrice } from '@/lib/orderPricing'
 import {
   findVariantById,
@@ -46,7 +52,15 @@ import {
   variantOptions,
 } from '@/lib/productVariants'
 import { formatCurrency, formatDate, formatDateTime } from '@/lib/format'
-import type { OrderFullDetail, Product, SalesOrder } from '@/types'
+import type {
+  BookingAllocationLine,
+  BookingAllocationSummary,
+  InventoryLocation,
+  LocationStockAvailability,
+  OrderFullDetail,
+  Product,
+  SalesOrder,
+} from '@/types'
 
 /** One editable line on the booking form. */
 interface DraftLine {
@@ -90,9 +104,27 @@ interface BookingFormState {
   advance: string
   note: string
   status: string
+  /** The one store this booking sells from (id — never a display name). */
+  locationId: string
 }
 
 const today = () => new Date().toISOString().slice(0, 10)
+
+/**
+ * The seeded main store — mirrors DEFAULT_LOCATION_ID in backend/src/stock.ts.
+ * It is both the default for a NEW booking and what a legacy (location-less)
+ * booking has always converted against, so selecting it changes nothing.
+ */
+const DEFAULT_STORE_ID = 'LOC-DEFAULT'
+
+/** Fallback label when the locations list cannot be loaded (e.g. no inventory.view). */
+const DEFAULT_STORE_FALLBACK: InventoryLocation = {
+  id: DEFAULT_STORE_ID,
+  name: 'Main Store',
+  type: 'store',
+  city: '',
+  manager: '',
+}
 
 type BadgeVariant = NonNullable<BadgeProps['variant']>
 
@@ -123,10 +155,6 @@ function isCancelled(b: SalesOrder): boolean {
 /** Still editable/convertible: never invoiced, never cancelled. */
 function isOpenBooking(b: SalesOrder): boolean {
   return !b.invoice && !isCancelled(b)
-}
-
-function balanceOf(b: SalesOrder): number {
-  return Math.max(0, Math.round((Number(b.value ?? 0) - Number(b.advancePaid ?? 0)) * 100) / 100)
 }
 
 function itemsSummary(b: SalesOrder): string {
@@ -166,11 +194,14 @@ export function BookingDetailView({
   detail,
   loading,
   error,
+  locationName,
 }: {
   booking: SalesOrder
   detail: OrderFullDetail | null
   loading?: boolean
   error?: string | null
+  /** Human label of the booking's ONE selling store (resolved by the page). */
+  locationName?: string
 }) {
   const advance = Number(booking.advancePaid ?? 0)
   const discount = Number(booking.discount ?? 0)
@@ -214,6 +245,9 @@ export function BookingDetailView({
           <Badge variant="secondary">Awaiting conversion</Badge>
         )}
         {outstanding > 0 ? <Badge variant="warning">{formatCurrency(outstanding)} outstanding</Badge> : null}
+        {isOpenBooking(booking) && trackedQuantity(booking) > 0 ? (
+          <AllocationStatusChip allocated={booking.allocated ?? 0} required={trackedQuantity(booking)} />
+        ) : null}
       </div>
 
       <div className="grid gap-x-6 sm:grid-cols-2">
@@ -223,6 +257,7 @@ export function BookingDetailView({
           {booking.expectedDelivery ? (
             <DetailField label="Expected delivery" value={formatDate(booking.expectedDelivery)} />
           ) : null}
+          {locationName ? <DetailField label="Selling store" value={locationName} /> : null}
           <DetailField
             label="Customer"
             value={
@@ -342,6 +377,288 @@ export function BookingDetailView({
   )
 }
 
+/**
+ * Availability for ONE booking line: the variant identity (name, SKU, selling
+ * price), the quantity this line requires, and stock broken out PER STORE.
+ *
+ * The combined figure is labelled informational — a booking never allocates
+ * across stores, so a silent cross-store total would invite selling stock the
+ * selling store does not hold. Presentational (props in, markup out) so the
+ * regression tests can exercise every state without booting the page.
+ */
+export function BookingLineAvailability({
+  sku,
+  variantName,
+  sellingPrice,
+  required,
+  availability,
+  selectedLocationId,
+}: {
+  sku: string
+  variantName?: string | null
+  sellingPrice?: number | null
+  required: number
+  /** Resolved data, `null` while in flight, `{ error }` when the call failed. */
+  availability: LocationStockAvailability | null | { error: string } | undefined
+  /**
+   * The booking's ONE selling store. When it resolves among the returned
+   * stores, that row is the actionable availability (emphasised, short-flagged)
+   * and every other store is shown strictly as informational context — a
+   * single-store booking can never be satisfied out of another store.
+   */
+  selectedLocationId?: string | null
+}) {
+  const error = availability && 'error' in availability ? availability.error : null
+  const loading = availability === null
+  const stock = availability && !('error' in availability) ? availability : null
+  const selected = selectedLocationId
+    ? stock?.locations.find((l) => l.locationId === selectedLocationId) ?? null
+    : null
+  const otherStores = selected
+    ? stock!.locations.filter((l) => l.locationId !== selected.locationId)
+    : stock?.locations ?? []
+
+  const storeRow = (
+    loc: { locationId: string; name: string; available: number },
+    opts: { emphasized?: boolean; informational?: boolean },
+  ) => {
+    const short = required > loc.available
+    return (
+      <li key={loc.locationId} className="flex items-center justify-between gap-2">
+        <span
+          className={`min-w-0 truncate ${opts.emphasized ? 'font-medium text-foreground' : 'text-muted-foreground'}`}
+        >
+          {loc.name}
+          {opts.emphasized ? (
+            <span className="ml-1.5 rounded bg-primary-50 px-1 py-0.5 text-[10px] font-medium uppercase tracking-wide text-primary-700">
+              selected store
+            </span>
+          ) : null}
+          {opts.informational ? (
+            <span className="ml-1.5 text-[10px] uppercase tracking-wide">informational</span>
+          ) : null}
+        </span>
+        <span className="flex shrink-0 items-center gap-1.5 tabular-nums">
+          <span className={short ? 'font-medium text-warning-700' : opts.emphasized ? 'font-semibold text-foreground' : 'text-foreground'}>
+            {loc.available} available
+          </span>
+          {short ? (
+            <span className="rounded bg-warning-50 px-1 py-0.5 text-warning-700">
+              short {required - loc.available}
+            </span>
+          ) : null}
+        </span>
+      </li>
+    )
+  }
+
+  return (
+    <div className="mt-1.5 space-y-1 rounded-md border border-border/50 bg-card/60 px-2.5 py-1.5 text-[11px]">
+      {/* Identity: variant name, exact SKU, catalogue selling price. */}
+      <p className="flex flex-wrap items-center gap-x-1.5">
+        {variantName ? <span className="font-medium text-foreground">{variantName}</span> : null}
+        <span className="text-muted-foreground">
+          SKU <span className="font-mono">{sku || '—'}</span>
+        </span>
+        {sellingPrice != null ? (
+          <span className="text-muted-foreground">· Selling {formatCurrency(sellingPrice)}</span>
+        ) : null}
+      </p>
+
+      <p className="font-medium text-foreground">Required: {required}</p>
+
+      {error ? (
+        <p className="text-red-600">{error}</p>
+      ) : loading || !stock ? (
+        <p className="flex items-center gap-1.5 text-muted-foreground">
+          <Loader2 className="h-3 w-3 animate-spin" /> Availability by store…
+        </p>
+      ) : stock.locations.length === 0 ? (
+        <p className="text-muted-foreground">No stores configured.</p>
+      ) : (
+        <>
+          <ul className="space-y-0.5">
+            {selected ? storeRow(selected, { emphasized: true }) : null}
+            {selected && otherStores.length > 0 ? (
+              <li className="pt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                Other stores — informational only
+              </li>
+            ) : null}
+            {otherStores.map((loc) => storeRow(loc, selected ? { informational: true } : {}))}
+          </ul>
+          {/* Combined is information ONLY: a single-store booking is satisfied
+              by the selected store above, never by pooling stores. */}
+          <p className="border-t border-border/50 pt-1 text-muted-foreground">
+            All stores: <span className="tabular-nums text-foreground">{stock.combined}</span>
+            {' '}· informational only — cross-store stock is never allocated
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
+// Allocation PLANNING helpers (status math, tracked quantities, draft
+// validation) live in @/lib/bookingAllocations — the pure frontend half of
+// backend/src/bookings.ts — so this file exports only components.
+
+export function AllocationStatusChip({ allocated, required }: { allocated: number; required: number }) {
+  if (!(required > 0)) return null // nothing tracked (legacy/custom lines) → no chip
+  const status = allocationStatusFor(allocated, required)
+  if (status === 'fully') return <Badge variant="success" dot>Fully allocated {allocated}/{required}</Badge>
+  if (status === 'partial') return <Badge variant="warning" dot>Partially allocated {allocated}/{required}</Badge>
+  return <Badge variant="muted" dot>Unallocated</Badge>
+}
+
+/**
+ * The allocation editor body: one card per CATALOGUE line — required, draft
+ * allocated and remaining quantities, the live status chip, every store's
+ * CURRENT stock, and the draft store rows (add / edit / remove). Pure
+ * planning: availability is shown per store and never pooled. Presentational
+ * (props in, markup out) so the tests can exercise it without the page.
+ */
+export function BookingAllocationBody({
+  lines,
+  rows,
+  locations,
+  availability,
+  serverError,
+  serverLineErrors,
+  onAdd,
+  onRemove,
+  onChange,
+}: {
+  lines: BookingAllocationLine[]
+  rows: AllocationDraft[]
+  locations: InventoryLocation[]
+  availability: Record<string, LocationStockAvailability | null | { error: string } | undefined>
+  serverError?: string | null
+  serverLineErrors?: Record<number, string>
+  onAdd: (lineIndex: number) => void
+  onRemove: (rowKey: string) => void
+  onChange: (rowKey: string, patch: Partial<AllocationDraft>) => void
+}) {
+  const issues = allocationDraftIssues({ lines, rows, locations, availability })
+  const trackedLines = lines.filter((l) => l.tracked)
+  const untrackedLines = lines.filter((l) => !l.tracked)
+
+  return (
+    <div className="space-y-3 text-sm">
+      {serverError ? (
+        <div className="whitespace-pre-line rounded-md border border-danger-200 bg-danger-50 px-3 py-2 text-xs text-danger-700">
+          {serverError}
+        </div>
+      ) : null}
+
+      {trackedLines.length === 0 ? (
+        <p className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
+          Nothing to allocate — this booking has no catalogue lines (hand-typed lines carry no product or variant).
+        </p>
+      ) : null}
+
+      {trackedLines.map((line) => {
+        const lineRows = rows.filter((r) => r.lineIndex === line.lineIndex)
+        const draftAllocated = lineRows.reduce((sum, r) => sum + Math.max(0, Math.floor(Number(r.quantity) || 0)), 0)
+        const remaining = Math.max(0, line.required - draftAllocated)
+        const stock = availability[`${line.productId ?? ''}|${line.variantId ?? ''}`]
+        const stockError = stock && 'error' in stock ? stock.error : null
+        const stockData = stock && !('error' in stock) ? stock : null
+        const usedStores = new Set(lineRows.map((r) => r.locationId))
+        const error = issues.perLine[line.lineIndex] ?? serverLineErrors?.[line.lineIndex]
+        return (
+          <div key={line.lineIndex} className="rounded-lg border bg-muted/30 p-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="truncate font-medium text-foreground">
+                  {line.title || 'Item'}
+                  {line.sku ? <span className="ml-1.5 font-mono text-[11px] text-muted-foreground">{line.sku}</span> : null}
+                </p>
+                <p className="text-[11px] text-muted-foreground">
+                  Required {line.required} · Draft allocated {draftAllocated} · Remaining {remaining}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <AllocationStatusChip allocated={draftAllocated} required={line.required} />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onAdd(line.lineIndex)}
+                  disabled={remaining <= 0 || lineRows.length >= locations.length}
+                >
+                  <Plus className="h-3.5 w-3.5" /> Add store
+                </Button>
+              </div>
+            </div>
+
+            {/* Every store's CURRENT stock for this exact product/variant —
+                exactly what the server validates a save against. */}
+            {stockData ? (
+              <ul className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
+                {stockData.locations.map((loc) => (
+                  <li key={loc.locationId}>
+                    {loc.name}: <span className="tabular-nums text-foreground">{loc.available} available</span>
+                  </li>
+                ))}
+              </ul>
+            ) : stock === null ? (
+              <p className="mt-1.5 text-[11px] text-muted-foreground">Loading store availability…</p>
+            ) : stockError ? (
+              <p className="mt-1.5 text-[11px] text-red-600">{stockError}</p>
+            ) : null}
+
+            <div className="mt-2 space-y-1.5">
+              {lineRows.map((row) => {
+                const storeName = locations.find((l) => l.id === row.locationId)?.name ?? 'Unknown store'
+                const options = locations
+                  .filter((l) => !usedStores.has(l.id) || l.id === row.locationId)
+                  .map((l) => ({ value: l.id, label: locationLabel(null, l.id, locations) }))
+                return (
+                  <div key={row.key} className="flex items-center gap-2">
+                    <div className="min-w-0 flex-1">
+                      <Select
+                        options={options}
+                        value={row.locationId}
+                        onValueChange={(v) => onChange(row.key, { locationId: v })}
+                      />
+                    </div>
+                    <Input
+                      type="number"
+                      min="1"
+                      step="1"
+                      className="w-20 text-right"
+                      value={row.quantity}
+                      onChange={(e) => onChange(row.key, { quantity: e.target.value })}
+                      aria-label={`Quantity allocated at ${storeName}`}
+                    />
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => onRemove(row.key)}
+                      aria-label={`Remove store allocation at ${storeName}`}
+                    >
+                      <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                    </Button>
+                  </div>
+                )
+              })}
+              {lineRows.length === 0 ? (
+                <p className="text-[11px] text-warning-700">Not allocated to any store yet.</p>
+              ) : null}
+            </div>
+            {error ? <p className="mt-1 text-[12px] text-red-600">{error}</p> : null}
+          </div>
+        )
+      })}
+
+      {untrackedLines.length > 0 ? (
+        <p className="text-[11px] text-muted-foreground">
+          {untrackedLines.length} hand-typed line(s) carry no catalogue product and need no allocation.
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
 /** Booking orders: take an advance, fulfil later, convert to invoice when ready. */
 export default function Bookings() {
   const [bookings, setBookings] = useState<SalesOrder[]>([])
@@ -350,11 +667,14 @@ export default function Bookings() {
   const [converting, setConverting] = useState<string | null>(null)
   // Which row's cancel call is in flight (avoids double-submits).
   const [cancelling, setCancelling] = useState<string | null>(null)
+  const [refunding, setRefunding] = useState<string | null>(null)
 
   // Catalogue + managed silver rate + store GST rate: everything the form
   // needs to price a line the way Sales Orders does.
   const [products, setProducts] = useState<Product[]>([])
   const [defaultGst, setDefaultGst] = useState('3')
+  /** Stores the selling-store selector offers (and every store label resolves against). */
+  const [locations, setLocations] = useState<InventoryLocation[]>([])
   const { rate } = useSilverRate()
   const ratePerGram = rate?.rate ?? 0
 
@@ -366,8 +686,29 @@ export default function Bookings() {
   const [form, setForm] = useState<BookingFormState>({
     customer: '', customerId: '', email: '', phone: '',
     date: today(), expectedDate: '', gst: '3', discount: '0', advance: '', note: '', status: 'confirmed',
+    locationId: DEFAULT_STORE_ID,
   })
   const [lines, setLines] = useState<DraftLine[]>([newLine()])
+  /**
+   * Per-store availability for each line's product/variant, keyed by
+   * `${productId}|${variantId}` so lines sharing a target share one request.
+   * undefined = not requested, null = in flight, { error } = failed.
+   * Display only — creating or editing a booking never reserves stock.
+   */
+  const [availability, setAvailability] = useState<Record<string, LocationStockAvailability | null | { error: string }>>({})
+  const requestedTargets = useRef<Set<string>>(new Set())
+
+  // ── Allocation (Phase 3): planning records across stores — they never
+  //    reserve or move stock; conversion revalidates at fulfilment time. ──
+  const [allocOpen, setAllocOpen] = useState(false)
+  const [allocTarget, setAllocTarget] = useState<SalesOrder | null>(null)
+  const [allocSummary, setAllocSummary] = useState<BookingAllocationSummary | null>(null)
+  const [allocRows, setAllocRows] = useState<AllocationDraft[]>([])
+  const [allocBaseline, setAllocBaseline] = useState('')
+  const [allocLoading, setAllocLoading] = useState(false)
+  const [allocSaving, setAllocSaving] = useState(false)
+  const [allocError, setAllocError] = useState('')
+  const [allocLineErrors, setAllocLineErrors] = useState<Record<number, string>>({})
   const [formBaseline, setFormBaseline] = useState('')
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState('')
@@ -416,6 +757,7 @@ export default function Bookings() {
       void load()
     })
     dbApi.getProducts().then(setProducts).catch(() => setProducts([]))
+    dbApi.getInventoryLocations().then(setLocations).catch(() => setLocations([]))
     dbApi.getSettings()
       .then((s) => {
         if (s?.gstRate != null) queueMicrotask(() => setDefaultGst(String(s.gstRate)))
@@ -453,10 +795,15 @@ export default function Bookings() {
           advance: String(target.advancePaid ?? 0),
           note: target.note ?? '',
           status: FORM_STATUSES.includes((target.status ?? '') as never) ? String(target.status) : 'confirmed',
+          // A legacy booking (NULL) displays the default store — the only
+          // store it has ever sold from — and keeps that NULL until the user
+          // genuinely picks a different store.
+          locationId: target.locationId ?? DEFAULT_STORE_ID,
         }
       : {
           customer: '', customerId: '', email: '', phone: '',
           date: today(), expectedDate: '', gst: defaultGst, discount: '0', advance: '', note: '', status: 'confirmed',
+          locationId: DEFAULT_STORE_ID,
         }
     const nextLines: DraftLine[] = target
       ? (target.lineItems ?? []).map((li) => {
@@ -579,13 +926,20 @@ export default function Bookings() {
     })
   }
 
-  /** On-hand stock for the row's product/variant — DISPLAY ONLY. */
-  const stockFor = (line: DraftLine): number | null => {
-    if (!line.productId) return null
+  /**
+   * What the line points at, for display: the exact variant name and its
+   * catalogue selling price (base + variant add-on, Default-Title safe — the
+   * same fallback the auto-priced line price was filled from).
+   */
+  const lineIdentity = (line: DraftLine): { variantName: string | null; sellingPrice: number | null } => {
+    if (!line.productId) return { variantName: null, sellingPrice: null }
     const p = products.find((x) => x.id === line.productId)
-    if (!p) return null
+    if (!p) return { variantName: null, sellingPrice: null }
     const v = line.variantId ? findVariantById(p, line.variantId) : null
-    return Number((v ?? p).stock ?? 0)
+    return {
+      variantName: v ? variantLabel(v) : null,
+      sellingPrice: (v ? variantFinalPrice(p.sellingPrice, v.sellingPrice, v.name) : p.sellingPrice) ?? null,
+    }
   }
 
   const productOptions = useMemo(
@@ -593,12 +947,24 @@ export default function Bookings() {
       ...products.map((p) => ({
         value: p.id,
         label: p.name,
-        keywords: p.sku,
+        // Search by the parent SKU OR any variant SKU: someone holding a
+        // variant code still lands on the product, then picks the exact variant.
+        keywords: [p.sku, ...productVariants(p).map((v) => v.sku)].filter(Boolean).join(' '),
         subtitle: productVariants(p).length > 0 ? `${productVariants(p).length} variants` : p.sku,
       })),
       { value: CUSTOM_PRODUCT, label: 'Type manually…', subtitle: 'Not in the catalogue' },
     ],
     [products],
+  )
+
+  /** What the selling-store selector offers; the default store is always present. */
+  const knownLocations = useMemo(
+    () => (locations.length > 0 ? locations : [DEFAULT_STORE_FALLBACK]),
+    [locations],
+  )
+  const locationOptions = useMemo(
+    () => knownLocations.map((l) => ({ value: l.id, label: locationLabel(null, l.id, knownLocations) })),
+    [knownLocations],
   )
 
   // Live totals — the SAME formula the backend stores and the invoice will
@@ -610,17 +976,56 @@ export default function Bookings() {
     return bookingPricing(counted, Number(form.gst) || 0, Number(form.discount) || 0, Number(form.advance) || 0)
   }, [lines, form.gst, form.discount, form.advance])
 
-  const stats = useMemo(() => {
-    const totalValue = bookings.reduce((a, o) => a + Number(o.value ?? 0), 0)
-    const totalAdvance = bookings.reduce((a, o) => a + Number(o.advancePaid ?? 0), 0)
-    // A cancelled booking is closed business: it is neither awaiting
-    // conversion nor part of the open pipeline, so it leaves the count.
-    const pending = bookings.filter((o) => !o.invoice && !isCancelled(o)).length
-    const outstanding = bookings
-      .filter((o) => !isCancelled(o))
-      .reduce((a, o) => a + balanceOf(o), 0)
-    return { totalValue, totalAdvance, pending, outstanding }
-  }, [bookings])
+  /**
+   * Fetch per-store availability for one `${productId}|${variantId}` target
+   * into the shared cache — once per target (guarded by the ref, so StrictMode
+   * double-runs and repeated effects never duplicate a request).
+   */
+  const requestAvailability = useCallback((target: string) => {
+    if (requestedTargets.current.has(target)) return
+    requestedTargets.current.add(target)
+    setAvailability((prev) => ({ ...prev, [target]: null }))
+    const [productId, variantId] = target.split('|')
+    dbApi
+      .getBookingStockByLocation(productId, variantId || undefined)
+      .then((data) => setAvailability((prev) => ({ ...prev, [target]: data })))
+      .catch((err) =>
+        setAvailability((prev) => ({
+          ...prev,
+          [target]: { error: err instanceof Error ? err.message : 'Failed to load stock by location' },
+        })),
+      )
+  }, [])
+
+  // Form lines: fetched when a line points at a NEW product/variant (quantity
+  // or price edits never refetch — stock does not depend on them). Read-only:
+  // nothing is reserved or deducted, each store on its own row.
+  const availabilitySignature = lines.map((l) => `${l.productId}:${l.variantId}`).join('|')
+  useEffect(() => {
+    const targets = [...new Set(lines.filter((l) => l.productId).map((l) => `${l.productId}|${l.variantId || ''}`))]
+    for (const target of targets) requestAvailability(target)
+    // `lines` is captured through the signature (same product/variant fields).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [availabilitySignature, requestAvailability])
+
+  // The allocation dialog needs availability for the BOOKING's lines (its rows
+  // are not part of the form) — same cache, same once-per-target guard.
+  useEffect(() => {
+    if (!allocSummary) return
+    const targets = [
+      ...new Set(allocSummary.lines.filter((l) => l.tracked && l.productId).map((l) => `${l.productId}|${l.variantId ?? ''}`)),
+    ]
+    for (const target of targets) requestAvailability(target)
+  }, [allocSummary, requestAvailability])
+
+  const stats = useMemo(
+    // A cancelled booking is closed business everywhere (Phase 5.1): it
+    // leaves the pending/outstanding pipelines AND the active advance — its
+    // advance was reversed in the payment ledger with an Advance Refund
+    // entry, so counting it would report cash the business no longer holds.
+    () => bookingStats(bookings),
+    [bookings],
+  )
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -690,7 +1095,9 @@ export default function Bookings() {
       toast.success(`Invoice ${r.invoiceNumber} created — advance ${formatCurrency(r.advanceApplied)}, balance ${formatCurrency(r.balance)}`)
       void load()
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Conversion failed')
+      // A stock refusal arrives as a structured 409 — formatApiError expands
+      // it to product/variant, available, requested and shortage per line.
+      toast.error(formatApiError(err, 'Conversion failed'))
     } finally {
       setConverting(null)
     }
@@ -709,7 +1116,7 @@ export default function Bookings() {
     const confirmed = await confirmDialog({
       title: `Cancel booking ${label}?`,
       description:
-        'The booking can no longer be edited or converted. Any advance already collected stays recorded — refund it separately if due.',
+        'The booking can no longer be edited or converted. Any advance already collected STAYS recorded — cancellation is not a refund. Record an advance refund from the booking once the money is actually returned.',
       confirmLabel: 'Cancel booking',
       danger: true,
     })
@@ -724,6 +1131,185 @@ export default function Bookings() {
       toast.error(err instanceof Error ? err.message : 'Could not cancel the booking')
     } finally {
       setCancelling(null)
+    }
+  }
+
+  /**
+   * Record an ACTUAL advance refund (Phase 5.1 correction): cancellation
+   * never moves money — this is the ONLY path an `Advance Refund` entry is
+   * written, and only for cash the payment ledger still holds. The API caps
+   * the amount at the refundable balance, so a duplicate full refund is
+   * refused instead of double-paying; the original collection is untouched.
+   */
+  const refundAdvance = async (b: SalesOrder) => {
+    const refundable = Number(b.advanceRefundable ?? 0)
+    if (!(refundable > 0)) return
+    if (
+      !(await confirmDialog({
+        title: `Record advance refund for ${b.internalId || b.id}?`,
+        description: `Confirm that ${formatCurrency(refundable)} was actually returned to the customer. This adds an Advance Refund payment entry — the original collection is never changed or deleted.`,
+        confirmLabel: 'Record refund',
+      }))
+    )
+      return
+    setRefunding(b.id)
+    try {
+      const r = await dbApi.refundBookingAdvance(b.id)
+      toast.success(
+        `Advance refund of ${formatCurrency(r.amount)} recorded — ${formatCurrency(r.refundable)} still refundable`,
+      )
+      void load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Refund failed')
+    } finally {
+      setRefunding(null)
+    }
+  }
+
+  /**
+   * Open the allocation editor for a booking: the stored plan (or, for a
+   * never-allocated booking, an UNSAVED prefill at the store the booking
+   * already sells from — nothing is written until Save, so legacy bookings are
+   * never silently converted into allocation records).
+   */
+  const openAllocation = (b: SalesOrder) => {
+    setAllocTarget(b)
+    setAllocSummary(null)
+    setAllocRows([])
+    setAllocBaseline('')
+    setAllocError('')
+    setAllocLineErrors({})
+    setAllocLoading(true)
+    setViewTarget(null)
+    setAllocOpen(true)
+    dbApi
+      .getBookingAllocations(b.id)
+      .then((summary) => {
+        setAllocSummary(summary)
+        const initial: AllocationDraft[] =
+          summary.allocations.length > 0
+            ? summary.allocations.map((a) => ({
+                key: crypto.randomUUID(),
+                lineIndex: a.lineIndex,
+                locationId: a.locationId,
+                quantity: String(a.quantity),
+              }))
+            : summary.lines
+                .filter((l) => l.tracked && l.required > 0)
+                .map((l) => ({
+                  key: crypto.randomUUID(),
+                  lineIndex: l.lineIndex,
+                  locationId: summary.suggestedLocationId ?? DEFAULT_STORE_ID,
+                  quantity: String(l.required),
+                }))
+        setAllocRows(initial)
+        setAllocBaseline(JSON.stringify(initial))
+      })
+      .catch((err) => setAllocError(err instanceof Error ? err.message : 'Failed to load allocations'))
+      .finally(() => setAllocLoading(false))
+  }
+
+  /** Add a store row for a line: the first unused store, qty = what still remains. */
+  const addAllocRow = (lineIndex: number) => {
+    setAllocRows((prev) => {
+      const used = new Set(prev.filter((r) => r.lineIndex === lineIndex).map((r) => r.locationId))
+      const free = knownLocations.find((l) => !used.has(l.id))
+      if (!free) return prev
+      const line = allocSummary?.lines.find((l) => l.lineIndex === lineIndex)
+      const already = prev
+        .filter((r) => r.lineIndex === lineIndex)
+        .reduce((sum, r) => sum + Math.max(0, Math.floor(Number(r.quantity) || 0)), 0)
+      const remaining = line ? Math.max(1, line.required - already) : 1
+      return [...prev, { key: crypto.randomUUID(), lineIndex, locationId: free.id, quantity: String(remaining) }]
+    })
+  }
+
+  const removeAllocRow = (key: string) => setAllocRows((prev) => prev.filter((r) => r.key !== key))
+
+  const changeAllocRow = (key: string, patch: Partial<AllocationDraft>) =>
+    setAllocRows((prev) => prev.map((r) => (r.key === key ? { ...r, ...patch } : r)))
+
+  const allocIssues = useMemo(
+    () =>
+      allocSummary
+        ? allocationDraftIssues({ lines: allocSummary.lines, rows: allocRows, locations: knownLocations, availability })
+        : { invalid: false, perLine: {} as Record<number, string> },
+    [allocSummary, allocRows, knownLocations, availability],
+  )
+
+  /**
+   * Save the allocation set (replace-all: edit, redistribute or clear in one
+   * call). The draft is validated client-side for instant feedback, then the
+   * SERVER re-validates every row against each store's real availability —
+   * shortfalls and line mismatches come back and are shown inline.
+   */
+  const saveAllocations = async () => {
+    if (!allocTarget || !allocSummary) return
+    const payload = allocRows.map((r) => {
+      const line = allocSummary.lines.find((l) => l.lineIndex === r.lineIndex)
+      return {
+        lineIndex: r.lineIndex,
+        locationId: r.locationId,
+        quantity: Math.max(0, Math.floor(Number(r.quantity) || 0)),
+        // Identity is sent so the server can prove the row still matches the
+        // booked line (an unrelated variant/product is refused server-side).
+        ...(line?.productId ? { productId: line.productId, variantId: line.variantId, sku: line.sku } : {}),
+      }
+    })
+    setAllocSaving(true)
+    setAllocError('')
+    setAllocLineErrors({})
+    try {
+      await dbApi.putBookingAllocations(allocTarget.id, payload)
+      // Rows are replaced wholesale (fresh ids) and availability entries are
+      // keyed by allocation id — refetch to stay exact.
+      const fresh = await dbApi.getBookingAllocations(allocTarget.id)
+      setAllocSummary(fresh)
+      const rowsNow = fresh.allocations.map((a) => ({
+        key: crypto.randomUUID(),
+        lineIndex: a.lineIndex,
+        locationId: a.locationId,
+        quantity: String(a.quantity),
+      }))
+      setAllocRows(rowsNow)
+      setAllocBaseline(JSON.stringify(rowsNow))
+      const tracked = fresh.lines.filter((l) => l.tracked)
+      const allocated = tracked.reduce((a, l) => a + l.allocated, 0)
+      const required = tracked.reduce((a, l) => a + l.required, 0)
+      toast.success(
+        fresh.status === 'fully'
+          ? `Allocations saved — fully allocated (${allocated}/${required})`
+          : fresh.status === 'partial'
+            ? `Allocations saved — partially allocated (${allocated}/${required})`
+            : 'Allocations saved — nothing allocated yet',
+      )
+      void load() // refresh the list's allocation totals
+    } catch (err) {
+      const api = err instanceof ApiError ? err : null
+      setAllocError(formatApiError(err, 'Failed to save allocations'))
+      if (api?.details) {
+        const map: Record<number, string> = {}
+        for (const d of api.details) {
+          if (d.lineIndex === undefined) continue
+          map[d.lineIndex] =
+            d.required !== undefined && d.allocated !== undefined
+              ? `Allocated ${d.allocated} but only ${d.required} booked — adjust the quantities.`
+              : 'This line does not match the booked product/variant.'
+        }
+        setAllocLineErrors(map)
+      } else if (api?.code === 'INSUFFICIENT_STOCK' && api.products) {
+        const map: Record<number, string> = {}
+        for (const p of api.products) {
+          const idx = allocSummary.lines.find((l) => l.sku === p.sku)?.lineIndex
+          if (idx !== undefined) {
+            const short = p.shortage ?? Math.max(0, p.requested - p.available)
+            map[idx] = `Only ${p.available} available at ${p.location ?? 'that store'} — ${short} short.`
+          }
+        }
+        setAllocLineErrors(map)
+      }
+    } finally {
+      setAllocSaving(false)
     }
   }
 
@@ -744,6 +1330,7 @@ export default function Bookings() {
     if (!Number.isFinite(discount) || discount < 0) nextField.discount = 'Discount cannot be negative'
     const advance = Number(form.advance || '0')
     if (!Number.isFinite(advance) || advance < 0) nextField.advance = 'Advance cannot be negative'
+    if (!form.locationId) nextField.locationId = 'Selling store is required'
 
     let validCount = 0
     for (const l of lines) {
@@ -802,6 +1389,15 @@ export default function Bookings() {
       ...(form.customerId ? { customerId: form.customerId } : {}),
       date: form.date,
       expectedDate: form.expectedDate || null,
+      // The single store: a NEW booking always records its store; an EDIT sends
+      // one only when the selection differs from what the row already holds —
+      // a legacy booking (NULL = default store) therefore keeps its NULL
+      // instead of being silently rewritten to a default id.
+      ...(editTarget
+        ? form.locationId !== (editTarget.locationId ?? DEFAULT_STORE_ID)
+          ? { locationId: form.locationId }
+          : {}
+        : { locationId: form.locationId }),
       gst,
       discount,
       advanceAmount: advance,
@@ -907,8 +1503,20 @@ export default function Bookings() {
       header: 'Advance',
       meta: { align: 'right' as const },
       cell: ({ row }) => {
-        const v = Number(row.original.value ?? 0)
-        const adv = Number(row.original.advancePaid ?? 0)
+        const b = row.original
+        const v = Number(b.value ?? 0)
+        const adv = Number(b.advancePaid ?? 0)
+        // A cancelled booking's money is REFUNDABLE, not active: show what
+        // the payment ledger still holds and an operator may explicitly
+        // return (Phase 5.1) — cancellation itself never moves cash.
+        const refundable = Number(b.advanceRefundable ?? 0)
+        if (isCancelled(b)) {
+          return refundable > 0 ? (
+            <Badge variant="warning">{formatCurrency(refundable)} refundable</Badge>
+          ) : (
+            <Badge variant="muted">{formatCurrency(adv)}</Badge>
+          )
+        }
         const full = v > 0 && adv >= v
         return <Badge variant={full ? 'default' : 'secondary'}>{formatCurrency(adv)}{full ? ' · Full' : ''}</Badge>
       },
@@ -919,7 +1527,7 @@ export default function Bookings() {
       meta: { align: 'right' as const },
       cell: ({ row }) => {
         if (isCancelled(row.original)) return <span className="text-sm text-muted-foreground">—</span>
-        const balance = balanceOf(row.original)
+        const balance = bookingBalance(row.original)
         return (
           <span className={`text-sm tabular-nums ${balance > 0 ? 'font-medium text-warning-700' : 'text-muted-foreground'}`}>
             {formatCurrency(balance)}
@@ -935,25 +1543,38 @@ export default function Bookings() {
         // A cancelled booking is closed: it must never still read as waiting
         // for a conversion it can no longer perform.
         if (isCancelled(row.original)) return <Badge variant="danger" dot>Cancelled</Badge>
-        if (row.original.invoice) {
+        const tracked = trackedQuantity(row.original)
+        const allocationChip =
+          tracked > 0 && isOpenBooking(row.original) ? (
+            <AllocationStatusChip allocated={row.original.allocated ?? 0} required={tracked} />
+          ) : null
+        const primary = row.original.invoice ? (
           // The number is a live link: the list carries the NUMBER, so one
           // order-360 call resolves the id the invoice page routes by.
-          return (
-            <button
-              type="button"
-              className="inline-flex items-center gap-1 text-sm font-medium text-primary-700 hover:underline"
-              title="Open the invoice this booking became"
-              onClick={() => void openInvoice(row.original)}
-            >
-              <Receipt className="h-3 w-3" /> {row.original.invoice}
-            </button>
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 text-sm font-medium text-primary-700 hover:underline"
+            title="Open the invoice this booking became"
+            onClick={() => void openInvoice(row.original)}
+          >
+            <Receipt className="h-3 w-3" /> {row.original.invoice}
+          </button>
+        ) : (() => {
+          const meta = BOOKING_STATUS[row.original.status] ?? null
+          return meta && row.original.status !== 'confirmed' ? (
+            <Badge variant={meta.variant} dot>{meta.label}</Badge>
+          ) : (
+            <Badge variant="secondary">Awaiting conversion</Badge>
           )
-        }
-        const meta = BOOKING_STATUS[row.original.status] ?? null
-        return meta && row.original.status !== 'confirmed' ? (
-          <Badge variant={meta.variant} dot>{meta.label}</Badge>
-        ) : (
-          <Badge variant="secondary">Awaiting conversion</Badge>
+        })()
+        if (!allocationChip) return primary
+        // Status + allocation state together: how far this open booking is
+        // planned across stores.
+        return (
+          <div className="flex flex-col items-center gap-1">
+            {primary}
+            {allocationChip}
+          </div>
         )
       },
     },
@@ -974,7 +1595,7 @@ export default function Bookings() {
             </Tooltip>
             {isOpenBooking(row.original) ? (
               <>
-                {canEdit ? (
+                  {canEdit ? (
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button variant="ghost" size="icon-sm" aria-label="Edit booking" onClick={() => openForm(row.original)}>
@@ -982,6 +1603,16 @@ export default function Bookings() {
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>Edit booking</TooltipContent>
+                  </Tooltip>
+                ) : null}
+                {canEdit ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button variant="ghost" size="icon-sm" aria-label="Allocate stock" onClick={() => openAllocation(row.original)}>
+                        <Layers className="h-3.5 w-3.5" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Allocate across stores</TooltipContent>
                   </Tooltip>
                 ) : null}
                 {canCreate ? (
@@ -1042,6 +1673,26 @@ export default function Bookings() {
                 ) : null}
               </>
             ) : null}
+            {isCancelled(row.original) && Number(row.original.advanceRefundable ?? 0) > 0 && canEdit ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Record advance refund"
+                    disabled={refunding === row.original.id}
+                    onClick={() => void refundAdvance(row.original)}
+                  >
+                    {refunding === row.original.id ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Undo2 className="h-3.5 w-3.5 text-warning-700" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Record advance refund</TooltipContent>
+              </Tooltip>
+            ) : null}
           </TooltipProvider>
         </div>
       ),
@@ -1050,7 +1701,7 @@ export default function Bookings() {
     // columns whenever one is redefined would rebuild the whole table for
     // nothing; the permission flags ARE included (a role change must re-render).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  ], [converting, cancelling, canCreate, canEdit])
+  ], [converting, cancelling, refunding, canCreate, canEdit])
 
   return (
     <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
@@ -1207,7 +1858,7 @@ export default function Bookings() {
             {/* Booking header — number, dates, status. */}
             <div>
               <Label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">Booking Details</Label>
-              <div className="grid gap-3 sm:grid-cols-4">
+              <div className="grid gap-3 sm:grid-cols-3">
                 <Field label="Booking number">
                   <Input
                     disabled
@@ -1222,6 +1873,18 @@ export default function Bookings() {
                 </Field>
                 <Field label="Expected delivery">
                   <Input type="date" value={form.expectedDate} onChange={(e) => setFormValue('expectedDate', e.target.value)} />
+                </Field>
+                <Field label="Selling store *">
+                  <Select
+                    options={locationOptions}
+                    value={form.locationId}
+                    onValueChange={(v) => setFormValue('locationId', v)}
+                    aria-label="Selling store"
+                  />
+                  {fieldErrors.locationId ? <p className="mt-1 text-[12px] text-red-600">{fieldErrors.locationId}</p> : null}
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    One store per booking — conversion validates and deducts here only.
+                  </p>
                 </Field>
                 <Field label="Status">
                   {editTarget && FORM_STATUSES.includes((editTarget.status ?? '') as never) ? (
@@ -1256,9 +1919,10 @@ export default function Bookings() {
                 {lines.map((l) => {
                   const product = products.find((x) => x.id === l.productId) ?? null
                   const variants = product && hasRealOptions(product.options) ? variantOptions(product) : []
-                  const stock = stockFor(l)
+                  const identity = lineIdentity(l)
                   const qty = Math.max(0, Math.floor(Number(l.qty) || 0))
                   const lineTotal = (Number(l.price) || 0) * qty
+                  const availabilityKey = `${l.productId}|${l.variantId || ''}`
                   return (
                     <div key={l.key} className="rounded-lg border bg-muted/30 p-2.5">
                       <div className="grid grid-cols-2 gap-2 sm:grid-cols-12">
@@ -1278,11 +1942,6 @@ export default function Bookings() {
                               onChange={(e) => setLine(l.key, { title: e.target.value })}
                               placeholder="Item name (SKU optional)"
                             />
-                          ) : null}
-                          {l.sku ? (
-                            <p className="mt-0.5 text-[11px] text-muted-foreground">
-                              SKU <span className="font-mono">{l.sku}</span>
-                            </p>
                           ) : null}
                         </div>
                         {variants.length > 0 ? (
@@ -1323,11 +1982,6 @@ export default function Bookings() {
                           <div className="min-w-0">
                             <Label className="text-xs text-muted-foreground">Total</Label>
                             <p className="text-sm font-semibold tabular-nums">{formatCurrency(lineTotal)}</p>
-                            {l.productId ? (
-                              <p className={`truncate text-[11px] ${stock != null && stock > 0 ? 'text-muted-foreground' : 'text-warning-700'}`}>
-                                {stock != null && stock > 0 ? `${stock} in stock` : 'Out of stock — book anyway'}
-                              </p>
-                            ) : null}
                           </div>
                           <Button
                             variant="ghost"
@@ -1340,6 +1994,21 @@ export default function Bookings() {
                           </Button>
                         </div>
                       </div>
+                      {/* Variant identity + required qty + PER-STORE stock.
+                          Replaces the old single "N in stock" hint, which read
+                          the global mirror and silently summed every store. */}
+                      {l.productId && !l.custom ? (
+                        <div className="mt-2">
+                          <BookingLineAvailability
+                            sku={l.sku}
+                            variantName={identity.variantName}
+                            sellingPrice={identity.sellingPrice}
+                            required={qty}
+                            availability={availability[availabilityKey]}
+                            selectedLocationId={form.locationId}
+                          />
+                        </div>
+                      ) : null}
                       {lineErrors[l.key] ? <p className="mt-1.5 text-[12px] text-red-600">{lineErrors[l.key]}</p> : null}
                     </div>
                   )
@@ -1348,7 +2017,7 @@ export default function Bookings() {
               {fieldErrors.lines ? <p className="mt-1.5 text-[12px] text-red-600">{fieldErrors.lines}</p> : null}
               <p className="mt-1.5 text-[11px] text-muted-foreground">
                 Prices fill in from the catalogue at the managed silver rate, exactly as Sales Orders prices them, and stay editable.
-                {' '}Stock is shown for reference — booking never deducts inventory.
+                {' '}Stock is shown for EACH store separately (the cross-store total is informational) — booking never reserves or deducts inventory.
               </p>
             </div>
 
@@ -1395,6 +2064,57 @@ export default function Bookings() {
           </div>
       </AppDialog>
 
+      {/* ── Allocation: planning records across stores (never moves stock) ── */}
+      <AppDialog
+        open={allocOpen}
+        onOpenChange={(open) => { if (!open) setAllocOpen(false) }}
+        size="lg"
+        isDirty={allocOpen && JSON.stringify(allocRows) !== allocBaseline}
+        title={allocTarget ? `Allocate stock — ${allocTarget.internalId || allocTarget.id.slice(0, 8)}` : 'Allocate stock'}
+        description="Split each line across stores. Planning only: allocating never moves or reserves stock — conversion revalidates the fulfilment store when it runs."
+        footer={
+          <DialogFooter className="flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={() => setAllocOpen(false)} disabled={allocSaving}>
+              Close
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => void saveAllocations()}
+              disabled={allocSaving || allocLoading || !allocSummary || allocIssues.invalid}
+            >
+              {allocSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />} Save allocations
+            </Button>
+          </DialogFooter>
+        }
+      >
+        {allocLoading || !allocSummary ? (
+          <p className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading allocation…
+          </p>
+        ) : (
+          <>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Saved allocation</span>
+              <AllocationStatusChip
+                allocated={allocSummary.lines.filter((l) => l.tracked).reduce((a, l) => a + l.allocated, 0)}
+                required={allocSummary.lines.filter((l) => l.tracked).reduce((a, l) => a + l.required, 0)}
+              />
+            </div>
+            <BookingAllocationBody
+              lines={allocSummary.lines}
+              rows={allocRows}
+              locations={knownLocations}
+              availability={availability}
+              serverError={allocError || null}
+              serverLineErrors={allocLineErrors}
+              onAdd={addAllocRow}
+              onRemove={removeAllocRow}
+              onChange={changeAllocRow}
+            />
+          </>
+        )}
+      </AppDialog>
+
       {/* ── Booking details ───────────────────────────────────────────────── */}
       <AppDialog
         open={viewTarget !== null}
@@ -1408,6 +2128,11 @@ export default function Bookings() {
             {viewTarget && isOpenBooking(viewTarget) && canEdit ? (
               <Button size="sm" onClick={() => openForm(viewTarget)}>
                 <Pencil className="h-3.5 w-3.5" /> Edit
+              </Button>
+            ) : null}
+            {viewTarget && isOpenBooking(viewTarget) && canEdit ? (
+              <Button variant="outline" size="sm" onClick={() => openAllocation(viewTarget)}>
+                <Layers className="h-3.5 w-3.5" /> Allocate
               </Button>
             ) : null}
             {viewTarget && isOpenBooking(viewTarget) && canCreate ? (
@@ -1442,7 +2167,17 @@ export default function Bookings() {
         }
       >
           {viewTarget ? (
-            <BookingDetailView booking={viewTarget} detail={viewDetail} loading={viewLoading} error={viewError} />
+            <BookingDetailView
+              booking={viewTarget}
+              detail={viewDetail}
+              loading={viewLoading}
+              error={viewError}
+              locationName={
+                viewTarget
+                  ? locationLabel(null, viewTarget.locationId ?? DEFAULT_STORE_ID, knownLocations)
+                  : undefined
+              }
+            />
           ) : null}
       </AppDialog>
     </div>
