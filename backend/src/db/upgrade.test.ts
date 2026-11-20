@@ -63,6 +63,14 @@ const KEY_COLUMNS = [
   // Shopify location mapping: ALTERed onto inventory_locations (the CREATE
   // TABLE statement does not carry it), so the upgrade path must add it too.
   'inventory_locations.shopify_location_id',
+  // Multi-store fulfilment traceability (Phase 4): ALTERed onto existing
+  // tables by BOOKING_FULFILMENT_DDL, so the upgrade path must add them too.
+  'sales_invoice_items.location_id',
+  'sales_invoice_items.booking_line_id',
+  'sales_invoice_items.booking_allocation_id',
+  'booking_allocations.line_id',
+  'booking_allocations.invoice_id',
+  'booking_allocations.fulfilled_at',
 ]
 
 test('upgrade restores the full purchase schema on a pre-purchase database', async (t) => {
@@ -105,6 +113,18 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
       await sql.unsafe('alter table sales_orders drop column if exists location_id')
       // …and one that predates the Shopify location mapping column.
       await sql.unsafe('alter table inventory_locations drop column if exists shopify_location_id')
+      // …and ones that predate multi-store fulfilment traceability (Phase 4):
+      // all ALTERed onto existing tables, so the upgrade must add them back.
+      await sql.unsafe(
+        `alter table sales_invoice_items drop column if exists location_id,
+           drop column if exists booking_line_id,
+           drop column if exists booking_allocation_id`,
+      )
+      await sql.unsafe(
+        `alter table booking_allocations drop column if exists line_id,
+           drop column if exists invoice_id,
+           drop column if exists fulfilled_at`,
+      )
       // Emulate an install whose products.created_at is still a DATE
       // (predates the timestamp upgrade): the upgrade must widen it back.
       await sql.unsafe('alter table products alter column created_at type date using created_at::date')

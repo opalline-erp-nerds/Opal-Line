@@ -672,55 +672,119 @@ export async function setSalesReturnStatus(
         const [order] = row.orderId
           ? await tx.select({ locationId: s.salesOrders.locationId }).from(s.salesOrders).where(eq(s.salesOrders.id, row.orderId)).limit(1)
           : [undefined]
-        const locationId =
-          input.locationId ?? (order?.locationId as string | null | undefined) ?? null
+        // PHASE 4: where received goods restock. The original invoice item's
+        // store is the primary source of truth; an explicit operator location
+        // wins over everything; historical items (NULL) fall back exactly as
+        // before (the order's own store → default). Never guessed.
+        const invoiceItems = row.invoiceId
+          ? await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, row.invoiceId))
+          : []
+        // Earlier RETURNS that actually restocked this invoice (Phase 4): the
+        // new receipt continues where they left off per store, so repeated
+        // returns can never over-fill the first store past what it sold.
+        const priorReturns = row.invoiceId
+          ? await tx
+              .select({
+                id: s.salesReturns.id,
+                status: s.salesReturns.status,
+                restocked: s.salesReturns.restocked,
+                returnItems: s.salesReturns.returnItems,
+                receivedItems: s.salesReturns.receivedItems,
+              })
+              .from(s.salesReturns)
+              .where(eq(s.salesReturns.invoiceId, row.invoiceId))
+          : []
+        const { planReturnRestock, priorRestockLegs, lineKey } = await import('./invoiceReturn')
+        const priorBySku = priorRestockLegs(
+          priorReturns,
+          (order?.locationId as string | null | undefined) ?? null,
+          { excludeId: row.id },
+        )
+        const planFor = (sku: string, qty: number) =>
+          planReturnRestock(invoiceItems, sku, qty, {
+            explicitLocationId: input.locationId ?? null,
+            fallbackLocationId: (order?.locationId as string | null | undefined) ?? null,
+            prior: priorBySku.get(lineKey(sku)) ?? [],
+          })
+        const receiptPlans = new Map<string, Array<{ qty: number; locationId?: string | null }>>()
         for (const line of inspection) {
           if (line.accepted <= 0) continue
-          // A variant SKU resolves to its parent product inside applyStockMovement.
-          const moved = await applyStockMovement({
-            sku: line.sku,
-            qty: line.accepted,
-            type: 'sale_return_in',
-            locationId,
-            refType: 'return',
-            refId: row.id,
-            note: `Return ${row.number} received${line.damaged > 0 ? ` (${line.damaged} damaged, not restocked)` : ''}`,
-            createdBy: input.actor ?? undefined,
-            tx,
-          })
-          if (moved !== null) {
-            restocked += line.accepted
+          const legs = planFor(line.sku, line.accepted)
+          receiptPlans.set(line.sku, legs)
+          let lineRestocked = 0
+          for (const leg of legs) {
+            if (leg.qty <= 0) continue
+            // A variant SKU resolves to its parent product inside applyStockMovement.
+            const moved = await applyStockMovement({
+              sku: line.sku,
+              qty: leg.qty,
+              type: 'sale_return_in',
+              ...(leg.locationId ? { locationId: leg.locationId } : {}),
+              refType: 'return',
+              refId: row.id,
+              note: `Return ${row.number} received${line.damaged > 0 ? ` (${line.damaged} damaged, not restocked)` : ''}`,
+              createdBy: input.actor ?? undefined,
+              tx,
+            })
+            if (moved !== null) lineRestocked += leg.qty
+          }
+          if (lineRestocked > 0) {
+            restocked += lineRestocked
             movedSkus.push(line.sku)
           }
         }
-        patch.receivedItems = inspection
+        // Remember EXACTLY where each line was restocked so a later reject
+        // undoes the same stores. Rows written before Phase 4 carry no plan
+        // and re-derive through the same fallback rules at undo time.
+        patch.receivedItems = inspection.map((l) => ({
+          ...l,
+          ...(receiptPlans.has(l.sku) ? { restockPlan: receiptPlans.get(l.sku) } : {}),
+        }))
         patch.receivedAt = now
         patch.restocked = restocked > 0
       }
 
       if (target === 'rejected' && current === 'received') {
-        // Undo exactly the receipt: the accepted units go back out of stock.
+        // Undo exactly the receipt: the accepted units go back out of stock —
+        // FROM THE SAME STORES they were restocked into (the plan recorded at
+        // receipt; rows from before Phase 4 re-derive it with the legacy
+        // fallbacks). Never a guessed store, never a different one.
         const { applyStockMovement } = await import('./stock')
+        const { planReturnRestock } = await import('./invoiceReturn')
         const received = Array.isArray(row.receivedItems)
-          ? (row.receivedItems as Array<{ sku?: string; accepted?: number }>)
+          ? (row.receivedItems as Array<{ sku?: string; accepted?: number; restockPlan?: Array<{ qty?: number; locationId?: string | null }> }>)
           : []
         const [order] = row.orderId
           ? await tx.select({ locationId: s.salesOrders.locationId }).from(s.salesOrders).where(eq(s.salesOrders.id, row.orderId)).limit(1)
           : [undefined]
+        const invoiceItems = row.invoiceId
+          ? await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, row.invoiceId))
+          : []
         for (const line of received) {
           const qty = Math.max(0, Math.floor(num(line.accepted)))
           if (!line.sku || qty <= 0) continue
-          await applyStockMovement({
-            sku: String(line.sku),
-            qty: -qty,
-            type: 'count_adjust',
-            locationId: input.locationId ?? (order?.locationId as string | null | undefined) ?? null,
-            refType: 'return',
-            refId: row.id,
-            note: `Return ${row.number} rejected after receipt — undoing restock`,
-            createdBy: input.actor ?? undefined,
-            tx,
-          })
+          const stored = Array.isArray(line.restockPlan) && line.restockPlan.length > 0 ? line.restockPlan : null
+          const legs = input.locationId
+            ? planReturnRestock([], '', qty, { explicitLocationId: input.locationId })
+            : stored
+              ? stored.map((l) => ({ qty: Math.max(0, Math.floor(num(l.qty))), locationId: l.locationId ?? null }))
+              : planReturnRestock(invoiceItems, line.sku, qty, {
+                  fallbackLocationId: (order?.locationId as string | null | undefined) ?? null,
+                })
+          for (const leg of legs) {
+            if (leg.qty <= 0) continue
+            await applyStockMovement({
+              sku: String(line.sku),
+              qty: -leg.qty,
+              type: 'count_adjust',
+              ...(leg.locationId ? { locationId: leg.locationId } : {}),
+              refType: 'return',
+              refId: row.id,
+              note: `Return ${row.number} rejected after receipt — undoing restock`,
+              createdBy: input.actor ?? undefined,
+              tx,
+            })
+          }
           movedSkus.push(String(line.sku))
         }
         patch.receivedItems = null

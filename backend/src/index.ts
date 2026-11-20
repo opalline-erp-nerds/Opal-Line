@@ -2657,7 +2657,11 @@ async function startServer() {
     rateLimitPruneTimer.unref()
     // Monthly customer statements (1st, 08:30) and due-date reminders (daily 09:15).
     void import('./monthlyStatements').then((m) => m.startMonthlyStatements())
-    void import('./dueReminders').then((d) => d.startDueReminders())
+    // Arm the durable post-commit side-effect recovery next to the other
+  // schedulers: an invoice whose loyalty/journal/IRN failed AFTER the commit
+  // is repaired here within one interval instead of being lost forever.
+  void import('./invoiceSideEffects').then((m) => m.startSideEffectRecovery())
+  void import('./dueReminders').then((d) => d.startDueReminders())
     // Daily sales follow-up sweep (10:05): lapses quotations, logs what to chase.
     void import('./salesFollowups').then((f) => f.startSalesFollowUps())
     // Daily supplier payables summary (09:20): one email, never per-supplier.
