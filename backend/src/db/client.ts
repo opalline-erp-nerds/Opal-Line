@@ -9,9 +9,10 @@ let _db: PostgresJsDatabase<typeof schema> | null = null
 
 function createClient(url: string) {
   return postgres(url, {
-    max: 10,
-    idle_timeout: 30,
-    connect_timeout: 10,
+    max: 5,
+    prepare: false,
+    idle_timeout: 20,
+    connect_timeout: 30,
     onnotice: (notice) => logger.debug({ notice }, 'PostgreSQL notice'),
     transform: { undefined: null },
   })
@@ -20,9 +21,6 @@ function createClient(url: string) {
 const initialUrl = process.env.DATABASE_URL
 if (initialUrl) {
   client = createClient(initialUrl)
-  client.listen('drizzle', (err) => {
-    if (err) logger.error({ err }, 'PostgreSQL connection error')
-  })
   _db = drizzle(client, { schema, logger: { logQuery: (query, params) => logger.debug({ query, params }, 'SQL Query') } })
   logger.info('Database client initialized')
 } else {
@@ -51,9 +49,6 @@ export async function reconnect(newUrl: string): Promise<{ ok: boolean; error?: 
       try { await client.end({ timeout: 5 }) } catch { /* ignore */ }
     }
     client = testClient
-    client.listen('drizzle', (err) => {
-      if (err) logger.error({ err }, 'PostgreSQL reconnection error')
-    })
     _db = drizzle(client, { schema, logger: { logQuery: (query, params) => logger.debug({ query, params }, 'SQL Query') } })
     process.env.DATABASE_URL = newUrl
     logger.info({ url: newUrl.replace(/\/\/([^:]+):([^@]+)@/, '//$1:***@') }, 'Database reconnected')

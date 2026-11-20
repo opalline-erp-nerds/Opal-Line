@@ -1,8 +1,9 @@
 import 'dotenv/config'
-import postgres from 'postgres'
+import type postgres from 'postgres'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import { eq } from 'drizzle-orm'
 import * as schema from './schema'
+import { getRawClient } from './client'
 import { defaultRolePermissions, emptyPermissions, MODULE_KEYS, MODULES } from '../rbac'
 import type { Permissions } from '../types'
 import { roleNames } from './seedData'
@@ -38,12 +39,6 @@ let bootstrapped = false
  */
 export function resetBootstrapForTests(): void {
   bootstrapped = false
-}
-
-async function createClient(): Promise<postgres.Sql> {
-  const url = process.env.DATABASE_URL
-  if (!url) throw new Error('DATABASE_URL is not set')
-  return postgres(url, { max: 1, connect_timeout: 10 })
 }
 
 async function tableExists(sql: postgres.Sql, name: string): Promise<boolean> {
@@ -1545,56 +1540,54 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
   bootstrapped = true
   if (!process.env.DATABASE_URL) return { ran: false, tablesCreated: false }
 
-  const sql = await createClient()
-  try {
-    const hasUsers = await tableExists(sql, 'users')
-    if (!hasUsers) {
-      if (isPublicHost()) seedAdminPassword()
-      logger.info('Bootstrap: fresh database detected — creating schema')
-      await createSchema(sql)
-      // Bring the fresh schema fully up to date BEFORE seeding defaults —
-      // seedDefaults inserts columns (settings.pan, TDS/UPI flags, …) that
-      // createSchema's baseline DDL does not include yet.
-      await applyUpgrades(sql)
-      // Foundation rows (collections + categories) before defaults, so a fresh
-      // install can open Inventory → Collections & Categories immediately.
-      await ensureCollectionFoundation(sql)
-      const drizzleDb = drizzle(sql, { schema })
-      const seeded = await seedDefaults(drizzleDb)
-      await import('../supplierLinking')
-        .then((m) => m.linkProductsToSuppliersSafe(sql))
-        .catch(() => undefined)
-      return { ran: true, tablesCreated: true, adminPassword: seeded.adminPassword }
-    }
+  const sql = getRawClient()
+  if (!sql) throw new Error('Database client is not initialized')
 
-    // Existing DB: apply idempotent additions for upgrades
+  const hasUsers = await tableExists(sql, 'users')
+  if (!hasUsers) {
+    if (isPublicHost()) seedAdminPassword()
+    logger.info('Bootstrap: fresh database detected — creating schema')
+    await createSchema(sql)
+    // Bring the fresh schema fully up to date BEFORE seeding defaults —
+    // seedDefaults inserts columns (settings.pan, TDS/UPI flags, …) that
+    // createSchema's baseline DDL does not include yet.
     await applyUpgrades(sql)
-    // Seed the collection foundation without touching rows that already exist
-    // (a renamed collection or an edited category is left exactly as it is).
+    // Foundation rows (collections + categories) before defaults, so a fresh
+    // install can open Inventory → Collections & Categories immediately.
     await ensureCollectionFoundation(sql)
-    const upgradeDb = drizzle(sql, { schema })
-    await repairAdminRolePermissions(upgradeDb).catch(() => undefined)
-    await repairAdminUserOverride(upgradeDb).catch(() => undefined)
-    await repairOwnerSuperAdmin(upgradeDb).catch(() => undefined)
-    await repairDefaultRolePermissions(upgradeDb).catch(() => undefined)
-    // Stock balances predate the movement ledger. Give them a dated opening
-    // entry so an upgraded install has real history instead of a balance that
-    // appears from nowhere on the day of its first sale.
-    await import('../stock').then((m) => m.backfillOpeningBalances(upgradeDb)).catch(() => undefined)
-    // Invoice items raised before the weight snapshot carried weight 0. Fill
-    // them from the catalogue (net weight × qty) so totals, prints and the
-    // dashboard agree with new invoices. Idempotent; failures are logged but
-    // never block boot.
-    await import('../invoiceWeights')
-      .then((m) => m.backfillInvoiceItemWeights(upgradeDb))
-      .then((n) => {
-        if (n > 0) logger.info({ items: n }, 'Bootstrap: backfilled invoice item weights')
-      })
-      .catch((err) => logger.warn({ err: (err as Error)?.message }, 'Bootstrap: invoice weight backfill failed'))
-    return { ran: true, tablesCreated: false }
-  } finally {
-    await sql.end({ timeout: 5 })
+    const drizzleDb = drizzle(sql, { schema })
+    const seeded = await seedDefaults(drizzleDb)
+    await import('../supplierLinking')
+      .then((m) => m.linkProductsToSuppliersSafe(sql))
+      .catch(() => undefined)
+    return { ran: true, tablesCreated: true, adminPassword: seeded.adminPassword }
   }
+
+  // Existing DB: apply idempotent additions for upgrades
+  await applyUpgrades(sql)
+  // Seed the collection foundation without touching rows that already exist
+  // (a renamed collection or an edited category is left exactly as it is).
+  await ensureCollectionFoundation(sql)
+  const upgradeDb = drizzle(sql, { schema })
+  await repairAdminRolePermissions(upgradeDb).catch(() => undefined)
+  await repairAdminUserOverride(upgradeDb).catch(() => undefined)
+  await repairOwnerSuperAdmin(upgradeDb).catch(() => undefined)
+  await repairDefaultRolePermissions(upgradeDb).catch(() => undefined)
+  // Stock balances predate the movement ledger. Give them a dated opening
+  // entry so an upgraded install has real history instead of a balance that
+  // appears from nowhere on the day of its first sale.
+  await import('../stock').then((m) => m.backfillOpeningBalances(upgradeDb)).catch(() => undefined)
+  // Invoice items raised before the weight snapshot carried weight 0. Fill
+  // them from the catalogue (net weight × qty) so totals, prints and the
+  // dashboard agree with new invoices. Idempotent; failures are logged but
+  // never block boot.
+  await import('../invoiceWeights')
+    .then((m) => m.backfillInvoiceItemWeights(upgradeDb))
+    .then((n) => {
+      if (n > 0) logger.info({ items: n }, 'Bootstrap: backfilled invoice item weights')
+    })
+    .catch((err) => logger.warn({ err: (err as Error)?.message }, 'Bootstrap: invoice weight backfill failed'))
+  return { ran: true, tablesCreated: false }
 }
 
 /**
