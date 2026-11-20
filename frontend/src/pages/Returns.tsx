@@ -4,8 +4,6 @@ import {
   ArrowDownToLine,
   Ban,
   CheckCircle2,
-  ChevronLeft,
-  ChevronRight,
   ClipboardCheck,
   CreditCard,
   Eye,
@@ -26,6 +24,7 @@ import { Input } from '@/components/ui/input'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Select } from '@/components/ui/select'
 import { DataTable } from '@/components/ui/data-table'
+import { Pager } from '@/components/ui/pager'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
@@ -1265,24 +1264,8 @@ function Field({ label, value }: { label: string; value: string }) {
   )
 }
 
-function Pager({ page, pages, total, onChange }: { page: number; pages: number; total: number; onChange: (page: number) => void }) {
-  if (total === 0) return null
-  return (
-    <div className="flex flex-wrap items-center justify-between gap-2 text-[12px] text-muted-foreground">
-      <span>
-        Page {page} of {pages} · {total} record{total === 1 ? '' : 's'}
-      </span>
-      <div className="flex items-center gap-1">
-        <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => onChange(page - 1)}>
-          <ChevronLeft className="h-3.5 w-3.5" /> Prev
-        </Button>
-        <Button variant="outline" size="sm" disabled={page >= pages} onClick={() => onChange(page + 1)}>
-          Next <ChevronRight className="h-3.5 w-3.5" />
-        </Button>
-      </div>
-    </div>
-  )
-}
+// The pagination footer moved to components/ui/pager.tsx so Bookings reuses
+// the same control instead of growing a second copy.
 
 // ── Legacy invoice-return view ───────────────────────────────────────────────
 // Credit notes raised by the invoice-return workflow still render through this

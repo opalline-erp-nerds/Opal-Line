@@ -264,6 +264,19 @@ export const salesOrders = pgTable('sales_orders', {
   isBooking: boolean('is_booking'),
   advancePaid: numericNumber('advance_paid'),
   /**
+   * Booking-form fields (also written by other local orders where set).
+   * `note` already existed as a column but was never exposed here; the
+   * booking workflow reads and writes all three.
+   */
+  note: text('note'),
+  /** When the customer expects the booking to be delivered. */
+  expectedDelivery: ts('expected_delivery'),
+  /**
+   * GST rate the document was booked at. NULL on legacy rows — conversion
+   * then falls back to the store-wide settings rate, exactly as before.
+   */
+  gst: numericNumber('gst'),
+  /**
    * Where this order was rung up, so its stock movements — and every reversal
    * of them — land on the same location's balance rather than the default one.
    */
@@ -308,6 +321,60 @@ export const salesOrders = pgTable('sales_orders', {
   customerIdx: index('sales_orders_customer_idx').on(table.customer),
   dateIdx: index('sales_orders_date_idx').on(table.date),
   statusIdx: index('sales_orders_status_idx').on(table.status),
+}))
+
+/**
+ * Explicit per-store allocation PLANNING for a booking line (Bookings Phase 3).
+ *
+ * Pure planning records: creating or editing them never moves or reserves
+ * stock — the ledger only changes when an invoice is raised, and the existing
+ * conversion guard re-validates the fulfilment store at that moment. One row
+ * per (booking line, store); the unique index is what makes duplicate or
+ * conflicting allocations impossible at the database level.
+ *
+ * Bookings without rows here — every legacy and single-store booking — keep
+ * behaving exactly as before: `sales_orders.location_id` remains the store
+ * conversion validates and deducts against, and nothing is ever auto-written
+ * into this table for them.
+ */
+export const bookingAllocations = pgTable('booking_allocations', {
+  id: text('id').primaryKey(),
+  /** The booking — `sales_orders.id`. */
+  orderId: text('order_id').notNull(),
+  /** Index of the exact line inside `sales_orders.line_items`. */
+  lineIndex: integer('line_index').notNull(),
+  /**
+   * Stable identity of the booked line (Phase 4): the `id` inside
+   * `line_items[].id`, assigned on create/edit/first-allocation for every
+   * catalogue-tracked line. NULL only on Phase-3 rows written before this
+   * column existed — those still resolve by `line_index` + an identity
+   * cross-check (product/variant/sku), so history is never remapped. Resolution
+   * prefers this column and REFUSES when it no longer matches a line, rather
+   * than silently fulfilling a different product.
+   */
+  lineId: text('line_id'),
+  productId: text('product_id').notNull(),
+  /** NULL for a product-level (flat) line — never another variant's id. */
+  variantId: text('variant_id'),
+  /** The line's own SKU (the variant SKU when a variant is allocated). */
+  sku: text('sku').notNull(),
+  locationId: text('location_id').notNull(),
+  quantity: integer('quantity').notNull(),
+  createdAt: timestamp('created_at', { mode: 'string' }),
+  /**
+   * Set inside the conversion transaction when this allocation is fulfilled —
+   * the invoice number it became part of. Together with
+   * `sales_invoice_items.booking_allocation_id` this makes fulfilment traceable
+   * in both directions. NULL until converted (planning rows) and on every
+   * pre-Phase-4 row that was never converted.
+   */
+  invoiceId: text('invoice_id'),
+  /** When the allocation was consumed — written in the same transaction as the invoice. */
+  fulfilledAt: timestamp('fulfilled_at', { mode: 'string' }),
+}, (table) => ({
+  orderIdx: index('booking_allocations_order_idx').on(table.orderId),
+  /** One row per line per store — the database's duplicate/conflict guard. */
+  lineStoreUq: uniqueIndex('booking_allocations_line_store_idx').on(table.orderId, table.lineIndex, table.locationId),
 }))
 
 export const salesInvoices = pgTable('sales_invoices', {
@@ -363,9 +430,33 @@ export const salesInvoiceItems = pgTable('sales_invoice_items', {
   makingCharge: numericNumber('making_charge'),
   tax: numericNumber('tax'),
   amount: numericNumber('amount'),
+  /**
+   * Where THIS line's units were fulfilled from (Phase 4, Option A). Written
+   * on new invoices whenever this call moved stock — one row per allocated
+   * store when a booking line was split across stores — and left NULL on every
+   * historical invoice and on callers that did not deduct (the Shopify import),
+   * so a NULL always means "legacy: resolve exactly as before"
+   * (`resolveMovementLocation(order.location_id)`), never a fabricated store.
+   * Every reversal (invoice edit / delete / re-invoice, credit note, RMA)
+   * restores to this column first.
+   */
+  locationId: text('location_id'),
+  /**
+   * The booking line this item fulfils (`line_items[].id`). NULL on invoices
+   * that did not come from a booking line and on all pre-Phase-4 invoices.
+   */
+  bookingLineId: text('booking_line_id'),
+  /**
+   * The exact `booking_allocations` row this item consumed — one allocation
+   * maps to at most one invoice item, making fulfilment traceable in both
+   * directions (the allocation also records the invoice number). NULL unless
+   * the invoice was raised from explicit allocations.
+   */
+  bookingAllocationId: text('booking_allocation_id'),
 }, (table) => ({
   invoiceIdIdx: index('sales_invoice_items_invoice_id_idx').on(table.invoiceId),
   skuIdx: index('sales_invoice_items_sku_idx').on(table.sku),
+  bookingLineIdx: index('sales_invoice_items_booking_line_idx').on(table.bookingLineId),
   invoiceFk: foreignKey({ columns: [table.invoiceId], foreignColumns: [salesInvoices.id], name: 'sales_invoice_items_invoice_id_fk' }).onDelete('cascade'),
 }))
 

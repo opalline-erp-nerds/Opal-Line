@@ -3166,8 +3166,21 @@ dashboardRouter.get('/orders/:id/full', async (req, res) => {
     const [order] = await db!.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, id)).limit(1)
     if (!order) return res.status(404).json({ error: 'Order not found' })
 
+    // An invoice links to its order by the Shopify order name (imported
+    // orders) or by the invoice number the order row carries (bookings and
+    // other ERP-created rows have no Shopify name). Prefer the order's own
+    // number — that is the invoice it points at — and keep the Shopify-name
+    // lookup as the fallback for rows that carry neither reliably.
+    const invoiceQuery = order.invoice
+      ? db!.select().from(schema.salesInvoices).where(eq(schema.salesInvoices.number, order.invoice)).limit(1).then(
+          (rows) => rows.length > 0
+            ? rows
+            : db!.select().from(schema.salesInvoices).where(eq(schema.salesInvoices.shopifyOrder, order.shopifyId ?? '')).limit(1),
+        )
+      : db!.select().from(schema.salesInvoices).where(eq(schema.salesInvoices.shopifyOrder, order.shopifyId ?? '')).limit(1)
+
     const [invoiceRows, pays, ship, events, customerRows] = await Promise.all([
-      db!.select().from(schema.salesInvoices).where(eq(schema.salesInvoices.shopifyOrder, order.shopifyId ?? '')).limit(1),
+      invoiceQuery,
       db!.select().from(schema.payments).where(eq(schema.payments.invoice, order.invoice ?? '')).orderBy(desc(schema.payments.date)),
       db!.select().from(schema.shipments).where(eq(schema.shipments.orderId, id)).limit(1),
       db!.select().from(schema.orderEvents).where(eq(schema.orderEvents.orderId, id)).orderBy(desc(schema.orderEvents.createdAt)),

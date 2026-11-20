@@ -24,6 +24,8 @@ import type {
   GstReportResult,
   Invoice,
   InventoryLocation,
+  LocationStockAvailability,
+  BookingAllocationSummary,
   ShopifyStoreLocation,
   LocationStockSummary,
   InvoiceItem,
@@ -455,14 +457,109 @@ export const dbApi = {
   /** Per-line sold / previously returned / remaining quantities for the return dialog. */
   getInvoiceReturnStatus: (invoiceId: string) =>
     request<{ invoiceId: string; number: string; status: Invoice['status']; returnStatus: 'partially_returned' | 'fully_returned' | null; anyReturnable: boolean; totalReturnedAmount: number; lines: Array<{ sku: string; product: string; sold: number; returned: number; remaining: number }> }>(`/db/invoices/${encodeURIComponent(invoiceId)}/return-status`),
-  createBooking: (payload: { customer: string; items: Array<{ product: string; sku?: string; qty: number; price: number }>; advanceAmount?: number; discount?: number }) =>
+  createBooking: (payload: {
+    customer: string
+    email?: string
+    phone?: string
+    /** The `customers` row the picker chose — linked, never duplicated. */
+    customerId?: string
+    /** Booking date (any JS-parseable form; stored as ISO). */
+    date?: string
+    /** Expected delivery, date-only `YYYY-MM-DD`. */
+    expectedDate?: string | null
+    /** The single store the booking sells from; omit for the default store. */
+    locationId?: string
+    /** GST rate (%) the booking is taken at; omit to use the store rate. */
+    gst?: number | null
+    note?: string | null
+    items: Array<{
+      product: string
+      sku?: string
+      qty: number
+      /** PER-UNIT, GST-inclusive — the sales_orders convention. */
+      price: number
+      productId?: string
+      variantId?: string
+    }>
+    advanceAmount?: number
+    discount?: number
+  }) =>
     request<SalesOrder>('/db/bookings', { method: 'POST', body: JSON.stringify(payload) }),
-  updateBooking: (orderId: string, payload: { customer?: string; items?: Array<{ product: string; sku?: string; qty: number; price: number }>; advanceAmount?: number; discount?: number }) =>
+  updateBooking: (
+    orderId: string,
+    payload: {
+      customer?: string
+      email?: string
+      phone?: string
+      customerId?: string
+      date?: string
+      expectedDate?: string | null
+      locationId?: string
+      gst?: number | null
+      note?: string | null
+      /** The only transitions a form may perform (fulfilled/cancelled are actions). */
+      status?: 'confirmed' | 'processing'
+      items?: Array<{
+        product: string
+        sku?: string
+        qty: number
+        price: number
+        productId?: string
+        variantId?: string
+      }>
+      advanceAmount?: number
+      discount?: number
+    },
+  ) =>
     request<SalesOrder>(`/db/bookings/${orderId}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  /** All booking rows (server-side predicate), newest first. */
+  getBookings: (): Promise<SalesOrder[]> => list<SalesOrder>('/db/bookings', PAGED),
+  /**
+   * Per-store availability for one booking line's product/variant — display
+   * only: creating or editing a booking never reserves or deducts stock, and
+   * the `combined` total it returns is informational, never spendable.
+   */
+  getBookingStockByLocation: (productId: string, variantId?: string): Promise<LocationStockAvailability> =>
+    request<LocationStockAvailability>(
+      `/db/bookings/stock-by-location?productId=${encodeURIComponent(productId)}${variantId ? `&variantId=${encodeURIComponent(variantId)}` : ''}`,
+    ),
+  /** The booking's allocation plan: derived status, stored rows, current availability. */
+  getBookingAllocations: (orderId: string): Promise<BookingAllocationSummary> =>
+    request<BookingAllocationSummary>(`/db/bookings/${encodeURIComponent(orderId)}/allocations`),
+  /**
+   * Replace a booking's allocation set (edit / redistribute / clear).
+   * Planning only — allocations never reserve or move stock; the server
+   * validates every row against that store's real availability.
+   */
+  putBookingAllocations: (
+    orderId: string,
+    items: Array<{
+      lineIndex: number
+      locationId: string
+      quantity: number
+      productId?: string
+      variantId?: string | null
+      sku?: string
+    }>,
+  ): Promise<BookingAllocationSummary> =>
+    request<BookingAllocationSummary>(`/db/bookings/${encodeURIComponent(orderId)}/allocations`, {
+      method: 'PUT',
+      body: JSON.stringify({ items }),
+    }),
   convertBooking: (orderId: string) =>
     request<{ invoiceNumber: string; advanceApplied: number; balance: number }>(`/db/bookings/${orderId}/convert`, {
       method: 'POST',
       body: JSON.stringify({}),
+    }),
+  /**
+   * Record an ACTUAL advance refund on a cancelled booking — the only way an
+   * `Advance Refund` entry is ever written. Capped at what the ledger still
+   * holds; omit `amount` to refund the whole remaining balance.
+   */
+  refundBookingAdvance: (orderId: string, amount?: number) =>
+    request<{ ok: true; amount: number; refundable: number }>(`/db/bookings/${orderId}/refund-advance`, {
+      method: 'POST',
+      body: JSON.stringify(amount !== undefined ? { amount } : {}),
     }),
   bookingPaymentLink: (bookingId: string) =>
     request<{ url: string; id: string; amount: number; configured: boolean }>(`/db/bookings/${bookingId}/payment-link`, {
