@@ -6,6 +6,7 @@ import { sendEmail } from './notifications'
 import { loadNotificationPrefs } from './notificationPrefs'
 import { escapeHtml } from './htmlEscape'
 import { createScheduler } from './lib/scheduler'
+import { collectedByInvoice, invoiceOutstanding } from './outstanding'
 
 /**
  * Due-date reminders: daily at 09:15, email customers whose unpaid invoices
@@ -41,6 +42,8 @@ export async function runDueReminders(): Promise<{ sent: number; invoices: numbe
       customer: schema.salesInvoices.customer,
       number: schema.salesInvoices.number,
       grandTotal: schema.salesInvoices.grandTotal,
+      paymentStatus: schema.salesInvoices.paymentStatus,
+      status: schema.salesInvoices.status,
       dueDate: schema.salesInvoices.dueDate,
       email: schema.customers.email,
     })
@@ -56,20 +59,30 @@ export async function runDueReminders(): Promise<{ sent: number; invoices: numbe
       ),
     )
 
-  const byCustomer = new Map<string, { email: string; invoices: Array<{ number: string; grandTotal: number; dueDate: string | null }> }>()
+  // What is ACTUALLY still owed per invoice (Phase 5.2): grandTotal minus
+  // what payments already collected — a booking advance credited at
+  // conversion or a partial payment shrinks the reminder to the real figure,
+  // so we never ask a customer for money they have already paid.
+  const paidByInvoice = await collectedByInvoice()
+  const byCustomer = new Map<string, { email: string; invoices: Array<{ number: string; due: number; dueDate: string | null }> }>()
   for (const r of rows) {
     if (!r.customer || !r.email) continue
+    const due = invoiceOutstanding(
+      { grandTotal: r.grandTotal, paymentStatus: r.paymentStatus, status: r.status, number: r.number },
+      paidByInvoice,
+    )
+    if (due <= 0) continue // fully collected already — nothing to remind about
     const entry = byCustomer.get(r.customer) ?? { email: r.email, invoices: [] }
-    entry.invoices.push({ number: r.number, grandTotal: Number(r.grandTotal ?? 0), dueDate: r.dueDate })
+    entry.invoices.push({ number: r.number, due, dueDate: r.dueDate })
     byCustomer.set(r.customer, entry)
   }
 
   let sent = 0
   for (const [customer, entry] of byCustomer) {
-    const total = entry.invoices.reduce((a, i) => a + i.grandTotal, 0)
+    const total = entry.invoices.reduce((a, i) => a + i.due, 0)
     const money = (n: number) => '₹' + n.toLocaleString('en-IN', { maximumFractionDigits: 2 })
     const lines = entry.invoices
-      .map((i) => `<li>${escapeHtml(i.number)} — ${escapeHtml(money(i.grandTotal))} — due ${i.dueDate ? new Date(i.dueDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : 'soon'}</li>`)
+      .map((i) => `<li>${escapeHtml(i.number)} — ${escapeHtml(money(i.due))} — due ${i.dueDate ? new Date(i.dueDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : 'soon'}</li>`)
       .join('')
     const ok = await sendEmail({
       to: entry.email,

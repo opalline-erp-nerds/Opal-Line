@@ -288,6 +288,19 @@ export async function generateEInvoiceForInvoice(
 ): Promise<{ ok: true; irn: string; irnDate: string; qrCode: string | null; provider: string } | { ok: false; error: string }> {
   if (!db) return { ok: false, error: 'Database unavailable' }
 
+  // Idempotent (Phase 4 hardening): an invoice that already carries an IRN
+  // never calls the gateway again — a recovery retry or a repeated manual
+  // trigger can therefore never mint a SECOND IRN for one invoice.
+  const [existing] = await db
+    .select({ irn: schema.salesInvoices.irn, irnDate: schema.salesInvoices.irnDate, qrCode: schema.salesInvoices.qrCode })
+    .from(schema.salesInvoices)
+    .where(eq(schema.salesInvoices.id, invoiceId))
+    .limit(1)
+  if (!existing) return { ok: false, error: 'Invoice not found' }
+  if (existing.irn) {
+    return { ok: true, irn: existing.irn, irnDate: existing.irnDate ?? '', qrCode: existing.qrCode ?? null, provider: 'existing' }
+  }
+
   const built = await buildEInvoicePayload(invoiceId)
   if (!built) return { ok: false, error: 'Invoice or its line items could not be loaded' }
 

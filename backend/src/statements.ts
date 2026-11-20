@@ -3,6 +3,7 @@ import { and, asc, ne, sql } from 'drizzle-orm'
 import { db } from './db/client'
 import * as schema from './db/schema'
 import { logger } from './logger'
+import { collectedByInvoice, INVOICE_OUTSTANDING_SQL, invoiceCollected } from './outstanding'
 
 export interface CustomerDue {
   customer: string
@@ -12,14 +13,22 @@ export interface CustomerDue {
   invoiceNumbers: string[]
 }
 
-/** Collect all unpaid (non-cancelled/refunded) invoices grouped by customer. */
+/**
+ * Collect all unpaid (non-cancelled/refunded) invoices grouped by customer.
+ *
+ * `total` is what is actually still owed (Phase 5.2): per invoice,
+ * grandTotal − collected — a booking advance credited at conversion and any
+ * earlier partial payment reduce it, so the Dues page, its pay dialog's
+ * pre-fill, the reminder emails and the dues statement all quote the SAME
+ * number the payment endpoint will accept.
+ */
 export async function collectDues(): Promise<CustomerDue[]> {
   if (!db) return []
   const rows = await db
     .select({
       customer: schema.salesInvoices.customer,
       invoiceCount: sql<number>`count(*)::int`,
-      total: sql<number>`coalesce(sum(${schema.salesInvoices.grandTotal}), 0)::float`,
+      total: sql<number>`coalesce(sum(${INVOICE_OUTSTANDING_SQL}), 0)::float`,
       oldestDate: sql<string | null>`min(${schema.salesInvoices.date})::text`,
     })
     .from(schema.salesInvoices)
@@ -31,7 +40,7 @@ export async function collectDues(): Promise<CustomerDue[]> {
       ),
     )
     .groupBy(schema.salesInvoices.customer)
-    .orderBy(sql`coalesce(sum(${schema.salesInvoices.grandTotal}), 0) desc`)
+    .orderBy(sql`coalesce(sum(${INVOICE_OUTSTANDING_SQL}), 0) desc`)
 
   const withInvoices = await db
     .select({
@@ -57,13 +66,17 @@ export async function collectDues(): Promise<CustomerDue[]> {
     numbersByCustomer.set(key, list)
   }
 
-  return rows.map((r) => ({
-    customer: r.customer ?? 'Unknown',
-    invoiceCount: Number(r.invoiceCount ?? 0),
-    total: Number(r.total ?? 0),
-    oldestDate: r.oldestDate ?? null,
-    invoiceNumbers: numbersByCustomer.get(r.customer ?? 'Unknown') ?? [],
-  }))
+  return rows
+    .map((r) => ({
+      customer: r.customer ?? 'Unknown',
+      invoiceCount: Number(r.invoiceCount ?? 0),
+      total: Number(r.total ?? 0),
+      oldestDate: r.oldestDate ?? null,
+      invoiceNumbers: numbersByCustomer.get(r.customer ?? 'Unknown') ?? [],
+    }))
+    // A customer whose open invoices are already fully collected (flag not
+    // yet flipped) owes nothing — never show ₹0 rows on the Dues page.
+    .filter((r) => r.total > 0)
 }
 
 export interface DuesStatement {
@@ -124,6 +137,10 @@ export async function generateCustomerStatementPDF(customer: string): Promise<Cu
     y += 22
     let totalBilled = 0
     let totalPaid = 0
+    // What payments have actually collected per invoice (Phase 5.2) — a
+    // partially paid invoice or one carrying a booking advance contributes
+    // its collected amount here, not nothing (and not its gross twice).
+    const paidByInvoice = await collectedByInvoice()
 
     for (const inv of invoices) {
       if (y > 770) {
@@ -135,8 +152,10 @@ export async function generateCustomerStatementPDF(customer: string): Promise<Cu
       const amount = Number(inv.grandTotal ?? 0)
       const paid = inv.paymentStatus === 'paid'
       const refunded = inv.status === 'refunded' || inv.status === 'cancelled'
-      if (!refunded) totalBilled += amount
-      if (paid && !refunded) totalPaid += amount
+      if (!refunded) {
+        totalBilled += amount
+        totalPaid += invoiceCollected(inv, paidByInvoice)
+      }
       doc.font('Helvetica-Bold').fontSize(9).fillColor('#111827').text(inv.number, 50, y)
       doc.font('Helvetica').fontSize(9).fillColor('#374151')
       doc.text(inv.date ? new Date(inv.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' }) : '—', 160, y)

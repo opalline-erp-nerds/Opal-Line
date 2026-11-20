@@ -603,6 +603,68 @@ export interface InventoryLocation {
   shopifyLocationId?: string | null
 }
 
+/**
+ * Location-wise availability for one product/variant (GET
+ * /db/bookings/stock-by-location). One row PER STORE — never pre-combined —
+ * so the booking form can show each store separately.
+ */
+export interface LocationStockAvailability {
+  locations: Array<{ locationId: string; name: string; available: number }>
+  /**
+   * Sum of the rows above — INFORMATIONAL ONLY. Bookings never allocate
+   * across stores, so no caller may treat this as stock at any one store.
+   */
+  combined: number
+}
+
+/** One stored allocation row (booking_allocations) — a planning record. */
+export interface BookingAllocation {
+  id: string
+  orderId: string
+  lineIndex: number
+  /**
+   * Stable booking-line identity (Phase 4). NULL only on Phase-3 rows written
+   * before this column existed — those resolve by line_index + identity.
+   */
+  lineId?: string | null
+  productId: string
+  variantId: string | null
+  /** The line's own SKU (the variant SKU when a variant is allocated). */
+  sku: string
+  locationId: string
+  quantity: number
+  createdAt: string | null
+  /** Set when fulfilled: the invoice this allocation became part of. */
+  invoiceId?: string | null
+  fulfilledAt?: string | null
+}
+
+/** Derived per-line allocation state (never stored). */
+export interface BookingAllocationLine {
+  lineIndex: number
+  title: string
+  sku: string
+  productId: string | null
+  variantId: string | null
+  /** False for hand-typed lines: no catalogue identity, nothing to allocate. */
+  tracked: boolean
+  required: number
+  allocated: number
+  remaining: number
+  status: 'unallocated' | 'partial' | 'fully'
+}
+
+/** GET/PUT /db/bookings/:id/allocations response. */
+export interface BookingAllocationSummary {
+  status: 'unallocated' | 'partial' | 'fully'
+  lines: BookingAllocationLine[]
+  allocations: BookingAllocation[]
+  /** CURRENT availability per saved allocation — surfaces post-save shortages. */
+  availability: Array<{ allocationId: string; available: number }>
+  /** Prefill hint only (booking's own store; legacy NULL → default). */
+  suggestedLocationId: string | null
+}
+
 /** One location that already exists on the connected Shopify store. */
 export interface ShopifyStoreLocation {
   shopifyLocationId: string
@@ -977,9 +1039,26 @@ export interface InvoiceItem {
   makingCharge: number
   tax: number
   amount: number
+  /**
+   * The store this line's units were fulfilled from (Phase 4). Present on new
+   * invoices that moved stock — a booking line split across stores becomes one
+   * item per store; NULL on historical invoices ("legacy: resolve as before").
+   */
+  locationId?: string | null
+  /** The booking line this item fulfils (Phase 4) — NULL unless booked. */
+  bookingLineId?: string | null
+  /** The exact allocation this item consumed (Phase 4). */
+  bookingAllocationId?: string | null
 }
 
 export interface SalesOrderLineItem {
+  /**
+   * Stable line identity for catalogue-tracked booking lines (Phase 4) —
+   * assigned on create/edit/first allocation, inherited through supported
+   * edits, so allocations and invoice items can point at the exact line.
+   * Absent on hand-typed lines and on pre-Phase-4 rows until edited.
+   */
+  id?: string
   title: string
   sku?: string
   quantity: number
@@ -1085,6 +1164,36 @@ export interface SalesOrder {
   shippingAddress?: Record<string, string> | null
   isBooking?: boolean | null
   advancePaid?: number | null
+  /**
+   * ACTUAL advance cash the payment ledger holds for this booking (collections
+   * minus real refunds) — what `GET /db/bookings` reports so statistics show
+   * cash, not terms. Falls back to `advancePaid` for bookings that predate the
+   * ledger. Phase 5.1.
+   */
+  advanceCollected?: number | null
+  /**
+   * What a CANCELLED booking still holds in the ledger and an operator may
+   * refund explicitly (`POST /db/bookings/:id/refund-advance`). 0 on active or
+   * converted bookings, and on history the ledger never recorded. Phase 5.1.
+   */
+  advanceRefundable?: number | null
+  /** Booking-form fields (nullable on rows that predate them). */
+  note?: string | null
+  /** When the customer expects the booking delivered (date-only). */
+  expectedDelivery?: string | null
+  /** GST rate (%) the booking was taken at; null = the store settings rate. */
+  gst?: number | null
+  /**
+   * The single store this booking sells from. Null on legacy rows — they have
+   * always converted against the default store — never a display name.
+   */
+  locationId?: string | null
+  /**
+   * Σ allocated quantities across `booking_allocations` — COMPUTED by
+   * `GET /db/bookings`, never a column. 0 when the booking has no allocation
+   * records (every legacy/single-store booking).
+   */
+  allocated?: number
   /** Authoritative Shopify state, kept separate from the ERP pipeline status. */
   shopifyGid?: string | null
   shopifyFinancialStatus?: string | null

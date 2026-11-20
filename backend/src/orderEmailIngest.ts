@@ -5,12 +5,14 @@ import { and, eq, or, sql } from 'drizzle-orm'
 import { db } from './db/client'
 import * as schema from './db/schema'
 import { invoiceTotals } from './invoiceTotals'
+import { buildManualInvoiceLines } from './orderPricing'
 import { computeShopifyInvoiceAmounts } from './shopifyInvoiceAmounts'
 import { getLatestSilverRate } from './shopify'
 import { decryptSecret } from './lib/crypto'
 import { recountCustomerStatsBoth } from './customerStats'
 import { upgradeName } from './shopifyCustomerData'
-import { applyStockMovement, resolveMovementLocation } from './stock'
+import { applyStockMovement, assertStockAvailable, InsufficientStockError, resolveMovementLocation, resolveStockSku, type Tx } from './stock'
+import { ensureInvoiceSideEffects } from './invoiceSideEffects'
 import { logger } from './logger'
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
@@ -747,13 +749,24 @@ async function nextInvoiceNumber(prefix: string): Promise<string> {
 }
 
 /**
- * Deduct sold quantity from product stock. Never blocks invoicing on stock gaps.
+ * Deduct sold quantity from product stock, inside the caller's transaction.
  *
- * Email orders carry no shop, so they deduct from the default location unless
- * the order row already records one — which keeps a later reversal (edit or
- * cancellation) landing on the same balance the deduction did.
+ * The caller has already validated availability at THIS location through
+ * assertStockAvailable (with the products row-locked), so a refusal here would
+ * mean the ledger changed its mind between check and write — never swallow it:
+ * a stock refusal must abort the document, not create an invoice that quietly
+ * drove a balance negative. Email orders carry no shop, so they deduct from
+ * the default location unless the order row already records one — which keeps
+ * a later reversal (edit or cancellation) landing on the same balance the
+ * deduction did.
  */
-async function deductStock(tx: any, sku: string, qty: number, locationId?: string | null): Promise<void> {
+async function deductStock(
+  tx: any,
+  sku: string,
+  qty: number,
+  locationId?: string | null,
+  ref?: { refId?: string; note?: string },
+): Promise<void> {
   if (!sku || !qty) return
   try {
     await applyStockMovement({
@@ -761,10 +774,20 @@ async function deductStock(tx: any, sku: string, qty: number, locationId?: strin
       qty: -qty,
       type: 'sale_out',
       refType: 'email_order',
+      // Fulfilled-from store: an allocation-driven deduction always names its
+      // own store; a legacy call resolves exactly as before (NULL → default).
       locationId: await resolveMovementLocation(locationId ?? null, tx),
+      // Optional traceability: multi-store booking fulfilments stamp the
+      // invoice they belong to and the booking line they consumed.
+      ...(ref?.refId ? { refId: ref.refId } : {}),
+      ...(ref?.note ? { note: ref.note } : {}),
       tx,
     })
-  } catch { /* stock tracking optional for email orders */ }
+  } catch (err) {
+    // A stock refusal is never swallowed; other ledger quirks stay
+    // non-blocking so stock tracking remains optional for untracked SKUs.
+    if (err instanceof InsufficientStockError) throw err
+  }
 }
 
 export interface CreateInvoiceOptions {
@@ -774,81 +797,48 @@ export interface CreateInvoiceOptions {
    * inserted, so invoicing must not deduct it a second time.
    */
   deductStock?: boolean
+  /**
+   * GST rate to bill at instead of the store-wide settings rate. Bookings
+   * carry the rate they were taken at (read from the LOCKED row inside the
+   * transaction — a concurrent rate edit wins over any pre-read), so the
+   * invoice matches what the customer was shown; every other caller keeps the
+   * settings behaviour.
+   */
+  gstRate?: number
+  /**
+   * Actor recorded on the post-commit side effects (journal attribution).
+   */
+  actor?: string | null
+  /**
+   * Runs INSIDE the conversion transaction, after the invoice, its items,
+   * its stock movements, the allocation fulfilment marks and the booking
+   * financial workflow are written but BEFORE the transaction commits —
+   * reserved for caller-specific extras (the tests use it to inject a
+   * mid-transaction failure). The booking's status and advance payment are
+   * NOT this hook's job: they are applied by the shared workflow below for
+   * every entry point.
+   */
+  afterInvoice?: (
+    tx: Tx,
+    ctx: { invoiceId: string; number: string; order: typeof schema.salesOrders.$inferSelect },
+  ) => Promise<void>
 }
 
-/**
- * Raise a tax invoice for any order row (email-synced or manual).
- * Idempotent: returns the existing invoice number if one is already linked.
- * Returns null when the order has no line items to invoice.
- */
-export async function createInvoiceForOrderRow(
-  order: typeof schema.salesOrders.$inferSelect,
-  opts: CreateInvoiceOptions = {},
-): Promise<string | null> {
-  if (!db) return null
+/** What `raiseInvoiceForOrder` produced: the number, and whether WE claimed it. */
+export interface InvoiceRaiseResult {
+  number: string | null
+  /**
+   * True when this call won the invoice claim — and therefore ran the
+   * post-commit side effects and the `afterInvoice` hook. False on a
+   * fast-path return or when a concurrent caller claimed the order first:
+   * a caller that lost the race must NOT write its own financial records,
+   * because the winner already wrote them inside that transaction.
+   */
+  claimed: boolean
+}
 
-  const rawLineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
-  // Detect manual orders (created via ERP, not imported from Shopify)
-  const isManualOrder = (order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#')
-  const orderValue = round2(Number(order.value ?? 0))
-
-  // An invoiced order is normally left alone. The one exception is an invoice
-  // that carries no amount for a real order — the Shopify import used to build
-  // the total from catalogue weights only, so a SKU missing from the catalogue
-  // produced a ₹0 invoice for a valid Shopify order. Those are repaired from
-  // the order they belong to instead of being skipped forever.
-  if (order.invoice) {
-    const [linked] = await db
-      .select({ grandTotal: schema.salesInvoices.grandTotal })
-      .from(schema.salesInvoices)
-      .where(eq(schema.salesInvoices.number, order.invoice))
-      .limit(1)
-    if (!linked || Number(linked.grandTotal ?? 0) > 0 || orderValue <= 0) return order.invoice
-  }
-
-  // Older Shopify rows were imported without line items. Their order total is
-  // still a real sale, so invoice it as one line rather than returning null.
-  const lineItems: OrderEmailData['items'] = rawLineItems.length > 0
-    ? rawLineItems
-    : !isManualOrder && orderValue > 0
-      ? [{ title: `Order ${order.shopifyId ?? ''}`.trim(), sku: '', quantity: 1, price: orderValue }]
-      : []
-  if (lineItems.length === 0) return null
-
-  // Settings: gst rate + invoice prefix
-  const [settingsRow] = await db.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
-  const gstRate = Number(settingsRow?.gstRate ?? 3)
-  const prefix = settingsRow?.invoicePrefix?.trim() || 'INV-'
-  const payment = order.payment === 'paid' ? 'Online' : order.payment === 'cod' ? 'COD' : 'Pending'
-
-  // Authoritative silver rate from Silver Rate Management (silver_rates table).
-  // This is the single source of truth for new pricing operations.
-  const latestRate = await getLatestSilverRate()
-  if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
-    throw new Error('Current silver rate is not available. Please update the rate in Silver Rate Management before creating invoices.')
-  }
-  const silverRate = latestRate.rate
-
-  // Load product data keyed by SKU for invoice-item snapshots (weight, making charge).
-  // Silver rate comes from Silver Rate Management, not the product catalogue.
-  const productData = await db
-    .select({
-      sku: schema.products.sku,
-      netWeight: schema.products.netWeight,
-      makingCharge: schema.products.makingCharge,
-    })
-    .from(schema.products)
-  const productMap = Object.fromEntries(
-    productData.map((p) => [
-      p.sku,
-      {
-        netWeight: Number(p.netWeight ?? 0),
-        makingCharge: Number(p.makingCharge ?? 0),
-      },
-    ])
-  )
-
-  let items: Array<{
+type InvoiceArtifacts = {
+  items: Array<{
     product: string
     sku: string
     qty: number
@@ -860,6 +850,55 @@ export async function createInvoiceForOrderRow(
     silverValue?: number
     makingValue?: number
   }>
+  payment: string
+  subtotal: number
+  gstAmount: number
+  effectiveDiscount: number
+  grandTotal: number
+  silverValue: number | null
+  makingCharge: number | null
+}
+
+/**
+ * An invoice line as the fulfilment write emits it: the money fields plus the
+ * optional store/source provenance (set on every allocation-driven split part,
+ * on unsplit items only when this call actually deducted at a store).
+ */
+type FulfilmentItem = InvoiceArtifacts['items'][number] & {
+  locationId?: string
+  bookingLineId?: string
+  bookingAllocationId?: string
+  /** Source booking line index (0-based) — transient, stripped before the insert. */
+  lineIndex?: number
+}
+
+/**
+ * The money half of an invoice raise: line items + header totals for ONE order
+ * row, computed with the exact pre-existing rules (manual/booking component
+ * vs price lines, Shopify billed-total spread). Extracted as a pure function so
+ * the conversion transaction can REBUILD them from the freshly locked row when
+ * the order changed between the pre-read and the lock — an invoice must always
+ * mirror the row it claims, never a stale snapshot of it.
+ */
+function buildInvoiceArtifacts(
+  order: typeof schema.salesOrders.$inferSelect,
+  scalars: { gstRate: number; silverRate: number; productMap: Record<string, { netWeight: number; makingCharge: number }> },
+): InvoiceArtifacts | null {
+  const rawLineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
+  const isManualOrder = (order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#')
+  const orderValue = round2(Number(order.value ?? 0))
+  const lineItems: OrderEmailData['items'] = rawLineItems.length > 0
+    ? rawLineItems
+    : !isManualOrder && orderValue > 0
+      ? [{ title: `Order ${order.shopifyId ?? ''}`.trim(), sku: '', quantity: 1, price: orderValue }]
+      : []
+  if (lineItems.length === 0) return null
+
+  const { gstRate, silverRate, productMap } = scalars
+  const payment = order.payment === 'paid' ? 'Online' : order.payment === 'cod' ? 'COD' : 'Pending'
+  const discount = Number(order.discount ?? 0)
+
+  let items: InvoiceArtifacts['items']
   let erpSilverValue: number
   let erpMakingCharge: number
   let erpSubtotal: number
@@ -869,32 +908,13 @@ export async function createInvoiceForOrderRow(
   let effectiveDiscount: number
   let gstAmount: number
   let grandTotal: number
-  const discount = Number(order.discount ?? 0)
 
   if (isManualOrder) {
-    // Manual orders: lineItems already contain ERP components (silverValue, makingValue, amount as subtotal, weight, silverRate, makingCharge)
-    // Use them directly to ensure invoice totals match order totals exactly.
-    items = lineItems.map((li) => {
-      const qty = Number(li.quantity ?? 0)
-      const weight = Number(li.weight ?? 0)
-      const itemSilverRate = Number(li.silverRate ?? 0)
-      const itemMakingCharge = Number(li.makingCharge ?? 0)
-      const silverValue = Number(li.silverValue ?? (weight > 0 ? round2(weight * itemSilverRate) : 0))
-      const makingValue = Number(li.makingValue ?? (weight > 0 ? round2(weight * itemMakingCharge) : 0))
-      const amount = Number(li.amount ?? round2(silverValue + makingValue))
-      return {
-        product: String(li.title ?? '').trim(),
-        sku: String(li.sku ?? ''),
-        qty,
-        weight,
-        silverRate: itemSilverRate,
-        makingCharge: itemMakingCharge,
-        tax: round2((amount * gstRate) / 100),
-        amount,      // Line subtotal (ex-GST)
-        silverValue,
-        makingValue,
-      }
-    })
+    // Manual orders: component-shaped lines (silverValue, makingValue, amount,
+    // weight, silverRate, makingCharge) bill from their stored components;
+    // price-only lines — bookings — are billed from their price. One path for
+    // both, so invoice totals always match the order's own value.
+    items = buildManualInvoiceLines(lineItems, gstRate)
     // For manual orders, ERP components come directly from stored line items
     erpSilverValue = round2(items.reduce((a, it) => a + (it.silverValue ?? 0), 0))
     erpMakingCharge = round2(items.reduce((a, it) => a + (it.makingValue ?? 0), 0))
@@ -954,15 +974,124 @@ export async function createInvoiceForOrderRow(
     makingCharge = amounts.makingCharge
   }
 
-  // Customer snapshot: customer record first, then the order's addresses
+  return { items, payment, subtotal, gstAmount, effectiveDiscount, grandTotal, silverValue, makingCharge }
+}
+
+/** Customer record + address block for the invoice snapshot (reusable under a lock). */
+async function customerSnapshotFor(order: typeof schema.salesOrders.$inferSelect, client: any): Promise<{
+  customer: typeof schema.customers.$inferSelect | undefined
+  addr: Record<string, string>
+}> {
   const [customer] = order.customer
-    ? await db.select().from(schema.customers).where(eq(schema.customers.name, order.customer)).limit(1)
+    ? await client.select().from(schema.customers).where(eq(schema.customers.name, order.customer)).limit(1)
     : []
   const addr = (order.shippingAddress && (order.shippingAddress as Record<string, string>).address1)
     ? order.shippingAddress as Record<string, string>
     : (order.billingAddress as Record<string, string> | null) ?? {}
-  const address1 = String(addr.address1 ?? '')
-  const address2 = String(addr.address2 ?? '')
+  return { customer, addr }
+}
+
+/**
+ * Raise a tax invoice for any order row (email-synced or manual).
+ * Idempotent: returns the existing invoice number if one is already linked.
+ * Returns null when the order has no line items to invoice.
+ *
+ * TRANSACTION BOUNDARY (Phase 4): the order row lock, the LOCKED-SNAPSHOT
+ * preparation (derived payment, customer, discount, GST, totals, line items —
+ * a concurrent edit can never leak stale financials into the invoice), the
+ * fulfilment plan, the stock guard, the claim, the invoice + items, the stock
+ * movements, the allocation fulfilment marks, the booking financial workflow
+ * (fulfilled status + the advance payment — shared by EVERY booking entry
+ * point) and the caller's `afterInvoice` extras all happen in ONE
+ * transaction: a failure at any point rolls back ALL of it, so no partially
+ * completed financial state can exist. The external side effects (loyalty,
+ * e-invoicing, accounting journals) run once, after commit, only for the call
+ * that won the claim — and are DURABLY retried by the recovery sweep in
+ * invoiceSideEffects.ts if they fail.
+ */
+export async function raiseInvoiceForOrder(
+  order: typeof schema.salesOrders.$inferSelect,
+  opts: CreateInvoiceOptions = {},
+): Promise<InvoiceRaiseResult> {
+  if (!db) return { number: null, claimed: false }
+
+  const rawLineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
+  // Detect manual orders (created via ERP, not imported from Shopify)
+  const isManualOrder = (order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#')
+  const orderValue = round2(Number(order.value ?? 0))
+
+  // An invoiced order is normally left alone. The one exception is an invoice
+  // that carries no amount for a real order — the Shopify import used to build
+  // the total from catalogue weights only, so a SKU missing from the catalogue
+  // produced a ₹0 invoice for a valid Shopify order. Those are repaired from
+  // the order they belong to instead of being skipped forever.
+  if (order.invoice) {
+    const [linked] = await db
+      .select({ grandTotal: schema.salesInvoices.grandTotal })
+      .from(schema.salesInvoices)
+      .where(eq(schema.salesInvoices.number, order.invoice))
+      .limit(1)
+    if (!linked || Number(linked.grandTotal ?? 0) > 0 || orderValue <= 0) return { number: order.invoice, claimed: false }
+  }
+
+  // Older Shopify rows were imported without line items. Their order total is
+  // still a real sale, so invoice it as one line rather than returning null.
+  const lineItems: OrderEmailData['items'] = rawLineItems.length > 0
+    ? rawLineItems
+    : !isManualOrder && orderValue > 0
+      ? [{ title: `Order ${order.shopifyId ?? ''}`.trim(), sku: '', quantity: 1, price: orderValue }]
+      : []
+  if (lineItems.length === 0) return { number: null, claimed: false }
+
+  // Settings: gst rate + invoice prefix
+  const [settingsRow] = await db.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
+  const gstRate = opts.gstRate != null && Number.isFinite(Number(opts.gstRate))
+    ? Number(opts.gstRate)
+    : Number(settingsRow?.gstRate ?? 3)
+  const prefix = settingsRow?.invoicePrefix?.trim() || 'INV-'
+
+  // Authoritative silver rate from Silver Rate Management (silver_rates table).
+  // This is the single source of truth for new pricing operations.
+  const latestRate = await getLatestSilverRate()
+  if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
+    throw new Error('Current silver rate is not available. Please update the rate in Silver Rate Management before creating invoices.')
+  }
+  const silverRate = latestRate.rate
+
+  // Load product data keyed by SKU for invoice-item snapshots (weight, making charge).
+  // Silver rate comes from Silver Rate Management, not the product catalogue.
+  const productData = await db
+    .select({
+      sku: schema.products.sku,
+      netWeight: schema.products.netWeight,
+      makingCharge: schema.products.makingCharge,
+    })
+    .from(schema.products)
+  const productMap = Object.fromEntries(
+    productData.map((p) => [
+      p.sku,
+      {
+        netWeight: Number(p.netWeight ?? 0),
+        makingCharge: Number(p.makingCharge ?? 0),
+      },
+    ])
+  )
+
+  // The money half — one pure builder shared with the in-transaction rebuild
+  // below, so the pre-read and the locked state can never price differently.
+  const art = buildInvoiceArtifacts(order, { gstRate, silverRate, productMap })
+  if (!art) return { number: null, claimed: false }
+  const items = art.items
+  const subtotal = art.subtotal
+  const gstAmount = art.gstAmount
+  const effectiveDiscount = art.effectiveDiscount
+  const grandTotal = art.grandTotal
+  const silverValue = art.silverValue
+  const makingCharge = art.makingCharge
+
+  // (The customer/address snapshot is taken INSIDE the transaction from the
+  // locked row — see lockedSnap below — so a concurrent contact edit cannot
+  // leak a stale snapshot into the invoice.)
 
   // Repair path: the top guard only falls through when the linked invoice has
   // no amount. Write the amounts derived from the order and rebuild its lines,
@@ -995,13 +1124,120 @@ export async function createInvoiceForOrderRow(
       })
       logger.info({ orderId: order.id, invoice: order.invoice, grandTotal }, 'Repaired zero-value invoice from its order total')
     }
-    return order.invoice
+    return { number: order.invoice, claimed: false }
   }
 
   const number = await nextInvoiceNumber(prefix)
   const invoiceId = crypto.randomUUID()
   try {
-    await db.transaction(async (tx) => {
+    const written = await db.transaction(async (tx) => {
+      // 1. LOCK THE ORDER ROW FIRST: allocation edits, booking edits and this
+      //    conversion all serialise on this lock, so the saved plan can never
+      //    change underneath fulfilment and two conversions cannot interleave.
+      const [lockedRow] = await tx
+        .select()
+        .from(schema.salesOrders)
+        .where(eq(schema.salesOrders.id, order.id))
+        .limit(1)
+        .for('update')
+      if (!lockedRow || lockedRow.invoice) {
+        // Vanished, or a concurrent caller claimed it first — the catch below
+        // reuses the winner's invoice instead of raising a second one.
+        const err = new Error(`Sales order ${order.id} is already linked to an invoice`)
+        ;(err as Error & { code?: string }).code = 'ORDER_ALREADY_INVOICED'
+        throw err
+      }
+      // The ONE snapshot everything below is built from: we hold the row lock,
+      // so no edit can interleave between this read and the commit.
+      let fresh = lockedRow
+
+      // 1b. LOCK-FIRST PREPARATION (hardening): a booking's derived
+      //    `payment` is levelled from ITS OWN advance/value on the locked row
+      //    FIRST, so the invoice's payment fields, the advance payment row and
+      //    every later reader reflect one consistent snapshot. This runs for
+      //    EVERY booking entry point (Convert, kanban fulfilment,
+      //    create-invoice, re-invoice) — and the levelled update commits or
+      //    rolls back with the invoice.
+      if (fresh.isBooking) {
+        const value = Number(fresh.value ?? 0)
+        const advance = Number(fresh.advancePaid ?? 0)
+        const leveled = advance >= value && value > 0 ? 'paid' : 'pending'
+        if (String(fresh.payment ?? '') !== leveled) {
+          await tx.update(schema.salesOrders).set({ payment: leveled }).where(eq(schema.salesOrders.id, fresh.id))
+          fresh = { ...fresh, payment: leveled }
+        }
+      }
+      // The GST rate this invoice bills at: a booking's rate lives on the
+      // LOCKED row (a concurrent rate edit wins over the caller's pre-read);
+      // every other caller keeps its caller/settings rate exactly as before.
+      const lockedGstRate =
+        fresh.isBooking && fresh.gst != null && Number.isFinite(Number(fresh.gst)) ? Number(fresh.gst) : gstRate
+      // The money THIS invoice is built from — from the locked row, never the
+      // pre-lock read, so a concurrent header edit (discount, GST, customer,
+      // advance, lines) can never produce an invoice priced from stale values.
+      const lockedArt = buildInvoiceArtifacts(fresh, { gstRate: lockedGstRate, silverRate, productMap })
+      if (!lockedArt) return null
+      const lockedSnap = await customerSnapshotFor(fresh, tx)
+
+      // 2. Multi-store fulfilment plan (Phase 4, Option A): when the booking
+      //    carries explicit allocations, EVERY catalogue-tracked line must be
+      //    fully allocated (hand-typed lines are exempt — they carry no
+      //    product to allocate) and the invoice items split per store, each
+      //    naming its source booking line and allocation. Identity is
+      //    re-checked here: an allocation can never fulfil a different line
+      //    than the one it was saved against. Bookings with NO allocation
+      //    rows (every legacy/single-store booking) skip this entirely and
+      //    keep the single-store path byte-for-byte.
+      const allocations = await tx
+        .select()
+        .from(schema.bookingAllocations)
+        .where(eq(schema.bookingAllocations.orderId, fresh.id))
+      let planItems: FulfilmentItem[] | null = null
+      if (allocations.length > 0) {
+        const freshLines = Array.isArray(fresh.lineItems) ? (fresh.lineItems as unknown[]) : []
+        const { buildBookingFulfilmentPlan } = await import('./bookings')
+        planItems = buildBookingFulfilmentPlan({ lineItems: freshLines, items: lockedArt.items, gstRate: lockedGstRate, allocations })
+      }
+      const finalItems: FulfilmentItem[] = planItems ?? (lockedArt.items as FulfilmentItem[])
+
+      // 3. Validate the WHOLE basket at EACH store the deduction will land on,
+      //    BEFORE anything is written — the standard locked guard, once per
+      //    store (aggregating per SKU within the store, resolving variants to
+      //    their own balances, counting the default store's pre-ledger
+      //    adoption). A shortfall throws INSUFFICIENT_STOCK carrying that
+      //    store's own id + name, and the transaction rolls back completely —
+      //    no invoice, no claim, no movement, no marks, nothing converted.
+      //    Combined/cross-store stock is never consulted: each bucket is
+      //    measured only where its units will actually leave.
+      //
+      //    Only checked when THIS call will move stock: a caller that opted out
+      //    (the Shopify order import) already deducted — and was already
+      //    validated — when the order row was inserted.
+      const deduct = opts.deductStock !== false
+      const resolvedOrderLocation = deduct ? await resolveMovementLocation(fresh.locationId ?? null, tx) : undefined
+      if (deduct) {
+        const groups = new Map<string, Array<{ sku: string; qty: number; name: string }>>()
+        for (const it of finalItems) {
+          const loc = it.locationId || resolvedOrderLocation!
+          const entry = { sku: it.sku, qty: it.qty, name: it.product }
+          const group = groups.get(loc)
+          if (group) group.push(entry)
+          else groups.set(loc, [entry])
+        }
+        const locationIds = [...groups.keys()].sort((a, b) => a.localeCompare(b))
+        if (locationIds.length > 1) {
+          // Deterministic lock order across stores: take EVERY product and
+          // variant lock ONCE, in the same SKU order assertStockAvailable
+          // itself uses, before any per-store comparison — two multi-store
+          // conversions (or one against a single-store writer) can then never
+          // deadlock against each other.
+          const skus = [...new Set(finalItems.map((it) => String(it.sku ?? '').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b))
+          for (const sku of skus) await resolveStockSku(tx, sku)
+        }
+        for (const locationId of locationIds) {
+          await assertStockAvailable(tx, groups.get(locationId)!, { locationId })
+        }
+      }
       // Atomically claim the order for THIS invoice. The UPDATE locks the
       // order row and only matches while it is still un-invoiced, so a
       // concurrent or repeated create-invoice request loses the race here —
@@ -1022,85 +1258,144 @@ export async function createInvoiceForOrderRow(
         throw err
       }
       // Store effectiveDiscount (includes adjustment) so that grandTotal = subtotal + gstAmount - discount holds
-      const storedDiscount = effectiveDiscount
+      const storedDiscount = lockedArt.effectiveDiscount
+      const lockedAddress1 = String(lockedSnap.addr.address1 ?? '')
+      const lockedAddress2 = String(lockedSnap.addr.address2 ?? '')
       await tx.insert(schema.salesInvoices).values({
         id: invoiceId,
         number,
-        shopifyOrder: order.shopifyId ?? null,
-        customer: order.customer,
+        shopifyOrder: fresh.shopifyId ?? null,
+        customer: fresh.customer,
         // Fall back to the order's own contact columns when the customer row
         // could not be matched (placeholder 'Guest' name on a guest checkout
         // still left a fillable customer_email / customer_phone on the order).
-        customerEmail: customer?.email || String(order.customerEmail ?? ''),
-        customerPhone: customer?.phone || String(addr.phone ?? '') || String(order.customerPhone ?? ''),
-        customerAddress: [address1, address2].filter(Boolean).join(', '),
-        customerCity: String(addr.city ?? customer?.city ?? ''),
-        customerState: String(addr.province ?? customer?.province ?? ''),
-        customerPincode: String(addr.zip ?? ''),
-        silverValue,
-        makingCharge,
-        subtotal,
-        gst: gstRate,
-        gstAmount,
+        customerEmail: lockedSnap.customer?.email || String(fresh.customerEmail ?? ''),
+        customerPhone: lockedSnap.customer?.phone || String(lockedSnap.addr.phone ?? '') || String(fresh.customerPhone ?? ''),
+        customerAddress: [lockedAddress1, lockedAddress2].filter(Boolean).join(', '),
+        customerCity: String(lockedSnap.addr.city ?? lockedSnap.customer?.city ?? ''),
+        customerState: String(lockedSnap.addr.province ?? lockedSnap.customer?.province ?? ''),
+        customerPincode: String(lockedSnap.addr.zip ?? ''),
+        silverValue: lockedArt.silverValue,
+        makingCharge: lockedArt.makingCharge,
+        subtotal: lockedArt.subtotal,
+        gst: lockedGstRate,
+        gstAmount: lockedArt.gstAmount,
         discount: storedDiscount,
-        grandTotal,
-        paymentMethod: payment,
-        paymentStatus: order.payment,
-        status: order.payment === 'paid' ? 'paid' : 'issued',
-        currency: order.currency ?? 'INR',
-        date: order.date ?? new Date().toISOString(),
+        grandTotal: lockedArt.grandTotal,
+        paymentMethod: lockedArt.payment,
+        paymentStatus: fresh.payment,
+        status: fresh.payment === 'paid' ? 'paid' : 'issued',
+        currency: fresh.currency ?? 'INR',
+        date: fresh.date ?? new Date().toISOString(),
       })
-      const orderLocationId = (order as { locationId?: string | null }).locationId ?? null
-      for (const it of items) {
-        await tx.insert(schema.salesInvoiceItems).values({ ...it, id: crypto.randomUUID(), invoiceId })
+      // 5. Items + ONE location-correct deduction per item. Split parts carry
+      //    their own store and their exact source line/allocation; unsplit
+      //    legacy items record the store they were actually deducted at (NULL
+      //    only when this call did not move stock, e.g. the Shopify import —
+      //    never a fabricated location). Σ(split amounts) ≡ the whole line's
+      //    amount by construction, so header totals are identical to a
+      //    single-store conversion.
+      const lineRows = Array.isArray(fresh.lineItems) ? (fresh.lineItems as Array<{ id?: string }>) : []
+      const stampByIndex = planItems == null && finalItems.length === lineRows.length
+      const bookingRef = `Booking ${String(fresh.internalId ?? fresh.id)}`
+      let idx = 0
+      for (const it of finalItems) {
+        const { lineIndex, ...row } = it
+        const sourceLineId = row.bookingLineId ?? (stampByIndex ? lineRows[idx]?.id : undefined)
+        idx++
+        const locationId = row.locationId ?? resolvedOrderLocation
+        await tx.insert(schema.salesInvoiceItems).values({
+          ...row,
+          id: crypto.randomUUID(),
+          invoiceId,
+          ...(locationId ? { locationId } : {}),
+          ...(sourceLineId ? { bookingLineId: sourceLineId } : {}),
+        })
         // Deduct stock for the sold SKU, same rule as manual invoices. The
-        // order's own location is honoured so the deduction and any later
-        // reversal agree on which balance they touch. Skipped when the caller
-        // already moved stock (Shopify order import).
-        if (opts.deductStock !== false) {
-          await deductStock(tx, it.sku, it.qty, orderLocationId)
+        // item's own location is honoured so the deduction and any later
+        // reversal agree on which balance they touch — and it is the SAME
+        // location the availability guard above measured. Skipped when the
+        // caller already moved stock (Shopify order import). Allocation-driven
+        // movements additionally name the invoice and the booking line they
+        // fulfilled, for the audit trail.
+        if (deduct) {
+          await deductStock(
+            tx,
+            it.sku,
+            it.qty,
+            locationId,
+            planItems
+              ? { refId: invoiceId, note: lineIndex !== undefined ? `${bookingRef} line ${lineIndex + 1}` : bookingRef }
+              : undefined,
+          )
         }
       }
+
+      // 6. Allocation fulfilment marks — SAME transaction as the invoice, so
+      //    an allocation is either consumed by a committed invoice or still
+      //    open; it can never be half-marked, and a rollback leaves the plan
+      //    exactly as it was saved.
+      if (planItems) {
+        await tx
+          .update(schema.bookingAllocations)
+          .set({ invoiceId: number, fulfilledAt: new Date().toISOString() })
+          .where(eq(schema.bookingAllocations.orderId, fresh.id))
+      }
+
+      // 7. Booking financial workflow — EVERY booking→invoice entry point
+      //    (Convert button, kanban fulfilment auto-invoice, create-invoice,
+      //    re-invoice) runs the SAME atomic block: fulfilled status + the
+      //    advance payment row, recorded exactly ONCE (an existing Advance
+      //    row for this booking is re-pointed to the invoice instead of being
+      //    inserted again). A failure here rolls EVERYTHING back, so no
+      //    partially completed financial state can be committed.
+      if (fresh.isBooking) {
+        const { applyBookingInvoiceFinancials } = await import('./bookings')
+        await applyBookingInvoiceFinancials(tx, fresh, number)
+      }
+      // Caller-specific extras (tests inject a mid-transaction failure here).
+      if (opts.afterInvoice) await opts.afterInvoice(tx, { invoiceId, number, order: fresh })
+      return true
     })
+    if (!written) return { number: null, claimed: false }
   } catch (err) {
     if ((err as Error & { code?: string }).code !== 'ORDER_ALREADY_INVOICED') throw err
     // Another request claimed the order first — return its invoice number
-    // instead of failing or, worse, inserting a duplicate.
+    // instead of failing or, worse, inserting a duplicate. `claimed: false`
+    // tells the caller NOT to write its own financial records: the winner's
+    // transaction already wrote them (status, advance, marks and all).
     const [fresh] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, order.id)).limit(1)
     if (fresh?.invoice) {
       logger.info({ orderId: order.id, invoice: fresh.invoice }, 'order already invoiced; reusing the linked invoice')
-      return fresh.invoice
+      return { number: fresh.invoice, claimed: false }
     }
     throw err
   }
 
-  // Loyalty: award points for this invoice (fire-and-forget, never blocks sync)
-  void import('./loyalty').then(({ earnForInvoice }) =>
-    earnForInvoice({
-      id: invoiceId,
-      number,
-      customer: order.customer ?? '',
-      customerEmail: customer?.email || String(order.customerEmail ?? ''),
-      customerPhone: customer?.phone || String(order.customerPhone ?? ''),
-      grandTotal,
-      status: order.payment === 'paid' ? 'paid' : 'issued',
-      // Order-linked invoices earn once, under the order's own identity.
-      shopifyOrder: order.shopifyId ?? null,
-    }),
-  )
-  // E-invoicing: in `automatic` mode the IRN must be generated for invoices
-  // raised by THIS pipeline (fulfilment, email sync) too — not only for
-  // invoices created through POST /invoices. Fire-and-forget, same rule as
-  // the manual route: a gateway failure must never fail the invoice.
-  void import('./einvoice')
-    .then(async ({ resolveEInvoiceMode, generateEInvoiceForInvoice }) => {
-      if ((await resolveEInvoiceMode()) !== 'automatic') return
-      const result = await generateEInvoiceForInvoice(invoiceId)
-      if (!result.ok) logger.error({ err: result.error, invoice: number }, 'automatic IRN generation failed for auto-raised invoice')
-    })
-    .catch(() => undefined)
-  void import('./accounting/postings').then(({ postSalesInvoiceJournal }) => postSalesInvoiceJournal(invoiceId)).catch((err) => logger.warn({ err, invoiceId }, 'Failed to auto-post auto-raised invoice journal'))
-  return number
+  // ── Post-commit side effects: run ONCE, only for the call that won the
+  //    claim (every lost race and every retry returned above) — and DURABLY.
+  //    The invoice transaction itself never runs external work (it would
+  //    hold product/order locks across network calls), so if any effect
+  //    fails in this window, `ensureInvoiceSideEffects`' periodic recovery
+  //    sweep re-runs just the missing ones. Every effect is idempotent, so a
+  //    retry can never duplicate a journal, an award or an IRN — and a
+  //    conversion retry never reaches here at all (no second claim → no
+  //    second invoice → no second advance payment).
+  void ensureInvoiceSideEffects(invoiceId, { actor: opts.actor ?? null })
+    .catch((err) => logger.warn({ err, invoiceId }, 'post-commit side effects failed — recovery will retry'))
+  return { number, claimed: true }
+}
+
+/**
+ * Back-compat wrapper around `raiseInvoiceForOrder` for callers that only
+ * need the invoice number (email sync, kanban auto-invoice, create-invoice,
+ * duplicate/convert relays).
+ */
+export async function createInvoiceForOrderRow(
+  order: typeof schema.salesOrders.$inferSelect,
+  opts: CreateInvoiceOptions = {},
+): Promise<string | null> {
+  return (await raiseInvoiceForOrder(order, opts)).number
 }
 
 /**

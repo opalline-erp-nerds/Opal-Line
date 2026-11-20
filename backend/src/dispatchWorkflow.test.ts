@@ -88,6 +88,10 @@ test(
       category: 'test',
       netWeight: 10,
       makingCharge: 5,
+      // The order dispatches ONE unit, so the fixture must actually hold it:
+      // since the inventory guard landed, an invoice can no longer be raised
+      // for stock the store never had (that used to leave products.stock at −1).
+      stock: 1,
     })
 
     const orderId = `${marker}-order`

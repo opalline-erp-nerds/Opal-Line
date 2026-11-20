@@ -43,16 +43,35 @@ function resetCsrfToken(): void {
 export { resetCsrfToken }
 
 export interface ApiErrorDetail {
+  error?: string
   code?: string
   message?: string
   /** Per-product stock shortfalls for `INSUFFICIENT_STOCK`. */
-  products?: Array<{ sku: string; name: string; available: number; requested: number }>
+  products?: Array<{
+    sku: string
+    name: string
+    available: number
+    requested: number
+    shortage?: number
+    /** Catalogue identity of the short line (Phase 4). */
+    productId?: string
+    variantId?: string | null
+    /** Which store THIS line was measured at — each entry carries its own. */
+    locationId?: string
+    location?: string
+  }>
+  /** Per-line validation detail (e.g. allocation over-allocation errors). */
+  details?: Array<{ lineIndex?: number; sku?: string; required?: number; allocated?: number }>
+  /** The store a single-store refusal was measured at, by id and name. */
+  location?: { id: string; name: string }
 }
 
 export class ApiError extends Error {
   status: number
   code?: string
   products?: ApiErrorDetail['products']
+  details?: ApiErrorDetail['details']
+  location?: ApiErrorDetail['location']
 
   constructor(status: number, message: string, detail?: ApiErrorDetail) {
     super(message)
@@ -60,6 +79,8 @@ export class ApiError extends Error {
     this.status = status
     this.code = detail?.code
     this.products = detail?.products
+    this.details = detail?.details
+    this.location = detail?.location
   }
 }
 
@@ -93,9 +114,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
         headers: { ...headers, 'X-CSRF-Token': newToken, ...(init?.headers as Record<string, string> | undefined) },
       })
       if (!retryRes.ok) {
-        const body = (await retryRes.json().catch(() => null)) as
-          | { error?: string; code?: string; message?: string; products?: ApiErrorDetail['products'] }
-          | null
+        const body = (await retryRes.json().catch(() => null)) as ApiErrorDetail | null
         if (retryRes.status === 401 && !path.startsWith('/auth/')) {
           notifyUnauthorized(requestEpoch)
         }
@@ -103,6 +122,8 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
           code: body?.code,
           message: body?.message,
           products: body?.products,
+          details: body?.details,
+          location: body?.location,
         })
       }
       return retryRes.json() as Promise<T>
@@ -110,9 +131,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   
   if (!res.ok) {
-    const body = (await res.json().catch(() => null)) as
-      | { error?: string; code?: string; message?: string; products?: ApiErrorDetail['products'] }
-      | null
+    const body = (await res.json().catch(() => null)) as ApiErrorDetail | null
     // Hand the loss to the auth provider. It clears the session once and the
     // router moves to /login, so a burst of failing requests does not reload
     // the page (and a stale request cannot sign out a newer session).
@@ -123,6 +142,8 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       code: body?.code,
       message: body?.message,
       products: body?.products,
+      details: body?.details,
+      location: body?.location,
     })
   }
   return res.json() as Promise<T>
@@ -185,15 +206,21 @@ export async function maybe<T>(path: string): Promise<T | undefined> {
  *
  * Stock shortfalls come back as a structured 409 with per-product detail; this
  * expands them into a line per product ("Name (SKU) — Available: X, Requested:
- * Y") so the user can see exactly which lines to reduce. Everything else falls
- * back to the server's own message.
+ * Y, Short by: Z") so the user can see the product/variant, the required
+ * quantity, what is on hand and exactly how much is missing. Everything else
+ * falls back to the server's own message.
  */
 export function formatApiError(err: unknown, fallback = 'Something went wrong'): string {
   if (err instanceof ApiError) {
     if (err.code === 'INSUFFICIENT_STOCK' && err.products && err.products.length > 0) {
-      const lines = err.products.map(
-        (p) => `${p.name || p.sku}${p.name && p.sku ? ` (${p.sku})` : ''} — Available: ${p.available}, Requested: ${p.requested}`,
-      )
+      const lines = err.products.map((p) => {
+        const label = `${p.name || p.sku}${p.name && p.sku ? ` (${p.sku})` : ''}`
+        // Name the store the shortfall was measured at, when the API sent it
+        // (single-store booking conversion and allocation checks).
+        const at = p.location ? ` @ ${p.location}` : ''
+        const shortage = p.shortage ?? Math.max(0, p.requested - p.available)
+        return `${label}${at} — Available: ${p.available}, Requested: ${p.requested}, Short by: ${shortage}`
+      })
       return `Insufficient Stock:\n${lines.join('\n')}`
     }
     return err.message || fallback

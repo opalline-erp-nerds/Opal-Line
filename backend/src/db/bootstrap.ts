@@ -88,6 +88,29 @@ const INVENTORY_LOCATION_SHOPIFY_DDL: string[] = [
 ]
 
 /**
+ * Multi-store fulfilment traceability (Bookings Phase 4, Option A).
+ *
+ * Declared once and applied from BOTH createSchema (fresh installs) and
+ * applyUpgrades (existing installs) — the same rule STOCK_LEDGER_DDL
+ * documents. Additive only: `booking_allocations.line_id` is the stable
+ * booking-line identity (NULL on Phase-3 rows, which still resolve by
+ * line_index + identity), and the three sales_invoice_items columns record
+ * where each invoiced line was fulfilled from and which booking line and
+ * allocation it consumed. NULL everywhere on historical invoices — a NULL
+ * always means "legacy: resolve exactly as before", never a fabricated
+ * reference. No existing row is rewritten and no backfill runs.
+ */
+const BOOKING_FULFILMENT_DDL: string[] = [
+  `ALTER TABLE booking_allocations ADD COLUMN IF NOT EXISTS line_id text`,
+  `ALTER TABLE booking_allocations ADD COLUMN IF NOT EXISTS invoice_id text`,
+  `ALTER TABLE booking_allocations ADD COLUMN IF NOT EXISTS fulfilled_at timestamp`,
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS location_id text`,
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS booking_line_id text`,
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS booking_allocation_id text`,
+  `CREATE INDEX IF NOT EXISTS sales_invoice_items_booking_line_idx ON sales_invoice_items (booking_line_id)`,
+]
+
+/**
  * Per-location stock balances and the append-only movement ledger.
  *
  * Declared once and applied from both createSchema (fresh installs) and
@@ -572,6 +595,8 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         is_booking boolean,
         advance_paid numeric,
         note text,
+        expected_delivery timestamp,
+        gst numeric,
         shopify_gid text,
         shopify_financial_status text,
         shopify_fulfillment_status text,
@@ -602,6 +627,23 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
       )`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS order_events_order_id_idx ON order_events (order_id)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS order_events_created_idx ON order_events (created_at)`)
+
+    // Booking allocation planning (Bookings Phase 3): additive — bookings
+    // without rows here (every legacy/single-store booking) are unaffected.
+    await tx.unsafe(`
+      CREATE TABLE IF NOT EXISTS booking_allocations (
+        id text PRIMARY KEY,
+        order_id text NOT NULL,
+        line_index integer NOT NULL,
+        product_id text NOT NULL,
+        variant_id text,
+        sku text NOT NULL,
+        location_id text NOT NULL,
+        quantity integer NOT NULL,
+        created_at timestamp
+      )`)
+    await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS booking_allocations_line_store_idx ON booking_allocations (order_id, line_index, location_id)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS booking_allocations_order_idx ON booking_allocations (order_id)`)
 
     await tx.unsafe(`
       CREATE TABLE IF NOT EXISTS sales_invoices (
@@ -933,6 +975,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
     for (const stmt of STOCK_LEDGER_DDL) await tx.unsafe(stmt)
     for (const stmt of SHOPIFY_OUTBOUND_DDL) await tx.unsafe(stmt)
     for (const stmt of COLLECTIONS_DDL) await tx.unsafe(stmt)
+    for (const stmt of BOOKING_FULFILMENT_DDL) await tx.unsafe(stmt)
 
     // ── Finance ───────────────────────────────────────────────────────────
     await tx.unsafe(`
@@ -1605,6 +1648,7 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
     ...INVENTORY_LOCATION_SHOPIFY_DDL,
     ...STOCK_LEDGER_DDL,
     ...SHOPIFY_OUTBOUND_DDL,
+    ...BOOKING_FULFILMENT_DDL,
       // Accounting: store the journal source so unified/Shopify filtering is exact.
       `ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS source text`,
       // Duplicate prevention at the database level: one journal per source record.
@@ -1724,6 +1768,21 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
         actor text,
         created_at timestamp
       )`,
+      // Booking allocation planning (Bookings Phase 3) — idempotent, so
+      // existing databases gain the table without touching their bookings.
+      `CREATE TABLE IF NOT EXISTS booking_allocations (
+        id text PRIMARY KEY,
+        order_id text NOT NULL,
+        line_index integer NOT NULL,
+        product_id text NOT NULL,
+        variant_id text,
+        sku text NOT NULL,
+        location_id text NOT NULL,
+        quantity integer NOT NULL,
+        created_at timestamp
+      )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS booking_allocations_line_store_idx ON booking_allocations (order_id, line_index, location_id)`,
+      `CREATE INDEX IF NOT EXISTS booking_allocations_order_idx ON booking_allocations (order_id)`,
       `ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS customer_phone text`,
       `ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS customer_address text`,
       `ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS customer_city text`,
@@ -1757,6 +1816,11 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `CREATE INDEX IF NOT EXISTS sales_orders_shopify_gid_idx ON sales_orders (shopify_gid)`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS is_booking boolean`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS advance_paid numeric`,
+      // Booking form: expected delivery date + the GST rate the booking was
+      // taken at (nullable — a NULL means "use the settings rate" so rows
+      // created before this column behave exactly as they always did).
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS expected_delivery timestamp`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS gst numeric`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS metal text DEFAULT 'silver'`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS purity_label text`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS diamond_weight numeric`,
