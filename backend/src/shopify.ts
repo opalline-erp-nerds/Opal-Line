@@ -3852,6 +3852,12 @@ export interface DraftOrderLineInput {
   sku?: string
   /** Shopify ProductVariant id (numeric or gid:// form) when the line was billed against a specific variant. */
   variantId?: string | number
+  /**
+   * The shop's own id for the variant the line sold, resolved from
+   * `product_variants.shopify_variant_id`. Wins over `variantId`: a local row
+   * id wrapped in a gid names a variant the shop does not have.
+   */
+  shopifyVariantId?: string | number
 }
 
 /**
@@ -3877,13 +3883,17 @@ export function draftOrderInputLines(
       const quantity = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
       if (!title || quantity <= 0) return null
       const price = Number(li.price)
+      // The shop's own variant id wins; a bare `variantId` is only trusted
+      // when the caller already resolved it to a Shopify id (see
+      // shopifyDraftLines in index.ts — a local row id is not one).
+      const variantTarget = li.shopifyVariantId ?? li.variantId
       return {
         title,
         quantity,
         price: Number.isFinite(price) ? Math.round(price * 100) / 100 : null,
         ...(li.sku != null && String(li.sku).trim() !== '' ? { sku: String(li.sku).trim() } : {}),
-        ...(li.variantId != null && String(li.variantId).trim() !== ''
-          ? { variantId: li.variantId as string | number }
+        ...(variantTarget != null && String(variantTarget).trim() !== ''
+          ? { variantId: variantTarget as string | number }
           : {}),
       }
     })
@@ -3897,24 +3907,52 @@ export function toShopifyVariantGid(variantId: string | number): string {
 }
 
 /**
+ * Swap LOCAL `product_variants.id` values for the shop's own ids before a
+ * draft is built.
+ *
+ * The order form stores the local row id on the line; wrapping THAT in a gid
+ * names a variant the shop does not have, so the caller resolves the map from
+ * `product_variants.shopify_variant_id` and hands it here. A variant with no
+ * Shopify id loses its target entirely — the line falls back to the historic
+ * title/sku/price shape instead of shipping a bogus gid.
+ */
+export function resolveShopifyVariantTargets(
+  lines: ReadonlyArray<unknown>,
+  shopifyIdByVariantId: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> {
+  return (lines ?? []).map((raw) => {
+    const li = (raw ?? null) as Record<string, unknown> | null
+    if (!li) return {}
+    const localId = String(li.variantId ?? '').trim()
+    if (!localId) return li
+    const resolved = shopifyIdByVariantId.get(localId)
+    const rest = { ...li }
+    delete rest.variantId
+    return resolved ? { ...rest, variantId: resolved } : rest
+  })
+}
+
+/**
  * Draft-order line mapping, kept pure so the variant plumbing is testable:
- * a line with a variantId targets that exact Shopify variant (so multi-variant
- * products sync the right SKU/price), while flat lines keep the historic
- * title/sku/price shape.
+ * a line with a variant target (the shop's resolved `shopifyVariantId`, or a
+ * plain `variantId` the caller already translated) targets that exact Shopify
+ * variant so multi-variant products sync the right SKU/price, while flat lines
+ * keep the historic title/sku/price shape.
  */
 export function buildDraftOrderLineItems(lineItems: DraftOrderLineInput[]): Array<Record<string, unknown>> {
   return (lineItems ?? [])
     .filter((li) => li.title && li.quantity > 0)
-    .map((li) => ({
-      ...(li.variantId != null && String(li.variantId).trim() !== ''
-        ? { variantId: toShopifyVariantGid(li.variantId) }
-        : {}),
-      title: li.title,
-      quantity: li.quantity,
-      sku: li.sku || undefined,
-      originalUnitPrice:
-        li.price != null && Number.isFinite(li.price) && li.price >= 0 ? li.price.toFixed(2) : '0.00',
-    }))
+    .map((li) => {
+      const target = li.shopifyVariantId ?? li.variantId
+      return {
+        ...(target != null && String(target).trim() !== '' ? { variantId: toShopifyVariantGid(target) } : {}),
+        title: li.title,
+        quantity: li.quantity,
+        sku: li.sku || undefined,
+        originalUnitPrice:
+          li.price != null && Number.isFinite(li.price) && li.price >= 0 ? li.price.toFixed(2) : '0.00',
+      }
+    })
 }
 
 export interface DraftOrderAddressInput {

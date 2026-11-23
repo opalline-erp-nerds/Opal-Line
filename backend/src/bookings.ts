@@ -591,6 +591,8 @@ export interface PreparedInvoiceLine {
   amount: number
   silverValue?: number
   makingValue?: number
+  /** The variant the booked line sold, when it had one. */
+  variantId?: string | null
 }
 
 /** One invoice line as the fulfilment write emits it. */
@@ -751,6 +753,9 @@ export function buildBookingFulfilmentPlan(input: {
         makingCharge: base.makingCharge,
         tax,
         amount,
+        // Every split part keeps naming the variant its units came from — the
+        // stock guard, the deduction and the stored invoice line all key off it.
+        ...(base.variantId ? { variantId: base.variantId } : {}),
         ...(lineId ? { bookingLineId: lineId } : {}),
         locationId: r.locationId,
         bookingAllocationId: r.id,

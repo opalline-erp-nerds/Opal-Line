@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildManualInvoiceLines, buildPricedOrder } from './orderPricing'
+import { buildManualInvoiceLines, buildPricedOrder, fixedPieceRateFor } from './orderPricing'
 import { invoiceTotals } from './invoiceTotals'
 
 // Regression suite for the order-pricing double count: the create handler
@@ -237,4 +237,77 @@ test('booking lines round to the paisa across a multi-line order', () => {
   const { grandTotal } = invoiceTotals(subtotal, 3, 0)
   const booked = round2(3 * 333.33 + 1999.5)
   assert.ok(Math.abs(grandTotal - booked) <= 0.02, `invoice ${grandTotal} within 2 paise of booked ${booked}`)
+})
+
+// ── Piece Rate: the fixed ₹/pc is the price, never weight × (rate + making) ──
+// A ₹2,000/pc toy with a 200 g net weight used to arrive as 200 × (rate + making)
+// on the manual-order screen. The stored unit price stays the catalogue's fixed
+// figure (so Σ price × qty still reproduces the order value on edit) and the
+// taxable amount is that GST-inclusive price backed out.
+
+const PIECE_RATE_PRODUCT = [
+  {
+    sku: 'SKU-TOY',
+    netWeight: 200,
+    makingCharge: 20,
+    pieceRateProduct: true,
+    fixedPieceRate: 2000,
+    sellingPrice: 2000,
+  },
+]
+
+test('a Piece Rate line prices from its fixed ₹/pc, never from weight', () => {
+  const one = buildPricedOrder(
+    [{ title: 'silver toy', sku: 'SKU-TOY', quantity: 1, price: 2000 }],
+    PIECE_RATE_PRODUCT,
+    RATE,
+  )
+  assert.equal(one.lines[0].price, 2000, 'unit price is the fixed rate')
+  assert.equal(one.lines[0].amount, 1941.75, 'taxable value = the GST-inclusive fixed price backed out')
+  assert.equal(one.lines[0].silverRate, 0, 'no silver rate on a fixed-price line')
+  assert.equal(one.lines[0].makingCharge, 0, 'no making charge either')
+  assert.equal(one.lines[0].silverValue, one.lines[0].amount, 'the whole taxable amount sits in silverValue')
+  assert.equal(one.lines[0].makingValue, 0)
+  assert.equal(one.grandTotal, 2000, 'the customer pays qty × fixed')
+  // The weight maths it replaces would have been 200 g × (60 + 5) = 13,000.
+  assert.notEqual(one.lines[0].amount, 13000)
+  assert.equal(one.lines[0].weight, 200, 'the physical weight is still recorded on the line')
+})
+
+test('quantity scales the fixed price: 3 × ₹2,000 = ₹6,000', () => {
+  const three = buildPricedOrder(
+    [{ title: 'silver toy', sku: 'SKU-TOY', quantity: 3, price: 6000 }],
+    PIECE_RATE_PRODUCT,
+    RATE,
+  )
+  assert.equal(three.lines[0].price, 2000, 'the per-unit price never scales with quantity')
+  assert.equal(three.grandTotal, 6000)
+  const reEdit = Math.round(three.lines.reduce((s, li) => s + li.price * li.quantity, 0) * 100) / 100
+  assert.equal(reEdit, three.grandTotal, 're-editing the order reproduces the same value')
+})
+
+test('a variant line takes the parent piece rate through its productSku', () => {
+  // loadOrderProductData answers BOTH codes with the parent's pricing inputs,
+  // which is what makes a variant of a Piece Rate product bill at the rate.
+  const rows = [
+    ...PIECE_RATE_PRODUCT,
+    { ...PIECE_RATE_PRODUCT[0], sku: 'SKU-TOY-RED' },
+  ]
+  const [line] = buildPricedOrder(
+    [{ title: 'silver toy — red', sku: 'SKU-TOY-RED', productSku: 'SKU-TOY', quantity: 1, price: 2000 }],
+    rows,
+    RATE,
+  ).lines
+  assert.equal(line.price, 2000)
+  assert.equal(line.amount, 1941.75)
+})
+
+test('fixedPieceRateFor reads the flag first, falls back to sellingPrice, and never fires for weight-based rows', () => {
+  assert.equal(fixedPieceRateFor({ pieceRateProduct: true, fixedPieceRate: 2000, sellingPrice: 2000 }), 2000)
+  // Rows saved before the fixed_piece_rate column existed carry the same
+  // number in sellingPrice (setPieceRate writes both).
+  assert.equal(fixedPieceRateFor({ pieceRateProduct: true, fixedPieceRate: null, sellingPrice: 1500 }), 1500)
+  assert.equal(fixedPieceRateFor({ pieceRateProduct: false, fixedPieceRate: 2000, sellingPrice: 2000 }), null)
+  assert.equal(fixedPieceRateFor({ pieceRateProduct: true, fixedPieceRate: 0, sellingPrice: 0 }), null)
+  assert.equal(fixedPieceRateFor({}), null)
 })

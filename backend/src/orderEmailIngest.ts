@@ -759,18 +759,28 @@ async function nextInvoiceNumber(prefix: string): Promise<string> {
  * the default location unless the order row already records one — which keeps
  * a later reversal (edit or cancellation) landing on the same balance the
  * deduction did.
+ *
+ * `variantId` names the exact variant when the line sold one: the movement is
+ * pinned to that variant's bucket instead of being inferred from the SKU
+ * string, so a line whose SKU and variant ever disagree still draws from the
+ * variant the document actually billed (and records it in stock history).
  */
 async function deductStock(
   tx: any,
-  sku: string,
-  qty: number,
-  locationId?: string | null,
-  ref?: { refId?: string; note?: string },
+  input: {
+    sku: string
+    qty: number
+    locationId?: string | null
+    variantId?: string | null
+    ref?: { refId?: string; note?: string }
+  },
 ): Promise<void> {
+  const { sku, qty, locationId, variantId, ref } = input
   if (!sku || !qty) return
   try {
     await applyStockMovement({
       sku,
+      ...(variantId ? { variantId } : {}),
       qty: -qty,
       type: 'sale_out',
       refType: 'email_order',
@@ -849,6 +859,8 @@ type InvoiceArtifacts = {
     amount: number
     silverValue?: number
     makingValue?: number
+    /** The variant the line sold, when the order named one. */
+    variantId?: string | null
   }>
   payment: string
   subtotal: number
@@ -1319,15 +1331,17 @@ export async function raiseInvoiceForOrder(
         // movements additionally name the invoice and the booking line they
         // fulfilled, for the audit trail.
         if (deduct) {
-          await deductStock(
-            tx,
-            it.sku,
-            it.qty,
+          await deductStock(tx, {
+            sku: it.sku,
+            qty: it.qty,
             locationId,
-            planItems
-              ? { refId: invoiceId, note: lineIndex !== undefined ? `${bookingRef} line ${lineIndex + 1}` : bookingRef }
-              : undefined,
-          )
+            // The exact variant this line billed: the guard above measured ITS
+            // balance at this store, so the write must move that same bucket.
+            variantId: it.variantId ?? null,
+            ...(planItems
+              ? { ref: { refId: invoiceId, note: lineIndex !== undefined ? `${bookingRef} line ${lineIndex + 1}` : bookingRef } }
+              : {}),
+          })
         }
       }
 

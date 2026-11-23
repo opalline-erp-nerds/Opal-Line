@@ -41,6 +41,7 @@ import {
   type AgingBucketKey,
 } from '../lib/stockAging'
 import { invoiceTotals } from '../invoiceTotals'
+import { fixedPieceRateFor } from '../orderPricing'
 import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
 import { splitQtyAcrossVariants } from '../lib/variantSplit'
 import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
@@ -331,6 +332,36 @@ const listOf = (table: any, orderCol?: any) =>
     }
   }
 
+/** One `product_variants` row, as the catalogue endpoints return it. */
+type ProductVariantRow = typeof s.productVariants.$inferSelect
+
+/**
+ * Attach each product's `product_variants` rows to the product rows themselves.
+ *
+ * Every catalogue picker (Bookings, New Sales Invoice, Create Manual Order)
+ * flattens `product.variants` into one selectable row per variant, and all of
+ * them read ONLY these endpoints — a list without variants silently degrades
+ * each picker back to parent-only selection, which is how variant SKUs became
+ * unsearchable while the variant feature itself was fully built. One query per
+ * page (never N+1); a product with no variant rows gets `variants: null`, the
+ * "flat single-SKU product" the whole app already treats as the default.
+ */
+async function withVariants<T extends { id: string }>(rows: T[]): Promise<Array<T & { variants: ProductVariantRow[] | null }>> {
+  if (rows.length === 0) return []
+  const variantRows = await db!
+    .select()
+    .from(s.productVariants)
+    .where(inArray(s.productVariants.productId, rows.map((r) => r.id)))
+    .orderBy(s.productVariants.sku, s.productVariants.id)
+  const byProduct = new Map<string, typeof variantRows>()
+  for (const v of variantRows) {
+    const list = byProduct.get(v.productId)
+    if (list) list.push(v)
+    else byProduct.set(v.productId, [v])
+  }
+  return rows.map((r) => ({ ...r, variants: byProduct.get(r.id) ?? null }))
+}
+
 const oneOf = (table: any, idCol: any) =>
     async (req: Request, res: Response) => {
     if (!requireDb(res)) return
@@ -348,7 +379,20 @@ const s = schema
 
 // Newest products first: orderedColumn descends *_at columns automatically,
 // so the list opens on the latest creations (column headers still re-sort).
-dbRouter.get('/products', listOf(s.products, s.products.createdAt))
+// Products carry their variant rows so the sales pickers can offer every
+// variant SKU as its own selectable line (see withVariants).
+dbRouter.get('/products', async (req: Request, res: Response) => {
+  if (!requireDb(res)) return
+  try {
+    const result = await paginate(s.products, req.query, s.products.createdAt, req)
+    const rows = result.data.map(stripHash) as Array<{ id: string }>
+    result.data = await withVariants(rows)
+    res.json(result)
+  } catch (err) {
+    logger.error({ err }, 'products list failed')
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
 
 // ─── SKU identity helpers ─────────────────────────────────────────────
 // SKUs are the only product identifier: generated per category under an
@@ -1284,16 +1328,29 @@ dbRouter.get('/products/search', async (req, res) => {
     const q = String(req.query.q ?? '').trim()
     if (!q) return res.json({ data: [] })
     const pattern = `%${escapeLike(q)}%`
+    // A picker types the CODE it is holding: variant SKUs and variant names
+    // must land on their parent product exactly like the product's own name
+    // and SKU do, otherwise `OL-GIF-001-RED` never resolves from the server.
+    const variantMatches = db!
+      .select({ productId: s.productVariants.productId })
+      .from(s.productVariants)
+      .where(or(
+        ilike(s.productVariants.sku, pattern),
+        ilike(s.productVariants.title, pattern),
+      ))
     const rows = await db!
       .select()
       .from(s.products)
       .where(or(
         ilike(s.products.name, pattern),
         ilike(s.products.sku, pattern),
+        inArray(s.products.id, variantMatches),
       ))
       .orderBy(s.products.name)
       .limit(SEARCH_LIMIT)
-    res.json({ data: rows.map(stripHash) })
+    // Same shape as the list endpoint: pickers search by VARIANT sku/name, so
+    // the rows they hit here must carry their variants too.
+    res.json({ data: (await withVariants(rows.map(stripHash) as Array<{ id: string }>)) })
   } catch (err) {
     logger.error({ err }, 'product search failed')
     res.status(500).json({ error: 'Internal server error' })
@@ -1549,8 +1606,19 @@ export function round2(value: number): number {
  * manual invoice never reduced what the app treats as shoppable stock, and
  * the rollup silently drifted from the ledger. The historical oversell guard
  * (row lock + insufficient-stock error) is preserved.
+ *
+ * `variantId` names the exact variant when the line billed one: the movement
+ * is pinned to that variant's bucket instead of being inferred from the SKU
+ * string, and the ledger row records it — the parent rollup is re-derived as
+ * the sum of its variants either way.
  */
-async function applyStockDelta(tx: any, sku: string, delta: number, locationId?: string | null): Promise<void> {
+async function applyStockDelta(
+  tx: any,
+  sku: string,
+  delta: number,
+  locationId?: string | null,
+  variantId?: string | null,
+): Promise<void> {
   if (!sku || !delta) return
   if (delta < 0) {
     // Centralised guard: one code path owns the "would this go negative?"
@@ -1561,6 +1629,7 @@ async function applyStockDelta(tx: any, sku: string, delta: number, locationId?:
   }
   await applyStockMovement({
     sku,
+    ...(variantId ? { variantId } : {}),
     qty: delta,
     type: delta < 0 ? 'sale_out' : 'sale_return_in',
     refType: 'invoice',
@@ -1608,6 +1677,10 @@ export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number):
       delete row.bookingAllocationId
       row.product = String(item.product ?? item.title ?? '').trim()
       row.sku = String(item.sku ?? '').trim()
+      // The exact variant the line billed (NULL on flat lines): carried into
+      // sales_invoice_items so an invoice keeps naming the variant its stock
+      // was drawn from, not just a SKU string.
+      row.variantId = String(item.variantId ?? '').trim() || null
       row.qty = Math.max(1, Math.floor(num(item.qty, 1)))
       row.weight = num(item.weight, 0)
       // The rate from Silver Rate Management is AUTHORITATIVE whenever one is
@@ -1660,9 +1733,47 @@ export function applyPieceRateItems<T extends Record<string, unknown>>(
 }
 
 /**
+ * Fixed piece rates for a set of codes, keyed by LOWERCASED code.
+ *
+ * A code resolves to a Piece Rate Product either directly (it IS the
+ * product's SKU) or through a variant row (the SKU belongs to a variant of a
+ * Piece Rate Product — the path `OL-GIF-001-RED` takes). The rate itself comes
+ * from the SAME rule the client's `sellableItemPrice` uses, so the preview and
+ * the stored line can never disagree. Pure by design: the resolution rule is
+ * unit-testable without a database.
+ */
+export function pieceRateMapFor(
+  codes: string[],
+  products: Array<{
+    id: string
+    sku: string | null
+    pieceRateProduct?: boolean | null
+    fixedPieceRate?: number | string | null
+    sellingPrice?: number | string | null
+  }>,
+  variants: Array<{ sku: string | null; productId: string | null }>,
+): Map<string, number> {
+  const wanted = new Set(codes.map((c) => String(c).trim().toLowerCase()).filter(Boolean))
+  const byId = new Map(products.map((p) => [p.id, p]))
+  const rates = new Map<string, number>()
+  const consider = (code: string | null | undefined, product: (typeof products)[number] | undefined) => {
+    const key = String(code ?? '').trim().toLowerCase()
+    if (!key || !wanted.has(key) || rates.has(key) || !product) return
+    const rate = fixedPieceRateFor(product)
+    if (rate != null) rates.set(key, rate)
+  }
+  for (const p of products) consider(p.sku, p)
+  for (const v of variants) consider(v.sku, v.productId ? byId.get(v.productId) : undefined)
+  return rates
+}
+
+/**
  * Loads the fixed piece rates for an invoice's SKUs and rewrites every line
- * that belongs to a Piece Rate Product. Returns the items untouched when no
- * line maps to one, so ordinary invoices never pay for the lookup.
+ * that belongs to a Piece Rate Product — the product's own SKU or, through
+ * `product_variants`, a VARIANT's SKU, which is how a piece-rate product's
+ * variants bill at their fixed ₹/pc instead of the silver-weight maths.
+ * Returns the items untouched when no line maps to one, so ordinary invoices
+ * never pay for the lookups.
  */
 export async function applyPieceRateInvoiceItems<T extends Record<string, unknown>>(
   items: T[],
@@ -1671,16 +1782,31 @@ export async function applyPieceRateInvoiceItems<T extends Record<string, unknow
   if (items.length === 0 || !client) return items
   const skus = [...new Set(items.map((it) => String(it.sku ?? '').trim()).filter(Boolean))]
   if (skus.length === 0) return items
+  // Typed explicitly: the shared client is `any`, and an untyped callback
+  // parameter is exactly how an `any` silently becomes an untestable `any`.
+  type VariantCodeRow = { sku: string | null; productId: string | null }
+  const variants: VariantCodeRow[] = await client
+    .select({ sku: s.productVariants.sku, productId: s.productVariants.productId })
+    .from(s.productVariants)
+    .where(inArray(s.productVariants.sku, skus))
+  const parentIds: string[] = [
+    ...new Set(variants.map((v) => v.productId).filter((id): id is string => Boolean(id))),
+  ]
   const rows = await client
-    .select({ sku: s.products.sku, fixedPieceRate: s.products.fixedPieceRate })
+    .select({
+      id: s.products.id,
+      sku: s.products.sku,
+      pieceRateProduct: s.products.pieceRateProduct,
+      fixedPieceRate: s.products.fixedPieceRate,
+      sellingPrice: s.products.sellingPrice,
+    })
     .from(s.products)
-    .where(and(inArray(s.products.sku, skus), eq(s.products.pieceRateProduct, true)))
-  const rates = new Map<string, number>()
-  for (const r of rows) {
-    const rate = Number(r.fixedPieceRate)
-    if (Number.isFinite(rate) && rate > 0) rates.set(String(r.sku ?? '').trim().toLowerCase(), rate)
-  }
-  return applyPieceRateItems(items, rates)
+    .where(
+      parentIds.length > 0
+        ? or(inArray(s.products.sku, skus), inArray(s.products.id, parentIds))
+        : inArray(s.products.sku, skus),
+    )
+  return applyPieceRateItems(items, pieceRateMapFor(skus, rows, variants))
 }
 
 // Duplicate an existing invoice into a fresh draft (same items/customer, new number, no payment)
@@ -1822,7 +1948,7 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
         .returning()
       for (const it of items) {
         await tx.insert(s.salesInvoiceItems).values({ ...it, id: randomUUID(), invoiceId: id })
-        await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0))
+        await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0), undefined, String(it.variantId ?? '') || null)
       }
       return invoice
     })
@@ -1890,7 +2016,7 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         // exactly as before (default store).
         const oldItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
         for (const oi of oldItems) {
-          await applyStockDelta(tx, String(oi.sku ?? ''), num(oi.qty, 0), oi.locationId)
+          await applyStockDelta(tx, String(oi.sku ?? ''), num(oi.qty, 0), oi.locationId, oi.variantId ?? null)
         }
         // Where the REPLACEMENT lines may draw from: the invoice's own
         // fulfilment stores. One store → reuse it; none stored (historical
@@ -1932,7 +2058,7 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
             invoiceId: routeParam(req.params.id),
             ...(loc ? { locationId: loc } : {}),
           })
-          await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0), loc)
+          await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0), loc, String(it.variantId ?? '') || null)
         }
         const gst = num(body.gst, num(existing.gst, 3))
         const subtotal = round2(items.reduce((a, it) => a + num(it.amount, 0), 0))
@@ -2008,7 +2134,7 @@ dbRouter.delete('/invoices/:id', requirePermission('sales', 'delete'), async (re
       for (const it of items) {
         // Each line goes back to ITS fulfilment store (Phase 4); historical
         // items (NULL location) keep the legacy default-store behaviour.
-        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0), it.locationId)
+        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0), it.locationId, it.variantId ?? null)
       }
       await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
       await tx.delete(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id)))
@@ -2117,7 +2243,7 @@ dbRouter.post('/sales-orders/by-invoice/:invoice/reinvoice', requirePermission('
         // legacy default-store behaviour unchanged. The re-raise that follows
         // re-consumes the booking's allocations at the same stores (the plan
         // is applied automatically), so stock lands exactly where it came from.
-        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0), it.locationId)
+        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0), it.locationId, it.variantId ?? null)
       }
       await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, existing.id))
       await tx.delete(s.salesInvoices).where(eq(s.salesInvoices.id, existing.id))

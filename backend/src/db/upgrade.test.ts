@@ -71,6 +71,10 @@ const KEY_COLUMNS = [
   'booking_allocations.line_id',
   'booking_allocations.invoice_id',
   'booking_allocations.fulfilled_at',
+  // Variant identity on an invoice line (ALTERed onto sales_invoice_items by
+  // INVOICE_VARIANT_DDL — the fresh CREATE TABLE does not carry it either),
+  // so a converted booking's invoice keeps naming the variant it drew from.
+  'sales_invoice_items.variant_id',
 ]
 
 test('upgrade restores the full purchase schema on a pre-purchase database', async (t) => {
@@ -118,7 +122,8 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
       await sql.unsafe(
         `alter table sales_invoice_items drop column if exists location_id,
            drop column if exists booking_line_id,
-           drop column if exists booking_allocation_id`,
+           drop column if exists booking_allocation_id,
+           drop column if exists variant_id`,
       )
       await sql.unsafe(
         `alter table booking_allocations drop column if exists line_id,

@@ -25,6 +25,8 @@ export interface OrderItemInput {
   productSku?: string
   quantity?: number
   price?: number
+  /** The exact variant the line sold, when the product has variants. */
+  variantId?: string | null
   /** Weight per piece (g) entered on the order form; only fills a product with no configured weight. */
   netWeight?: number | null
   /** Total line weight (g): qty × weight-per-piece, or a manual override from the form. */
@@ -66,15 +68,45 @@ export interface PricedOrder<T extends OrderItemInput = OrderItemInput> {
   itemCount: number
 }
 
+/** One catalogue row `buildPricedOrder` may price a line from. */
+export interface OrderCatalogueRow {
+  sku: string | null
+  netWeight: number | string | null
+  makingCharge: number | string | null
+  /** Piece Rate Product — a fixed ₹/pc replaces the silver-weight maths. */
+  pieceRateProduct?: boolean | null
+  fixedPieceRate?: number | string | null
+  /** Legacy carrier of the same number on rows saved before the column existed. */
+  sellingPrice?: number | string | null
+}
+
+/**
+ * The fixed ₹/pc a Piece Rate row bills, or null when it prices by weight.
+ *
+ * Mirrors `lib/sellableItems.ts → sellableItemPrice` on the client so the
+ * dialog's preview and the stored line can never disagree: `fixed_piece_rate`
+ * wins, `sellingPrice` carries it on older rows, and a row that is not a Piece
+ * Rate Product never has one — whatever its price columns say.
+ */
+export function fixedPieceRateFor(
+  row: Pick<OrderCatalogueRow, 'pieceRateProduct' | 'fixedPieceRate' | 'sellingPrice'>,
+): number | null {
+  if (row.pieceRateProduct !== true) return null
+  const fixed = Number(row.fixedPieceRate ?? 0)
+  if (Number.isFinite(fixed) && fixed > 0) return fixed
+  const selling = Number(row.sellingPrice ?? 0)
+  return Number.isFinite(selling) && selling > 0 ? selling : null
+}
+
 export function buildPricedOrder<T extends OrderItemInput>(
   items: T[],
-  productData: Array<{ sku: string | null; netWeight: number | string | null; makingCharge: number | string | null }>,
+  productData: OrderCatalogueRow[],
   silverRate: number,
 ): PricedOrder<T> {
   const productMap = new Map(
     productData.map((p) => [
       String(p.sku ?? '').trim(),
-      { netWeight: Number(p.netWeight ?? 0), makingCharge: Number(p.makingCharge ?? 0) },
+      { netWeight: Number(p.netWeight ?? 0), makingCharge: Number(p.makingCharge ?? 0), pieceRate: fixedPieceRateFor(p) },
     ]),
   )
 
@@ -86,7 +118,7 @@ export function buildPricedOrder<T extends OrderItemInput>(
   //   grandTotal  = Σ amount + 3% GST
   const lines = items.map((li) => {
     const sku = String(li.productSku ?? li.sku ?? '').trim()
-    const product = productMap.get(sku) ?? { netWeight: 0, makingCharge: 0 }
+    const product = productMap.get(sku) ?? { netWeight: 0, makingCharge: 0, pieceRate: null as number | null }
     // A weight entered on the form wins (it must round-trip through
     // save/refresh); the catalogue fills in when the form sent none — which
     // covers every client that predates weight editing. Never invents a
@@ -106,6 +138,33 @@ export function buildPricedOrder<T extends OrderItemInput>(
       : netWeight > 0
         ? Math.round(netWeight * qty * 1000) / 1000
         : 0
+
+    // ── Piece Rate: the fixed ₹/pc IS the per-unit price. The silver-weight
+    //    arithmetic below never runs for such a line — a ₹2,000/pc toy with a
+    //    200 g net weight used to arrive as 200 × (rate + making). The stored
+    //    `price` stays the catalogue's fixed figure (which is what the dialog
+    //    shows and what Σ price × qty re-derives the order value from), and the
+    //    taxable amount is that GST-inclusive price backed out — with the whole
+    //    amount in silverValue and makingValue 0, the same shape
+    //    `buildManualInvoiceLines` bills price-only lines from, so the header
+    //    sums and the invoice raised from this order stay consistent.
+    const pieceRate = product.pieceRate
+    if (pieceRate != null) {
+      const amount = qty > 0 ? roundMoney((pieceRate * qty) / (1 + ORDER_GST_RATE / 100)) : 0
+      return {
+        ...li,
+        price: pieceRate,
+        quantity: qty,
+        netWeight,
+        makingCharge: 0,
+        weight,
+        silverRate: 0,
+        silverValue: amount,
+        makingValue: 0,
+        amount,
+      }
+    }
+
     const itemSilverRate = weight > 0 ? silverRate : 0
     const itemMakingCharge = weight > 0 ? makingChargePerGram : 0
     const silverValue = weight > 0 ? roundMoney(weight * itemSilverRate) : 0
@@ -153,6 +212,8 @@ export interface StoredOrderLine {
   silverValue?: number | null
   makingValue?: number | null
   amount?: number | null
+  /** The exact variant the line sold — carried onto the invoice it becomes. */
+  variantId?: string | null
 }
 
 /** One `sales_invoice_items` row raised from a stored order line. */
@@ -169,6 +230,8 @@ export interface ManualInvoiceLine {
   amount: number
   silverValue: number
   makingValue: number
+  /** NULL on flat lines — kept so the invoice keeps naming its variant. */
+  variantId?: string | null
 }
 
 /**
@@ -225,6 +288,9 @@ export function buildManualInvoiceLines(lines: StoredOrderLine[], gstRate: numbe
       amount,
       silverValue,
       makingValue,
+      // The variant travels with the line: the invoice must keep naming the
+      // exact variant its stock was deducted from, not just its SKU string.
+      ...(li.variantId ? { variantId: li.variantId } : {}),
     }
   })
 }

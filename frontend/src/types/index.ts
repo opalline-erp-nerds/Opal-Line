@@ -1063,6 +1063,14 @@ export interface SalesOrderLineItem {
   sku?: string
   quantity: number
   price: number
+  /** Catalogue product the line points at — absent on hand-typed lines. */
+  productId?: string
+  /**
+   * The exact `product_variants` row the line sells, when the product has
+   * variants. NULL/absent = the product itself (a flat single-SKU line); the
+   * line's `sku` is then the variant's own code.
+   */
+  variantId?: string
   /** Weight per piece (g) snapshotted on the line. */
   netWeight?: number | null
   /** Total line weight (g) = quantity × weight per piece (or a manual override). */

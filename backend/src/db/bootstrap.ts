@@ -116,6 +116,20 @@ const BOOKING_FULFILMENT_DDL: string[] = [
 ]
 
 /**
+ * Which variant an invoiced line billed.
+ *
+ * Declared once and applied from BOTH createSchema and applyUpgrades (the
+ * BOOKING_FULFILMENT_DDL rule): booking conversion writes it so a converted
+ * booking's invoice keeps pointing at the exact variant its stock was taken
+ * from, and the manual invoice flows write it for the same reason. Additive
+ * only — historical lines stay NULL, which means "resolve through the SKU",
+ * exactly as before. No backfill runs.
+ */
+const INVOICE_VARIANT_DDL: string[] = [
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS variant_id text`,
+]
+
+/**
  * Per-location stock balances and the append-only movement ledger.
  *
  * Declared once and applied from both createSchema (fresh installs) and
@@ -981,6 +995,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
     for (const stmt of SHOPIFY_OUTBOUND_DDL) await tx.unsafe(stmt)
     for (const stmt of COLLECTIONS_DDL) await tx.unsafe(stmt)
     for (const stmt of BOOKING_FULFILMENT_DDL) await tx.unsafe(stmt)
+    for (const stmt of INVOICE_VARIANT_DDL) await tx.unsafe(stmt)
 
     // ── Finance ───────────────────────────────────────────────────────────
     await tx.unsafe(`
@@ -1656,6 +1671,7 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
     ...STOCK_LEDGER_DDL,
     ...SHOPIFY_OUTBOUND_DDL,
     ...BOOKING_FULFILMENT_DDL,
+    ...INVOICE_VARIANT_DDL,
       // Accounting: store the journal source so unified/Shopify filtering is exact.
       `ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS source text`,
       // Duplicate prevention at the database level: one journal per source record.
