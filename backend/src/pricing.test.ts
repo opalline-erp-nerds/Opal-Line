@@ -149,6 +149,58 @@ describe('applyPieceRateItems (piece-rate invoice lines)', () => {
   })
 })
 
+describe('pieceRateMapFor (variant SKU resolution)', () => {
+  const products = [
+    { id: 'p-toy', sku: 'OL-GIF-001', pieceRateProduct: true, fixedPieceRate: 2000, sellingPrice: 2000 },
+    { id: 'p-chain', sku: 'OL-CHN-001', pieceRateProduct: false, fixedPieceRate: null, sellingPrice: 4999 },
+    { id: 'p-legacy', sku: 'OL-OLD-001', pieceRateProduct: true, fixedPieceRate: null, sellingPrice: 1500 },
+  ]
+  const variants = [
+    { sku: 'OL-GIF-001-RED', productId: 'p-toy' },
+    { sku: 'OL-GIF-001-WHI', productId: 'p-toy' },
+    { sku: 'OL-CHN-001-L', productId: 'p-chain' },
+  ]
+
+  test("a variant's SKU resolves to its PARENT's piece rate", () => {
+    const rates = dbRoutes.pieceRateMapFor(['OL-GIF-001-RED'], products, variants)
+    assert.equal(rates.get('ol-gif-001-red'), 2000, 'the variant bills the fixed ₹/pc of its product')
+  })
+
+  test("the product's own SKU resolves too, and weight-based rows never enter the map", () => {
+    const rates = dbRoutes.pieceRateMapFor(['OL-GIF-001', 'OL-CHN-001', 'OL-CHN-001-L'], products, variants)
+    assert.equal(rates.get('ol-gif-001'), 2000)
+    assert.equal(rates.has('ol-chn-001'), false, 'a non Piece Rate product is never rewritten')
+    assert.equal(rates.has('ol-chn-001-l'), false, 'nor is its variant')
+  })
+
+  test('legacy rows fall back to sellingPrice; unknown codes stay absent', () => {
+    const rates = dbRoutes.pieceRateMapFor(['OL-OLD-001', 'NOPE'], products, variants)
+    assert.equal(rates.get('ol-old-001'), 1500, 'fixed_piece_rate was null — sellingPrice carries the rate')
+    assert.equal(rates.has('nope'), false, 'an unknown code resolves to nothing')
+  })
+
+  test('the resolved map rewrites a variant line exactly like a parent line', () => {
+    const rates = dbRoutes.pieceRateMapFor(['OL-GIF-001-RED'], products, variants)
+    const [row] = dbRoutes.applyPieceRateItems(
+      [
+        {
+          product: 'silver toy - red',
+          sku: 'OL-GIF-001-RED',
+          qty: 2,
+          weight: 400,
+          silverRate: 105,
+          makingCharge: 20,
+          amount: 45000,
+        },
+      ],
+      rates,
+    )
+    assert.equal(row.amount, 4000, '2 × ₹2,000 — never 400 g × (105 + 20)')
+    assert.equal(row.silverRate, 0)
+    assert.equal(row.makingCharge, 0)
+  })
+})
+
 describe('quotation normalization and totals', () => {
   test('computes line amount as round2(weight x (rate + makingChargePerGram))', () => {
     // Correct formula: amount = weight × (silverRate + makingChargePerGram)

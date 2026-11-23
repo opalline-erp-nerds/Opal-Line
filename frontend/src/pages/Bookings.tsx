@@ -42,11 +42,17 @@ import { bookingBalance, bookingStats } from '@/lib/bookingStats'
 import { exportTable } from '@/lib/export'
 import { bookingPricing } from '@/lib/bookingPricing'
 import { locationLabel } from '@/lib/locations'
-import { perUnitLinePrice } from '@/lib/orderPricing'
+import {
+  flattenSellableItems,
+  parseSellableValue,
+  sellableItemOptions,
+  sellableItemPrice,
+  sellableItemValue,
+  type SellableItem,
+} from '@/lib/sellableItems'
 import {
   findVariantById,
   hasRealOptions,
-  productVariants,
   variantFinalPrice,
   variantLabel,
   variantOptions,
@@ -159,7 +165,15 @@ function isOpenBooking(b: SalesOrder): boolean {
 
 function itemsSummary(b: SalesOrder): string {
   const lines = b.lineItems ?? []
-  return lines.map((li) => `${li.quantity ?? 1}× ${li.title || li.sku || 'Item'}`).join(', ')
+  return lines
+    .map((li) => {
+      const base = `${li.quantity ?? 1}× ${li.title || li.sku || 'Item'}`
+      // A variant line's title already carries the variant NAME; its CODE is
+      // the half the list used to drop, and the half a counter matches a
+      // physical label against.
+      return li.variantId && li.sku ? `${base} (${li.sku})` : base
+    })
+    .join(', ')
 }
 
 function DetailField({ label, value }: { label: string; value: ReactNode }) {
@@ -875,54 +889,60 @@ export default function Bookings() {
     setLines((prev) => (prev.length === 1 ? [newLine()] : prev.filter((l) => l.key !== key)))
 
   /**
-   * Picking a catalogue product: name, SKU, relationship ids and the price
-   * come from the SAME pricing rule Sales Orders uses — managed silver rate ×
-   * net weight + making charge, falling back to the catalogue/variant selling
-   * price — so a booking is priced exactly like an order would be.
+   * Every row the Product dropdown can sell: one per VARIANT when the product
+   * has them (so a held code like `OL-GIF-001-RED` is its own selectable,
+   * searchable line), one for the product itself when it does not. Built from
+   * the SAME helper the invoice and order pickers use, and re-keyed by the
+   * per-store availability cache — which is itself keyed by
+   * `${productId}|${variantId}`, exactly this option value.
    */
-  const selectProduct = (key: string, productId: string) => {
-    if (productId === CUSTOM_PRODUCT) {
+  const sellables = useMemo(
+    () => flattenSellableItems(products, availability),
+    [products, availability],
+  )
+
+  /**
+   * Picking a catalogue row: name, SKU, relationship ids and the price all
+   * come from that flattened row. The price follows the row's pricing mode —
+   * a Piece Rate row opens at its fixed ₹/pc and a weight-based row at the
+   * managed silver-rate calculation — so a ₹2,000/pc product can never be
+   * re-priced by silver weight here. Both stay editable.
+   */
+  const selectProduct = (key: string, value: string) => {
+    if (value === CUSTOM_PRODUCT) {
       setLine(key, { productId: '', variantId: '', title: '', sku: '', custom: true, price: '' })
       return
     }
-    const p = products.find((x) => x.id === productId)
-    if (!p) return
-    const firstVariant = hasRealOptions(p.options) ? productVariants(p)[0] ?? null : null
-    const price =
-      perUnitLinePrice({
-        silverRate: ratePerGram,
-        netWeight: p.netWeight,
-        makingCharge: p.makingCharge,
-        fallback: firstVariant ? variantFinalPrice(p.sellingPrice, firstVariant.sellingPrice, firstVariant.name) : p.sellingPrice,
-      }) ?? 0
-    setLine(key, {
-      productId: p.id,
-      variantId: firstVariant?.id ?? '',
-      title: firstVariant ? `${p.name} — ${variantLabel(firstVariant)}` : p.name,
-      sku: firstVariant ? firstVariant.sku : p.sku,
-      custom: false,
-      price: price ? String(price) : '',
-    })
+    const { productId, variantId } = parseSellableValue(value)
+    // The requested pair first; a line pointing at a product that has since
+    // gained variants falls back to the product's own row rather than silently
+    // doing nothing.
+    const item =
+      sellables.find((s) => s.productId === productId && (s.variantId ?? null) === variantId) ??
+      sellables.find((s) => s.productId === productId && s.variantId === null)
+    if (!item) return
+    applySellable(key, item)
   }
 
   /** Swap the variant: SKU, title and price all follow the selection. */
   const selectVariant = (key: string, variantId: string) => {
     const line = lines.find((l) => l.key === key)
-    const p = products.find((x) => x.id === (line?.productId ?? ''))
-    const v = findVariantById(p ?? null, variantId)
-    if (!p || !v || !line) return
-    const price =
-      perUnitLinePrice({
-        silverRate: ratePerGram,
-        netWeight: p.netWeight,
-        makingCharge: p.makingCharge,
-        fallback: v.sellingPrice == null ? Number(line.price) || 0 : variantFinalPrice(p.sellingPrice, v.sellingPrice, v.name),
-      }) ?? 0
+    if (!line?.productId) return
+    const item = sellables.find((s) => s.productId === line.productId && s.variantId === variantId)
+    if (!item) return
+    applySellable(key, item)
+  }
+
+  /** Write one flattened row onto a line — the single place titles come from. */
+  const applySellable = (key: string, item: SellableItem) => {
+    const price = sellableItemPrice(item, { silverRate: ratePerGram })
     setLine(key, {
-      variantId: v.id,
-      title: `${p.name} — ${variantLabel(v)}`,
-      sku: v.sku,
-      price: price ? String(price) : line.price,
+      productId: item.productId,
+      variantId: item.variantId ?? '',
+      title: item.variantId ? `${item.productName} — ${item.variantName}` : item.productName,
+      sku: item.sku,
+      custom: false,
+      price: price != null ? String(price) : '',
     })
   }
 
@@ -942,20 +962,29 @@ export default function Bookings() {
     }
   }
 
-  const productOptions = useMemo(
-    () => [
-      ...products.map((p) => ({
-        value: p.id,
-        label: p.name,
-        // Search by the parent SKU OR any variant SKU: someone holding a
-        // variant code still lands on the product, then picks the exact variant.
-        keywords: [p.sku, ...productVariants(p).map((v) => v.sku)].filter(Boolean).join(' '),
-        subtitle: productVariants(p).length > 0 ? `${productVariants(p).length} variants` : p.sku,
-      })),
-      { value: CUSTOM_PRODUCT, label: 'Type manually…', subtitle: 'Not in the catalogue' },
-    ],
-    [products],
-  )
+  const productOptions = useMemo(() => {
+    const options = sellableItemOptions(sellables)
+    // A line saved BEFORE the pickers flattened variants — or written by a
+    // client that only ever sent a bare product id — may name a pair that is
+    // no longer an option of its own. Give that line its own row so opening
+    // the form for an untouched edit never blanks the picker.
+    for (const l of lines) {
+      if (l.custom || !l.productId) continue
+      const value = sellableItemValue({ productId: l.productId, variantId: l.variantId || null })
+      if (options.some((o) => o.value === value)) continue
+      const p = products.find((x) => x.id === l.productId)
+      if (p) {
+        options.push({
+          value,
+          label: p.name,
+          subtitle: p.sku || undefined,
+          keywords: [p.sku, p.name].filter(Boolean).join(' '),
+        })
+      }
+    }
+    options.push({ value: CUSTOM_PRODUCT, label: 'Type manually…', subtitle: 'Not in the catalogue', keywords: '' })
+    return options
+  }, [sellables, lines, products])
 
   /** What the selling-store selector offers; the default store is always present. */
   const knownLocations = useMemo(
@@ -1916,7 +1945,7 @@ export default function Bookings() {
                 </Button>
               </div>
               <div className="space-y-2.5">
-                {lines.map((l) => {
+                {lines.map((l, index) => {
                   const product = products.find((x) => x.id === l.productId) ?? null
                   const variants = product && hasRealOptions(product.options) ? variantOptions(product) : []
                   const identity = lineIdentity(l)
@@ -1930,9 +1959,15 @@ export default function Bookings() {
                           <Label className="text-xs text-muted-foreground">Product</Label>
                           <SearchableSelect
                             placeholder="Select product"
-                            searchPlaceholder="Search name or SKU…"
+                            searchPlaceholder="Search name, SKU or variant…"
                             options={productOptions}
-                            value={l.custom ? CUSTOM_PRODUCT : l.productId}
+                            value={
+                              l.custom
+                                ? CUSTOM_PRODUCT
+                                : l.productId
+                                  ? sellableItemValue({ productId: l.productId, variantId: l.variantId || null })
+                                  : ''
+                            }
                             onValueChange={(v) => selectProduct(l.key, v)}
                           />
                           {l.custom ? (
@@ -1964,6 +1999,9 @@ export default function Bookings() {
                             step="1"
                             value={l.qty}
                             onChange={(e) => setLine(l.key, { qty: e.target.value })}
+                            // The label above is a sibling, not a wrapper, so
+                            // without this the field has no accessible name.
+                            aria-label={`Qty for line ${index + 1}`}
                             className="text-right"
                           />
                         </div>
@@ -1975,6 +2013,7 @@ export default function Bookings() {
                             step="0.01"
                             value={l.price}
                             onChange={(e) => setLine(l.key, { price: e.target.value })}
+                            aria-label={`Price per unit for line ${index + 1} (incl. GST)`}
                             className="text-right"
                           />
                         </div>

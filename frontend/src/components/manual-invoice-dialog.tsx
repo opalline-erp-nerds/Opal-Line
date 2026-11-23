@@ -11,6 +11,7 @@ import { dbApi } from '@/lib/api'
 import { formatCurrency } from '@/lib/format'
 import { useSilverRate } from '@/lib/silver-rate-context'
 import { lineAmount, invoiceTotalsPreview } from '@/lib/invoicePricing'
+import { flattenSellableItems, searchSellableItems, sellableItemValue, type SellableItem } from '@/lib/sellableItems'
 import type { Invoice, Product } from '@/types'
 
 /** Sentinel: the line's product is typed by hand, not picked from the catalogue. */
@@ -20,15 +21,34 @@ const CUSTOM_SKU = '__custom__'
 interface DraftLine {
   product: string
   sku: string
+  /** Catalogue row the line points at — empty on a hand-typed line. */
+  productId: string
+  /** The exact variant when the picked row was one; '' = the product itself. */
+  variantId: string
   qty: string
   /** Per-PIECE net weight in grams (from the catalogue). */
   netWeight: string
   /** Making charge PER GRAM (from the catalogue, editable). */
   makingCharge: string
+  /**
+   * Fixed ₹/pc when the picked row is a Piece Rate product, else ''. A line
+   * carrying it bills `qty × fixed` and never touches the silver maths — the
+   * rule `applyPieceRateItems` applies server-side, so preview and store agree.
+   */
+  pieceRate: string
 }
 
 function emptyLine(): DraftLine {
-  return { product: '', sku: '', qty: '1', netWeight: '', makingCharge: '' }
+  return {
+    product: '',
+    sku: '',
+    productId: '',
+    variantId: '',
+    qty: '1',
+    netWeight: '',
+    makingCharge: '',
+    pieceRate: '',
+  }
 }
 
 /** Total billable weight for a line = per-piece net weight × qty. */
@@ -36,6 +56,11 @@ function lineTotalWeight(line: DraftLine): number {
   const net = Number(line.netWeight) || 0
   const qty = Math.max(1, Math.floor(Number(line.qty) || 1))
   return net * qty
+}
+
+/** True when the line bills at a fixed ₹/pc instead of by weight. */
+function isPieceRateLine(line: DraftLine): boolean {
+  return Number(line.pieceRate) > 0
 }
 
 interface DraftForm {
@@ -91,9 +116,20 @@ export function ManualInvoiceDialog({
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [products, setProducts] = useState<Product[]>([])
+  /**
+   * The catalogue FLATTENED into selectable rows: one per product, one per
+   * variant — the shared shape every sales picker (Bookings, this dialog, the
+   * manual order form) selects from, so a variant code is a row of its own.
+   */
+  const sellables = useMemo(() => flattenSellableItems(products), [products])
+  /** Rows returned by the SERVER search — not merged into `products`, so a
+   * catalogue that cannot satisfy a query locally never re-triggers itself. */
+  const [serverHits, setServerHits] = useState<Product[]>([])
+  const serverSellables = useMemo(() => flattenSellableItems(serverHits), [serverHits])
   const [productQuery, setProductQuery] = useState('')
-  const [productHits, setProductHits] = useState<Product[]>([])
-  // Tracks the query whose results are in productHits, so the spinner is
+  /** The rows currently listed under the search box (capped at 20). */
+  const [hits, setHits] = useState<SellableItem[]>([])
+  // Tracks the query whose results are in hits, so the spinner is
   // derived (not set synchronously in the search effect).
   const [resolvedProductQuery, setResolvedProductQuery] = useState('')
   const [form, setForm] = useState<DraftForm>(emptyForm)
@@ -111,7 +147,8 @@ export function ManualInvoiceDialog({
     queueMicrotask(() => {
       setError('')
       setProductQuery('')
-      setProductHits([])
+      setHits([])
+      setServerHits([])
       setForm({ ...emptyForm(), customer: initialCustomer ?? '', customerPhone: initialCustomerPhone ?? '' })
       setLines([emptyLine()])
     })
@@ -123,34 +160,30 @@ export function ManualInvoiceDialog({
     if (!open || products.length > 0) return
     dbApi.getProducts().then((all) => {
       setProducts(all)
-      setProductHits(all.slice(0, 20))
+      setHits(flattenSellableItems(all).slice(0, 20))
     }).catch(() => setProducts([]))
   }, [open, products.length])
 
-  // Debounced product search (name / SKU) with a stale-guard.
+  // Debounced search over the FLATTENED catalogue with a stale-guard: a
+  // variant is found by its own SKU, its own name or its parent's name. Only
+  // when nothing local matches does the server get asked (it searches variant
+  // codes too, so a code the list has not loaded still resolves).
   useEffect(() => {
     if (!open) return
     const q = productQuery.trim()
     if (q === '') {
       // Defer the reset out of the effect body (react/set-state-in-effect).
       queueMicrotask(() => {
-        setProductHits(products.slice(0, 20))
+        setHits(sellables.slice(0, 20))
         setResolvedProductQuery('')
       })
       return
     }
-    const lower = q.toLowerCase()
-    // Filter the already-loaded catalogue first; only reach out when the local
-    // list doesn't obviously contain the term (keeps keystrokes snappy).
-    const local = products.filter(
-      (p) =>
-        p.name.toLowerCase().includes(lower) ||
-        p.sku.toLowerCase().includes(lower),
-    )
+    const local = searchSellableItems(sellables, q)
     if (local.length > 0) {
       // Defer out of the effect body (react/set-state-in-effect).
       queueMicrotask(() => {
-        setProductHits(local.slice(0, 20))
+        setHits(local.slice(0, 20))
         setResolvedProductQuery(q)
       })
       return
@@ -159,16 +192,17 @@ export function ManualInvoiceDialog({
       const token = ++productToken.current
       dbApi.searchProducts(q).then((rows) => {
         if (token !== productToken.current) return // stale — a newer query won
-        setProductHits(rows)
+        setServerHits(rows)
+        setHits(flattenSellableItems(rows).slice(0, 20))
         setResolvedProductQuery(q)
       }).catch(() => {
         if (token !== productToken.current) return
-        setProductHits([])
+        setHits([])
         setResolvedProductQuery(q)
       })
     }, 250)
     return () => window.clearTimeout(t)
-  }, [productQuery, open, products])
+  }, [productQuery, open, sellables])
 
   // Derived: a non-empty query is "searching" until its results have landed.
   const searchingProducts = productQuery.trim() !== '' && productQuery.trim() !== resolvedProductQuery
@@ -179,20 +213,31 @@ export function ManualInvoiceDialog({
   const removeLine = (index: number) =>
     setLines((prev) => (prev.length === 1 ? [emptyLine()] : prev.filter((_, i) => i !== index)))
 
-  // Picking a catalogue product prefills name, per-piece net weight and the
-  // per-gram making charge — the two numbers that drive the price.
-  const pickProduct = (index: number, sku: string) => {
-    if (sku === CUSTOM_SKU) {
-      setLine(index, { sku: '', product: '' })
+  /**
+   * Picking a row prefills its identity and the numbers that drive the price.
+   * A Piece Rate row switches the line onto its fixed ₹/pc — no weight, no
+   * making charge — so the amount is `qty × fixed` instead of
+   * `net wt × (silver rate + making)`, exactly as a quotation submits it.
+   */
+  const pickProduct = (index: number, value: string) => {
+    if (value === CUSTOM_SKU) {
+      setLine(index, { sku: '', product: '', productId: '', variantId: '', netWeight: '', makingCharge: '', pieceRate: '' })
       return
     }
-    const p = products.find((x) => x.sku === sku) ?? productHits.find((x) => x.sku === sku)
-    if (!p) return
+    // The row may have come from the loaded catalogue or from a server search.
+    const item =
+      sellables.find((s) => sellableItemValue(s) === value) ??
+      serverSellables.find((s) => sellableItemValue(s) === value)
+    if (!item) return
+    const pieceRate = item.pricingType === 'piece_rate' && item.fixedPieceRate != null
     setLine(index, {
-      sku: p.sku,
-      product: p.name,
-      netWeight: p.netWeight != null ? String(p.netWeight) : '',
-      makingCharge: p.makingCharge != null ? String(p.makingCharge) : '',
+      sku: item.sku,
+      product: item.variantName ? `${item.productName} - ${item.variantName}` : item.productName,
+      productId: item.productId,
+      variantId: item.variantId ?? '',
+      netWeight: pieceRate ? '' : item.netWeight != null ? String(item.netWeight) : '',
+      makingCharge: pieceRate ? '' : item.makingCharge != null ? String(item.makingCharge) : '',
+      pieceRate: pieceRate ? String(item.fixedPieceRate) : '',
     })
   }
 
@@ -213,6 +258,10 @@ export function ManualInvoiceDialog({
         weight: lineTotalWeight(l),
         silverRatePerGram: ratePerGram,
         makingChargePerGram: Number(l.makingCharge) || 0,
+        // A Piece Rate line bills qty × fixed; weight and rates are ignored
+        // there (the server applies the same rule to what we submit).
+        pieceRate: isPieceRateLine(l) ? Number(l.pieceRate) : undefined,
+        qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
       }))
     return invoiceTotalsPreview(priced, Number(form.gst) || 0, Number(form.discount) || 0)
   }, [lines, form.gst, form.discount, ratePerGram])
@@ -222,7 +271,10 @@ export function ManualInvoiceDialog({
     if (!customer) { setError('Customer name is required'); return }
     const usable = lines.filter((l) => l.sku.trim() !== '' || l.product.trim() !== '')
     if (usable.length === 0) { setError('Add at least one line item'); return }
-    if (!(ratePerGram > 0)) { setError('Silver rate is not loaded yet — set it in Silver Rate Management.'); return }
+    // Only a weight-based line needs the managed rate: a Piece Rate line bills
+    // its fixed ₹/pc whether or not silver is quoted today.
+    const needsRate = usable.some((l) => !isPieceRateLine(l))
+    if (needsRate && !(ratePerGram > 0)) { setError('Silver rate is not loaded yet — set it in Silver Rate Management.'); return }
     setSaving(true)
     setError('')
     try {
@@ -238,19 +290,35 @@ export function ManualInvoiceDialog({
         discount: Number(form.discount) || 0,
         date: new Date().toISOString(),
         items: usable.map((l) => {
-          const weight = lineTotalWeight(l)
-          const making = Number(l.makingCharge) || 0
+          const qty = Math.max(1, Math.floor(Number(l.qty) || 1))
+          const piece = isPieceRateLine(l)
+          // Piece-rate lines carry no weight/rates — the fixed price is the
+          // whole calculation, and weight 0 stops the server re-deriving a
+          // silver amount over it (it applies the same fixed-rate rule back).
+          const weight = piece ? 0 : lineTotalWeight(l)
+          const making = piece ? 0 : Number(l.makingCharge) || 0
           return {
             product: l.product.trim(),
             sku: l.sku.trim(),
-            qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
+            // Catalogue identity: the invoice keeps pointing at the exact
+            // product/variant its stock was drawn from (`variant_id` is the
+            // column that survives; productId is dropped server-side).
+            productId: l.productId || undefined,
+            variantId: l.variantId || undefined,
+            qty,
             weight,
             // The server overwrites the rate with the managed value; sending it
             // keeps the payload self-describing for logs and for the preview
             // matching the stored row.
-            silverRate: ratePerGram,
+            silverRate: piece ? 0 : ratePerGram,
             makingCharge: making,
-            amount: lineAmount({ weight, silverRatePerGram: ratePerGram, makingChargePerGram: making }),
+            amount: lineAmount({
+              weight,
+              silverRatePerGram: ratePerGram,
+              makingChargePerGram: making,
+              pieceRate: piece ? Number(l.pieceRate) : undefined,
+              qty,
+            }),
           }
         }),
       }
@@ -325,10 +393,14 @@ export function ManualInvoiceDialog({
               <tbody>
                 {lines.map((line, index) => {
                   const weight = lineTotalWeight(line)
+                  const piece = isPieceRateLine(line)
+                  const qty = Math.max(1, Math.floor(Number(line.qty) || 1))
                   const preview = lineAmount({
                     weight,
                     silverRatePerGram: ratePerGram,
                     makingChargePerGram: Number(line.makingCharge) || 0,
+                    pieceRate: piece ? Number(line.pieceRate) : undefined,
+                    qty,
                   })
                   return (
                     <tr key={index} className="border-b border-border/40 last:border-0">
@@ -337,34 +409,48 @@ export function ManualInvoiceDialog({
                           value={line.sku ? `${line.product} (${line.sku})` : line.product}
                           onChange={(e) => {
                             const v = e.target.value
-                            // Typing clears the picked SKU (back to a hand line)
+                            // Typing clears the picked row (back to a hand line)
                             // and re-runs the product search.
-                            setLine(index, { product: v, sku: '', netWeight: '', makingCharge: '' })
+                            setLine(index, {
+                              product: v,
+                              sku: '',
+                              productId: '',
+                              variantId: '',
+                              netWeight: '',
+                              makingCharge: '',
+                              pieceRate: '',
+                            })
                             setProductQuery(v)
                           }}
                           placeholder="Search name or SKU…"
                           className="h-8 text-xs"
                           aria-label="Search products"
                         />
-                        {productQuery.trim() !== '' && (productHits.length > 0 || searchingProducts) ? (
+                        {productQuery.trim() !== '' && (hits.length > 0 || searchingProducts) ? (
                           <div className="mt-1 max-h-32 overflow-auto rounded-md border border-border/60 bg-card p-1">
-                            {searchingProducts && productHits.length === 0 ? (
+                            {searchingProducts && hits.length === 0 ? (
                               <p className="flex items-center gap-2 px-2 py-1 text-[11px] text-muted-foreground">
                                 <Loader2 className="h-3 w-3 animate-spin" /> Searching…
                               </p>
                             ) : (
-                              productHits.map((p) => (
+                              hits.map((item) => (
                                 <button
-                                  key={p.sku}
+                                  key={sellableItemValue(item)}
                                   type="button"
                                   onClick={() => {
-                                    pickProduct(index, p.sku)
+                                    pickProduct(index, sellableItemValue(item))
                                     setProductQuery('')
                                   }}
                                   className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left text-[11px] transition-colors hover:bg-muted"
                                 >
-                                  <span className="truncate">{p.name}</span>
-                                  <span className="shrink-0 text-muted-foreground">{p.sku}</span>
+                                  {/* The label already carries the variant's
+                                      code — `silver toy - red (OL-GIF-001-RED)`. */}
+                                  <span className="truncate">{item.label}</span>
+                                  {item.pricingType === 'piece_rate' && item.fixedPieceRate != null ? (
+                                    <span className="shrink-0 rounded bg-emerald-100 px-1 text-[9px] font-semibold text-emerald-700">
+                                      fixed ₹{item.fixedPieceRate}/pc
+                                    </span>
+                                  ) : null}
                                 </button>
                               ))
                             )}
@@ -372,18 +458,29 @@ export function ManualInvoiceDialog({
                         ) : null}
                       </td>
                       <td className="px-2 py-1.5">
-                        <Input type="number" min="1" value={line.qty} onChange={(e) => setLine(index, { qty: e.target.value })} className="h-8 text-right text-xs" />
+                        <Input type="number" min="1" value={line.qty} onChange={(e) => setLine(index, { qty: e.target.value })} aria-label={`Qty for line ${index + 1}`} className="h-8 text-right text-xs" />
                       </td>
                       <td className="px-2 py-1.5">
-                        <Input type="number" min="0" step="0.001" value={line.netWeight} onChange={(e) => setLine(index, { netWeight: e.target.value })} className="h-8 text-right text-xs" />
+                        {/* A Piece Rate line bills its fixed price: weight is not
+                            part of the calculation, so the field is inert. */}
+                        <Input type="number" min="0" step="0.001" value={piece ? '' : line.netWeight} disabled={piece} onChange={(e) => setLine(index, { netWeight: e.target.value })} aria-label={`Net weight per piece for line ${index + 1} (g)`} className="h-8 text-right text-xs" />
                       </td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-xs text-muted-foreground">
-                        {ratePerGram > 0 ? ratePerGram.toFixed(2) : '—'}
+                        {piece
+                          ? <span className="text-emerald-700">₹{Number(line.pieceRate)} / pc</span>
+                          : ratePerGram > 0 ? ratePerGram.toFixed(2) : '—'}
                       </td>
                       <td className="px-2 py-1.5">
-                        <Input type="number" min="0" step="0.01" value={line.makingCharge} onChange={(e) => setLine(index, { makingCharge: e.target.value })} className="h-8 text-right text-xs" />
+                        <Input type="number" min="0" step="0.01" value={piece ? '' : line.makingCharge} disabled={piece} onChange={(e) => setLine(index, { makingCharge: e.target.value })} aria-label={`Making charge for line ${index + 1} (₹/g)`} className="h-8 text-right text-xs" />
                       </td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-xs" title={weight > 0 ? `${weight.toFixed(3)} gm × (₹${ratePerGram.toFixed(2)} + making)` : undefined}>
+                      <td
+                        className="px-2 py-1.5 text-right tabular-nums text-xs"
+                        title={
+                          piece
+                            ? `${qty} × ₹${Number(line.pieceRate)} (fixed piece rate)`
+                            : weight > 0 ? `${weight.toFixed(3)} gm × (₹${ratePerGram.toFixed(2)} + making)` : undefined
+                        }
+                      >
                         {formatCurrency(preview)}
                       </td>
                       <td className="px-2 py-1.5 text-right">
@@ -398,7 +495,9 @@ export function ManualInvoiceDialog({
             </table>
           </div>
           <p className="mt-1.5 text-[11px] text-muted-foreground">
-            Rate / gm is locked to the managed silver rate. Amount = total weight (net wt × qty) × (rate + making per gm).
+            Rate / gm is locked to the managed silver rate; a Piece Rate product bills qty × its fixed price instead
+            (weight and making are not part of that calculation). Amount = total weight (net wt × qty) × (rate + making
+            per gm) for weight-based lines.
           </p>
         </div>
 

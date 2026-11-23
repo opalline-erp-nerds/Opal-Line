@@ -424,6 +424,14 @@ export const salesInvoiceItems = pgTable('sales_invoice_items', {
   invoiceId: text('invoice_id').notNull(),
   product: text('product'),
   sku: text('sku'),
+  /**
+   * The exact `product_variants` row this line billed, when the product has
+   * variants — so a converted booking (or any variant-aware invoice) keeps
+   * pointing at the variant its stock was deducted from. NULL on flat lines
+   * and on every historical invoice; a NULL always means "resolve through the
+   * SKU", never a fabricated variant.
+   */
+  variantId: text('variant_id'),
   qty: integer('qty'),
   weight: numericNumber('weight'),
   silverRate: numericNumber('silver_rate'),

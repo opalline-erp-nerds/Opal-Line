@@ -74,6 +74,9 @@ export const createOrderSchema = z.object({
     title: z.string().min(1).max(255),
     sku: z.string().max(100).optional(),
     productSku: z.string().max(100).optional(),
+    // The catalogue row the line points at — kept on the stored line so an
+    // edit still knows which product (and which piece rate) to price from.
+    productId: z.string().max(64).optional(),
     quantity: z.number().int().min(1),
     price: z.number().min(0),
     // Shopify ProductVariant id (numeric or gid:// form) when the line was

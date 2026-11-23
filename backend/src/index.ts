@@ -8,8 +8,8 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
-import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, DraftOrderResult, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
-import { buildPricedOrder, ORDER_GST_RATE, type ValidatedOrderItem } from './orderPricing'
+import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, DraftOrderResult, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, resolveShopifyVariantTargets, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
+import { buildPricedOrder, fixedPieceRateFor, ORDER_GST_RATE, type OrderCatalogueRow, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
 import { deductOrderLineStock, resolveMovementLocation, restoreOrderLineStock } from './stock'
@@ -2041,6 +2041,89 @@ async function linkShopifyOrderToRow(input: {
   }
 }
 
+/**
+ * Catalogue inputs for order lines, answered for WHATEVER code a line carries.
+ *
+ * A variant line sends its parent SKU as `productSku` — and a scan path may
+ * send only the variant's own code — so both are answered from the parent row:
+ * net weight, making charge, and the piece-rate flag a fixed-price line must
+ * bill from. The result carries one entry per code it answers (parent SKU and
+ * every matched variant SKU), which is exactly what `buildPricedOrder`'s
+ * sku map looks up.
+ */
+async function loadOrderProductData(codes: Array<string | null | undefined>): Promise<OrderCatalogueRow[]> {
+  const skus = [...new Set(codes.map((c) => String(c ?? '').trim()).filter(Boolean))]
+  if (skus.length === 0 || !db) return []
+  const variantRows = await db
+    .select({ sku: schema.productVariants.sku, productId: schema.productVariants.productId })
+    .from(schema.productVariants)
+    .where(inArray(schema.productVariants.sku, skus))
+  const parentIds = [...new Set(variantRows.map((v) => v.productId))]
+  const rows = await db
+    .select({
+      id: schema.products.id,
+      sku: schema.products.sku,
+      netWeight: schema.products.netWeight,
+      makingCharge: schema.products.makingCharge,
+      pieceRateProduct: schema.products.pieceRateProduct,
+      fixedPieceRate: schema.products.fixedPieceRate,
+      sellingPrice: schema.products.sellingPrice,
+    })
+    .from(schema.products)
+    .where(
+      parentIds.length > 0
+        ? or(inArray(schema.products.sku, skus), inArray(schema.products.id, parentIds))
+        : inArray(schema.products.sku, skus),
+    )
+  const toRow = (r: (typeof rows)[number]): OrderCatalogueRow => ({
+    sku: r.sku,
+    netWeight: r.netWeight,
+    makingCharge: r.makingCharge,
+    pieceRateProduct: r.pieceRateProduct,
+    fixedPieceRate: r.fixedPieceRate,
+    sellingPrice: r.sellingPrice,
+  })
+  const out = rows.map(toRow)
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  for (const v of variantRows) {
+    const parent = byId.get(v.productId)
+    // The variant's own code answers with the parent's pricing inputs: a
+    // variant carries no weight/charge/flag columns of its own.
+    if (parent) out.push({ ...toRow(parent), sku: v.sku })
+  }
+  return out
+}
+
+/**
+ * Order lines shaped for the Shopify draft: a line that billed a variant must
+ * target THAT Shopify variant (`product_variants.shopify_variant_id`), never
+ * the local row id — wrapping a local UUID in `gid://shopify/ProductVariant/…`
+ * names a variant the shop does not have. A variant with no Shopify id falls
+ * back to the historic title/sku/price line instead of a bogus gid.
+ */
+async function shopifyDraftLines(lines: ReadonlyArray<unknown> | null | undefined): Promise<ReturnType<typeof draftOrderInputLines>> {
+  if (!Array.isArray(lines)) return []
+  const localIds = [
+    ...new Set(
+      lines
+        .map((li) => String((li as { variantId?: unknown } | null)?.variantId ?? '').trim())
+        .filter(Boolean),
+    ),
+  ]
+  const shopifyIds = new Map<string, string>()
+  if (localIds.length > 0 && db) {
+    const rows = await db
+      .select({ id: schema.productVariants.id, shopifyVariantId: schema.productVariants.shopifyVariantId })
+      .from(schema.productVariants)
+      .where(inArray(schema.productVariants.id, localIds))
+    for (const r of rows) {
+      const gid = String(r.shopifyVariantId ?? '').trim()
+      if (gid) shopifyIds.set(r.id, gid)
+    }
+  }
+  return draftOrderInputLines(resolveShopifyVariantTargets(lines, shopifyIds))
+}
+
 // Shopify Flow webhook — receives full order + customer data from a Shopify Flow
 // This bypasses the Admin API PII limitations on development stores.
 // The Flow sends: order name, customer name, email, phone, billing/shipping addresses
@@ -2062,21 +2145,18 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     return res.status(503).json({ error: 'Database unavailable' })
   }
 
-  // Calculate item prices using the current silver rate and product data
-  // Load product data (netWeight, makingCharge) keyed by SKU
-  const productData = await db
-    .select({
-      sku: schema.products.sku,
-      netWeight: schema.products.netWeight,
-      makingCharge: schema.products.makingCharge,
-    })
-    .from(schema.products)
-    .where(inArray(schema.products.sku, items.map((li: { sku?: string; productSku?: string }) => String(li.productSku ?? li.sku ?? '')).filter(Boolean)))
+  // Calculate item prices using the current silver rate and product data.
+  // The catalogue rows answer for the parent SKU AND any variant code the
+  // lines carry, so a variant line prices (and piece-rates) like its parent.
+  const productData = await loadOrderProductData(
+    items.map((li: { sku?: string; productSku?: string }) => li.productSku ?? li.sku),
+  )
   // Price the lines with the authoritative silver rate — canonical invoice
   // formula, extracted so the per-unit convention is unit-testable. Each
   // line's stored price is PER-UNIT and GST-inclusive: every consumer (the
   // edit dialog's subtotal, the print doc, the update handler's value)
-  // multiplies it by quantity exactly once.
+  // multiplies it by quantity exactly once. Piece Rate lines take their fixed
+  // ₹/pc instead (see buildPricedOrder).
   const priced = buildPricedOrder(items as ValidatedOrderItem[], productData, silverRate)
   const itemsWithCalculatedPrice = priced.lines
   const value = priced.grandTotal
@@ -2089,7 +2169,8 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
   // GST-inclusive — exactly what a draft line's originalUnitPrice expects.
   // (Remapping it to the full line total amount × 1.03 made Shopify bill that
   // total per unit, so a qty-3 manual order arrived on Shopify at ~3× its value.)
-  const shopifyLineItems = draftOrderInputLines(itemsWithCalculatedPrice)
+  // A variant line resolves to the shop's own variant id here.
+  const shopifyLineItems = await shopifyDraftLines(itemsWithCalculatedPrice)
 
   if (!db) {
     return res.status(503).json({ error: 'Service temporarily unavailable' })
@@ -2309,25 +2390,10 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       // generator reads weight/silverValue/makingValue/amount straight off
       // manual orders, so an edit must keep that snapshot coherent instead of
       // stripping it to {title, sku, qty, price} and invoicing ₹0 later.
-      const productSkus: string[] = Array.from(
-        new Set<string>(
-          items
-            .map((li: any) => String(li.productSku ?? li.sku ?? '').trim())
-            .filter(Boolean),
-        ),
-      )
-      const productRows = productSkus.length
-        ? await db
-            .select({ sku: schema.products.sku, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge })
-            .from(schema.products)
-            .where(inArray(schema.products.sku, productSkus))
-        : []
-      const productMap = new Map(
-        productRows.map((p) => [
-          String(p.sku ?? '').trim(),
-          { netWeight: Number(p.netWeight ?? 0), makingCharge: Number(p.makingCharge ?? 0) },
-        ]),
-      )
+      // The catalogue rows answer for the parent SKU and any variant code, so
+      // a variant line keeps its parent's piece-rate flag through an edit.
+      const productRows = await loadOrderProductData(items.map((li: any) => li.productSku ?? li.sku))
+      const productMap = new Map(productRows.map((p) => [String(p.sku ?? '').trim(), p]))
       const latestRate = await getLatestSilverRate()
       const currentRate = latestRate && latestRate.rate && latestRate.rate > 0 ? latestRate.rate : 0
 
@@ -2339,11 +2405,14 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
           const price = Number(li.price ?? 0)
           // Same weight rules as create: the form's value wins, the catalogue
           // fills in when the form sent none, total = qty × weight per piece.
-          const product = productMap.get(String(li.productSku ?? sku).trim()) ?? { netWeight: 0, makingCharge: 0 }
+          const product: OrderCatalogueRow = productMap.get(String(li.productSku ?? sku).trim()) ?? { sku: null, netWeight: 0, makingCharge: 0 }
           const formWeightPerPiece = Number(li.netWeight ?? 0)
-          const netWeight = formWeightPerPiece > 0 ? formWeightPerPiece : product.netWeight
+          const netWeight = formWeightPerPiece > 0 ? formWeightPerPiece : Number(product.netWeight ?? 0)
+          const isPieceRate = fixedPieceRateFor(product) != null
           const makingCharge =
-            li.makingCharge === undefined || li.makingCharge === null ? product.makingCharge : Number(li.makingCharge)
+            li.makingCharge === undefined || li.makingCharge === null
+              ? Number(product.makingCharge ?? 0)
+              : Number(li.makingCharge)
           const formTotalWeight = Number(li.weight ?? 0)
           const weight =
             formTotalWeight > 0
@@ -2355,22 +2424,24 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
           // edited order reproduces its order value exactly (amount is the
           // ex-GST half of price × qty; the silver/making split follows the
           // current rate — identical to create's split while the rate holds).
+          // A Piece Rate line has no silver/making split to follow: its whole
+          // taxable amount sits in silverValue, exactly as create stores it.
           const lineTotal = Math.round(price * quantity * 100) / 100
           const amount = Math.round((lineTotal / (1 + ORDER_GST_RATE / 100)) * 100) / 100
           const splitBase = currentRate + Math.max(makingCharge, 0)
-          const silverValue =
-            weight > 0 && currentRate > 0 && splitBase > 0
-              ? Math.round(amount * (currentRate / splitBase) * 100) / 100
-              : amount
-          const makingValue = Math.round((amount - silverValue) * 100) / 100
+          const splitByRate = weight > 0 && currentRate > 0 && splitBase > 0
+          const silverValue = isPieceRate || !splitByRate
+            ? amount
+            : Math.round(amount * (currentRate / splitBase) * 100) / 100
+          const makingValue = isPieceRate ? 0 : Math.round((amount - silverValue) * 100) / 100
           return {
             title,
             sku,
             quantity,
             price,
-            makingCharge,
+            makingCharge: isPieceRate ? 0 : makingCharge,
             ...(netWeight > 0 ? { netWeight } : {}),
-            ...(weight > 0 ? { weight, silverRate: currentRate } : { silverRate: 0 }),
+            ...(weight > 0 ? { weight, silverRate: isPieceRate ? 0 : currentRate } : { silverRate: 0 }),
             ...(weight > 0 ? { silverValue, makingValue } : { silverValue: amount, makingValue: 0 }),
             amount,
             ...(li.variantId !== undefined && li.variantId !== null ? { variantId: li.variantId } : {}),
@@ -2498,7 +2569,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
           shippingAddress: ((shippingAddress ?? updated.shippingAddress) as DraftOrderAddressInput | null | undefined) ?? undefined,
           note: note ? String(note).trim() : undefined,
           tags: 'manual-order',
-          lineItems: draftOrderInputLines(updated.lineItems as ReadonlyArray<unknown> | null),
+          lineItems: await shopifyDraftLines(updated.lineItems as ReadonlyArray<unknown> | null),
         })
         shopifySync = draft
         if (draft.ok) {
