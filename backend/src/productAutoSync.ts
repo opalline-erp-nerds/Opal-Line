@@ -171,6 +171,9 @@ async function runInternal(manual: boolean, allowRemovals: boolean): Promise<Pro
     mode: manual ? 'full' : 'auto',
     allowRemovals: manual && allowRemovals,
     mergeVariants: true,
+    // Scheduled runs mirror the store onto the ERP when the ERP has no newer
+    // edit waiting to be pushed. A manual full sync stays ERP → Shopify.
+    mirrorFromShopify: !manual,
     updatedAtMin,
     catalogGuard: (liveCount, isFull) => {
       const verdict = evaluateCatalogGuards({
@@ -198,6 +201,17 @@ async function runInternal(manual: boolean, allowRemovals: boolean): Promise<Pro
     paused = false
     pauseWarning = null
     await recordSuccessfulProductAutoSync(result.synced, fullCatalog)
+    if (!manual) {
+      try {
+        const { importShopifyOrders, importShopifyCustomers } = await import('./shopify')
+        const { flushOutboundShopifyJobs } = await import('./shopifyOutbound')
+        await importShopifyOrders({ updatedAtMin })
+        await importShopifyCustomers({ updatedAtMin })
+        await flushOutboundShopifyJobs()
+      } catch (err) {
+        logger.warn({ err }, 'Scheduled order/customer sync or outbound flush failed')
+      }
+    }
     logger.info(
       { synced: result.synced, created: result.created, updated: result.updated, durationMs: result.durationMs, manual },
       'Product auto-sync completed',

@@ -1,6 +1,6 @@
 export type AutoSyncUnit = 'seconds' | 'minutes' | 'hours'
 
-export const DEFAULT_INTERVAL_SECONDS = 6 * 60 * 60
+export const DEFAULT_INTERVAL_SECONDS = 10 * 60
 export const MIN_INTERVAL_SECONDS = 60
 export const MAX_INTERVAL_SECONDS = 168 * 60 * 60
 
