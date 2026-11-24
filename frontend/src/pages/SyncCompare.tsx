@@ -345,12 +345,11 @@ export default function SyncComparePage() {
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              The ERP is the source of truth for the catalogue: name, description, price, stock, images, product type and
-              collection are never imported from Shopify. Scheduled auto-sync is <strong>incremental</strong> and only
-              discovers new listings and refreshes links; <strong>Full Sync Now</strong> does the same and then pushes the
-              ERP values to the store. Removing products that Shopify no longer lists stays a separate, manual choice.
-              For hosted stores, <strong>15–30 minutes</strong> is a practical auto-sync window (webhooks cover most
-              catalog edits between runs).
+              Every <strong>10 minutes</strong> (or whatever interval you save), the sync runs both ways. An ERP edit is
+              pushed to Shopify. A Shopify edit of name, description, price, or stock is written into the ERP when that
+              store edit is newer than a pending ERP change. Orders and customers changed since the last run are pulled
+              in on the same timer. Issued invoices are not rewritten. Set the interval to <strong>10 minutes</strong>.
+              Removing products that Shopify no longer lists stays a separate, manual choice.
             </p>
             {stockPreview && stockPreview.samples.length > 0 && (
               <div className="rounded-md border px-3 py-2 text-xs">

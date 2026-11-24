@@ -10,6 +10,7 @@ const WEBHOOK_UPSERT_OPTS = {
   mode: 'auto' as const,
   allowRemovals: false,
   mergeVariants: true,
+  mirrorFromShopify: true,
 }
 
 export function productFromWebhookBody(body: unknown): SyncProduct | null {

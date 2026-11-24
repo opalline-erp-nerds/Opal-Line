@@ -344,6 +344,43 @@ describe('applyLiveCatalog (variant sync)', () => {
     assert.equal(rows[0].name, existing.name, 'nor the product name')
   })
 
+  test('mirror copies a newer Shopify edit unless an ERP push is still queued', async () => {
+    const existing = localRow({
+      id: 'row-mirror',
+      sku: 'MIRROR-1',
+      name: 'Old name',
+      description: 'Old text',
+      stock: 4,
+      sellingPrice: 100,
+    })
+    const { io, rows } = fakeCatalog([existing])
+    const live = liveProduct({
+      id: 41,
+      sku: 'MIRROR-1',
+      title: 'Store name',
+      description: 'Store text',
+      inventoryQuantity: 9,
+      price: '250',
+    })
+    await shopify.applyLiveCatalog([live], rows, 92.8, io, { mirrorFromShopify: true })
+    assert.equal(rows[0].name, 'Store name')
+    assert.equal(rows[0].description, 'Store text')
+    assert.equal(rows[0].stock, 9)
+    assert.equal((rows[0] as { sellingPrice?: number }).sellingPrice, 250)
+
+    const pending = localRow({ id: 'row-pending', sku: 'MIRROR-2', name: 'ERP name', stock: 3, sellingPrice: 80 })
+    const held = fakeCatalog([pending])
+    await shopify.applyLiveCatalog(
+      [liveProduct({ id: 42, sku: 'MIRROR-2', title: 'Store name', inventoryQuantity: 1, price: '10' })],
+      held.rows,
+      92.8,
+      held.io,
+      { mirrorFromShopify: true, pendingProductIds: new Set(['row-pending']) },
+    )
+    assert.equal(held.rows[0].name, 'ERP name')
+    assert.equal(held.rows[0].stock, 3)
+  })
+
   test('claimUniqueVariantSku suffixes a SKU another product already owns', () => {
     const taken = new Set<string>(['007'])
     assert.equal(shopify.claimUniqueVariantSku('007', taken), '007-2')

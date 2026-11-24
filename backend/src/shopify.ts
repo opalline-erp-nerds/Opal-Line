@@ -874,6 +874,8 @@ export interface SyncProductsToDbOptions {
    */
   allowRemovals?: boolean
   mergeVariants?: boolean
+  /** Copy newer Shopify catalogue fields onto ERP rows that have no queued ERP edit. */
+  mirrorFromShopify?: boolean
   updatedAtMin?: string | null
   /** When set, skips Shopify catalog fetch and applies only these rows. */
   liveProducts?: SyncProduct[]
@@ -976,6 +978,8 @@ export interface CatalogRow {
    */
   collectionId?: string | null
   categoryId?: string | null
+  sellingPrice?: number | null
+  pieceRateProduct?: boolean | null
 }
 
 /** Insert payload built by the pull — exactly what `insert(schema.products).values()` takes. */
@@ -1001,6 +1005,8 @@ export interface CatalogPatch {
   productType: string | null
   description: string | null
   compareAtPrice: number | null
+  /** Present only on a two-way mirror of a non-piece-rate product. */
+  sellingPrice?: number | null
   image: string | null
   images: string[] | null
   netWeight: number | null
@@ -1057,6 +1063,12 @@ export interface ApplyLiveCatalogOptions {
    * ERP values: it never writes them, whatever this flag says.
    */
   pendingProductIds?: ReadonlySet<string>
+  /**
+   * Two-way mirror: when the ERP has no newer outbound edit queued, copy
+   * Shopify name, description, images, price and stock onto the ERP row.
+   * Piece-rate prices stay local. Default off so a normal pull never overwrites.
+   */
+  mirrorFromShopify?: boolean
 }
 
 export async function applyLiveCatalog(
@@ -1108,17 +1120,14 @@ export async function applyLiveCatalog(
       if (hasLiveVariants && io.saveVariants) await io.saveVariants(productId, p.options, p.variants)
     }
     if (existing) {
-      // ERP is the source of truth for every catalogue field. An inbound pull
-      // may DISCOVER a product (the insert path below) and refresh the link to
-      // one it already knows, but it never writes the store's copy over the
-      // ERP row: the next push would export that stale value straight back and
-      // the edit would be gone for good. This is what "sync overwrote my
-      // product" looked like from the outside — the flags that used to guard
-      // price/stock were opt-in and defaulted off, and name, description,
-      // vendor, product type and images were never guarded at all.
+      // Default pull only refreshes the Shopify link. A two-way mirror copies
+      // the store's newer catalogue onto the ERP row, unless an ERP edit is
+      // still queued to be pushed (that edit is newer).
       const pendingOutbound = options.pendingProductIds?.has(existing.id) === true
+      const mirror = options.mirrorFromShopify === true && !pendingOutbound
+      const pieceRate = existing.pieceRateProduct === true
       const patch: CatalogPatch = {
-        name: existing.name,
+        name: mirror && p.title ? p.title : existing.name,
         // A blank ERP barcode is a gap, not a value: filling it from the
         // listing is not an overwrite, so that much still happens here.
         barcode:
@@ -1127,22 +1136,22 @@ export async function applyLiveCatalog(
             : p.barcode ?? existing.barcode,
         category: existing.category,
         collection: existing.collection,
-        // No `stock` here on purpose: the pull never writes stock — not even
-        // back its own previous value (see CatalogPatch.stock).
         shopifyId: String(p.id),
         shopifyStatus: 'synced',
         status: existing.status ?? 'active',
-        vendor: existing.vendor,
-        productType: existing.productType,
-        description: existing.description,
-        compareAtPrice: existing.compareAtPrice,
-        image: existing.image,
-        images: existing.images as string[] | null,
+        vendor: mirror ? p.vendor || existing.vendor : existing.vendor,
+        productType: mirror ? p.productType || existing.productType : existing.productType,
+        description: mirror ? (p.description ? p.description : existing.description) : existing.description,
+        compareAtPrice: mirror ? (effectiveCompareAt ?? existing.compareAtPrice) : existing.compareAtPrice,
+        image: mirror ? (p.image ?? existing.image) : existing.image,
+        images: mirror ? mergeImages(existing.images as string[] | null, p.images) : (existing.images as string[] | null),
         netWeight: existing.netWeight,
         makingCharge: existing.makingCharge,
         silverRate: existing.silverRate,
         chargeOnTax: existing.chargeOnTax,
       }
+      if (mirror && Number.isFinite(p.inventoryQuantity)) patch.stock = p.inventoryQuantity
+      if (mirror && !pieceRate && price > 0) patch.sellingPrice = price
       await io.update(existing, patch)
       // The option/variant set is ERP-owned as well: the pull only records
       // which listing variant each ERP row points at, so the outbound push can
@@ -1481,10 +1490,23 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
     const applied = await applyLiveCatalog(live, rows, pricingRate, {
       insert: async (values) => (await database.insert(schema.products).values(values).returning())[0],
       update: async (existing, patch) => {
-        // The pull never changes stock, so this is always a plain write: no
-        // `shopify_sync` ledger movement is generated, and an inbound run can
-        // therefore never double-count or deduct inventory. (Stock only moves
-        // through applyStockMovement from an ERP document.)
+        const sku = String(existing.sku ?? '').trim()
+        const nextStock = patch.stock
+        const prevStock = Number(existing.stock ?? 0)
+        if (sku && nextStock != null && Number.isFinite(nextStock) && Number(nextStock) !== prevStock) {
+          const delta = Number(nextStock) - prevStock
+          const { stock: _stock, ...rest } = patch
+          await applyStockMovement({
+            sku,
+            qty: delta,
+            type: 'shopify_sync',
+            refType: 'shopify_pull',
+            note: `Two-way sync → ${Number(nextStock)} on Shopify`,
+            createdBy: 'system',
+          })
+          await database.update(schema.products).set(rest).where(eq(schema.products.id, existing.id))
+          return
+        }
         await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
       },
       // Replace-all: the listing owns the option/variant set, exactly like
@@ -1627,7 +1649,7 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
           bySid.set(sid, row)
         }
       },
-    }, { pendingProductIds })
+    }, { pendingProductIds, mirrorFromShopify: options.mirrorFromShopify === true })
     created = applied.created
     updated = applied.updated
 
@@ -4410,7 +4432,7 @@ function mapImportedStatus(raw: any): string {
   return 'imported'
 }
 
-export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> {
+export async function importShopifyOrders(options?: { updatedAtMin?: string | null }): Promise<ShopifyOrdersImportResult> {
   if (!isConfigured()) {
     return { ok: false, imported: 0, updated: 0, errors: ['Shopify is not configured. Set SHOPIFY_STORE_URL and SHOPIFY_ACCESS_TOKEN in server/.env'], message: 'Shopify is not configured' }
   }
@@ -4419,7 +4441,11 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
   }
 
   try {
-    const raw = await paginate<any>('orders', 'status=any&fulfillment_status=any')
+    const since = options?.updatedAtMin?.trim()
+    const orderQuery = since
+      ? `status=any&updated_at_min=${encodeURIComponent(since)}`
+      : 'status=any&fulfillment_status=any'
+    const raw = await paginate<any>('orders', orderQuery)
     const existing = await db
       .select({
         id: schema.salesOrders.id,
@@ -4997,7 +5023,7 @@ export interface ShopifyCustomersImportResult {
   message?: string
 }
 
-export async function importShopifyCustomers(): Promise<ShopifyCustomersImportResult> {
+export async function importShopifyCustomers(options?: { updatedAtMin?: string | null }): Promise<ShopifyCustomersImportResult> {
   if (!isConfigured()) {
     return { ok: false, imported: 0, updated: 0, errors: ['Shopify is not configured'], message: 'Shopify is not configured' }
   }
@@ -5006,7 +5032,9 @@ export async function importShopifyCustomers(): Promise<ShopifyCustomersImportRe
   }
 
   try {
-    const raw = await paginate<any>('customers', 'limit=250')
+    const since = options?.updatedAtMin?.trim()
+    const customerQuery = since ? `limit=250&updated_at_min=${encodeURIComponent(since)}` : 'limit=250'
+    const raw = await paginate<any>('customers', customerQuery)
     const existing = await db.select().from(schema.customers)
     const knownByShopifyId = new Map(existing.filter((r) => r.shopifyId).map((r) => [r.shopifyId!, r]))
     const knownByEmail = new Map(existing.filter((r) => r.email).map((r) => [r.email!, r]))
