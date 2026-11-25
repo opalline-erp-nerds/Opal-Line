@@ -496,7 +496,7 @@ export default function PurchaseOrdersPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Purchase Orders"
         subtitle="Orders raised with silver suppliers for raw material and finished pieces."
@@ -730,7 +730,7 @@ export default function PurchaseOrdersPage() {
                   setForm((f) => ({ ...f, supplierId: id, supplier: s?.name ?? '' }))
                   setFieldErrors((e) => ({ ...e, supplier: undefined }))
                 }}
-                className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
+                className="h-9 rounded-lg border border-gray-200 dark:border-border text-[14px] text-foreground"
               />
               {fieldErrors.supplier ? <p className="text-[12px] text-red-600">{fieldErrors.supplier}</p> : null}
             </div>
@@ -745,7 +745,7 @@ export default function PurchaseOrdersPage() {
                     setForm((f) => ({ ...f, date: e.target.value }))
                     setFieldErrors((err) => ({ ...err, date: undefined }))
                   }}
-                  className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
+                  className="h-9 rounded-lg border border-gray-200 dark:border-border text-[14px] text-foreground"
                 />
                 {fieldErrors.date ? <p className="text-[12px] text-red-600">{fieldErrors.date}</p> : null}
               </div>
@@ -755,14 +755,14 @@ export default function PurchaseOrdersPage() {
                   type="date"
                   value={form.expectedDate}
                   onChange={(e) => setForm((f) => ({ ...f, expectedDate: e.target.value }))}
-                  className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
+                  className="h-9 rounded-lg border border-gray-200 dark:border-border text-[14px] text-foreground"
                 />
               </div>
             </div>
 
             <div>
               <div className="mb-2 flex items-center justify-between">
-                <p className="text-[13px] font-semibold text-[#2e1065]">Line Items</p>
+                <p className="text-[13px] font-semibold text-foreground">Line Items</p>
                 <span className="text-[12px] text-muted-foreground">
                   {lineTotals.count} item{lineTotals.count === 1 ? '' : 's'} added
                 </span>
@@ -775,7 +775,7 @@ export default function PurchaseOrdersPage() {
                     <div
                       key={index}
                       className={`space-y-2.5 rounded-lg border p-3 transition-colors ${
-                        line.confirmed ? 'border-[#7c3aed]/40 bg-[#f5f3ff]/60' : 'border-gray-200 bg-white'
+                        line.confirmed ? 'border-primary/40 bg-accent/60' : 'border-gray-200 dark:border-border bg-white dark:bg-card'
                       }`}
                     >
                       <div className="space-y-1.5">
@@ -788,14 +788,14 @@ export default function PurchaseOrdersPage() {
                           ]}
                           value={line.custom ? CUSTOM_SKU : line.sku}
                           onValueChange={(v) => pickProduct(index, v)}
-                          className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
+                          className="h-9 rounded-lg border border-gray-200 dark:border-border text-[14px] text-foreground"
                         />
                         {line.custom ? (
                           <Input
                             value={line.product}
                             onChange={(e) => setLine(index, { product: e.target.value })}
                             placeholder="Item name / SKU"
-                            className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
+                            className="h-9 rounded-lg border border-gray-200 dark:border-border text-[14px] text-foreground"
                           />
                         ) : null}
                       </div>
@@ -808,7 +808,7 @@ export default function PurchaseOrdersPage() {
                             min="1"
                             value={line.qty}
                             onChange={(e) => setLine(index, { qty: e.target.value })}
-                            className="h-9 rounded-lg border border-gray-200 text-right text-[14px] text-[#2e1065]"
+                            className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
                           />
                         </div>
                         <div className="space-y-1.5">
@@ -819,7 +819,7 @@ export default function PurchaseOrdersPage() {
                             step="0.001"
                             value={line.weight}
                             onChange={(e) => setLine(index, { weight: e.target.value })}
-                            className="h-9 rounded-lg border border-gray-200 text-right text-[14px] text-[#2e1065]"
+                            className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
                           />
                         </div>
                         <div className="space-y-1.5">
@@ -830,7 +830,7 @@ export default function PurchaseOrdersPage() {
                             step="0.01"
                             value={line.rate}
                             onChange={(e) => setLine(index, { rate: e.target.value })}
-                            className="h-9 rounded-lg border border-gray-200 text-right text-[14px] text-[#2e1065]"
+                            className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
                           />
                         </div>
                       </div>
@@ -838,7 +838,7 @@ export default function PurchaseOrdersPage() {
                       <div className="flex items-end justify-between gap-2">
                         <div className="space-y-1.5">
                           <ColLabel>Total</ColLabel>
-                          <p className="text-[14px] font-semibold tabular-nums text-[#2e1065]">{inr(amount)}</p>
+                          <p className="text-[14px] font-semibold tabular-nums text-foreground">{inr(amount)}</p>
                         </div>
                         <div className="flex items-center gap-1 pb-1">
                           <Button
@@ -857,7 +857,7 @@ export default function PurchaseOrdersPage() {
                             variant="ghost"
                             aria-label="Duplicate item"
                             onClick={() => duplicateLine(index)}
-                            className="text-[#7c3aed] hover:bg-[#f5f3ff] hover:text-[#6d28d9]"
+                            className="text-primary hover:bg-accent hover:text-primary-800"
                           >
                             <Copy className="h-3.5 w-3.5" />
                           </Button>
@@ -867,7 +867,7 @@ export default function PurchaseOrdersPage() {
                             variant="ghost"
                             aria-label="Delete item"
                             onClick={() => removeLine(index)}
-                            className="text-red-600 hover:bg-red-50"
+                            className="text-red-600 hover:bg-red-50 dark:hover:bg-red-900/40"
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </Button>
@@ -885,21 +885,21 @@ export default function PurchaseOrdersPage() {
                   setLineErrors({})
                   setLines((prev) => [...prev, emptyLine()])
                 }}
-                className="mt-2.5 inline-flex items-center gap-1 text-[13px] font-medium text-[#7c3aed] hover:underline"
+                className="mt-2.5 inline-flex items-center gap-1 text-[13px] font-medium text-primary hover:underline"
               >
                 <Plus className="h-3.5 w-3.5" /> Add Another Item
               </button>
               {fieldErrors.lines ? <p className="mt-1 text-[12px] text-red-600">{fieldErrors.lines}</p> : null}
             </div>
 
-            {/* Summary — lavender box with the live GST math (poMoneyTotals) */}
-            <div className="space-y-2.5 rounded-lg bg-[#f5f3ff] p-4">
+            {/* Summary — mint box with the live GST math (poMoneyTotals) */}
+            <div className="space-y-2.5 rounded-lg bg-accent p-4">
               <div className="flex items-center justify-between text-[13px]">
-                <span className="text-[#2e1065]/80">Subtotal</span>
-                <span className="font-medium tabular-nums text-[#2e1065]">{inr(money.subtotal)}</span>
+                <span className="text-foreground/80">Subtotal</span>
+                <span className="font-medium tabular-nums text-foreground">{inr(money.subtotal)}</span>
               </div>
               <div className="flex items-center justify-between text-[13px]">
-                <span className="flex items-center gap-2 text-[#2e1065]/80">
+                <span className="flex items-center gap-2 text-foreground/80">
                   GST %
                   <Input
                     type="number"
@@ -909,15 +909,15 @@ export default function PurchaseOrdersPage() {
                     value={form.gst}
                     onChange={(e) => setForm((f) => ({ ...f, gst: e.target.value }))}
                     aria-label="GST percent"
-                    className="h-7 w-16 rounded-md border border-gray-200 bg-white px-2 text-right text-[13px] text-[#2e1065]"
+                    className="h-7 w-16 rounded-md border border-gray-200 dark:border-border bg-white dark:bg-card px-2 text-right text-[13px] text-foreground"
                   />
                 </span>
-                <span className="tabular-nums text-[#2e1065]">{inr(money.gstAmount)}</span>
+                <span className="tabular-nums text-foreground">{inr(money.gstAmount)}</span>
               </div>
-              <div className="border-t border-[#2e1065]" />
+              <div className="border-t border-border" />
               <div className="flex items-center justify-between">
-                <span className="text-[15px] font-bold text-[#2e1065]">Total Amount</span>
-                <span className="text-[17px] font-bold tabular-nums text-[#2e1065]">{inr(money.grandTotal)}</span>
+                <span className="text-[15px] font-bold text-foreground">Total Amount</span>
+                <span className="text-[17px] font-bold tabular-nums text-foreground">{inr(money.grandTotal)}</span>
               </div>
             </div>
 
@@ -928,10 +928,10 @@ export default function PurchaseOrdersPage() {
   )
 }
 
-/** Compact form label — 12.5px deep indigo, with an optional required star. */
+/** Compact form label — 12.5px foreground ink, with an optional required star. */
 function FormLabel({ children, required }: { children: React.ReactNode; required?: boolean }) {
   return (
-    <p className="text-[12.5px] font-medium text-[#2e1065]">
+    <p className="text-[12.5px] font-medium text-foreground">
       {children}
       {required ? <span className="ml-0.5 text-red-500">*</span> : null}
     </p>
@@ -940,7 +940,7 @@ function FormLabel({ children, required }: { children: React.ReactNode; required
 
 /** Small column label above each line-item input. */
 function ColLabel({ children }: { children: React.ReactNode }) {
-  return <p className="text-[12px] font-medium text-[#2e1065]/80">{children}</p>
+  return <p className="text-[12px] font-medium text-foreground/80">{children}</p>
 }
 
 function MiniCard({ icon: Icon, label, value, sub, tint }: { icon: React.ComponentType<{ className?: string }>; label: string; value: string; sub?: string; tint: string }) {

@@ -82,7 +82,7 @@ export default function ProductDetailPage() {
 
   if (loading) {
     return (
-      <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+      <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
         <Skeleton className="h-10 w-72" />
         <Skeleton className="h-10 w-96" />
         <Skeleton className="h-96 rounded-lg" />
@@ -92,7 +92,7 @@ export default function ProductDetailPage() {
 
   if (error) {
     return (
-      <div className="mx-auto w-full max-w-[1400px] px-4 py-6">
+      <div className="mx-auto w-full max-w-[1600px] px-4 py-6">
         <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
       </div>
     )
@@ -100,7 +100,7 @@ export default function ProductDetailPage() {
 
   if (!product) {
     return (
-      <div className="mx-auto w-full max-w-[1400px] px-4 py-6">
+      <div className="mx-auto w-full max-w-[1600px] px-4 py-6">
         <p className="text-sm text-muted-foreground">Product not found.</p>
       </div>
     )
@@ -143,7 +143,7 @@ export default function ProductDetailPage() {
   const gstAmount = (subtotal * (product.gst ?? 3)) / 100
 
   return (
-    <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <Link to="/inventory/products" className="hover:text-primary-700">Products</Link>
         <ChevronRight className="h-3 w-3" />
@@ -226,7 +226,7 @@ export default function ProductDetailPage() {
       ) : null}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-        <QuickFact label="Selling Price" value={formatCurrency(product.sellingPrice)} sub={`Silver rate ₹${product.silverRate ?? '—'}/g · Making ₹${product.makingCharge ?? '—'}/g`} tint="purple" />
+        <QuickFact label="Selling Price" value={formatCurrency(product.sellingPrice)} sub={`Silver rate ₹${product.silverRate ?? '—'}/g · Making ₹${product.makingCharge ?? '—'}/g`} tint="teal" />
         <QuickFact label="Net Silver Weight" value={formatWeight(product.netWeight)} sub={`Gross ${formatWeight(product.grossWeight)} · Stone ${formatWeight(product.stoneWeight)}`} tint="green" />
         <QuickFact label="Available Stock" value={`${stock} pcs`} sub={`Reorder level ${reorderLevel} pcs`} tint={stock <= reorderLevel ? 'red' : 'blue'} />
       </div>
@@ -458,12 +458,12 @@ export default function ProductDetailPage() {
   )
 }
 
-function QuickFact({ label, value, sub, tint }: { label: string; value: string; sub?: string; tint: 'purple' | 'green' | 'blue' | 'red' }) {
+function QuickFact({ label, value, sub, tint }: { label: string; value: string; sub?: string; tint: 'teal' | 'green' | 'blue' | 'red' }) {
   const tints = {
-    purple: 'border-primary-100 bg-primary-50/60',
+    teal: 'border-primary-100 bg-primary-50/60',
     green: 'border-success-100 bg-success-50/60',
     blue: 'border-info-100 bg-info-50/60',
-    red: 'border-red-100 bg-red-50/60',
+    red: 'border-red-100 bg-red-50/60 dark:border-red-500/30',
   }
   return (
     <div className={cn('rounded-lg border p-4', tints[tint])}>

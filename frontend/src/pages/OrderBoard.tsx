@@ -34,7 +34,7 @@ import type { OrderSyncStatus, PipelineStage, SalesOrder, ShopifyOrderState } fr
 
 const COLUMNS: Array<{ key: SalesOrder['status']; label: string; accent: string }> = [
   { key: 'imported', label: 'New', accent: 'bg-sky-500' },
-  { key: 'confirmed', label: 'Confirmed', accent: 'bg-violet-500' },
+  { key: 'confirmed', label: 'Confirmed', accent: 'bg-primary-500' },
   { key: 'processing', label: 'Processing', accent: 'bg-amber-500' },
   { key: 'fulfilled', label: 'Fulfilled', accent: 'bg-emerald-500' },
   { key: 'cancelled', label: 'Cancelled', accent: 'bg-rose-500' },
@@ -71,7 +71,7 @@ function eventAccent(event: string): string {
   const e = event.toLowerCase()
   if (e.includes('fulfilled')) return 'bg-emerald-500'
   if (e.includes('return')) return 'bg-rose-500'
-  if (e.includes('invoice') || e.includes('convert')) return 'bg-violet-500'
+  if (e.includes('invoice') || e.includes('convert')) return 'bg-primary'
   if (e.includes('cancel')) return 'bg-zinc-400'
   return 'bg-sky-500'
 }
@@ -81,10 +81,10 @@ function nativeBadge(value: string | null | undefined): { label: string; classNa
   const v = String(value ?? '').trim().toUpperCase()
   if (!v) return null
   const label = v.replace(/_/g, ' ').toLowerCase().replace(/^./, (c) => c.toUpperCase())
-  if (v.includes('REFUND') || v === 'VOIDED') return { label, className: 'bg-rose-50 text-rose-700 border-rose-200' }
-  if (v === 'PAID' || v === 'FULFILLED') return { label, className: 'bg-emerald-50 text-emerald-700 border-emerald-200' }
-  if (v === 'PARTIALLY_FULFILLED' || v === 'PARTIALLY_PAID') return { label, className: 'bg-amber-50 text-amber-700 border-amber-200' }
-  if (v === 'UNFULFILLED' || v === 'PENDING' || v === 'AUTHORIZED') return { label, className: 'bg-sky-50 text-sky-700 border-sky-200' }
+  if (v.includes('REFUND') || v === 'VOIDED') return { label, className: 'bg-rose-50 text-rose-700 border-rose-200 dark:border-rose-500/30' }
+  if (v === 'PAID' || v === 'FULFILLED') return { label, className: 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:border-emerald-500/30' }
+  if (v === 'PARTIALLY_FULFILLED' || v === 'PARTIALLY_PAID') return { label, className: 'bg-amber-50 text-amber-700 border-amber-200 dark:border-amber-500/30' }
+  if (v === 'UNFULFILLED' || v === 'PENDING' || v === 'AUTHORIZED') return { label, className: 'bg-sky-50 text-sky-700 border-sky-200 dark:border-sky-500/30' }
   return { label, className: 'bg-muted text-muted-foreground' }
 }
 

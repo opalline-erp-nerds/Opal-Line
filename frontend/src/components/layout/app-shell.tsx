@@ -15,7 +15,9 @@ export function AppShell() {
   const [helpOpen, setHelpOpen] = useState(false)
   const location = useLocation()
   const navigate = useNavigate()
-  const isMobile = useMediaQuery('(max-width: 767px)')
+  // Tablets use the overlay drawer too; a permanent 240px sidebar leaves too
+  // little room for the dashboard grids below 1024px.
+  const isMobile = useMediaQuery('(max-width: 1023px)')
 
   const toggleSidebar = useCallback(() => {
     if (isMobile) {

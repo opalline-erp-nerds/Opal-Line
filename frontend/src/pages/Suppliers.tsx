@@ -247,7 +247,7 @@ export default function SuppliersPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Suppliers"
         subtitle="Silver and jewellery material suppliers used across purchase orders and invoices."

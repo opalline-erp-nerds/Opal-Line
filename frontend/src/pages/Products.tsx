@@ -63,7 +63,7 @@ const statusVariant: Record<NonNullable<Product['status']>, 'success' | 'muted' 
   draft: 'warning',
 }
 
-const PURE = '#7c3aed'
+const PURE = '#008F78'
 const GREEN = '#16a34a'
 const ORANGE = '#f59e0b'
 const RED = '#ef4444'
@@ -321,7 +321,7 @@ export default function ProductsPage() {
       },
       {
         accessorKey: 'purity', header: 'Purity', cell: ({ row }) => <span className="tabular-nums">{row.original.purity != null ? `${row.original.purity}%` : '—'}</span>, meta: { align: 'right' as const } },
-      { accessorKey: 'collection', header: 'Collection', cell: ({ row }) => <Badge variant="outline">{row.original.collection ?? '—'}</Badge> },
+      { accessorKey: 'collection', header: 'Collection', cell: ({ row }) => <Badge variant="outline" className="max-w-[170px] truncate whitespace-nowrap" title={row.original.collection ?? undefined}>{row.original.collection ?? '—'}</Badge> },
       { accessorKey: 'netWeight', header: 'Net Wt', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">{formatWeight(row.original.netWeight)}</span>, meta: { align: 'right' as const } },
       { accessorKey: 'makingCharge', header: 'Making', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">{row.original.makingCharge != null ? `${row.original.makingCharge} ₹/g` : '—'}</span>, meta: { align: 'right' as const } },
       { accessorKey: 'silverRate', header: 'Silver Rate', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">₹{row.original.silverRate?.toFixed(2) ?? '—'}/g</span>, meta: { align: 'right' as const } },
@@ -679,14 +679,14 @@ export default function ProductsPage() {
       </AppDialog>
 
       {error ? (
-        <div className="mx-4 flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-4 py-3 text-sm text-red-700 lg:mx-6">
+        <div className="mx-4 flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 lg:mx-6">
           <span className="mt-0.5 block h-2 w-2 shrink-0 rounded-full bg-red-600" />
           <p>{error}. Start the backend with <code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs">npm run dev --prefix backend</code>.</p>
         </div>
       ) : null}
 
       {pushMessage ? (
-        <div className={cn('mx-4 flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm lg:mx-6', pushMessage.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 bg-red-50/60 text-red-700')}>
+        <div className={cn('mx-4 flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm lg:mx-6', pushMessage.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 bg-red-50/60 text-red-700 dark:border-red-500/30')}>
           <span className={cn('mt-0.5 block h-2 w-2 shrink-0 rounded-full', pushMessage.ok ? 'bg-success-600' : 'bg-red-600')} />
           <p>{pushMessage.text}</p>
         </div>

@@ -185,7 +185,7 @@ export default function DispatchPage() {
   const delivered = shipments.filter((sh) => sh.status === 'delivered').length
 
   return (
-    <div className="mx-auto w-full max-w-[1400px] space-y-4 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-4 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Dispatch"
         subtitle="Assign couriers, print tracking and confirm deliveries. Customers are notified automatically."

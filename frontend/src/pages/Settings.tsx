@@ -176,7 +176,7 @@ function SettingsContent() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[1200px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Settings"
         subtitle="Business profile, silver-rate preferences, notifications and integrations."
@@ -560,8 +560,8 @@ function AppearanceCard() {
                 <span className="text-xs text-muted-foreground">{opt.description}</span>
                 {/* Mini preview strip */}
                 <div className="mt-1 flex h-8 w-full overflow-hidden rounded border border-border">
-                  <div className={`w-1/4 ${opt.value === 'dark' ? 'bg-[#241a35]' : 'bg-[#2e2550]'}`} />
-                  <div className={`flex-1 ${opt.value === 'dark' ? 'bg-[#12151d]' : 'bg-[#f5f4fa]'}`} />
+                  <div className={`w-1/4 ${opt.value === 'dark' ? 'bg-[#0E2A25]' : 'bg-[#006B5B]'}`} />
+                  <div className={`flex-1 ${opt.value === 'dark' ? 'bg-[#0B1412]' : 'bg-[#F1F8F6]'}`} />
                 </div>
               </button>
             )

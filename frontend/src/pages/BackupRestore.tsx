@@ -312,7 +312,7 @@ function BackupRestoreContent() {
   const restoreDialogOpen = restoreTarget !== null
 
   return (
-    <div className="mx-auto w-full max-w-[1200px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Backup & Restore"
         subtitle="Export, validate, and restore data backups."

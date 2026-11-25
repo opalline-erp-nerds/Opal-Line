@@ -35,12 +35,12 @@ import { formatCurrency } from '@/lib/format'
 
 export default function AccountingPage() {
   return (
-    <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Double-Entry Accounting"
         subtitle="Unified Shopify + ERP accounting dashboard, ledger, transactions, and reports"
         icon={<Calculator className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />}
-        iconTileClassName="bg-[#7547F5] text-white ring-[#7547F5] dark:bg-[#7547F5] dark:text-white dark:ring-[#7547F5]"
+        iconTileClassName="bg-primary text-primary-foreground ring-primary dark:bg-primary dark:text-primary-foreground dark:ring-primary"
       />
       <Tabs defaultValue="dashboard">
         <TabsList className="flex flex-wrap h-auto">
@@ -337,7 +337,7 @@ function ProfitLossTab() {
                 </div>
               </div>
             </Card>
-            <Card className={`p-4 ${data.netProfit >= 0 ? 'ring-2 ring-success-200' : 'ring-2 ring-red-200'}`}>
+            <Card className={`p-4 ${data.netProfit >= 0 ? 'ring-2 ring-success-200' : 'ring-2 ring-red-200 dark:ring-red-500/30'}`}>
               <div className="flex items-center gap-3">
                 <div className={`flex h-10 w-10 items-center justify-center rounded-lg ${data.netProfit >= 0 ? 'bg-success-50 text-success-700' : 'bg-red-50 text-red-700'}`}>
                   <DollarSign className="h-5 w-5" />
@@ -422,7 +422,7 @@ function ProfitLossTab() {
             </Card>
           </div>
 
-          <Card className={`p-5 ${data.netProfit >= 0 ? 'border-success-200 bg-success-50/30' : 'border-red-200 bg-red-50/30'}`}>
+          <Card className={`p-5 ${data.netProfit >= 0 ? 'border-success-200 bg-success-50/30' : 'border-red-200 bg-red-50/30 dark:border-red-500/30'}`}>
             <div className="flex items-center justify-between">
               <span className="text-sm font-semibold text-foreground">Net Profit / (Loss)</span>
               <span className={`text-xl font-bold ${data.netProfit >= 0 ? 'text-success-700' : 'text-red-700'}`}>

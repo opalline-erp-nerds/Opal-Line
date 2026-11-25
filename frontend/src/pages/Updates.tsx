@@ -34,7 +34,7 @@ const PHASE_LABEL: Record<UpdateStatusInfo['phase'], { text: string; cls: string
   'up-to-date': { text: 'Up to date', cls: 'bg-success-100 text-success-700 dark:bg-success-950/40 dark:text-success-300' },
   available: { text: 'Update available', cls: 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300' },
   downloading: { text: 'Downloading…', cls: 'bg-blue-100 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300' },
-  ready: { text: 'Ready to install', cls: 'bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-300' },
+  ready: { text: 'Ready to install', cls: 'bg-primary-100 text-primary-700 dark:bg-primary-100/60 dark:text-primary-300' },
   error: { text: 'Check failed', cls: 'bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-300' },
 }
 
@@ -113,7 +113,7 @@ export default function UpdatesPage() {
   const progress = Math.min(100, Math.max(0, Math.round(update?.progress ?? 0)))
 
   return (
-    <div className="mx-auto w-full max-w-[900px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[900px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="App Updates"
         subtitle="Check for updates manually or let the app keep itself current automatically."

@@ -13,7 +13,7 @@ import {
 import type { DashboardSeriesPoint, OrderSummaryPoint } from '@/types'
 import { compactCurrency, formatNumber } from '@/lib/format'
 import { ChartTooltipBox } from './chart-tooltip'
-import { SERIES_COLORS, useChartTheme } from './chart-theme'
+import { DONUT_TRACK, SERIES_COLORS, useChartTheme } from './chart-theme'
 
 /** Online vs in-store orders for the Order Summary card. */
 export function OrderSummaryBarChart({ data }: { data: OrderSummaryPoint[] }) {
@@ -21,8 +21,8 @@ export function OrderSummaryBarChart({ data }: { data: OrderSummaryPoint[] }) {
   return (
     <div className="h-[220px] w-full">
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} barGap={4} margin={{ top: 8, right: 4, left: -14, bottom: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={theme.grid} />
+        <BarChart data={data} barGap={6} margin={{ top: 8, right: 4, left: -14, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="2 6" vertical={false} stroke={theme.grid} />
           <XAxis
             dataKey="label"
             tickLine={false}
@@ -38,7 +38,7 @@ export function OrderSummaryBarChart({ data }: { data: OrderSummaryPoint[] }) {
             tickFormatter={(value) => formatNumber(Number(value))}
           />
           <Tooltip
-            cursor={{ fill: 'rgba(124, 92, 230, 0.06)' }}
+            cursor={{ fill: 'rgba(0, 143, 120, 0.06)' }}
             content={({ active, payload, label }) => {
               if (!active || !payload?.length) return null
               const point = payload[0].payload as OrderSummaryPoint
@@ -47,15 +47,15 @@ export function OrderSummaryBarChart({ data }: { data: OrderSummaryPoint[] }) {
                   title={String(label ?? point.label)}
                   rows={[
                     { label: 'Online', value: `${formatNumber(point.online)} orders`, color: SERIES_COLORS[1] },
-                    { label: 'In-store', value: `${formatNumber(point.inStore)} orders`, color: SERIES_COLORS[3] },
+                    { label: 'In-store', value: `${formatNumber(point.inStore)} orders`, color: SERIES_COLORS[0] },
                     { label: 'Revenue', value: compactCurrency(point.revenue) },
                   ]}
                 />
               )
             }}
           />
-          <Bar dataKey="online" name="Online" fill={SERIES_COLORS[1]} radius={[4, 4, 0, 0]} maxBarSize={18} />
-          <Bar dataKey="inStore" name="In-store" fill={SERIES_COLORS[3]} radius={[4, 4, 0, 0]} maxBarSize={18} />
+          <Bar dataKey="online" name="Online" fill={SERIES_COLORS[1]} radius={[10, 10, 0, 0]} maxBarSize={22} />
+          <Bar dataKey="inStore" name="In-store" fill={SERIES_COLORS[0]} radius={[10, 10, 0, 0]} maxBarSize={22} />
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -95,11 +95,11 @@ export function WidgetBarChart({
     <div style={{ height }} className="w-full">
       <ResponsiveContainer width="100%" height="100%">
         <BarChart data={data} margin={{ top: 4, right: 0, left: 0, bottom: 0 }} barCategoryGap={2}>
-          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={theme.grid} />
+          <CartesianGrid strokeDasharray="2 6" vertical={false} stroke={theme.grid} />
           <XAxis dataKey="label" hide />
           <YAxis hide domain={[0, 'auto']} />
           <Tooltip
-            cursor={{ fill: 'rgba(124, 92, 230, 0.06)' }}
+            cursor={{ fill: 'rgba(0, 143, 120, 0.06)' }}
             content={({ active, payload }) => {
               if (!active || !payload?.length) return null
               const point = payload[0].payload as DashboardSeriesPoint
@@ -112,7 +112,7 @@ export function WidgetBarChart({
               )
             }}
           />
-          <Bar dataKey="value" fill={color} radius={[3, 3, 0, 0]} maxBarSize={16}>
+          <Bar dataKey="value" fill={color} radius={[6, 6, 0, 0]} maxBarSize={16}>
             {getBarColor
               ? data.map((point, i) => <Cell key={`${point.label}-${i}`} fill={getBarColor(point)} />)
               : null}
@@ -158,13 +158,23 @@ export function StatusDonutChart({
             }}
           />
           <Pie
+            data={[{ name: 'track', value: 1, color: DONUT_TRACK }]}
+            dataKey="value"
+            nameKey="name"
+            innerRadius={54}
+            outerRadius={80}
+            fill={DONUT_TRACK}
+            strokeWidth={0}
+            isAnimationActive={false}
+          />
+          <Pie
             data={data}
             dataKey="value"
             nameKey="name"
-            innerRadius={52}
-            outerRadius={74}
-            paddingAngle={3}
-            cornerRadius={4}
+            innerRadius={54}
+            outerRadius={80}
+            paddingAngle={4}
+            cornerRadius={8}
             strokeWidth={0}
           >
             {data.map((slice) => (
@@ -174,8 +184,8 @@ export function StatusDonutChart({
         </PieChart>
       </ResponsiveContainer>
       <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-        <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{centerLabel}</p>
-        <p className="text-base font-bold tabular-nums text-foreground">{centerValue}</p>
+        <p className="text-[10.5px] font-medium text-muted-foreground">{centerLabel}</p>
+        <p className="text-[17px] font-bold tabular-nums tracking-tight text-foreground">{centerValue}</p>
       </div>
     </div>
   )

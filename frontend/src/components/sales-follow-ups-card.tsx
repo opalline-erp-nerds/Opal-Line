@@ -17,7 +17,7 @@ const KIND_META: Record<
   'booking-advance': { icon: BellRing, label: 'Advance due', dot: 'bg-amber-500', tint: 'text-amber-600 dark:text-amber-400' },
   quotation: { icon: Clock, label: 'Quotation', dot: 'bg-primary-500', tint: 'text-primary-700 dark:text-primary-300' },
   order: { icon: ShoppingBag, label: 'Order', dot: 'bg-sky-500', tint: 'text-sky-600 dark:text-sky-400' },
-  booking: { icon: ShoppingBag, label: 'Booking', dot: 'bg-violet-500', tint: 'text-violet-600 dark:text-violet-400' },
+  booking: { icon: ShoppingBag, label: 'Booking', dot: 'bg-primary-500', tint: 'text-primary-600 dark:text-primary-400' },
 }
 
 interface SalesFollowUpsCardProps {

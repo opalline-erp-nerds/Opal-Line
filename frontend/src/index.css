@@ -2,154 +2,176 @@
 @import "./theme.css";
 
 @layer base {
-  /* Midnight navy + gold.
+  /* FinSet-inspired emerald teal.
    *
-   * Navy carries the interface because it stays legible behind dense data
-   * tables, where a lighter brand hue washes out at small sizes. Gold is the
-   * accent and is used sparingly — on the active nav item and primary actions —
-   * because gold at large areas reads cheap rather than premium.
+   * Pale mint workspace, a lighter mint sidebar and a single deep teal accent.
+   * The accent is reserved for the active nav item, primary actions and the
+   * chart series so dense tables stay legible.
    */
   :root {
-    --background: 218 50% 97%;
-    --foreground: 224 42% 20%;
+    --background: 165 25% 97%;
+    --foreground: 190 25% 12%;
     --card: 0 0% 100%;
-    --card-foreground: 224 42% 20%;
+    --card-foreground: 190 25% 12%;
     --popover: 0 0% 100%;
-    --popover-foreground: 222 47% 11%;
-    --primary: 222 64% 28%;
-    --primary-foreground: 210 40% 98%;
-    --primary-50: 220 60% 97%;
-    --primary-100: 218 55% 92%;
-    --primary-200: 216 48% 84%;
-    --primary-300: 214 44% 72%;
-    --primary-400: 213 46% 58%;
-    --primary-500: 221 60% 36%;
-    --primary-600: 222 64% 28%;
-    --primary-700: 222 66% 22%;
-    --primary-800: 222 68% 17%;
-    --primary-900: 222 70% 13%;
-    --secondary: 220 22% 94%;
-    --secondary-foreground: 222 47% 14%;
-    --muted: 220 24% 95%;
-    --muted-foreground: 233 12% 42%;
-    --accent: 43 78% 94%;
-    --accent-foreground: 35 62% 24%;
-    --destructive: 0 72% 45%;
+    --popover-foreground: 190 25% 12%;
+    --primary: 170 100% 28%;
+    --primary-foreground: 172 100% 3%;
+    --on-green: 0 0% 100%;
+    --primary-50: 162 52% 96%;
+    --primary-100: 162 52% 94%;
+    --primary-200: 164 48% 86%;
+    --primary-300: 166 50% 74%;
+    --primary-400: 168 58% 55%;
+    --primary-500: 160 84% 39%;
+    --primary-600: 170 100% 28%;
+    --primary-700: 172 100% 25%;
+    --primary-800: 171 100% 21%;
+    --primary-900: 172 100% 15%;
+    --secondary: 165 24% 96%;
+    --secondary-foreground: 190 20% 24%;
+    --muted: 165 24% 96%;
+    --muted-foreground: 190 8% 44%;
+    --accent: 162 52% 94%;
+    --accent-foreground: 172 100% 22%;
+    --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
-    --border: 220 18% 87%;
-    --input: 220 12% 60%;
-    --ring: 222 64% 34%;
+    --border: 190 14% 91%;
+    --input: 190 12% 86%;
+    --ring: 170 100% 28%;
     /* Dashboard accents: links and chart grid lines. */
-    --link: 221 83% 53%;
-    --grid: 240 21% 93%;
+    --link: 172 100% 25%;
+    --grid: 165 20% 94%;
 
-    /* Gold — the single premium accent. Deliberately not a full ramp; only
-     * these four are ever referenced. */
-    --gold: 43 74% 45%;
-    --gold-foreground: 40 60% 12%;
-    --gold-muted: 43 60% 90%;
-    --gold-border: 43 55% 68%;
+    /* Hover surfaces. Both modes share one quiet language: a low-opacity
+       emerald wash on soft controls, a single step deeper on solid ones and a
+       faint emerald border - never a bright fill, glow or flash. */
+    --hover-solid: hsl(var(--primary-700));
+    --hover-solid-foreground: hsl(var(--on-green));
+    --hover-tint: hsl(var(--primary) / 0.08);
+    --hover-tint-foreground: hsl(var(--primary-800));
+    --hover-tint-pressed: hsl(var(--primary) / 0.14);
+    --hover-border: hsl(var(--primary) / 0.24);
 
-    --radius: 0.5rem;
+    /* Champagne gold — reserved for fine details (hero eyebrow, brand rule,
+       print templates and the label preview). Used sparingly so teal remains
+       the single functional accent. */
+    --gold: 38 46% 58%;
+    --gold-foreground: 34 45% 14%;
+    --gold-muted: 40 52% 92%;
+    --gold-border: 39 42% 72%;
+    --champagne: 38 46% 62%;
+    --champagne-soft: 40 54% 93%;
+    --silver: 195 14% 92%;
+    --silver-foreground: 195 18% 26%;
 
-    --success: 154 72% 27%;
+    --radius: 0.75rem;
+
+    --success: 158 70% 28%;
     --success-foreground: 0 0% 100%;
-    --success-50: 151 80% 95%;
-    --success-100: 150 75% 88%;
-    --success-700: 154 70% 22%;
+    --success-50: 152 65% 95%;
+    --success-100: 152 60% 89%;
+    --success-700: 158 65% 26%;
 
-    --warning: 24 82% 36%;
+    --warning: 30 95% 30%;
     --warning-foreground: 0 0% 100%;
-    --warning-50: 30 100% 95%;
-    --warning-100: 29 100% 88%;
-    --warning-700: 24 80% 30%;
+    --warning-50: 38 100% 95%;
+    --warning-100: 38 95% 89%;
+    --warning-700: 30 85% 30%;
 
-    --info: 212 78% 38%;
+    --info: 205 85% 40%;
     --info-foreground: 0 0% 100%;
-    --info-50: 209 100% 95%;
-    --info-100: 210 95% 88%;
-    --info-700: 212 76% 32%;
+    --info-50: 205 85% 96%;
+    --info-100: 205 80% 92%;
+    --info-700: 205 90% 32%;
 
-    --sidebar: 222 47% 13%;
-    --sidebar-foreground: 220 24% 88%;
-    --sidebar-muted: 218 14% 62%;
-    --sidebar-border: 220 24% 22%;
-    --sidebar-active: 43 74% 48%;
-    --sidebar-active-foreground: 40 60% 10%;
-    --sidebar-hover: 220 30% 20%;
+    /* Pale mint rail, dark text, deep teal active pill. */
+    --sidebar: 166 38% 98%;
+    --sidebar-foreground: 190 22% 22%;
+    --sidebar-muted: 190 8% 40%;
+    --sidebar-border: 166 28% 93%;
+    --sidebar-active: 171 100% 21%;
+    --sidebar-active-foreground: 0 0% 100%;
+    --sidebar-hover: 166 34% 95%;
   }
 
   .dark {
-    --background: 222 42% 7%;
-    --foreground: 220 22% 95%;
-    --card: 222 36% 10%;
-    --card-foreground: 220 22% 95%;
-    --popover: 222 36% 10%;
-    --popover-foreground: 220 22% 95%;
-    /* Kept deep enough to still read as navy rather than royal blue; a brighter
-     * fill here passed contrast but pulled the whole UI toward generic SaaS. */
-    --primary: 218 55% 40%;
-    --primary-foreground: 210 40% 98%;
-    --primary-50: 222 45% 11%;
-    --primary-100: 220 42% 16%;
-    --primary-200: 218 40% 23%;
-    --primary-300: 216 52% 62%;
-    --primary-400: 214 58% 70%;
-    --primary-500: 215 60% 58%;
-    --primary-600: 216 62% 48%;
-    --primary-700: 214 55% 70%;
-    --primary-800: 212 48% 80%;
-    --primary-900: 210 42% 88%;
-    --secondary: 220 20% 16%;
-    --secondary-foreground: 220 22% 93%;
-    --muted: 220 20% 14%;
-    --muted-foreground: 218 12% 65%;
-    --accent: 43 40% 16%;
-    --accent-foreground: 43 80% 72%;
-    /* On a near-black page, danger has to get lighter, not darker — the
-     * light-mode value is already too dark to read here. */
-    --destructive: 0 82% 68%;
-    --destructive-foreground: 0 0% 100%;
-    --border: 220 18% 22%;
-    --input: 218 12% 50%;
-    --ring: 43 74% 52%;
-    --link: 217 91% 65%;
-    --grid: 240 15% 20%;
+    --background: 172.5 20% 7.84%;
+    --foreground: 150 16.67% 95.29%;
+    --card: 167.14 20.59% 13.33%;
+    --card-foreground: 150 16.67% 95.29%;
+    --popover: 165.88 20% 16.67%;
+    --popover-foreground: 150 16.67% 95.29%;
+    --primary: 163.97 55.27% 46.47%;
+    --primary-foreground: 0 0% 100%;
+    --primary-50: 166 30% 15%;
+    --primary-100: 166 30% 19%;
+    --primary-200: 165 30% 28%;
+    --primary-300: 160 55% 72%;
+    --primary-400: 162 55% 61%;
+    --primary-500: 163.97 55.27% 46.47%;
+    --primary-600: 163.97 55.27% 46.47%;
+    --primary-700: 164 58% 40%;
+    --primary-800: 160 48% 71%;
+    --primary-900: 155 40% 88%;
+    --secondary: 165.88 20% 16.67%;
+    --secondary-foreground: 153.33 11.25% 68.63%;
+    --muted: 165.88 20% 16.67%;
+    --muted-foreground: 153.33 11.25% 68.63%;
+    --accent: 165.88 20% 16.67%;
+    --accent-foreground: 160 55% 72%;
+    --destructive: 0 78% 68%;
+    --destructive-foreground: 150 16.67% 95.29%;
+    --border: 163.33 15.79% 22.35%;
+    --input: 163.33 15.79% 22.35%;
+    --ring: 163.97 55.27% 55%;
+    --link: 160 55% 72%;
+    --grid: 163.33 15.79% 22.35%;
 
-    /* Lifted for dark backgrounds so gold keeps its metallic read instead of
-     * going muddy against near-black. */
-    --gold: 43 80% 62%;
-    --gold-foreground: 40 60% 8%;
-    --gold-muted: 43 40% 18%;
-    --gold-border: 43 50% 34%;
+    /* Night mode hover keeps the identical shape, one notch stronger so the
+       wash and ring still read against dark surfaces. */
+    --hover-solid: hsl(var(--primary-700));
+    --hover-solid-foreground: hsl(var(--on-green));
+    --hover-tint: hsl(var(--primary) / 0.12);
+    --hover-tint-foreground: hsl(var(--primary-300));
+    --hover-tint-pressed: hsl(var(--primary) / 0.2);
+    --hover-border: hsl(var(--primary) / 0.34);
 
-    --success: 150 65% 45%;
+    --gold: 38 56% 66%;
+    --gold-foreground: 164 50% 10%;
+    --gold-muted: 165.88 20% 16.67%;
+    --gold-border: 38 38% 42%;
+    --champagne: 38 56% 68%;
+    --champagne-soft: 165.88 20% 16.67%;
+    --silver: 165 16% 88%;
+    --silver-foreground: 166 30% 10%;
+
+    --success: 163.97 55.27% 46.47%;
     --success-foreground: 0 0% 100%;
-    --success-50: 150 50% 12%;
-    --success-100: 150 50% 18%;
-    --success-700: 150 60% 62%;
+    --success-50: 166 30% 15%;
+    --success-100: 166 30% 19%;
+    --success-700: 160 55% 72%;
 
-    --warning: 27 90% 55%;
-    --warning-foreground: 0 0% 100%;
-    --warning-50: 28 60% 12%;
-    --warning-100: 28 60% 20%;
-    --warning-700: 30 90% 62%;
+    --warning: 38 78% 62%;
+    --warning-foreground: 30 60% 10%;
+    --warning-50: 38 30% 15%;
+    --warning-100: 38 30% 20%;
+    --warning-700: 40 85% 72%;
 
-    --info: 210 90% 58%;
-    --info-foreground: 0 0% 100%;
-    --info-50: 210 60% 12%;
-    --info-100: 210 60% 20%;
-    --info-700: 210 90% 66%;
+    --info: 195 65% 62%;
+    --info-foreground: 195 70% 10%;
+    --info-50: 195 30% 15%;
+    --info-100: 195 30% 20%;
+    --info-700: 195 70% 76%;
 
-    /* Navy sidebar persists in dark mode, one step deeper so it recedes
-     * behind the content. */
-    --sidebar: 222 48% 9%;
-    --sidebar-foreground: 220 24% 88%;
-    --sidebar-muted: 218 14% 60%;
-    --sidebar-border: 220 24% 18%;
-    --sidebar-active: 43 80% 60%;
-    --sidebar-active-foreground: 40 60% 8%;
-    --sidebar-hover: 220 32% 15%;
+    /* Dark-green rail with a readable primary-green active pill. */
+    --sidebar: 169.09 21.57% 10%;
+    --sidebar-foreground: 150 16.67% 95.29%;
+    --sidebar-muted: 153.33 11.25% 68.63%;
+    --sidebar-border: 163.33 15.79% 22.35%;
+    --sidebar-active: 163.97 55.27% 46.47%;
+    --sidebar-active-foreground: 0 0% 100%;
+    --sidebar-hover: 165.88 20% 16.67%;
   }
 
   * {
@@ -181,22 +203,418 @@
     background-clip: content-box;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(240 10% 72%);
+    background: hsl(var(--primary-200));
     border: 2px solid transparent;
     background-clip: content-box;
   }
 
   .dark ::-webkit-scrollbar-thumb {
-    background: hsl(240 12% 30%);
+    background: hsl(190 14% 26%);
   }
   .dark ::-webkit-scrollbar-thumb:hover {
-    background: hsl(240 12% 40%);
+    background: hsl(190 14% 36%);
   }
 }
 
 @layer utilities {
   .text-balance {
     text-wrap: balance;
+  }
+
+  .dark :is([class~='text-primary-700'], [class~='data-[state=active]:text-primary-700']) {
+    color: hsl(var(--primary-300)) !important;
+  }
+
+  .dark :is(.hover\:text-primary-700):hover,
+  .dark .group:hover [class~='group-hover:text-primary-700'] {
+    color: hsl(var(--primary-300)) !important;
+  }
+
+  .dark :is([class~='bg-red-50'], [class~='bg-red-50/30'], [class~='bg-red-50/50'], [class~='bg-red-50/60'], [class~='bg-red-100'], [class~='bg-rose-50'], [class~='bg-sky-50'], [class~='bg-amber-50'], [class~='bg-amber-100'], [class~='bg-yellow-50'], [class~='bg-yellow-100'], [class~='bg-orange-50'], [class~='bg-emerald-50'], [class~='bg-emerald-100'], [class~='bg-green-50'], [class~='bg-green-100'], [class~='bg-blue-50'], [class~='bg-blue-100'], [class~='bg-slate-100'], [class~='bg-zinc-100']):not([class*='dark:bg-']) {
+    background-color: hsl(var(--muted)) !important;
+  }
+
+  .dark :is([class~='text-red-600'], [class~='text-red-700'], [class~='text-red-800'], [class~='text-red-900'], [class~='text-rose-600'], [class~='text-rose-700'], [class~='text-rose-800']):not([class*='dark:text-']) {
+    color: hsl(var(--destructive)) !important;
+  }
+
+  .dark :is([class~='text-amber-600'], [class~='text-amber-700'], [class~='text-amber-800'], [class~='text-amber-900'], [class~='text-yellow-600'], [class~='text-yellow-700'], [class~='text-orange-600'], [class~='text-orange-700']):not([class*='dark:text-']) {
+    color: hsl(var(--warning)) !important;
+  }
+
+  .dark :is([class~='text-emerald-600'], [class~='text-emerald-700'], [class~='text-emerald-800'], [class~='text-emerald-900'], [class~='text-green-600'], [class~='text-green-700'], [class~='text-green-800'], [class~='text-green-900']):not([class*='dark:text-']) {
+    color: hsl(var(--primary-300)) !important;
+  }
+
+  .dark :is([class~='text-blue-600'], [class~='text-blue-700'], [class~='text-blue-800'], [class~='text-blue-900'], [class~='text-indigo-600'], [class~='text-indigo-700'], [class~='text-sky-600'], [class~='text-sky-700']):not([class*='dark:text-']) {
+    color: hsl(var(--info)) !important;
+  }
+
+  .dark :is([class~='text-slate-600'], [class~='text-zinc-600'], [class~='text-gray-600']):not([class*='dark:text-']) {
+    color: hsl(var(--muted-foreground)) !important;
+  }
+
+  .dark :is([class~='text-slate-700'], [class~='text-slate-800'], [class~='text-slate-900'], [class~='text-zinc-700'], [class~='text-gray-700'], [class~='text-gray-800'], [class~='text-gray-900']):not([class*='dark:text-']) {
+    color: hsl(var(--foreground)) !important;
+  }
+
+  .dark :is([class~='hover:text-red-600'], [class~='hover:text-red-700'], [class~='hover:text-rose-600']):not([class*='dark:hover:text-']):hover {
+    color: hsl(var(--destructive)) !important;
+  }
+
+  .dark :is([class~='hover:text-amber-600'], [class~='hover:text-amber-700'], [class~='hover:text-yellow-700'], [class~='hover:text-orange-700']):not([class*='dark:hover:text-']):hover {
+    color: hsl(var(--warning)) !important;
+  }
+
+  .dark :is([class~='hover:text-emerald-600'], [class~='hover:text-emerald-700'], [class~='hover:text-green-600'], [class~='hover:text-green-700']):not([class*='dark:hover:text-']):hover {
+    color: hsl(var(--primary-300)) !important;
+  }
+
+  .dark :is([class~='hover:text-blue-600'], [class~='hover:text-blue-700'], [class~='hover:text-indigo-700']):not([class*='dark:hover:text-']):hover {
+    color: hsl(var(--info)) !important;
+  }
+
+  :is(
+    .bg-primary,
+    .bg-primary-500,
+    .bg-primary-600,
+    .bg-primary-700,
+    .bg-sidebar-active,
+    .bg-success,
+    .bg-emerald-500,
+    .bg-emerald-600,
+    .bg-emerald-700,
+    .bg-green-500,
+    .bg-green-600,
+    .bg-green-700
+  ) {
+    color: hsl(var(--on-green)) !important;
+  }
+
+  :is(
+    .bg-primary,
+    .bg-primary-500,
+    .bg-primary-600,
+    .bg-primary-700,
+    .bg-sidebar-active,
+    .bg-success,
+    .bg-emerald-500,
+    .bg-emerald-600,
+    .bg-emerald-700,
+    .bg-green-500,
+    .bg-green-600,
+    .bg-green-700
+  ) * {
+    color: inherit !important;
+  }
+
+  /* Controls that already carry colour only deepen by a step on hover. */
+  :is(
+    [class~='hover:bg-primary-600'],
+    [class~='hover:bg-primary-700'],
+    [class~='hover:bg-emerald-600'],
+    [class~='hover:bg-emerald-700'],
+    [class~='hover:bg-green-600'],
+    [class~='hover:bg-green-700']
+  ):hover:not(:disabled) {
+    background-color: var(--hover-solid) !important;
+    color: var(--hover-solid-foreground) !important;
+  }
+
+  /* Quiet surfaces: nav links, tabs, menu items and soft buttons. */
+  :is(
+    [class~='hover:bg-primary-50'],
+    [class~='hover:bg-primary-50/60'],
+    [class~='hover:bg-primary-50/70'],
+    [class~='hover:bg-primary-100'],
+    [class~='hover:bg-primary-200'],
+    [class~='hover:bg-emerald-50'],
+    [class~='hover:bg-emerald-100'],
+    [class~='hover:bg-green-50'],
+    [class~='hover:bg-green-100']
+  ):hover:not(:disabled),
+  aside nav a:hover:not([class~='bg-sidebar-active']),
+  :is([role='tab'], [role='menuitem'], [role='option'], [aria-pressed], [aria-selected]):not([data-state='active']):not([aria-pressed='true']):not([aria-selected='true']):hover,
+  [role='menuitem']:focus-visible:not([aria-selected='true']) {
+    background-color: var(--hover-tint) !important;
+    color: var(--hover-tint-foreground) !important;
+  }
+
+  /* Pressing a quiet control deepens its wash; coloured controls keep their
+     own fill so nothing flashes to a different colour mid-click. */
+  :is(button, a[href], [role='button']):not(:disabled):not(
+      [class~='hover:bg-primary-600'],
+      [class~='hover:bg-primary-700'],
+      [class~='hover:bg-emerald-600'],
+      [class~='hover:bg-emerald-700'],
+      [class~='hover:bg-green-600'],
+      [class~='hover:bg-green-700']
+    ):active {
+    background-color: var(--hover-tint-pressed) !important;
+    color: var(--hover-tint-foreground) !important;
+  }
+
+  :is(
+    [class~='hover:bg-primary-50'],
+    [class~='hover:bg-primary-50/60'],
+    [class~='hover:bg-primary-50/70'],
+    [class~='hover:bg-primary-100'],
+    [class~='hover:bg-primary-200'],
+    [class~='hover:bg-primary-600'],
+    [class~='hover:bg-primary-700'],
+    [class~='hover:bg-emerald-50'],
+    [class~='hover:bg-emerald-100'],
+    [class~='hover:bg-emerald-600'],
+    [class~='hover:bg-emerald-700'],
+    [class~='hover:bg-green-50'],
+    [class~='hover:bg-green-100'],
+    [class~='hover:bg-green-600'],
+    [class~='hover:bg-green-700']
+  ):hover:not(:disabled) *,
+  aside nav a:hover *,
+  :is([role='tab'], [role='menuitem'], [role='option'], [aria-pressed], [aria-selected]):not([data-state='active']):hover *,
+  [role='menuitem']:focus-visible *,
+  :is(button, a[href], [role='button']):not(:disabled):active * {
+    color: inherit !important;
+  }
+
+  :is(
+    [data-state='active'],
+    [data-state='checked'],
+    [aria-selected='true'],
+    [aria-pressed='true'],
+    [aria-current='page']
+  ):is(
+    [role='tab'],
+    [role='menuitemradio'],
+    [role='radio'],
+    [role='option'],
+    [aria-pressed],
+    [data-state='checked']
+  ),
+  [class~='data-[state=active]:bg-card'][data-state='active'],
+  [class~='data-[state=active]:bg-transparent'][data-state='active'] {
+    background-color: hsl(var(--primary)) !important;
+    color: hsl(var(--on-green)) !important;
+  }
+
+  :is(
+    [data-state='active'],
+    [data-state='checked'],
+    [aria-selected='true'],
+    [aria-pressed='true'],
+    [aria-current='page']
+  ):is(
+    [role='tab'],
+    [role='menuitemradio'],
+    [role='radio'],
+    [role='option'],
+    [aria-pressed],
+    [data-state='checked']
+  ) *,
+  [class~='data-[state=active]:bg-card'][data-state='active'] *,
+  [class~='data-[state=active]:bg-transparent'][data-state='active'] * {
+    color: inherit !important;
+  }
+
+  html.dark :is(
+    [class~='hover:bg-primary-50'],
+    [class~='hover:bg-primary-50/60'],
+    [class~='hover:bg-primary-50/70'],
+    [class~='hover:bg-primary-100'],
+    [class~='hover:bg-primary-200'],
+    [class~='hover:bg-primary-600'],
+    [class~='hover:bg-primary-700'],
+    [class~='hover:bg-emerald-50'],
+    [class~='hover:bg-emerald-100'],
+    [class~='hover:bg-emerald-600'],
+    [class~='hover:bg-emerald-700'],
+    [class~='hover:bg-green-50'],
+    [class~='hover:bg-green-100'],
+    [class~='hover:bg-green-600'],
+    [class~='hover:bg-green-700']
+  ):hover :is([class~='group-hover:text-primary-700'], svg, svg *),
+  html.dark aside nav a.group:hover,
+  html.dark aside nav a.group:hover :is([class~='group-hover:text-primary-700'], svg, svg *),
+  html.dark .group:hover :is(
+    [class~='hover:bg-primary-50'],
+    [class~='hover:bg-primary-50/60'],
+    [class~='hover:bg-primary-50/70'],
+    [class~='hover:bg-primary-100'],
+    [class~='hover:bg-primary-200'],
+    [class~='hover:bg-primary-600'],
+    [class~='hover:bg-primary-700']
+  ) :is([class~='group-hover:text-primary-700'], svg, svg *) {
+    color: var(--hover-tint-foreground) !important;
+  }
+
+  /* Hover borders fade to a quiet emerald ring in both modes. */
+  :is([class~='hover:border-primary-200'], [class~='hover:border-primary-300']):hover {
+    border-color: var(--hover-border) !important;
+  }
+
+  /* One shared easing so hover states fade instead of jumping. Elements that
+     bring their own transition utility keep it untouched. */
+  :is(
+    button,
+    a[href],
+    [role='button'],
+    [role='tab'],
+    [role='menuitem'],
+    [role='option'],
+    [aria-pressed],
+    [aria-selected]
+  ):not([class*='transition']) {
+    transition:
+      background-color 160ms ease-out,
+      border-color 160ms ease-out,
+      color 160ms ease-out,
+      box-shadow 160ms ease-out;
+  }
+
+  .dark option {
+    background-color: hsl(var(--popover));
+    color: hsl(var(--foreground));
+  }
+
+  .dark img {
+    filter: brightness(0.94) contrast(1.05) saturate(0.94);
+  }
+
+  .dark section[aria-label='Opal Line overview'] {
+    border-color: hsl(var(--border) / 0.85) !important;
+    /* Pure black: the night artwork is a black-field photo, so it continues the
+       banner seamlessly and only its emerald lighting and silver reflections
+       read against the section. */
+    background-color: #000 !important;
+    background-image: none !important;
+    box-shadow:
+      0 26px 60px -34px hsl(165 60% 2% / 0.95),
+      inset 0 1px 0 hsl(var(--border) / 0.55) !important;
+  }
+
+  /* Night mode keeps the light-mode rendition of the photo (no darkening or
+   * desaturation wash); only its left edge is eased into the banner with a
+   * long, soft mask instead of a hard-edged black half. */
+  .dark section[aria-label='Opal Line overview'] img {
+    filter: none !important;
+    opacity: 1 !important;
+    -webkit-mask-image: linear-gradient(
+      90deg,
+      rgb(0 0 0 / 0) 0%,
+      rgb(0 0 0 / 0.14) 6%,
+      rgb(0 0 0 / 0.4) 14%,
+      rgb(0 0 0 / 0.7) 24%,
+      rgb(0 0 0 / 0.92) 33%,
+      #000 42%
+    ) !important;
+    mask-image: linear-gradient(
+      90deg,
+      rgb(0 0 0 / 0) 0%,
+      rgb(0 0 0 / 0.14) 6%,
+      rgb(0 0 0 / 0.4) 14%,
+      rgb(0 0 0 / 0.7) 24%,
+      rgb(0 0 0 / 0.92) 33%,
+      #000 42%
+    ) !important;
+  }
+
+  /* Night Mode banner artwork. It is painted as an oversized, right-anchored
+     background layer rather than an <img> because the source banner is 16:9 with
+     its own headline baked into the left half: sizing it past the slot crops
+     that headline out and keeps the ring, which then screens onto the black
+     hero so no photo rectangle is visible. Light Mode never gets this layer,
+     and the mint <img> is only hidden once the night artwork actually exists. */
+  @media (min-width: 40rem) {
+    html.dark section[aria-label='Opal Line overview'] img.hero-artwork-day {
+      display: none;
+    }
+
+    .dark section[aria-label='Opal Line overview']::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 0;
+      width: 30%;
+      pointer-events: none;
+      background-image: var(--hero-night-art, none);
+      background-repeat: no-repeat;
+      /* The source is 1672x941 and its own headline ends at x=51%; showing the
+         right ~49% at 205% zoom leaves the ring (x 61-95%, y 35-70%) frame-filling
+         while that baked-in headline stays out of shot. */
+      background-position: right 53%;
+      background-size: 205% auto;
+      mix-blend-mode: screen;
+      -webkit-mask-image: linear-gradient(
+        90deg,
+        rgb(0 0 0 / 0) 0%,
+        rgb(0 0 0 / 0.5) 7%,
+        #000 18%
+      );
+      mask-image: linear-gradient(
+        90deg,
+        rgb(0 0 0 / 0) 0%,
+        rgb(0 0 0 / 0.5) 7%,
+        #000 18%
+      );
+    }
+  }
+
+  /* Mint light spilling out of the photo into the dark half, so the banner
+     and the image meet through a soft teal haze rather than a black edge. */
+  .dark section[aria-label='Opal Line overview']::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background: radial-gradient(
+      34% 150% at 72% 50%,
+      hsl(166 46% 50% / 0.14) 0%,
+      hsl(166 46% 50% / 0.06) 44%,
+      hsl(166 46% 50% / 0) 74%
+    );
+  }
+
+  /* Backdrop waves read as faint emerald light on the black banner, not bands. */
+  .dark section[aria-label='Opal Line overview'] > svg path:nth-child(1) {
+    fill: hsl(var(--primary-800));
+    opacity: 0.12;
+  }
+
+  .dark section[aria-label='Opal Line overview'] > svg path:nth-child(2) {
+    fill: hsl(var(--primary-800));
+    opacity: 0.08;
+  }
+
+  .dark section[aria-label='Opal Line overview'] > svg path:nth-child(3) {
+    fill: hsl(var(--primary-200));
+    opacity: 0.12;
+  }
+
+  .dark section[aria-label='Opal Line overview'] [class~='bg-white/70'] {
+    border-color: hsl(var(--border)) !important;
+    background-color: hsl(var(--popover) / 0.78) !important;
+    box-shadow: inset 0 1px 0 hsl(var(--border)) !important;
+  }
+
+  .dark section[aria-label='Opal Line overview'] [class~='bg-white/50'] {
+    background-color: hsl(var(--primary-300) / 0.08) !important;
+  }
+
+  .dark .recharts-cartesian-grid line {
+    stroke: hsl(var(--grid)) !important;
+  }
+
+  .dark .recharts-cartesian-axis-tick text,
+  .dark .recharts-cartesian-axis-tick-value {
+    fill: hsl(var(--muted-foreground)) !important;
+  }
+
+  .dark path[fill='#E6F7F2'] {
+    fill: hsl(var(--popover)) !important;
   }
 }
 
@@ -207,28 +625,32 @@
 @media print {
   /* Printing always happens on white paper — force light palette even in dark mode */
   html.dark {
-    --background: 218 50% 97%;
-    --foreground: 224 42% 20%;
+    --background: 165 20% 99%;
+    --foreground: 190 25% 12%;
     --card: 0 0% 100%;
-    --card-foreground: 224 42% 20%;
+    --card-foreground: 190 25% 12%;
     --popover: 0 0% 100%;
-    --popover-foreground: 222 47% 11%;
-    --muted: 220 24% 95%;
-    --muted-foreground: 233 12% 42%;
-    --secondary: 220 22% 94%;
-    --secondary-foreground: 222 47% 14%;
-    --border: 220 18% 87%;
-    --input: 220 18% 87%;
-    --primary: 222 64% 28%;
-    --primary-50: 220 60% 97%;
-    --primary-700: 222 66% 22%;
-    --primary-800: 222 68% 17%;
-    --accent: 43 78% 94%;
-    --accent-foreground: 35 62% 24%;
+    --popover-foreground: 190 25% 12%;
+    --muted: 165 24% 96%;
+    --muted-foreground: 190 8% 44%;
+    --secondary: 165 24% 96%;
+    --secondary-foreground: 190 20% 24%;
+    --border: 190 14% 91%;
+    --input: 190 12% 86%;
+    --primary: 170 100% 28%;
+    --primary-50: 162 52% 96%;
+    --primary-700: 172 100% 25%;
+    --primary-800: 171 100% 21%;
+    --accent: 162 52% 94%;
+    --accent-foreground: 172 100% 22%;
     --gold: 43 74% 45%;
     --gold-muted: 43 60% 90%;
     --gold-border: 43 55% 68%;
     color-scheme: light;
+  }
+
+  .dark img {
+    filter: none !important;
   }
 
   body * {
@@ -277,5 +699,26 @@
     max-width: none !important;
     width: 100% !important;
     padding: 8mm 10mm !important;
+  }
+}
+
+/* "Sync to Shopify" toggle in the Create Manual Order modal only.
+ * Scoped by .sync-shopify-switch, so no other switch or button changes:
+ *   ON  -> emerald track, white knob
+ *   OFF -> light-grey track, slate-grey knob
+ * Sits in the utilities layer after the global green "active state" rule so it
+ * wins there; size, shape, position, border and shadow are untouched. */
+@layer utilities {
+  .sync-shopify-switch.sync-shopify-switch[data-state='checked'] {
+    background-color: #008b68 !important;
+  }
+  .sync-shopify-switch[data-state='checked'] > span {
+    background-color: #ffffff !important;
+  }
+  .sync-shopify-switch.sync-shopify-switch[data-state='unchecked'] {
+    background-color: #d1d5db !important;
+  }
+  .sync-shopify-switch[data-state='unchecked'] > span {
+    background-color: #64748b !important;
   }
 }

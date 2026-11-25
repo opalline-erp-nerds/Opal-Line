@@ -50,7 +50,7 @@ export default function Customer360Page() {
 
   if (loading) {
     return (
-      <div className="mx-auto w-full max-w-[1300px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+      <div className="mx-auto w-full max-w-[1300px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
         <Skeleton className="h-10 w-72" />
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
           <Skeleton className="h-40 rounded-lg" />
@@ -62,7 +62,7 @@ export default function Customer360Page() {
 
   if (!data) {
     return (
-      <div className="mx-auto w-full max-w-[1300px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+      <div className="mx-auto w-full max-w-[1300px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
         <Button variant="outline" size="sm" onClick={() => navigate(-1)}>
           <ArrowLeft className="h-4 w-4" /> Back
         </Button>
@@ -72,7 +72,7 @@ export default function Customer360Page() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[1300px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1300px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title={data.customer}
         subtitle="Single view of orders, invoices, dues, payments and loyalty."

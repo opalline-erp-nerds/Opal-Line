@@ -22,11 +22,13 @@ async function previewGeometry(page: import('@playwright/test').Page) {
       return { wMm: +(b.width / (96 / 25.4)).toFixed(2), hMm: +(b.height / (96 / 25.4)).toFixed(2) }
     }
     return {
+      // The label renderer draws one physical box per label (`.lbl`) inside the
+      // printed page; the older tag-with-stem markup is gone, so the box itself
+      // is what the configured width/height must match.
       page: m('.page'),
-      body: m('.tag-content'),
-      outline: m('svg.tag-outline'),
+      body: m('.lbl'),
       qrSvg: !!doc.querySelector('.qr svg'),
-      text: doc.querySelector('.tag-content')?.textContent ?? '',
+      text: doc.querySelector('.lbl')?.textContent ?? '',
       embedded: doc.body.classList.contains('embedded'),
     }
   })
@@ -58,17 +60,19 @@ test('label designer preview tracks size, selection and content settings', async
   // which used to clip the same edge off permanently.
   expect(before!.embedded).toBe(true)
 
+  // The configured height is honoured too.
+  const heightInput = page.locator('label:has-text("Height")').locator('..').locator('input').first()
+  expect(before!.body!.hMm).toBeCloseTo(Number(await heightInput.inputValue()), 0)
+
   // Changing the size updates the preview immediately.
   const widthInput = page.locator('label:has-text("Width")').locator('..').locator('input').first()
   await widthInput.fill(String(Number(cfgLabel) + 10))
   await widthInput.blur()
   await expect.poll(async () => (await previewGeometry(page))?.body?.wMm).toBeCloseTo(Number(cfgLabel) + 10, 0)
-  // The stem still extends RIGHTWARD, OUTSIDE the (wider) body.
+  // The page is cut to the label, so it grows with the box instead of clipping it.
   const after = await previewGeometry(page)
-  expect(after!.outline!.wMm).toBeGreaterThan(after!.body!.wMm)
-  expect(after!.page!.wMm).toBeGreaterThan(after!.body!.wMm)
-  // Stem length stays proportional to the body width (40%).
-  expect(after!.outline!.wMm - after!.body!.wMm).toBeCloseTo((Number(cfgLabel) + 10) * 0.4, 0)
+  expect(after!.page!.wMm).toBeCloseTo(after!.body!.wMm, 0)
+  expect(after!.page!.wMm).toBeCloseTo(Number(cfgLabel) + 10, 0)
 })
 
 test('selecting another product swaps the rendered label data', async ({ page }) => {

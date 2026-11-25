@@ -145,7 +145,7 @@ export interface KpiCardData {
   /** Label of the range the figures cover, e.g. "This Week". */
   rangeLabel?: string
   icon: string
-  accent: 'purple' | 'green' | 'orange' | 'red' | 'blue' | 'slate'
+  accent: 'teal' | 'green' | 'orange' | 'red' | 'blue' | 'slate' | 'champagne'
 }
 
 export interface SilverRate {
@@ -163,6 +163,10 @@ export interface SalesOverviewPoint {
   label: string
   revenue: number
   orders: number
+  /** Generated invoices in the bucket (KPI sparkline). */
+  invoices?: number
+  /** Gross profit on costed invoices in the bucket (KPI sparkline). */
+  profit?: number
   /** Combined revenue/orders above, split by where the sale was made. */
   shopifyRevenue?: number
   shopifyOrders?: number

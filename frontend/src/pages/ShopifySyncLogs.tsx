@@ -22,9 +22,9 @@ const statusBadge: Record<SyncLog['status'], { label: string; variant: 'success'
   skipped: { label: 'Skipped', variant: 'muted' },
 }
 
-const entityBadge: Record<string, { variant: 'info' | 'purple' | 'success' | 'warning' | 'default' | 'muted' }> = {
+const entityBadge: Record<string, { variant: 'info' | 'brand' | 'success' | 'warning' | 'default' | 'muted' }> = {
   Order: { variant: 'info' },
-  Product: { variant: 'purple' },
+  Product: { variant: 'brand' },
   Customer: { variant: 'success' },
   Inventory: { variant: 'warning' },
   Price: { variant: 'default' },
@@ -156,7 +156,7 @@ export default function ShopifySyncLogsPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Sync Logs"
         subtitle="Audit trail of every order, product, customer, inventory and price operation with Shopify."
@@ -168,7 +168,7 @@ export default function ShopifySyncLogsPage() {
       />
 
       {error ? (
-        <Card className="border-red-200 bg-red-50/50">
+        <Card className="border-red-200 bg-red-50/50 dark:border-red-500/30">
           <CardContent className="flex items-center gap-3 p-4 text-sm text-red-700">
             <AlertCircle className="h-4 w-4 shrink-0" />
             <p>{error}</p>
@@ -177,7 +177,7 @@ export default function ShopifySyncLogsPage() {
       ) : null}
 
       <div className="grid grid-cols-2 gap-3 sm:gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard icon={RefreshCw} title="Total Operations" value={formatNumber(logs.length)} accent="purple" />
+        <StatCard icon={RefreshCw} title="Total Operations" value={formatNumber(logs.length)} accent="teal" />
         <StatCard icon={CheckCircle2} title="Successful" value={formatNumber(counts.success)} accent="green" />
         <StatCard icon={AlertCircle} title="Failed" value={formatNumber(counts.failed)} accent="red" />
         <StatCard icon={Clock} title="Pending / Retry" value={formatNumber(counts.pending)} accent="orange" />

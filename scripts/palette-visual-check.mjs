@@ -1,11 +1,13 @@
-// Measures the navy+gold palette as the browser actually computes it, in both
+// Measures the emerald-teal palette as the browser actually computes it, in both
 // light and dark mode. Token values in source are not proof the cascade
 // applied them.
 // Run: node scripts/palette-visual-check.mjs
 import { chromium } from '@playwright/test'
 
 const BASE = process.env.PALETTE_BASE_URL ?? 'http://127.0.0.1:47195'
-const browser = await chromium.launch()
+// Prefer the machine's installed Chrome; CI runners ship it too, and it avoids
+// a separate ~170 MB bundled-browser download just for this palette gate.
+const browser = await chromium.launch({ channel: 'chrome' })
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
 
 let failures = 0
@@ -42,12 +44,12 @@ for (const scheme of ['light', 'dark']) {
   console.log(`  --gold               ${read.gold}`)
   console.log(`  --sidebar-active     ${read.sidebarActive}`)
 
-  // Navy means blue-dominant and dark; gold means warm and light.
-  const navy = read.sidebar.match(/(\d+)\s+(\d+)%\s+(\d+)%/)
-  if (navy) {
-    const [, h, s, l] = navy.map(Number)
-    check('sidebar is navy (hue 200-240)', h >= 200 && h <= 240, true)
-    check('sidebar is dark (L < 25)', l < 25, true)
+  // The brand is teal: hue 150–185, strongly saturated.
+  const primary = read.primary.match(/(\d+)\s+(\d+)%\s+(\d+)%/)
+  if (primary) {
+    const [, h, s] = primary.map(Number)
+    check('brand is teal (hue 150-185)', h >= 150 && h <= 185, true)
+    check('brand is saturated (S > 50)', s > 50, true)
   } else { failures++ }
 
   const gold = read.gold.match(/(\d+)\s+(\d+)%\s+(\d+)%/)
@@ -58,9 +60,26 @@ for (const scheme of ['light', 'dark']) {
     check('gold is light (L > 40)', l > 40, true)
   } else { failures++ }
 
-  // No purple may survive anywhere.
-  const purple = await page.evaluate(() => document.documentElement.outerHTML.match(/262\s+\d+%/g)?.length ?? 0)
-  check('no purple HSL left', purple, 0)
+  // No purple/violet may survive anywhere — as a class or an inline style.
+  const purple = await page.evaluate(
+    () => document.documentElement.outerHTML.match(/(?:violet|purple|indigo)|hsl\(\s*(?:2[5-9]\d|300)\s/g)?.length ?? 0,
+  )
+  check('no purple/violet left', purple, 0)
+}
+
+// Phone width: the same teal palette must apply with no horizontal overflow.
+await page.setViewportSize({ width: 390, height: 844 })
+for (const scheme of ['light', 'dark']) {
+  await page.goto(`${BASE}/login`, { waitUntil: 'networkidle' })
+  await page.evaluate((s) => document.documentElement.classList.toggle('dark', s === 'dark'), scheme)
+  await page.waitForTimeout(200)
+  console.log(`\n── MOBILE ${scheme.toUpperCase()} (390px) ──`)
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+  check('no horizontal overflow', overflow <= 1, true)
+  const purple = await page.evaluate(
+    () => document.documentElement.outerHTML.match(/(?:violet|purple|indigo)|hsl\(\s*(?:2[5-9]\d|300)\s/g)?.length ?? 0,
+  )
+  check('no purple/violet left', purple, 0)
 }
 
 await page.screenshot({ path: 'palette-dark.png', fullPage: false })

@@ -122,10 +122,10 @@ export function OrderSummaryCard() {
     <Card>
       <CardHeader className="flex-row flex-wrap items-center justify-between gap-3 space-y-0">
         <div>
-          <CardTitle className="flex items-center gap-2 text-sm">
-            <ShoppingBag className="h-4 w-4 text-primary-700" /> Order Summary
+          <CardTitle className="flex items-center gap-2 text-[16px]">
+            <ShoppingBag className="h-4 w-4 text-primary-600" /> Order Summary
           </CardTitle>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
+          <p className="mt-1 text-[12px] text-muted-foreground">
             {data?.label ?? monthTitle(month)} · Online vs in-store orders
           </p>
         </div>
@@ -153,7 +153,7 @@ export function OrderSummaryCard() {
             aria-label="Order summary grain"
             value={grain}
             onChange={(e) => setGrain(e.target.value as 'week' | 'month' | 'year')}
-            className="h-8 rounded-md border border-input bg-card px-2 text-xs font-medium text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            className="h-9 rounded-full border border-border bg-card px-3 text-xs font-medium text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-ring/30"
           >
             <option value="week">Week</option>
             <option value="month">Month</option>
@@ -177,7 +177,7 @@ export function OrderSummaryCard() {
                 Online <span className="font-semibold tabular-nums text-foreground">{formatNumber(totalOnline)}</span>
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full" style={{ background: SERIES_COLORS[3] }} />
+                <span className="h-2 w-2 rounded-full" style={{ background: SERIES_COLORS[0] }} />
                 In-store <span className="font-semibold tabular-nums text-foreground">{formatNumber(totalInStore)}</span>
               </span>
             </div>
@@ -235,10 +235,10 @@ export function SupplierPaymentsCard({ range }: { range: RangeQuery }) {
     <Card className="h-full">
       <CardHeader className="flex-row flex-wrap items-center justify-between gap-2 space-y-0">
         <div>
-          <CardTitle className="flex items-center gap-2 text-sm">
-            <Wallet className="h-4 w-4 text-primary-700" /> Latest Payments
+          <CardTitle className="flex items-center gap-2 text-[16px]">
+            <Wallet className="h-4 w-4 text-primary-600" /> Latest Payments
           </CardTitle>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">Payments made to suppliers</p>
+          <p className="mt-1 text-[12px] text-muted-foreground">Payments made to suppliers</p>
         </div>
         <WidgetAction label="View all" onClick={() => navigate('/reports/supplier-dues')} />
       </CardHeader>

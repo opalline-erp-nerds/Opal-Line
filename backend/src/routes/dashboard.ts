@@ -288,7 +288,7 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
     const outstandingCount = Number(outstandingRows[0]?.count ?? 0)
 
     res.json([
-      { key: 'sales', label: 'Sales', value: inr(curSales), trend: salesCompare.trend, delta: salesCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'indian-rupee', accent: 'purple' },
+      { key: 'sales', label: 'Sales', value: inr(curSales), trend: salesCompare.trend, delta: salesCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'indian-rupee', accent: 'teal' },
       { key: 'orders', label: 'Orders', value: String(curTotals.orders), trend: orderCompare.trend, delta: orderCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'shopping-bag', accent: 'blue' },
       { key: 'invoices', label: 'Invoices', value: String(curTotals.invoiceCount), trend: invoiceCompare.trend, delta: invoiceCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'file-text', accent: 'green' },
       { key: 'grossProfit', label: 'Gross Profit', value: hasCost ? inr(cur.profit) : 'N/A', trend: profitCompare.trend, delta: profitCompare.delta, deltaLabel: profitCaption, rangeLabel: range.label, icon: 'trending-up', accent: 'orange' },
@@ -608,6 +608,8 @@ export type SalesLedgerBucket = {
   revenue: number
   orders: number
   invoiceCount: number
+  /** Gross profit on invoices that carry a full cost basis. */
+  profit: number
   shopifyRevenue: number
   shopifyOrders: number
   shopifyReturns: number
@@ -631,6 +633,7 @@ export async function salesLedgerBuckets(format: string, range: { from: string; 
         shopifyGross: sql<number>`coalesce(sum(case when ${SHOPIFY_INVOICE} and ${STANDALONE_INVOICE} then grand_total else 0 end), 0)`,
         erpGross: sql<number>`coalesce(sum(case when ${ERP_INVOICE} then grand_total else 0 end), 0)`,
         invoiceCount: sql<number>`count(*)`,
+        profit: sql<number>`coalesce(sum(grand_total - coalesce(silver_value, 0) - coalesce(making_charge, 0)) filter (where silver_value is not null and making_charge is not null), 0)`,
       })
       .from(schema.salesInvoices)
       .where(and(
@@ -669,7 +672,7 @@ export async function salesLedgerBuckets(format: string, range: { from: string; 
     const existing = map.get(key)
     if (existing) return existing
     const created: SalesLedgerBucket = {
-      gross: 0, erpOrderRevenue: 0, shopifyOrderRevenue: 0, returns: 0, refunds: 0, revenue: 0, orders: 0, invoiceCount: 0,
+      gross: 0, erpOrderRevenue: 0, shopifyOrderRevenue: 0, returns: 0, refunds: 0, revenue: 0, orders: 0, invoiceCount: 0, profit: 0,
       shopifyRevenue: 0, shopifyOrders: 0, shopifyReturns: 0, shopifyRefunds: 0,
       erpRevenue: 0, erpOrders: 0, erpReturns: 0, erpRefunds: 0,
     }
@@ -682,6 +685,7 @@ export async function salesLedgerBuckets(format: string, range: { from: string; 
     bucket.erpRevenue = num(r.erpGross)
     bucket.gross = round2(bucket.shopifyRevenue + bucket.erpRevenue)
     bucket.invoiceCount = Number(r.invoiceCount ?? 0)
+    bucket.profit = round2(num(r.profit))
   }
   for (const r of orderRows) {
     const bucket = bucketFor(String(r.bucket ?? ''))
@@ -721,7 +725,7 @@ export type SalesTotals = Omit<SalesLedgerBucket, 'gross'> & { gross: number }
 export async function salesTotals(range: DashboardRange): Promise<SalesTotals> {
   const buckets = await salesLedgerBuckets(bucketFormat(range), range)
   const totals: SalesTotals = {
-    gross: 0, erpOrderRevenue: 0, shopifyOrderRevenue: 0, returns: 0, refunds: 0, revenue: 0, orders: 0, invoiceCount: 0,
+    gross: 0, erpOrderRevenue: 0, shopifyOrderRevenue: 0, returns: 0, refunds: 0, revenue: 0, orders: 0, invoiceCount: 0, profit: 0,
     shopifyRevenue: 0, shopifyOrders: 0, shopifyReturns: 0, shopifyRefunds: 0,
     erpRevenue: 0, erpOrders: 0, erpReturns: 0, erpRefunds: 0,
   }
@@ -734,6 +738,7 @@ export async function salesTotals(range: DashboardRange): Promise<SalesTotals> {
     totals.revenue += bucket.revenue
     totals.orders += bucket.orders
     totals.invoiceCount += bucket.invoiceCount
+    totals.profit += bucket.profit
     totals.shopifyRevenue += bucket.shopifyRevenue
     totals.shopifyOrders += bucket.shopifyOrders
     totals.shopifyReturns += bucket.shopifyReturns
@@ -910,6 +915,7 @@ async function expenseBuckets(format: string, range: { from: string; to: string 
 
 type SalesPoint = {
   key: string; date: string; label: string; revenue: number; orders: number
+  invoices: number; profit: number
   shopifyRevenue: number; shopifyOrders: number
   erpRevenue: number; erpOrders: number
 }
@@ -928,6 +934,8 @@ async function buildSalesPoints(range: Pick<DashboardRange, 'from' | 'to' | 'day
       label: b.label,
       revenue: round2(num(bucket?.revenue)),
       orders: Number(bucket?.orders ?? 0),
+      invoices: Number(bucket?.invoiceCount ?? 0),
+      profit: round2(num(bucket?.profit)),
       shopifyRevenue: round2(num(bucket?.shopifyRevenue)),
       shopifyOrders: Number(bucket?.shopifyOrders ?? 0),
       erpRevenue: round2(num(bucket?.erpRevenue)),
@@ -2306,12 +2314,18 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
         : sql`true`,
     )
 
-    // Count total in range (for "Showing X of total")
-    const [totalAct, totalAud] = await Promise.all([
-      db!.select({ n: sql<number>`count(*)` }).from(schema.activityLogs).where(actWindow),
-      db!.select({ n: sql<number>`count(*)` }).from(schema.auditLogs).where(audWindow),
-    ])
-    const total = Number(totalAct[0]?.n ?? 0) + Number(totalAud[0]?.n ?? 0)
+    // Count total in range only for the paged Activity Log ("Showing X of
+    // total"). The header bell and the dashboard widget fetch a handful of
+    // recent rows and never read `total`, so `count=0` skips two full scans on
+    // every page load.
+    let total = 0
+    if (q.count !== '0' && q.count !== 'false') {
+      const [totalAct, totalAud] = await Promise.all([
+        db!.select({ n: sql<number>`count(*)` }).from(schema.activityLogs).where(actWindow),
+        db!.select({ n: sql<number>`count(*)` }).from(schema.auditLogs).where(audWindow),
+      ])
+      total = Number(totalAct[0]?.n ?? 0) + Number(totalAud[0]?.n ?? 0)
+    }
 
     const actSelect = db!
       .select({

@@ -269,7 +269,7 @@ export const dbApi = {
   getLowStock: (): Promise<LowStockItem[]> => request('/db/dashboard/low-stock'),
   getRecentActivities: (
     range?: DashboardRangeInput | string,
-    params?: { limit?: number; cursor?: string | null; latest?: boolean },
+    params?: { limit?: number; cursor?: string | null; latest?: boolean; count?: boolean },
   ): Promise<{ items: Activity[]; total: number; nextCursor: string | null }> => {
     const query = new URLSearchParams()
     if (typeof range === 'string') {
@@ -282,6 +282,9 @@ export const dbApi = {
     if (typeof params?.limit === 'number') query.set('limit', String(params.limit))
     if (params?.cursor) query.set('cursor', params.cursor)
     if (params?.latest) query.set('scope', 'latest')
+    // Callers that only render the newest rows (header bell, dashboard widget)
+    // opt out of the two COUNT(*) scans the paged log needs for its total.
+    if (params?.count === false) query.set('count', '0')
     const qs = query.toString()
     return request(qs ? `/db/dashboard/activities?${qs}` : '/db/dashboard/activities')
   },

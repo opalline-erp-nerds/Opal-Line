@@ -65,9 +65,9 @@ import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatDateTime, todayIST } from '@/lib/format'
 import { perUnitLinePrice, orderLinesTotal } from '@/lib/orderPricing'
 
-const statusMeta: Record<OrderStatus, { label: string; variant: 'success' | 'warning' | 'danger' | 'muted' | 'info' | 'purple' }> = {
+const statusMeta: Record<OrderStatus, { label: string; variant: 'success' | 'warning' | 'danger' | 'muted' | 'info' | 'brand' }> = {
   imported: { label: 'Imported', variant: 'info' },
-  confirmed: { label: 'Confirmed', variant: 'purple' },
+  confirmed: { label: 'Confirmed', variant: 'brand' },
   processing: { label: 'Processing', variant: 'warning' },
   fulfilled: { label: 'Fulfilled', variant: 'success' },
   cancelled: { label: 'Cancelled', variant: 'muted' },
@@ -1421,7 +1421,7 @@ export default function SalesOrdersPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-6 lg:px-7">
       <PageHeader
         title="Sales Orders"
         subtitle="Shopify orders imported into the ERP — tracked through confirmation, fulfillment and invoicing."
@@ -1449,7 +1449,7 @@ export default function SalesOrdersPage() {
           className={`flex items-center justify-between gap-3 rounded-md border px-3 py-2 text-xs ${
             syncMsg.ok
               ? 'border-success-100 bg-success-50/70 text-success-700'
-              : 'border-red-200 bg-red-50/60 text-red-700'
+              : 'border-red-200 bg-red-50/60 text-red-700 dark:border-red-500/30'
           }`}
         >
           <span className="flex items-center gap-2">
@@ -2039,11 +2039,15 @@ export default function SalesOrdersPage() {
                         : 'Create the order on Shopify with the selected payment status'}
                     </p>
                   </div>
-                  <Switch checked={syncToShopify} onCheckedChange={setSyncToShopify} />
+                  <Switch
+                    checked={syncToShopify}
+                    onCheckedChange={setSyncToShopify}
+                    className="sync-shopify-switch"
+                  />
                 </div>
 
                 {formError ? (
-                  <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
+                  <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700 dark:border-red-500/30">
                     <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     <span>{formError}</span>
                   </div>

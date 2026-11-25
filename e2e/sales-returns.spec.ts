@@ -8,7 +8,7 @@ import { expect, test } from '@playwright/test'
 test.describe('sales returns', () => {
   test('the returns page loads instead of falling into the error boundary', async ({ page }) => {
     await page.goto('/sales/returns')
-    await expect(page.getByRole('heading', { name: 'Sales Returns' })).toBeVisible({ timeout: 20000 })
+    await expect(page.getByRole('heading', { name: 'Returns & Refunds' })).toBeVisible({ timeout: 20000 })
     await expect(page.getByText('Something went wrong')).toHaveCount(0)
 
     // The table settles into either rows or its empty message — never the
@@ -27,10 +27,10 @@ test.describe('sales returns', () => {
 
   test('the search box filters the list once it has loaded', async ({ page }) => {
     await page.goto('/sales/returns')
-    await expect(page.getByRole('heading', { name: 'Sales Returns' })).toBeVisible({ timeout: 20000 })
-    await page.getByPlaceholder('Search return, order, customer...').fill('zzz-no-such-return')
+    await expect(page.getByRole('heading', { name: 'Returns & Refunds' })).toBeVisible({ timeout: 20000 })
+    await page.getByPlaceholder(/Search return, order, customer/).fill('zzz-no-such-return')
     // A search with no matches reports that honestly rather than erroring.
-    await expect(page.getByText('No returns found')).toBeVisible({ timeout: 15000 })
+    await expect(page.getByText(/No returns yet/)).toBeVisible({ timeout: 15000 })
     await expect(page.getByText('Something went wrong')).toHaveCount(0)
   })
 })

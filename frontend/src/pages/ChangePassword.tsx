@@ -47,10 +47,10 @@ export default function ChangePasswordPage() {
   return (
     <AuthLayout>
       <div>
-        <h1 className="text-[28px] font-bold leading-tight tracking-tight text-white sm:text-3xl">
+        <h1 className="text-[26px] font-semibold leading-tight tracking-tight text-foreground sm:text-[28px]">
           Choose a new password
         </h1>
-        <p className="mt-2 text-sm text-[#cdc0ad]">
+        <p className="mt-2 text-[13px] text-muted-foreground">
           {currentUser?.username ? `Signed in as ${currentUser.username}. ` : ''}
           You must set a new password before using Opal Line.
         </p>
@@ -84,11 +84,11 @@ export default function ChangePasswordPage() {
             onChange={(e) => setNewPassword(e.target.value)}
             className={authInputClass}
           />
-          <ul className="grid grid-cols-1 gap-0.5 text-xs text-[#bdae99] sm:grid-cols-2">
+          <ul className="grid grid-cols-1 gap-0.5 text-xs text-muted-foreground sm:grid-cols-2">
             {RULES.map((r) => {
               const ok = r.test(newPassword)
               return (
-                <li key={r.label} className={ok ? 'text-[#8fd6a8]' : undefined}>
+                <li key={r.label} className={ok ? 'text-success-700' : undefined}>
                   {ok ? '✓' : '•'} {r.label}
                 </li>
               )
@@ -108,11 +108,11 @@ export default function ChangePasswordPage() {
             onChange={(e) => setConfirmPassword(e.target.value)}
             className={authInputClass}
           />
-          {mismatch && <p className="text-xs text-[#ffc3b8]">Passwords do not match.</p>}
+          {mismatch && <p className="text-xs text-red-600 dark:text-red-400">Passwords do not match.</p>}
         </div>
 
         {error && (
-          <p role="alert" className="text-sm text-[#ffc3b8]">
+          <p role="alert" className="text-sm text-red-600 dark:text-red-400">
             {error}
           </p>
         )}
@@ -121,7 +121,7 @@ export default function ChangePasswordPage() {
           <Button
             type="submit"
             disabled={!ready || busy}
-            className="h-11 flex-1 rounded-lg bg-gold text-[15px] font-semibold text-gold-foreground shadow-lg shadow-black/30 hover:bg-gold/90 focus-visible:ring-2 focus-visible:ring-[#e6c16f] focus-visible:ring-offset-2 focus-visible:ring-offset-[#15110d]"
+            className="h-11 flex-1 rounded-lg bg-primary text-[15px] font-semibold text-primary-foreground shadow-sm hover:bg-primary-700 focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:ring-offset-2"
           >
             <KeyRound className="h-4 w-4" />
             {busy ? 'Saving…' : 'Set new password'}
@@ -130,7 +130,7 @@ export default function ChangePasswordPage() {
             type="button"
             variant="ghost"
             onClick={logout}
-            className="h-11 rounded-lg px-4 text-[#e8dcc8] hover:bg-white/10 hover:text-white"
+            className="h-11 rounded-lg px-4 text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             Sign out
           </Button>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { resolveClientRange, rangeToQuery } from '@/lib/dashboardRange'
 import {
@@ -8,7 +8,6 @@ import {
   Calendar,
   ChevronDown,
   Clock,
-  CloudCog,
   Database,
   FileText,
   Gem,
@@ -37,6 +36,7 @@ import { StatusPill } from '@/components/ui/status-pill'
 import { StatCard } from '@/components/ui/stat-card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
+import { DashboardHero } from '@/components/dashboard/dashboard-hero'
 import { FinancialAnalytics } from '@/components/dashboard/financial-analytics'
 import { SalesOrdersRevenueChart } from '@/components/charts/sales-orders-revenue-chart'
 import { SalesKpiCards } from '@/components/dashboard/sales-overview-analytics'
@@ -68,7 +68,7 @@ import type {
   RangeQuery,
 } from '@/types'
 import type { ShopifyStatus } from '@/types/shopify'
-import { compactCurrency, formatCurrency, formatDateTime, formatPieces, formatWeight } from '@/lib/format'
+import { compactCurrency, formatCurrency, formatPieces, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 const kpiIcons: Record<string, LucideIcon> = {
@@ -93,6 +93,33 @@ const activityIcons: Record<Activity['type'], { icon: LucideIcon; className: str
 
 const ListOrderedIcon = FileText
 
+// The dashboard owns the range/source state, so every widget and chart below
+// re-rendered whenever any one of its ~20 async results landed. These memos
+// keep the charts (and their Recharts animations) still unless their own data
+// changes. StatusDonutChart compares slices by value because the category
+// chart derives its slices inline.
+const MemoSalesOrdersRevenueChart = memo(SalesOrdersRevenueChart)
+const MemoPaymentDonutChart = memo(PaymentDonutChart)
+const MemoStatusDonutChart = memo(
+  StatusDonutChart,
+  (prev, next) =>
+    prev.centerLabel === next.centerLabel &&
+    prev.centerValue === next.centerValue &&
+    prev.height === next.height &&
+    prev.data.length === next.data.length &&
+    prev.data.every((slice, index) => {
+      const other = next.data[index]
+      return other != null && slice.name === other.name && slice.value === other.value && slice.color === other.color
+    }),
+)
+const MemoSalesKpiCards = memo(SalesKpiCards)
+const MemoFinancialAnalytics = memo(FinancialAnalytics)
+const MemoOrderSummaryCard = memo(OrderSummaryCard)
+const MemoSupplierPaymentsCard = memo(SupplierPaymentsCard)
+const MemoPurchaseOrdersCard = memo(PurchaseOrdersCard)
+const MemoRecentInvoicesCard = memo(RecentInvoicesCard)
+const MemoSilverRateHistoryCard = memo(SilverRateHistoryCard)
+
 type SalesSource = 'all' | 'shopify' | 'erp'
 
 const SALES_SOURCES: { key: SalesSource; label: string; icon: LucideIcon }[] = [
@@ -100,6 +127,17 @@ const SALES_SOURCES: { key: SalesSource; label: string; icon: LucideIcon }[] = [
   { key: 'shopify', label: 'Shopify Sales', icon: ShoppingBag },
   { key: 'erp', label: 'ERP Sales', icon: Database },
 ]
+
+// Sparkline hues stay inside the teal family; the two snapshot cards use the
+// same amber/red as their icon so the line reads as a state, not a trend.
+const KPI_SPARK_COLORS: Record<string, string> = {
+  sales: SERIES_COLORS[0],
+  orders: '#0E9F8C',
+  invoices: '#16A38A',
+  grossProfit: '#0B7F6C',
+  outstanding: '#D97706',
+  lowStock: '#E11D48',
+}
 
 const quickActions: { label: string; icon: LucideIcon; path: string; module: string }[] = [
   { label: 'Sales Invoice', icon: FileText, path: '/sales/invoices', module: 'sales' },
@@ -161,7 +199,11 @@ export default function DashboardPage() {
     const onVisible = () => {
       if (document.visibilityState === 'visible') refresh()
     }
-    const timer = window.setInterval(refresh, 60_000)
+    // Background refresh only while the tab is visible; focus and
+    // visibilitychange still refresh immediately when the user comes back.
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') refresh()
+    }, 300_000)
     window.addEventListener('focus', refresh)
     document.addEventListener('visibilitychange', onVisible)
     return () => {
@@ -183,7 +225,8 @@ export default function DashboardPage() {
       dbApi.getSalesOverview(range),
       dbApi.getTopCategory(range),
       dbApi.getLowStock(),
-      dbApi.getRecentActivities(range, { latest: true }),
+      // The widget never shows the paged total, so skip its COUNT(*) scans.
+      dbApi.getRecentActivities(range, { latest: true, count: false }),
       dbApi.getAnalyticsStats(range),
       shopifyApi.getStatus(),
     ]).then((results) => {
@@ -355,20 +398,33 @@ export default function DashboardPage() {
     }
   }, [period, customRange, salesSource, refreshTick])
 
-  const range = rangeToQuery(period, customRange) as RangeQuery
+  const range = useMemo(() => rangeToQuery(period, customRange) as RangeQuery, [period, customRange])
 
   // The API sends every platform in one payload, so switching filters is
   // instant and the chart, tooltip and summary cards share one dataset.
-  const visibleSales = salesData.map((point) => ({
+  const visibleSales = useMemo(() => salesData.map((point) => ({
     ...point,
     orders: salesSource === 'all' ? point.orders : salesSource === 'shopify' ? (point.shopifyOrders ?? 0) : (point.erpOrders ?? 0),
     revenue: salesSource === 'all' ? point.revenue : salesSource === 'shopify' ? (point.shopifyRevenue ?? 0) : (point.erpRevenue ?? 0),
-  }))
+  })), [salesData, salesSource])
   const hasVisibleSales = visibleSales.some((point) => Number(point.orders ?? 0) > 0 || Math.abs(Number(point.revenue ?? 0)) > 0.005)
   const sourceLabel = SALES_SOURCES.find((source) => source.key === salesSource)?.label ?? 'All Sales'
+  // Real per-bucket series for the KPI cards. Outstanding and low stock are
+  // point-in-time values, so those cards get an honest dashed snapshot line
+  // instead of an invented trend.
+  const kpiSparklines = useMemo<Record<string, number[] | undefined>>(() => {
+    if (salesData.length < 2) return {}
+    return {
+      sales: salesData.map((point) => Number(point.revenue ?? 0)),
+      orders: salesData.map((point) => Number(point.orders ?? 0)),
+      invoices: salesData.map((point) => Number(point.invoices ?? 0)),
+      grossProfit: salesData.map((point) => Number(point.profit ?? 0)),
+    }
+  }, [salesData])
+  const openSilverRate = useCallback(() => navigate('/silver-rate'), [navigate])
 
   return (
-    <div className="print-area mx-auto w-full max-w-[1600px] space-y-6 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="print-area mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Dashboard"
         subtitle="Here's what's happening with your ecommerce business today."
@@ -393,10 +449,13 @@ export default function DashboardPage() {
         </p>
       </div>
 
-      <ConnectionBanner
-        lastSyncAt={typeof summary?.lastSyncAt === 'string' ? summary.lastSyncAt : null}
-        shopifyStatus={shopifyStatus}
-      />
+      <div className="no-print">
+        <DashboardHero
+          lastSyncAt={typeof summary?.lastSyncAt === 'string' ? summary.lastSyncAt : null}
+          shopifyStatus={shopifyStatus}
+          systemHealthy={!dbError}
+        />
+      </div>
 
       {dbError ? (
         <Card className="mb-6">
@@ -432,7 +491,7 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
             ) : (kpis.length > 0 ? (
-              <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
+              <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 {kpis.map((kpi) => (
                   <StatCard
                     key={kpi.key}
@@ -444,7 +503,9 @@ export default function DashboardPage() {
                     deltaLabel={kpi.deltaLabel}
                     support={kpi.rangeLabel}
                     accent={kpi.accent}
-                    variant="gradient"
+                    sparkline={kpiSparklines[kpi.key]}
+                    sparklineColor={KPI_SPARK_COLORS[kpi.key]}
+                    snapshot={kpi.key === 'outstanding' || kpi.key === 'lowStock'}
                   />
                 ))}
               </div>
@@ -476,15 +537,14 @@ export default function DashboardPage() {
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <Card className="xl:col-span-2">
             <CardHeader className="flex-col gap-3 space-y-0 sm:flex-row sm:items-start sm:justify-between">
-              <div>
-                <CardTitle className="flex items-center gap-2 text-sm">
-                  <TrendingUp className="h-4 w-4 text-[#7C5CE6]" /> Sales Overview
+              <div>                    <CardTitle className="flex items-center gap-2 text-[16px]">
+                  <TrendingUp className="h-4 w-4 text-primary-600" /> Sales Overview
                 </CardTitle>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                <p className="mt-1 text-[12px] text-muted-foreground">
                   {resolveClientRange(period, customRange).rangeText} · {sourceLabel}
                 </p>
               </div>
-              <div className="no-print flex w-fit flex-wrap items-center gap-1 rounded-xl border border-border/70 bg-muted/30 p-1">
+              <div className="no-print flex w-fit flex-wrap items-center gap-1 rounded-full border border-border/60 bg-muted/60 p-1">
                 {SALES_SOURCES.map((source) => {
                   const Icon = source.icon
                   return (
@@ -494,10 +554,10 @@ export default function DashboardPage() {
                       aria-pressed={salesSource === source.key}
                       onClick={() => setSalesSource(source.key)}
                       className={cn(
-                        'flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-all sm:px-3 sm:text-[11.5px]',
+                        'flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] font-medium transition-all sm:text-[11.5px]',
                         salesSource === source.key
-                          ? 'border-[#7C5CE6] bg-[#7C5CE6] text-white shadow-sm'
-                          : 'border-border bg-card text-foreground shadow-sm hover:border-[#7C5CE6]/40 hover:bg-muted',
+                          ? 'border-primary bg-primary text-primary-foreground shadow-sm'
+                          : 'border-transparent bg-transparent text-muted-foreground hover:bg-card hover:text-primary-700',
                       )}
                     >
                       <Icon className="h-3.5 w-3.5" />
@@ -513,7 +573,7 @@ export default function DashboardPage() {
                   {Array.from({ length: 3 }).map((_, index) => <Skeleton key={index} className="h-[108px] rounded-xl" />)}
                 </div>
               ) : salesInsights ? (
-                <SalesKpiCards insights={salesInsights} source={salesSource} />
+                <MemoSalesKpiCards insights={salesInsights} source={salesSource} />
               ) : null}
               {salesInsightsError ? (
                 <div className="flex items-center justify-between gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[11px] text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-300">
@@ -524,9 +584,9 @@ export default function DashboardPage() {
                 </div>
               ) : null}
 
-              <div className="min-w-0 rounded-xl border border-border/70 bg-card p-3 shadow-sm sm:p-4">
+              <div className="min-w-0 rounded-2xl border border-border/60 bg-card p-4 shadow-sm">
                 {hasVisibleSales ? (
-                  <SalesOrdersRevenueChart data={visibleSales} />
+                  <MemoSalesOrdersRevenueChart data={visibleSales} />
                 ) : salesSource !== 'all' ? (
                   <EmptyState
                     icon={TrendingUp}
@@ -568,10 +628,10 @@ export default function DashboardPage() {
             <Card className="h-full xl:col-span-5">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
-                  <CardTitle className="flex items-center gap-2 text-sm">
-                    <Gem className="h-4 w-4 text-[#7C5CE6]" /> Top Selling Products
+                  <CardTitle className="flex items-center gap-2 text-[16px]">
+                    <Gem className="h-4 w-4 text-primary-600" /> Top Selling Products
                   </CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue · {sourceLabel}</p>
+                  <p className="mt-1 text-[12px] text-muted-foreground">Best sellers by revenue · {sourceLabel}</p>
                 </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
@@ -675,17 +735,17 @@ export default function DashboardPage() {
             </Card>
 
             <div className="h-full xl:col-span-4">
-              <SupplierPaymentsCard range={range} />
+              <MemoSupplierPaymentsCard range={range} />
             </div>
             <div className="h-full xl:col-span-3">
-              <PurchaseOrdersCard range={range} />
+              <MemoPurchaseOrdersCard range={range} />
             </div>
 
             <Card className="xl:col-span-4">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
-                  <CardTitle className="text-sm">Top Selling Category</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Revenue grouped by product category</p>
+                  <CardTitle className="text-[16px]">Top Selling Category</CardTitle>
+                  <p className="mt-1 text-[12px] text-muted-foreground">Revenue grouped by product category</p>
                 </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
@@ -717,7 +777,7 @@ export default function DashboardPage() {
                     }))
                     return (
                       <div className="grid grid-cols-1 items-center gap-3 sm:grid-cols-2">
-                        <StatusDonutChart
+                        <MemoStatusDonutChart
                           data={slices}
                           centerLabel="Revenue"
                           centerValue={compactCurrency(total)}
@@ -754,21 +814,21 @@ export default function DashboardPage() {
             </Card>
 
             <div className="xl:col-span-8">
-              <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
+              <MemoSilverRateHistoryCard onSetRate={openSilverRate} />
             </div>
           </div>
 
-          <OrderSummaryCard />
+          <MemoOrderSummaryCard />
 
           {/* Self-fetching: independent of the page-wide range above. */}
-          <FinancialAnalytics />
+          <MemoFinancialAnalytics />
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <Card>
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
-                  <CardTitle className="text-sm">Low Stock Alert</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">At or below their reorder level</p>
+                  <CardTitle className="text-[16px]">Low Stock Alert</CardTitle>
+                  <p className="mt-1 text-[12px] text-muted-foreground">At or below their reorder level</p>
                 </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/inventory/low-stock')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
@@ -834,14 +894,14 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
-            <RecentInvoicesCard range={range} source={salesSource} />
+            <MemoRecentInvoicesCard range={range} source={salesSource} />
           </div>
 
           <Card>
             <CardHeader className="flex-row items-center justify-between space-y-0">
               <div>
-                <CardTitle className="text-sm">Recent Activities</CardTitle>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoice, payment and sync events</p>
+                <CardTitle className="text-[16px]">Recent Activities</CardTitle>
+                <p className="mt-1 text-[12px] text-muted-foreground">Latest invoice, payment and sync events</p>
               </div>
               <Button variant="ghost" size="sm" className="gap-1 px-2 text-link" onClick={() => navigate('/system/activity')}>
                 View All <ArrowRight className="h-3.5 w-3.5" />
@@ -1024,8 +1084,8 @@ function PeriodSelect({
       <button
         onClick={() => (open ? setOpen(false) : openPanel())}
         className={cn(
-          'flex h-7 items-center gap-1.5 rounded-md border bg-card px-2.5 text-xs font-medium text-muted-foreground hover:bg-muted',
-          variant === 'range' && 'text-[12.5px]',
+          'flex h-9 items-center gap-1.5 rounded-full border border-border/80 bg-card px-4 text-[13px] font-medium text-foreground/80 hover:border-primary-200 hover:bg-primary-50/60',
+          variant === 'range' && 'text-[13px]',
         )}
       >
         {variant === 'range' ? <Calendar className="h-3.5 w-3.5 text-muted-foreground" /> : null}
@@ -1037,7 +1097,7 @@ function PeriodSelect({
           <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
           <div
             className={cn(
-              'absolute top-8 z-20 min-w-[150px] animate-scale-in rounded-md border bg-popover p-1 shadow-popover',
+              'absolute top-10 z-20 min-w-[160px] animate-scale-in rounded-2xl border border-border/70 bg-popover p-1.5 shadow-popover',
               align === 'right' ? 'right-0' : 'left-0',
             )}
           >
@@ -1136,11 +1196,11 @@ function PaymentStatusPanel({
       <CardHeader className="flex-row items-center justify-between space-y-0">
         <div>
           <CardTitle className="flex items-center gap-2 text-sm">
-            <IndianRupee className="h-4 w-4 text-[#2F5BE0]" /> Payment Status
+            <IndianRupee className="h-4 w-4 text-primary-600" /> Payment Status
           </CardTitle>
           <p className="mt-0.5 text-[11px] text-muted-foreground">Sales grouped by payment state</p>
         </div>
-        <Badge variant="muted" className="text-[10px]">{formatCurrency(total, { compact: true })}</Badge>
+        <Badge variant="muted" className="border border-border/70 bg-card text-[11px] font-semibold text-foreground">{formatCurrency(total, { compact: true })}</Badge>
       </CardHeader>
       <CardContent className="flex flex-1 flex-col">
         {loading ? (
@@ -1166,10 +1226,10 @@ function PaymentStatusPanel({
         ) : data && total > 0 ? (
           <>
             <div className="flex flex-1 flex-col justify-center">
-              <PaymentDonutChart data={data.segments} centerTotal={total} height={220} />
+              <MemoPaymentDonutChart data={data.segments} centerTotal={total} height={220} />
               <div className="mt-1 space-y-1.5">
                 {data.segments.map((s) => (
-                  <div key={s.status} className="flex items-center gap-2 text-[11.5px]">
+                  <div key={s.status} className="flex items-center gap-2 text-[12px]">
                     <span
                       className="h-2 w-2 shrink-0 rounded-full"
                       style={{ background: PAYMENT_STATUS_COLORS[s.status] }}
@@ -1201,47 +1261,6 @@ function PaymentStatusPanel({
   )
 }
 
-function ConnectionBanner({
-  lastSyncAt,
-  shopifyStatus,
-}: {
-  lastSyncAt: string | null
-  shopifyStatus: ShopifyStatus | null
-}) {
-  const fallbackSync = shopifyStatus
-    ? Object.values(shopifyStatus.lastSync ?? {})
-        .filter(Boolean)
-        .sort()
-        .pop() ?? null
-    : null
-  const syncedAt = lastSyncAt ?? fallbackSync
-  return (
-    <Card className="flex flex-wrap items-center gap-x-6 gap-y-2 border-primary-100 bg-gradient-to-r from-primary-50/70 via-card to-card px-4 py-3">
-      <ConnectionPill healthy={Boolean(shopifyStatus?.configured)} label="Shopify" sublabel={shopifyStatus?.configured ? 'Connected' : 'Not configured'} />
-        <ConnectionPill healthy label="System" sublabel="Healthy" />
-      <div className="ml-auto hidden items-center gap-1.5 text-xs text-muted-foreground md:flex">
-        <CloudCog className="h-3.5 w-3.5 text-info-700" />
-        Last sync: {syncedAt ? formatDateTime(syncedAt) : 'Never'}
-      </div>
-    </Card>
-  )
-}
-
-function ConnectionPill({ healthy, label, sublabel }: { healthy: boolean; label: string; sublabel: string }) {
-  return (
-    <div className="flex items-center gap-2">
-      <span className="relative flex h-2 w-2">
-        <span className={cn('absolute inline-flex h-full w-full animate-ping rounded-full opacity-60', healthy ? 'bg-success' : 'bg-destructive')} />
-        <span className={cn('relative inline-flex h-2 w-2 rounded-full', healthy ? 'bg-success' : 'bg-destructive')} />
-      </span>
-      <div className="leading-tight">
-        <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">{label}</p>
-        <p className="text-xs font-semibold text-foreground">{sublabel}</p>
-      </div>
-    </div>
-  )
-}
-
 function QuickActions() {
   const { hasPermission } = useAuth()
   const filtered = quickActions.filter((a) => !a.module || hasPermission(a.module, 'view'))
@@ -1254,7 +1273,7 @@ function QuickActions() {
           onClick={(e) => {
             if (a.path === '#') e.preventDefault()
           }}
-          className="group flex h-8 items-center gap-1.5 rounded-md border bg-card px-3 text-[12.5px] font-medium text-muted-foreground shadow-sm transition-colors hover:border-primary/40 hover:bg-primary-50 hover:text-primary-700"
+          className="group flex h-9 items-center gap-1.5 rounded-full border border-border/70 bg-card px-3.5 text-[12.5px] font-medium text-muted-foreground shadow-sm transition-colors hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700"
         >
           <a.icon className="h-3.5 w-3.5" />
           {a.label}
@@ -1296,7 +1315,7 @@ function OperationalStrip({
   ]
   return (
     <Card className="divide-y divide-border overflow-hidden">
-      <div className="grid grid-cols-2 gap-x-4 gap-y-3 px-4 py-3 sm:grid-cols-3 lg:grid-cols-5">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-3 px-5 py-4 sm:grid-cols-3 lg:grid-cols-5">
         {items.map((it, i) => (
           <div key={it.label} className={cn('flex items-center gap-2.5', i < items.length - 1 && 'xl:border-r xl:border-border/70 xl:pr-4')}>
             <div className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-md', it.tint)}>
@@ -1319,12 +1338,12 @@ const ScaleIcon = Boxes
 function DashboardSkeleton() {
   return (
     <div className="space-y-6">
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3">
         {Array.from({ length: 6 }).map((_, i) => (
-          <Skeleton key={i} className="h-[120px] rounded-lg" />
+          <Skeleton key={i} className="h-[132px] rounded-2xl" />
         ))}
       </div>
-      <Skeleton className="h-16 rounded-lg" />
+      <Skeleton className="h-16 rounded-2xl" />
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
         <Skeleton className="h-[320px] rounded-lg xl:col-span-1" />
         <Skeleton className="h-[320px] rounded-lg xl:col-span-1" />

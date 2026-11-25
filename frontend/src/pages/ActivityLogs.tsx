@@ -20,7 +20,7 @@ const moduleTint: Record<string, string> = {
   Accounts: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300',
   Inventory: 'bg-info-50 text-info-700',
   Purchase: 'bg-warning-50 text-warning-700',
-  System: 'bg-purple-50 dark:bg-purple-950/40 text-purple-700',
+  System: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300',
 }
 
 export default function ActivityLogsPage() {
@@ -118,7 +118,7 @@ export default function ActivityLogsPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Activity Log"
         subtitle="Live record of every operation in the billing software — who did it, what changed, when and from where."

@@ -3,12 +3,12 @@ import { Card, CardContent } from '@/components/ui/card'
 
 export function SyncErrorCard({ message }: { message: string }) {
   return (
-    <Card className="border-red-200 bg-red-50/50">
+    <Card className="border-red-200 bg-red-50/50 dark:border-red-700/60 dark:bg-red-950/40">
       <CardContent className="flex items-center gap-3 p-4 text-sm text-red-700">
         <AlertCircle className="h-4 w-4 shrink-0" />
         <p>
           {message}. Is the backend running? Start it with{' '}
-          <code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs">npm run dev --prefix backend</code>.
+          <code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs dark:bg-red-900/50">npm run dev --prefix backend</code>.
         </p>
       </CardContent>
     </Card>

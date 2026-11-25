@@ -49,7 +49,9 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
   const loadNotifications = useCallback(async () => {
     try {
       const [activities, feedRes] = await Promise.all([
-        dbApi.getRecentActivities(),
+        // The bell renders five rows and ignores the paged total, so skip the
+        // COUNT(*) scans and only ask for what is shown.
+        dbApi.getRecentActivities(undefined, { limit: 5, count: false }),
         dbApi.getNotificationFeed().catch(() => null),
       ])
       setNotifications(Array.isArray(activities) ? (activities as any) : (activities as any).items ?? [])
@@ -73,7 +75,7 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
     })
     const interval = window.setInterval(() => {
       if (document.visibilityState === 'visible') loadNotifications()
-    }, 15_000)
+    }, 60_000)
     return () => window.clearInterval(interval)
   }, [loadNotifications])
 
@@ -95,7 +97,7 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
     })
     const interval = window.setInterval(() => {
       if (document.visibilityState === 'visible') loadPendingRateRequests()
-    }, 60_000)
+    }, 300_000)
     return () => window.clearInterval(interval)
   }, [isRateApprover, loadPendingRateRequests])
 
@@ -112,10 +114,10 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
   }
 
   return (
-    <header className="flex h-14 shrink-0 items-center gap-2 border-b bg-card px-3 sm:h-16 sm:gap-3 sm:px-4 lg:px-6">
+    <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border/60 bg-card px-3 dark:bg-sidebar sm:h-16 sm:gap-3 sm:px-5 lg:px-7">
       <button
         onClick={onToggleSidebar}
-        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-primary-50 hover:text-primary-700"
         aria-label="Toggle sidebar"
       >
         <Menu className="h-5 w-5" />
@@ -123,16 +125,14 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
 
       <button
         onClick={onOpenSearch}
-        className="group flex h-9 min-w-0 flex-1 items-center gap-2.5 rounded-md border border-input bg-background/60 px-3 text-left shadow-sm transition-colors hover:border-primary/40 hover:bg-background sm:max-w-md"
+        aria-label="Search products, invoices, orders and customers"
+        className="group flex h-10 w-10 shrink-0 items-center justify-center gap-2.5 rounded-full border border-transparent bg-muted/60 text-left transition-colors hover:bg-primary-50/70 sm:w-auto sm:max-w-md sm:flex-1 sm:justify-start sm:px-4"
       >
         <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
         <span className="hidden truncate text-[13px] text-muted-foreground/80 sm:inline">
           Search products, invoices, orders, customers...
         </span>
-        <span className="truncate text-[13px] text-muted-foreground/80 sm:hidden">
-          Search...
-        </span>
-        <kbd className="hidden rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-semibold text-muted-foreground sm:inline">
+        <kbd className="hidden rounded-md border border-border bg-card px-1.5 py-0.5 font-mono text-[10px] font-semibold text-muted-foreground sm:inline">
           Ctrl K
         </kbd>
       </button>
@@ -141,7 +141,7 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
         {hasPermission('silver-rate', 'view') ? (
           <Link
             to="/silver-rate"
-            className="group hidden items-center gap-3 rounded-lg border border-primary-100 bg-primary-50/60 px-3 py-1.5 transition-colors hover:bg-primary-50 sm:flex"
+            className="group hidden items-center gap-3 rounded-full border border-primary-100 bg-primary-50/60 px-4 py-1.5 transition-colors hover:bg-primary-50 lg:flex"
           >
             <div className="flex flex-col">
               <p className="text-[10px] font-semibold uppercase tracking-wide text-primary-700/70">
@@ -167,7 +167,7 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
               <TooltipTrigger asChild>
                 <Link
                   to="/silver-rate"
-                  className="relative hidden h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:flex"
+                  className="relative hidden h-10 w-10 shrink-0 items-center justify-center rounded-full border border-border/70 bg-card text-muted-foreground transition-colors hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700 lg:flex"
                   aria-label="Pending silver rate requests"
                 >
                   <ShieldCheck className="h-[18px] w-[18px]" />
@@ -190,7 +190,7 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
         <button
           type="button"
           onClick={() => setThemeState(toggleTheme())}
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-border/70 bg-card text-muted-foreground transition-colors hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700"
           aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
         >
           {theme === 'dark' ? <Sun className="h-[18px] w-[18px]" /> : <Moon className="h-[18px] w-[18px]" />}
@@ -200,7 +200,7 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
           <TooltipProvider delayDuration={200}>
             <Tooltip>
               <TooltipTrigger asChild>
-                <DropdownMenuTrigger className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" aria-label="Notifications">
+                <DropdownMenuTrigger className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-border/70 bg-card text-muted-foreground transition-colors hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700" aria-label="Notifications">
                   <Bell className="h-[18px] w-[18px]" />
                   {unreadCount > 0 ? (
                     <span className="absolute -right-0.5 -top-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[10px] font-bold text-white">
@@ -262,7 +262,7 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
           <TooltipProvider delayDuration={200}>
             <Tooltip>
               <TooltipTrigger asChild>
-                <DropdownMenuTrigger className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" aria-label="Quick create">
+                <DropdownMenuTrigger className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-border/70 bg-card text-muted-foreground transition-colors hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700" aria-label="Quick create">
                   <Plus className="h-[18px] w-[18px]" />
                 </DropdownMenuTrigger>
               </TooltipTrigger>
@@ -297,7 +297,7 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
         <TooltipProvider delayDuration={200}>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Link to="/system/settings" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" aria-label="Settings">
+              <Link to="/system/settings" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-border/70 bg-card text-muted-foreground transition-colors hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700" aria-label="Settings">
                 <Settings className="h-[18px] w-[18px]" />
               </Link>
             </TooltipTrigger>
@@ -305,10 +305,10 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
           </Tooltip>
         </TooltipProvider>
 
-        <div className="hidden h-6 w-px bg-border sm:block" />
+        <div className="hidden h-6 w-px bg-border/60 sm:block" />
 
         <DropdownMenu>
-          <DropdownMenuTrigger className="flex items-center gap-2 rounded-md p-1 outline-none transition-colors hover:bg-muted">
+          <DropdownMenuTrigger className="flex items-center gap-2 rounded-full border border-border/70 bg-card px-2 py-1.5 outline-none transition-colors hover:border-primary-200 hover:bg-primary-50/60">
             <Avatar className="h-8 w-8">
               <AvatarFallback className={currentUser?.avatarColor ?? 'bg-primary-600 text-white'}>
                 {currentUser ? initials(currentUser.name) : '?'}

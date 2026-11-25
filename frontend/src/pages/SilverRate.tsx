@@ -573,7 +573,7 @@ export default function SilverRatePage() {
         }`
 
   return (
-    <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <Link to="/" className="hover:text-primary-700">Dashboard</Link>
         <ChevronRight className="h-3 w-3" />
@@ -599,7 +599,7 @@ export default function SilverRatePage() {
       {autoStatus && !autoStatus.apiUrlConfigured ? (
         <div
           role="alert"
-          className="flex flex-col items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 sm:flex-row sm:items-center sm:gap-x-3"
+          className="flex flex-col items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-200 sm:flex-row sm:items-center sm:gap-x-3"
         >
           <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
           <div className="min-w-0 sm:flex-1">
@@ -610,7 +610,7 @@ export default function SilverRatePage() {
           </div>
           <Link
             to="/system/settings"
-            className="rounded-md border border-amber-400 bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition-colors hover:bg-amber-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-700 focus-visible:ring-offset-1"
+            className="rounded-md border border-amber-400 bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 transition-colors hover:bg-amber-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-700 focus-visible:ring-offset-1 dark:border-amber-700/60 dark:bg-amber-900/40 dark:text-amber-200 dark:hover:bg-amber-900/60 dark:focus-visible:ring-amber-500"
           >
             Open settings
           </Link>
@@ -618,7 +618,7 @@ export default function SilverRatePage() {
       ) : null}
 
       {!canApprove ? (
-        <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50/60 px-4 py-3 text-sm text-amber-800">
+        <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50/60 px-4 py-3 text-sm text-amber-800 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-200">
           <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
             <p className="font-semibold">Approval required</p>
@@ -633,7 +633,7 @@ export default function SilverRatePage() {
         <div
           className={cn(
             'flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm',
-            syncResult.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 bg-red-50/60 text-red-700',
+            syncResult.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 dark:border-red-500/30 bg-red-50/60 text-red-700',
           )}
         >
           {syncResult.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />}
@@ -652,7 +652,7 @@ export default function SilverRatePage() {
         <div
           className={cn(
             'flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm',
-            fetchNowResult.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 bg-red-50/60 text-red-700',
+            fetchNowResult.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 dark:border-red-500/30 bg-red-50/60 text-red-700',
           )}
         >
           {fetchNowResult.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />}
@@ -665,11 +665,11 @@ export default function SilverRatePage() {
 
       {/* ── Hero: current rate + status at a glance ─────────────────────── */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-        <Card className="overflow-hidden border-primary-100 bg-gradient-to-br from-primary-700 to-primary-900 text-white md:col-span-2">
+        <Card className="overflow-hidden border-primary-100 bg-primary-50/60 md:col-span-2">
           <CardContent className="p-5">
             <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0">
-                <div className="flex items-center gap-2 text-primary-200">
+                <div className="flex items-center gap-2 text-primary-700">
                   <Tag className="h-4 w-4" />
                   <p className="text-xs font-semibold uppercase tracking-wide">Current silver rate</p>
                 </div>
@@ -678,28 +678,21 @@ export default function SilverRatePage() {
                     ₹{currentRate.rate.toFixed(2)}
                   </p>
                   <Badge
-                    variant="success"
-                    className={cn(
-                      'mb-1.5 border-white/20',
-                      currentRate.change > 0
-                        ? 'bg-success-500/20 text-success-100'
-                        : currentRate.change < 0
-                          ? 'bg-red-500/20 text-red-100'
-                          : 'bg-white/10 text-primary-100',
-                    )}
+                    variant={currentRate.change > 0 ? 'success' : currentRate.change < 0 ? 'danger' : 'muted'}
+                    className="mb-1.5"
                   >
                     {`${currentRate.change > 0 ? '+' : currentRate.change < 0 ? '−' : ''}₹${Math.abs(currentRate.change).toFixed(2)} (${currentRate.change > 0 ? '+' : currentRate.change < 0 ? '−' : ''}${Math.abs(currentRate.changePercent).toFixed(2)}%)`}
                   </Badge>
                 </div>
-                <p className="text-sm font-medium text-primary-200">per gram · 92.5 sterling silver</p>
-                <p className="mt-3 flex items-center gap-1.5 text-xs text-primary-200">
+                <p className="text-sm font-medium text-primary-700/80">per gram · 92.5 sterling silver</p>
+                <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
                   <Clock className="h-3.5 w-3.5" />
-                  Last updated <span className="font-medium text-white">{formatDateTime(currentRate.updatedAt)}</span>
+                  Last updated <span className="font-medium text-foreground">{formatDateTime(currentRate.updatedAt)}</span>
                 </p>
               </div>
               {sparkRates.length >= 2 ? (
-                <div className="shrink-0 text-left sm:text-right">
-                  <p className="text-[10.5px] uppercase tracking-wide text-primary-200">
+                <div className="shrink-0 text-left text-primary-600 sm:text-right">
+                  <p className="text-[10.5px] uppercase tracking-wide text-primary-700/80">
                     Last {sparkRates.length} rates
                   </p>
                   <RateSparkline rates={sparkRates} />
@@ -838,7 +831,7 @@ export default function SilverRatePage() {
           role="status"
           className={cn(
             'flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm',
-            error || schError ? 'border-red-200 bg-red-50/60 text-red-700' : 'border-success-100 bg-success-50/60 text-success-700',
+            error || schError ? 'border-red-200 dark:border-red-500/30 bg-red-50/60 text-red-700' : 'border-success-100 bg-success-50/60 text-success-700',
           )}
         >
           {error || schError ? <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />}
@@ -1172,7 +1165,7 @@ export default function SilverRatePage() {
           step < 3 ? (
             <DialogFooter className="mt-2">
               {footerError ? (
-                <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
+                <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 dark:border-red-500/30 bg-red-50/60 p-2.5 text-xs text-red-700">
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <span>{footerError}</span>
                 </div>
@@ -1534,7 +1527,7 @@ export default function SilverRatePage() {
               </p>
             )}
             {result && result.errors.length > 0 ? (
-              <div className="max-h-24 w-full max-w-sm overflow-auto rounded-lg border border-red-200 bg-red-50/60 p-2 text-left text-xs text-red-700">
+              <div className="max-h-24 w-full max-w-sm overflow-auto rounded-lg border border-red-200 dark:border-red-500/30 bg-red-50/60 p-2 text-left text-xs text-red-700">
                 {result.errors.slice(0, 5).map((msg, i) => (
                   <p key={i} className="font-mono">{msg}</p>
                 ))}
@@ -1755,7 +1748,7 @@ function RateSparkline({ rates }: { rates: number[] }) {
 
 function MiniBadge({ label, value, accent }: { label: string; value: string; accent?: 'green' | 'red' }) {
   return (
-    <div className={cn('rounded-lg border p-3', accent === 'green' ? 'border-success-100 bg-success-50/60' : accent === 'red' ? 'border-red-100 bg-red-50/60' : 'bg-muted/40')}>
+    <div className={cn('rounded-lg border p-3', accent === 'green' ? 'border-success-100 bg-success-50/60' : accent === 'red' ? 'border-red-100 dark:border-red-500/30 bg-red-50/60' : 'bg-muted/40')}>
       <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">{label}</p>
       <p className={cn('mt-0.5 text-sm font-bold tabular-nums', accent === 'green' ? 'text-success-700' : accent === 'red' ? 'text-red-600 dark:text-red-400' : 'text-foreground')}>
         {value}

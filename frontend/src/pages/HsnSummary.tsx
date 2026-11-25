@@ -55,7 +55,7 @@ export default function HsnSummaryPage() {
   const monthLabel = new Date(y, m - 1, 1).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })
 
   return (
-    <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="HSN-wise Summary & GST Reconciliation"
         subtitle={`HSN code-wise breakup of outward supplies for ${monthLabel}`}

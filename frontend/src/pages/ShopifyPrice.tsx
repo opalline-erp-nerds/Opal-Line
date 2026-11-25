@@ -119,7 +119,7 @@ export default function ShopifyPricePage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Price Sync"
         subtitle="Compare live Shopify prices against your local catalog prices computed from silver rate, and push updates."
@@ -144,7 +144,7 @@ export default function ShopifyPricePage() {
       {!configured ? <ShopifyNotConfigured /> : null}
 
       {pushResult ? (
-        <Card className={cn(pushResult.ok ? 'border-success-100 bg-success-50/50' : 'border-red-200 bg-red-50/50')}>
+        <Card className={cn(pushResult.ok ? 'border-success-100 bg-success-50/50' : 'border-red-200 bg-red-50/50 dark:border-red-500/30')}>
           <CardContent className="flex items-start gap-3 p-4 text-sm">
             {pushResult.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-success-700" /> : <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />}
             <div>
@@ -165,7 +165,7 @@ export default function ShopifyPricePage() {
       {configured && !error ? (
         <>
           <div className="grid grid-cols-2 gap-3 sm:gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard icon={Tags} title="Products Compared" value={formatNumber(data.length)} accent="purple" support={syncedAt ? `Computed ${syncedAt}` : 'Not computed'} />
+            <StatCard icon={Tags} title="Products Compared" value={formatNumber(data.length)} accent="teal" support={syncedAt ? `Computed ${syncedAt}` : 'Not computed'} />
             <StatCard icon={TrendingUp} title="Price Changes" value={formatNumber(pending.length)} accent="orange" support="Pending push" />
             <StatCard icon={CheckCircle2} title="Up to Date" value={formatNumber(upToDate)} accent="green" support="No change needed" />
             <StatCard icon={AlertCircle} title="No SKU Match" value={formatNumber(noMatch)} accent="slate" support="Not in local catalog" />
