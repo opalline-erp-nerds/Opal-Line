@@ -1,4 +1,5 @@
 import { expect, request, test, type Locator, type Page } from '@playwright/test'
+import { ensureSilverRate } from './fixtures'
 
 /**
  * Sales Orders — quantity → weight calculation, persistence through save and
@@ -41,6 +42,29 @@ async function api() {
 }
 
 type ApiClient = Awaited<ReturnType<typeof api>>
+
+/**
+ * Pin the store the order is rung up at.
+ *
+ * The form defaults to whatever the locations list returns FIRST (ordered by
+ * name), while a fixture product's opening stock is always counted into the
+ * DEFAULT store — on any database with a second store the default deduction
+ * then lands where the fixture holds nothing and the save is refused. Selecting
+ * the default store explicitly keeps the save path independent of how many
+ * stores exist and what they are called.
+ */
+async function pinDefaultStore(dialog: Locator, apiClient: ApiClient) {
+  const locs = (await (await apiClient.get('/api/v1/db/inventory/locations?limit=200')).json()) as {
+    data: Array<{ id: string; name: string }>
+  }
+  const store = locs.data.find((l) => l.id === 'LOC-DEFAULT') ?? locs.data[0]
+  if (!store) return
+  const select = dialog.getByLabel('Rung up at')
+  // The options render once the page's location fetch lands — wait for the one
+  // we want rather than racing it.
+  await expect(select.locator(`option[value="${store.id}"]`)).toHaveCount(1, { timeout: 15000 })
+  await select.selectOption(store.id)
+}
 
 /** Create a catalogue product with a configured weight and plenty of stock. */
 async function createWeightedProduct(apiClient: ApiClient, stamp: number) {
@@ -140,6 +164,8 @@ test.describe('sales order weight & customer editing', () => {
     const editedEmail = `edited.${stamp}@example.com`
     const editedPhone = '+91 98765 43210'
     const apiClient = await api()
+    // Saving an order needs a managed silver rate (see ensureSilverRate).
+    await ensureSilverRate(apiClient)
 
     // Fixture: a customer to edit (must be updated in place — no duplicates).
     const custResp = await apiClient.post('/api/v1/db/customers', {
@@ -161,6 +187,9 @@ test.describe('sales order weight & customer editing', () => {
       await page.getByRole('button', { name: 'Manual Order' }).click()
       const dialog = page.getByRole('dialog')
       await expect(dialog.getByText('Customer Details')).toBeVisible({ timeout: 10000 })
+
+      // The fixture's stock sits in the DEFAULT store — see pinDefaultStore.
+      await pinDefaultStore(dialog, apiClient)
 
       // Pick the fixture customer, then edit their details in place.
       await pickOption(dialog, page, 'Select customer', custName)

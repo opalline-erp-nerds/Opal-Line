@@ -1,8 +1,9 @@
 import 'dotenv/config'
-import postgres from 'postgres'
+import type postgres from 'postgres'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import { eq } from 'drizzle-orm'
 import * as schema from './schema'
+import { getRawClient } from './client'
 import { defaultRolePermissions, emptyPermissions, MODULE_KEYS, MODULES } from '../rbac'
 import type { Permissions } from '../types'
 import { roleNames } from './seedData'
@@ -38,12 +39,6 @@ let bootstrapped = false
  */
 export function resetBootstrapForTests(): void {
   bootstrapped = false
-}
-
-async function createClient(): Promise<postgres.Sql> {
-  const url = process.env.DATABASE_URL
-  if (!url) throw new Error('DATABASE_URL is not set')
-  return postgres(url, { max: 1, connect_timeout: 10 })
 }
 
 async function tableExists(sql: postgres.Sql, name: string): Promise<boolean> {
@@ -90,6 +85,63 @@ const SHOPIFY_OUTBOUND_DDL: string[] = [
 const INVENTORY_LOCATION_SHOPIFY_DDL: string[] = [
   `ALTER TABLE inventory_locations ADD COLUMN IF NOT EXISTS shopify_location_id text`,
   `CREATE UNIQUE INDEX IF NOT EXISTS inventory_locations_shopify_location_id_idx ON inventory_locations (shopify_location_id) WHERE shopify_location_id IS NOT NULL`,
+]
+
+/**
+ * Multi-store fulfilment traceability (Bookings Phase 4, Option A).
+ *
+ * Declared once and applied from BOTH createSchema (fresh installs) and
+ * applyUpgrades (existing installs) — the same rule STOCK_LEDGER_DDL
+ * documents. Additive only: `booking_allocations.line_id` is the stable
+ * booking-line identity (NULL on Phase-3 rows, which still resolve by
+ * line_index + identity), and the three sales_invoice_items columns record
+ * where each invoiced line was fulfilled from and which booking line and
+ * allocation it consumed. NULL everywhere on historical invoices — a NULL
+ * always means "legacy: resolve exactly as before", never a fabricated
+ * reference. No existing row is rewritten and no backfill runs.
+ */
+const BOOKING_FULFILMENT_DDL: string[] = [
+  `ALTER TABLE booking_allocations ADD COLUMN IF NOT EXISTS line_id text`,
+  `ALTER TABLE booking_allocations ADD COLUMN IF NOT EXISTS invoice_id text`,
+  `ALTER TABLE booking_allocations ADD COLUMN IF NOT EXISTS fulfilled_at timestamp`,
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS location_id text`,
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS booking_line_id text`,
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS booking_allocation_id text`,
+  `CREATE INDEX IF NOT EXISTS sales_invoice_items_booking_line_idx ON sales_invoice_items (booking_line_id)`,
+]
+
+/**
+ * Which variant an invoiced line billed.
+ *
+ * Declared once and applied from BOTH createSchema and applyUpgrades (the
+ * BOOKING_FULFILMENT_DDL rule): booking conversion writes it so a converted
+ * booking's invoice keeps pointing at the exact variant its stock was taken
+ * from, and the manual invoice flows write it for the same reason. Additive
+ * only — historical lines stay NULL, which means "resolve through the SKU",
+ * exactly as before. No backfill runs.
+ */
+const INVOICE_VARIANT_DDL: string[] = [
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS variant_id text`,
+]
+
+/**
+ * Catalogue identity on purchase line items (order / invoice / return).
+ *
+ * Added by `applyUpgrades` ONLY, and deliberately not from createSchema's
+ * statement loop: that loop runs before `purchase_return_items` exists (the
+ * fresh path creates it inside applyUpgrades itself), so an ALTER there would
+ * abort a brand-new bootstrap. applyUpgrades runs on EVERY boot — fresh
+ * installs included — immediately after the schema is created and before the
+ * server accepts a request, so both populations gain the columns from the one
+ * idempotent list. NULL on hand-typed and historical lines.
+ */
+const PURCHASE_VARIANT_DDL: string[] = [
+  `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS product_id text`,
+  `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS variant_id text`,
+  `ALTER TABLE purchase_invoice_items ADD COLUMN IF NOT EXISTS product_id text`,
+  `ALTER TABLE purchase_invoice_items ADD COLUMN IF NOT EXISTS variant_id text`,
+  `ALTER TABLE purchase_return_items ADD COLUMN IF NOT EXISTS product_id text`,
+  `ALTER TABLE purchase_return_items ADD COLUMN IF NOT EXISTS variant_id text`,
 ]
 
 /**
@@ -577,6 +629,8 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         is_booking boolean,
         advance_paid numeric,
         note text,
+        expected_delivery timestamp,
+        gst numeric,
         shopify_gid text,
         shopify_financial_status text,
         shopify_fulfillment_status text,
@@ -607,6 +661,23 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
       )`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS order_events_order_id_idx ON order_events (order_id)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS order_events_created_idx ON order_events (created_at)`)
+
+    // Booking allocation planning (Bookings Phase 3): additive — bookings
+    // without rows here (every legacy/single-store booking) are unaffected.
+    await tx.unsafe(`
+      CREATE TABLE IF NOT EXISTS booking_allocations (
+        id text PRIMARY KEY,
+        order_id text NOT NULL,
+        line_index integer NOT NULL,
+        product_id text NOT NULL,
+        variant_id text,
+        sku text NOT NULL,
+        location_id text NOT NULL,
+        quantity integer NOT NULL,
+        created_at timestamp
+      )`)
+    await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS booking_allocations_line_store_idx ON booking_allocations (order_id, line_index, location_id)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS booking_allocations_order_idx ON booking_allocations (order_id)`)
 
     await tx.unsafe(`
       CREATE TABLE IF NOT EXISTS sales_invoices (
@@ -938,6 +1009,8 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
     for (const stmt of STOCK_LEDGER_DDL) await tx.unsafe(stmt)
     for (const stmt of SHOPIFY_OUTBOUND_DDL) await tx.unsafe(stmt)
     for (const stmt of COLLECTIONS_DDL) await tx.unsafe(stmt)
+    for (const stmt of BOOKING_FULFILMENT_DDL) await tx.unsafe(stmt)
+    for (const stmt of INVOICE_VARIANT_DDL) await tx.unsafe(stmt)
 
     // ── Finance ───────────────────────────────────────────────────────────
     await tx.unsafe(`
@@ -1545,56 +1618,54 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
   bootstrapped = true
   if (!process.env.DATABASE_URL) return { ran: false, tablesCreated: false }
 
-  const sql = await createClient()
-  try {
-    const hasUsers = await tableExists(sql, 'users')
-    if (!hasUsers) {
-      if (isPublicHost()) seedAdminPassword()
-      logger.info('Bootstrap: fresh database detected — creating schema')
-      await createSchema(sql)
-      // Bring the fresh schema fully up to date BEFORE seeding defaults —
-      // seedDefaults inserts columns (settings.pan, TDS/UPI flags, …) that
-      // createSchema's baseline DDL does not include yet.
-      await applyUpgrades(sql)
-      // Foundation rows (collections + categories) before defaults, so a fresh
-      // install can open Inventory → Collections & Categories immediately.
-      await ensureCollectionFoundation(sql)
-      const drizzleDb = drizzle(sql, { schema })
-      const seeded = await seedDefaults(drizzleDb)
-      await import('../supplierLinking')
-        .then((m) => m.linkProductsToSuppliersSafe(sql))
-        .catch(() => undefined)
-      return { ran: true, tablesCreated: true, adminPassword: seeded.adminPassword }
-    }
+  const sql = getRawClient()
+  if (!sql) throw new Error('Database client is not initialized')
 
-    // Existing DB: apply idempotent additions for upgrades
+  const hasUsers = await tableExists(sql, 'users')
+  if (!hasUsers) {
+    if (isPublicHost()) seedAdminPassword()
+    logger.info('Bootstrap: fresh database detected — creating schema')
+    await createSchema(sql)
+    // Bring the fresh schema fully up to date BEFORE seeding defaults —
+    // seedDefaults inserts columns (settings.pan, TDS/UPI flags, …) that
+    // createSchema's baseline DDL does not include yet.
     await applyUpgrades(sql)
-    // Seed the collection foundation without touching rows that already exist
-    // (a renamed collection or an edited category is left exactly as it is).
+    // Foundation rows (collections + categories) before defaults, so a fresh
+    // install can open Inventory → Collections & Categories immediately.
     await ensureCollectionFoundation(sql)
-    const upgradeDb = drizzle(sql, { schema })
-    await repairAdminRolePermissions(upgradeDb).catch(() => undefined)
-    await repairAdminUserOverride(upgradeDb).catch(() => undefined)
-    await repairOwnerSuperAdmin(upgradeDb).catch(() => undefined)
-    await repairDefaultRolePermissions(upgradeDb).catch(() => undefined)
-    // Stock balances predate the movement ledger. Give them a dated opening
-    // entry so an upgraded install has real history instead of a balance that
-    // appears from nowhere on the day of its first sale.
-    await import('../stock').then((m) => m.backfillOpeningBalances(upgradeDb)).catch(() => undefined)
-    // Invoice items raised before the weight snapshot carried weight 0. Fill
-    // them from the catalogue (net weight × qty) so totals, prints and the
-    // dashboard agree with new invoices. Idempotent; failures are logged but
-    // never block boot.
-    await import('../invoiceWeights')
-      .then((m) => m.backfillInvoiceItemWeights(upgradeDb))
-      .then((n) => {
-        if (n > 0) logger.info({ items: n }, 'Bootstrap: backfilled invoice item weights')
-      })
-      .catch((err) => logger.warn({ err: (err as Error)?.message }, 'Bootstrap: invoice weight backfill failed'))
-    return { ran: true, tablesCreated: false }
-  } finally {
-    await sql.end({ timeout: 5 })
+    const drizzleDb = drizzle(sql, { schema })
+    const seeded = await seedDefaults(drizzleDb)
+    await import('../supplierLinking')
+      .then((m) => m.linkProductsToSuppliersSafe(sql))
+      .catch(() => undefined)
+    return { ran: true, tablesCreated: true, adminPassword: seeded.adminPassword }
   }
+
+  // Existing DB: apply idempotent additions for upgrades
+  await applyUpgrades(sql)
+  // Seed the collection foundation without touching rows that already exist
+  // (a renamed collection or an edited category is left exactly as it is).
+  await ensureCollectionFoundation(sql)
+  const upgradeDb = drizzle(sql, { schema })
+  await repairAdminRolePermissions(upgradeDb).catch(() => undefined)
+  await repairAdminUserOverride(upgradeDb).catch(() => undefined)
+  await repairOwnerSuperAdmin(upgradeDb).catch(() => undefined)
+  await repairDefaultRolePermissions(upgradeDb).catch(() => undefined)
+  // Stock balances predate the movement ledger. Give them a dated opening
+  // entry so an upgraded install has real history instead of a balance that
+  // appears from nowhere on the day of its first sale.
+  await import('../stock').then((m) => m.backfillOpeningBalances(upgradeDb)).catch(() => undefined)
+  // Invoice items raised before the weight snapshot carried weight 0. Fill
+  // them from the catalogue (net weight × qty) so totals, prints and the
+  // dashboard agree with new invoices. Idempotent; failures are logged but
+  // never block boot.
+  await import('../invoiceWeights')
+    .then((m) => m.backfillInvoiceItemWeights(upgradeDb))
+    .then((n) => {
+      if (n > 0) logger.info({ items: n }, 'Bootstrap: backfilled invoice item weights')
+    })
+    .catch((err) => logger.warn({ err: (err as Error)?.message }, 'Bootstrap: invoice weight backfill failed'))
+  return { ran: true, tablesCreated: false }
 }
 
 /**
@@ -1612,6 +1683,8 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
     ...INVENTORY_LOCATION_SHOPIFY_DDL,
     ...STOCK_LEDGER_DDL,
     ...SHOPIFY_OUTBOUND_DDL,
+    ...BOOKING_FULFILMENT_DDL,
+    ...INVOICE_VARIANT_DDL,
       // Accounting: store the journal source so unified/Shopify filtering is exact.
       `ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS source text`,
       // Duplicate prevention at the database level: one journal per source record.
@@ -1731,6 +1804,21 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
         actor text,
         created_at timestamp
       )`,
+      // Booking allocation planning (Bookings Phase 3) — idempotent, so
+      // existing databases gain the table without touching their bookings.
+      `CREATE TABLE IF NOT EXISTS booking_allocations (
+        id text PRIMARY KEY,
+        order_id text NOT NULL,
+        line_index integer NOT NULL,
+        product_id text NOT NULL,
+        variant_id text,
+        sku text NOT NULL,
+        location_id text NOT NULL,
+        quantity integer NOT NULL,
+        created_at timestamp
+      )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS booking_allocations_line_store_idx ON booking_allocations (order_id, line_index, location_id)`,
+      `CREATE INDEX IF NOT EXISTS booking_allocations_order_idx ON booking_allocations (order_id)`,
       `ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS customer_phone text`,
       `ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS customer_address text`,
       `ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS customer_city text`,
@@ -1764,6 +1852,11 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `CREATE INDEX IF NOT EXISTS sales_orders_shopify_gid_idx ON sales_orders (shopify_gid)`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS is_booking boolean`,
       `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS advance_paid numeric`,
+      // Booking form: expected delivery date + the GST rate the booking was
+      // taken at (nullable — a NULL means "use the settings rate" so rows
+      // created before this column behave exactly as they always did).
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS expected_delivery timestamp`,
+      `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS gst numeric`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS metal text DEFAULT 'silver'`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS purity_label text`,
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS diamond_weight numeric`,
@@ -2264,6 +2357,12 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
          FROM sales_orders o
         WHERE r.currency IS NULL AND o.shopify_id = r.order
           AND o.currency IS NOT NULL AND btrim(o.currency) <> ''`,
+    // AFTER every CREATE TABLE above: the purchase item tables are created in
+    // this same list, so an ALTER placed with the other DDL spreads at the top
+    // would run against a table that does not exist yet — and the per-statement
+    // catch below would log and skip it, leaving the columns missing on a
+    // fresh install forever.
+    ...PURCHASE_VARIANT_DDL,
     ]
     for (const stmt of upgrades) {
       // Failures are swallowed so one impossible-to-apply statement cannot

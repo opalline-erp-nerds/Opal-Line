@@ -50,14 +50,18 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { dbApi, shopifyApi, printTemplatesApi, formatApiError } from '@/lib/api'
 import { computeLineStockErrors, stockErrorsFromApiError } from '@/lib/orderStock'
+import { useOrderAutoRefresh } from '@/hooks/use-order-auto-refresh'
+import { newOrdersMessage } from '@/lib/orderAutoRefresh'
+import { productVariants, variantOptions } from '@/lib/productVariants'
 import {
-  findVariantById,
-  matchProductByCode,
-  productVariants,
-  variantFinalPrice,
-  variantLabel,
-  variantOptions,
-} from '@/lib/productVariants'
+  flattenSellableItems,
+  parseSellableValue,
+  resolveSellableByCode,
+  sellableItemOptions,
+  sellableItemPrice,
+  sellableItemValue,
+  type SellableItem,
+} from '@/lib/sellableItems'
 import { printDocument, printDocuments, mergePrintConfig, DEFAULT_PRINT_CONFIG, type PrintDoc, type PrintDesignerConfig } from '@/lib/printTemplate'
 import { exportTable } from '@/lib/export'
 import type { Customer, Customer360, InventoryLocation, OrderEvent, OrderFullDetail, OrderStatus, Product, ProductVariant, SalesOrder } from '@/types'
@@ -127,6 +131,12 @@ interface OrderLineItem {
    * field keeps the typed value until one of them changes next.
    */
   totalWeight?: number | null
+  /**
+   * Fixed ₹/pc when the picked row is a Piece Rate product, else null. A line
+   * carrying it prices from that figure alone — weight and making never
+   * re-derive its unit price (see lineUnitPrice).
+   */
+  pieceRate?: number | null
 }
 
 interface CreateResult {
@@ -178,6 +188,9 @@ let lineSeq = 0
 function emptyLine(): OrderLineItem {
   return { key: `li-${++lineSeq}`, productId: '', title: '', sku: '', qty: 1, price: 0 }
 }
+
+/** Sentinel: the "New product…" row that opens the product dialog in place. */
+const NEW_PRODUCT = '__new_product__'
 
 /** Grams round to 3 dp — silver jewellery is billed to milligram precision. */
 const roundWeight = (g: number) => Math.round(g * 1000) / 1000
@@ -343,6 +356,22 @@ export default function SalesOrdersPage() {
   const reload = useCallback(() => {
     dbApi.getSalesOrders().then(setOrders).catch(() => {})
   }, [])
+
+  // Shopify orders also arrive from the server's background poll (webhooks
+  // cannot reach the desktop app), so the list refreshes itself. Search,
+  // filters, sort and pagination are untouched, and every dialog suspends the
+  // refresh so an order being typed or viewed is never reset underneath.
+  const autoRefreshPaused =
+    dialogOpen || custEditOpen || viewOrder !== null || viewDialogOpen || newProductLineKey !== null
+  useOrderAutoRefresh({
+    paused: autoRefreshPaused,
+    fetchOrders: useCallback(() => dbApi.getSalesOrders(), []),
+    onOrders: setOrders,
+    onNewShopifyOrders: (fresh) => {
+      const message = newOrdersMessage(fresh.length)
+      if (message) toast.info(message)
+    },
+  })
 
   const bulkInvoice = async () => {
     if (selectedOrders.length === 0) return
@@ -996,6 +1025,14 @@ export default function SalesOrdersPage() {
     [lineItems],
   )
 
+  /**
+   * Every row the Product dropdown can sell: one per VARIANT when the product
+   * has them (so a held code like `OL-GIF-001-RED` is its own selectable,
+   * searchable line), one per product when it does not — the same flattened
+   * helper the invoice and booking pickers use.
+   */
+  const sellables = useMemo(() => flattenSellableItems(products), [products])
+
   // Live stock check per line: mirrors the order endpoints' per-line
   // validation against the catalog already loaded, so an over-quantity shows
   // under its own Qty field the moment it is typed. Variant lines carry the
@@ -1006,14 +1043,36 @@ export default function SalesOrdersPage() {
     for (const p of products) for (const v of productVariants(p)) m.set(v.id, v)
     return m
   }, [products])
-  const variantCountByProductId = useMemo(() => {
-    const m = new Map<string, number>()
-    for (const p of products) {
-      const n = productVariants(p).length
-      if (n > 0) m.set(p.id, n)
+  /**
+   * What the Product dropdown offers: every flattened row (variants included),
+   * plus a row for any line whose exact product/variant pair is no longer an
+   * option of its own — so opening the form for an untouched edit never
+   * blanks the picker — plus the manual "New product…" escape hatch.
+   */
+  const productOptions = useMemo(() => {
+    const options = sellableItemOptions(sellables)
+    for (const li of lineItems) {
+      if (!li.productId) continue
+      const value = sellableItemValue({ productId: li.productId, variantId: li.variantId ?? null })
+      if (options.some((o) => o.value === value)) continue
+      const p = products.find((x) => x.id === li.productId)
+      if (p) {
+        options.push({
+          value,
+          label: p.name,
+          subtitle: p.sku || undefined,
+          keywords: [p.sku, p.name].filter(Boolean).join(' '),
+        })
+      }
     }
-    return m
-  }, [products])
+    options.push({
+      value: NEW_PRODUCT,
+      label: 'New product…',
+      subtitle: 'Add it without leaving this order',
+      keywords: '',
+    })
+    return options
+  }, [sellables, lineItems, products])
   const stockCheckLines = useMemo(
     () =>
       lineItems.map((li) => ({
@@ -1039,116 +1098,88 @@ export default function SalesOrdersPage() {
     })
   }
 
-  const selectProduct = (key: string, productId: string) => {
-    const p = products.find((x) => x.id === productId)
-    if (!p) return
+  /** Write one flattened row onto a line: identity, price and pricing mode. */
+  const applySellable = (key: string, item: SellableItem) => {
     clearServerStockError(key)
-    // Multi-variant products open on their first variant so the line is
-    // immediately billable; the Variant dropdown swaps it. Flat products keep
-    // the plain product values, exactly as before.
-    const first = productVariants(p)[0] ?? null
-    const price = perUnitLinePrice({
-      silverRate,
-      netWeight: p.netWeight,
-      makingCharge: p.makingCharge,
-      // A real variant row carries the ADDITIONAL amount — bill base + add-on,
-      // exactly what Shopify is told. A Default-Title mirror prices from base.
-      fallback: first
-        ? variantFinalPrice(p.sellingPrice, first.sellingPrice, first.name)
-        : p.sellingPrice,
-    })
+    const pieceRate = item.pricingType === 'piece_rate' ? item.fixedPieceRate : null
+    const price = sellableItemPrice(item, { silverRate })
     setLineItems((prev) =>
-      prev.map((li) => {
-        if (li.key !== key) return li
-        return {
-          ...li,
-          productId,
-          variantId: first?.id ?? null,
-          title: first && p ? `${p.name} — ${variantLabel(first)}` : (p?.name ?? li.title),
-          sku: first ? first.sku : (p?.sku ?? li.sku),
-          price: price ?? li.price,
-          netWeight: p.netWeight,
-          makingCharge: p.makingCharge,
-          // Picking a product re-applies Total = qty × weight per piece.
-          totalWeight: derivedTotalWeight(li.qty, p.netWeight),
-        }
-      }),
-    )
-  }
-
-  // Swap the variant on a line of a multi-variant product: its SKU, price and
-  // (via variantById) stock all follow the selection.
-  const selectVariant = (key: string, variantId: string) => {
-    const li = lineItems.find((x) => x.key === key)
-    const p = products.find((x) => x.id === (li?.productId ?? ''))
-    const v = findVariantById(p ?? null, variantId)
-    if (!p || !v) return
-    clearServerStockError(key)
-    setLineItems((prev) =>
-      prev.map((row) =>
-        row.key === key
+      prev.map((li) =>
+        li.key === key
           ? {
-              ...row,
-              variantId: v.id,
-              title: `${p.name} — ${variantLabel(v)}`,
-              sku: v.sku,
-              price: perUnitLinePrice({
-                silverRate,
-                netWeight: p.netWeight,
-                makingCharge: p.makingCharge,
-                fallback:
-                  v.sellingPrice == null
-                    ? row.price
-                    : variantFinalPrice(p.sellingPrice, v.sellingPrice, v.name),
-              }) ?? row.price,
-              netWeight: p.netWeight,
-              makingCharge: p.makingCharge,
-              // Same rule as product selection: the total follows the new line weight.
-              totalWeight: derivedTotalWeight(row.qty, p.netWeight),
+              ...li,
+              productId: item.productId,
+              variantId: item.variantId,
+              title: item.variantName ? `${item.productName} — ${item.variantName}` : item.productName,
+              sku: item.sku,
+              price: price ?? li.price,
+              netWeight: item.netWeight ?? undefined,
+              makingCharge: item.makingCharge ?? undefined,
+              // Picking a product re-applies Total = qty × weight per piece.
+              totalWeight: derivedTotalWeight(li.qty, item.netWeight),
+              // A Piece Rate row keeps its fixed ₹/pc as the line's price and
+              // records it so later qty/weight edits can never re-derive a
+              // silver-weight figure from it.
+              pieceRate,
             }
-          : row,
+          : li,
       ),
     )
   }
 
+  /**
+   * Picking a row from the Product dropdown. A variant IS a row — searchable
+   * by its own SKU, its own name or its parent's name — while a flat product
+   * is its own row with `variantId: null`.
+   */
+  const selectProduct = (key: string, value: string) => {
+    const { productId, variantId } = parseSellableValue(value)
+    const item =
+      sellables.find((s) => s.productId === productId && (s.variantId ?? null) === variantId) ??
+      sellables.find((s) => s.productId === productId && s.variantId === null)
+    if (!item) return
+    applySellable(key, item)
+  }
+
+  // Swap the variant on a line of a multi-variant product: its SKU, price,
+  // pricing mode and (via variantById) stock all follow the selection.
+  const selectVariant = (key: string, variantId: string) => {
+    const li = lineItems.find((x) => x.key === key)
+    if (!li?.productId) return
+    const item = sellables.find((s) => s.productId === li.productId && s.variantId === variantId)
+    if (!item) return
+    applySellable(key, item)
+  }
+
   // Label scan: scanners type the code and press Enter instantly, so a plain
   // input with an Enter handler works. A label's QR encodes ONLY the SKU, so
-  // resolution is product SKU → variant SKU (exact, case-insensitive).
-  // Re-scanning the same product/variant pair bumps its quantity.
+  // resolution is an exact, case-insensitive match on the variant SKU, the
+  // variant name or the product name — `OL-GIF-001-RED` lands on
+  // `silver toy — red`. Re-scanning the same row bumps its quantity.
   const handleScan = () => {
     const code = scanInput.trim()
-    const match = matchProductByCode(products, code)
     setScanInput('')
-    if (!match) {
+    const item = resolveSellableByCode(sellables, code)
+    if (!item) {
       setScanFeedback({ ok: false, text: `No product matches "${code}"` })
       return
     }
-    const { product: p, variant } = match
-    const title = variant ? `${p.name} — ${variantLabel(variant)}` : p.name
-    const sku = variant ? variant.sku : p.sku
-    const price = perUnitLinePrice({
-      silverRate,
-      netWeight: p.netWeight,
-      makingCharge: p.makingCharge,
-      fallback: variant
-        ? variantFinalPrice(p.sellingPrice, variant.sellingPrice, variant.name)
-        : p.sellingPrice,
-    }) ?? 0
+    const title = item.variantName ? `${item.productName} — ${item.variantName}` : item.productName
+    const price = sellableItemPrice(item, { silverRate }) ?? 0
+    const pieceRate = item.pricingType === 'piece_rate' ? item.fixedPieceRate : null
     setScanFeedback({ ok: true, text: `Added ${title}${price ? ` · ₹${price.toFixed(2)}` : ''}` })
     setLineItems((prev) => {
-      const existing = prev.find((li) => li.productId === p.id && (li.variantId ?? null) === (variant?.id ?? null))
+      const existing = prev.find(
+        (li) => li.productId === item.productId && (li.variantId ?? null) === (item.variantId ?? null),
+      )
       if (existing) {
         // Re-scanning bumps the quantity; the price stays PER-UNIT (refreshed
-        // at the current rate). Pricing the full new quantity here and then
-        // multiplying by quantity in the subtotal double-counted every rescan.
+        // at the current rate — or held at the fixed ₹/pc on a Piece Rate
+        // line, which weight maths must never touch). Pricing the full new
+        // quantity here and then multiplying by quantity in the subtotal
+        // double-counted every rescan.
         const newQty = existing.qty + 1
-        const newPrice =
-          perUnitLinePrice({
-            silverRate,
-            netWeight: existing.netWeight,
-            makingCharge: existing.makingCharge,
-            fallback: existing.price,
-          }) ?? existing.price
+        const newPrice = lineUnitPrice(existing) ?? existing.price
         return prev.map((li) =>
           li.key === existing.key
             ? {
@@ -1162,15 +1193,16 @@ export default function SalesOrdersPage() {
         )
       }
       const fresh = {
-        productId: p.id,
-        variantId: variant?.id ?? null,
+        productId: item.productId,
+        variantId: item.variantId,
         title,
-        sku,
+        sku: item.sku,
         price,
         qty: 1,
-        netWeight: p.netWeight,
-        makingCharge: p.makingCharge,
-        totalWeight: derivedTotalWeight(1, p.netWeight),
+        netWeight: item.netWeight ?? undefined,
+        makingCharge: item.makingCharge ?? undefined,
+        totalWeight: derivedTotalWeight(1, item.netWeight),
+        pieceRate,
       }
       // Fill the empty first line if it's untouched, otherwise append
       const firstEmpty = prev.length === 1 && !prev[0].productId && !prev[0].title
@@ -1185,9 +1217,14 @@ export default function SalesOrdersPage() {
    * Per-unit price for a line at the current silver rate. A manually
    * overridden total weight enters as its per-unit equivalent (total ÷ qty),
    * so the price can never disagree with the weight on the same line.
+   *
+   * A Piece Rate line answers with its fixed ₹/pc instead: its unit price does
+   * not depend on weight at all — a 200 g ₹2,000 toy would otherwise re-price
+   * itself as 200 × (rate + making) the moment qty or weight is touched.
    */
-  const lineUnitPrice = (li: OrderLineItem): number | undefined =>
-    perUnitLinePrice({
+  const lineUnitPrice = (li: OrderLineItem): number | undefined => {
+    if (li.pieceRate && li.pieceRate > 0) return li.pieceRate
+    return perUnitLinePrice({
       silverRate,
       netWeight:
         li.qty > 0 && li.totalWeight != null && li.totalWeight > 0
@@ -1196,6 +1233,7 @@ export default function SalesOrdersPage() {
       makingCharge: li.makingCharge,
       fallback: null,
     })
+  }
 
   const updateLineItem = (key: string, patch: Partial<OrderLineItem>) => {
     setLineItems((prev) =>
@@ -1244,6 +1282,12 @@ export default function SalesOrdersPage() {
         sku: li.sku,
         quantity: Math.max(0, Math.floor(li.qty) || 0),
         price: Number(li.price) || 0,
+        // Catalogue identity travels with the line: the exact product (so an
+        // edit still knows which row to price/flag) and, for a variant line,
+        // its variant. `sku` stays the code the line was sold under — the
+        // variant's own — while `productSku` names the parent the catalogue
+        // row (and its piece rate) is looked up by.
+        ...(li.productId ? { productId: li.productId } : {}),
         // Weight & pricing per line: the weight per piece (product value or
         // manual entry), the total weight (qty × weight per piece, or the
         // manual override) and the making charge. Omitted when unknown so the
@@ -1782,23 +1826,17 @@ export default function SalesOrdersPage() {
                           <Label className="text-xs text-muted-foreground">Product</Label>
                           <SearchableSelect
                             placeholder="Select product"
-                            searchPlaceholder="Search products..."
-                            options={[
-                              ...products.map((p) => ({
-                                value: p.id,
-                                label: p.name,
-                                keywords: p.sku,
-                                subtitle: variantCountByProductId.has(p.id)
-                                  ? `${variantCountByProductId.get(p.id)} variants`
-                                  : p.sku,
-                              })),
-                              { value: '__new_product__', label: 'New product…', subtitle: 'Add it without leaving this order' },
-                            ]}
-                            value={li.productId}
+                            searchPlaceholder="Search name, SKU or variant…"
+                            options={productOptions}
+                            value={
+                              li.productId
+                                ? sellableItemValue({ productId: li.productId, variantId: li.variantId ?? null })
+                                : ''
+                            }
                             onValueChange={(v) => {
                               // Manual-entry escape hatch: open the product
                               // dialog instead of selecting a line.
-                              if (v === '__new_product__') {
+                              if (v === NEW_PRODUCT) {
                                 setNewProductLineKey(li.key)
                                 return
                               }
@@ -1852,7 +1890,12 @@ export default function SalesOrdersPage() {
                         li.qty > 0 && li.totalWeight != null && li.totalWeight > 0
                           ? li.totalWeight
                           : effWeightPerPiece * li.qty
-                      const showBreakdown = Boolean(effWeightPerPiece > 0 && makingCharge > 0 && silverRate)
+                      // A Piece Rate line has no silver/making components to
+                      // break out: its fixed ₹/pc IS the calculation, and the
+                      // weight fields only record the physical item.
+                      const isPieceRate = Boolean(li.pieceRate && li.pieceRate > 0)
+                      const showBreakdown =
+                        !isPieceRate && Boolean(effWeightPerPiece > 0 && makingCharge > 0 && silverRate)
                       return (
                         <div key={li.key} className="rounded-lg border bg-muted/30 p-2.5">
                           <p className="mb-2 truncate text-[11px] font-medium text-muted-foreground">
@@ -1926,8 +1969,22 @@ export default function SalesOrdersPage() {
                                 value={li.price}
                                 onChange={(e) => updateLineItem(li.key, { price: Number(e.target.value) })}
                               />
-                              {/* Price breakdown when the rate-based calculation applies */}
-                              {showBreakdown ? (
+                              {/* Price breakdown: the rate maths for a
+                                  weight-based line, the fixed ₹/pc for a
+                                  Piece Rate one (which never multiplies by
+                                  weight). */}
+                              {isPieceRate ? (
+                                <div className="mt-1 space-y-0.5 text-[10px] text-muted-foreground">
+                                  <div>
+                                    Fixed ₹{Number(li.pieceRate)}/pc × {li.qty} = ₹
+                                    {((Number(li.price) || 0) * (Number.isFinite(li.qty) ? li.qty : 0)).toFixed(2)}
+                                  </div>
+                                  <div className="font-medium text-foreground">
+                                    Total (incl. GST):{' '}
+                                    {formatCurrency((Number(li.price) || 0) * (Number.isFinite(li.qty) ? li.qty : 0))}
+                                  </div>
+                                </div>
+                              ) : showBreakdown ? (
                                 <div className="mt-1 space-y-0.5 text-[10px] text-muted-foreground">
                                   <div>Silver: {silverRate!.toFixed(2)} × {effWeightPerPiece} × {li.qty} = ₹{(silverRate! * billableGrams).toFixed(2)}</div>
                                   <div>Making: {makingCharge.toFixed(2)} × {effWeightPerPiece} × {li.qty} = ₹{(makingCharge * billableGrams).toFixed(2)}</div>
@@ -1976,6 +2033,9 @@ export default function SalesOrdersPage() {
                       value={locationId}
                       onValueChange={setLocationId}
                       placeholder="Select location"
+                      // The label above is a sibling, not a wrapper — without
+                      // this the store the stock leaves has no accessible name.
+                      aria-label="Rung up at"
                     />
                   </div>
 

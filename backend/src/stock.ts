@@ -476,6 +476,19 @@ export interface InsufficientStockDetail {
   name: string
   available: number
   requested: number
+  /** How far short this line is (requested − available) — the number the UI badges. */
+  shortage: number
+  /** Catalogue identity of the short line, so the UI can open/highlight the exact record. */
+  productId?: string
+  variantId?: string | null
+  /** The store the check ran against (set when the caller validated a location). */
+  locationId?: string
+  /**
+   * Display name of THAT store, resolved by the code that raised the refusal —
+   * one entry never borrows another entry's store: a multi-store shortfall
+   * carries each bucket's own location id and name.
+   */
+  location?: string
 }
 
 /**
@@ -547,6 +560,59 @@ export async function availableFor(
 }
 
 /**
+ * Availability for one resolved bucket AT a location, counting the pre-ledger
+ * balance the FIRST movement at the default store would materialise
+ * (shouldAdoptPreLedgerBalance).
+ *
+ * A product whose stock has never entered the ledger still holds
+ * `products.stock`, and its first default-store deduction adopts exactly that
+ * balance — reading `stock_levels` alone would report 0 and block a document
+ * the ledger is about to honour. Any location that is NOT the default store
+ * never adopts: stock that was never recorded there is not there, which is
+ * what makes the branch check meaningful instead of a rollup in disguise.
+ *
+ * Exported for the booking form's location-wise availability display: the UI
+ * must show EXACTLY what a later conversion would validate — variant-scoped,
+ * at one named store, including the default store's pre-ledger adoption — so
+ * the form and the guard can never disagree. Read-only: takes no locks beyond
+ * its SELECTs and writes nothing.
+ */
+export async function availableAtLocation(
+  client: Client,
+  resolved: StockSkuResolution,
+  locationId: string,
+): Promise<number> {
+  const level = await levelAt(client, resolved.productId, locationId, resolved.variantId)
+  if (locationId !== DEFAULT_LOCATION_ID) return level
+
+  // The product has never been through the ledger anywhere → its rollup is
+  // the balance a first default-store movement will adopt.
+  const [anyLevel] = await client
+    .select({ locationId: schema.stockLevels.locationId })
+    .from(schema.stockLevels)
+    .where(eq(schema.stockLevels.productId, resolved.productId))
+    .limit(1)
+  if (anyLevel) return level
+
+  const [product] = await client
+    .select({ stock: schema.products.stock })
+    .from(schema.products)
+    .where(eq(schema.products.id, resolved.productId))
+    .limit(1)
+  const preLedger = Math.floor(num(product?.stock))
+  if (!resolved.variantId) return preLedger
+
+  // A variant line is checked against the share it would be credited with —
+  // the same split the adopting movement applies (single variant takes all).
+  const variants = await client
+    .select({ id: schema.productVariants.id, sku: schema.productVariants.sku, stock: schema.productVariants.stock })
+    .from(schema.productVariants)
+    .where(eq(schema.productVariants.productId, resolved.productId))
+  const share = preLedgerShares({ stock: preLedger, variants }).find((s) => s.variantId === resolved.variantId)
+  return share?.qty ?? 0
+}
+
+/**
  * Blocks a document that would drive any product's stock negative.
  *
  * Aggregates the requested quantity per SKU first, so an invoice with two lines
@@ -554,6 +620,11 @@ export async function availableFor(
  * line passing on its own. Products are locked (`FOR UPDATE`) in SKU order
  * before the comparison, which serialises two concurrent invoices on the same
  * SKU so neither can read the other's pre-deduction balance and oversell.
+ *
+ * With a `locationId` the check runs against THAT branch's ledger (plus the
+ * default-store pre-ledger adoption above) — availability must be measured
+ * where the deduction will actually land, never against the global rollup
+ * alone.
  *
  * Must be called inside the same transaction that will write the document and
  * deduct the stock, so a rejection rolls the whole thing back and nothing is
@@ -602,15 +673,41 @@ export async function assertStockAvailable(
       .where(eq(schema.products.id, resolved.productId))
       .limit(1)
     const available = locationId
-      ? await levelAt(client, resolved.productId, locationId, resolved.variantId)
+      ? await availableAtLocation(client, resolved, locationId)
       : resolved.variantId
         ? await variantStockTotal(client, resolved.variantId)
         : Math.floor(num(row?.stock))
     if (entry.requested <= available) continue
-    short.push({ sku: entry.sku, name: entry.name, available, requested: entry.requested })
+    short.push({
+      sku: entry.sku,
+      name: entry.name,
+      available,
+      requested: entry.requested,
+      shortage: entry.requested - available,
+      // Catalogue identity of the short line — the UI needs the exact product
+      // and variant, not just a SKU string.
+      productId: resolved.productId,
+      variantId: resolved.variantId ?? null,
+      // Which store was measured — the single-store booking form shows it
+      // beside every short line ("@ Main Store").
+      ...(locationId ? { locationId } : {}),
+    })
   }
 
-  if (short.length > 0) throw new InsufficientStockError(short)
+  if (short.length > 0) {
+    // Resolve THIS check's store name once and stamp it on every entry raised
+    // here — each refusal carries its own location, never a sibling's.
+    if (locationId) {
+      const [loc] = await client
+        .select({ name: schema.inventoryLocations.name })
+        .from(schema.inventoryLocations)
+        .where(eq(schema.inventoryLocations.id, locationId))
+        .limit(1)
+      const name = loc?.name
+      if (name) for (const d of short) d.location = name
+    }
+    throw new InsufficientStockError(short)
+  }
 }
 
 /**
@@ -1039,12 +1136,40 @@ export async function restoreOrderLineStock(input: {
   sku: string
   qty: number
   refType?: string
+  refId?: string
+  /**
+   * Shopify's immutable variant id from the saved line. When present it beats
+   * SKU resolution: a Shopify order may carry the PARENT sku (blank or renamed
+   * variant), and restoring a parent sku on a multi-variant product would split
+   * the return across variants instead of returning it to the one sold.
+   */
+  shopifyVariantId?: string | null
 }): Promise<{ productId: string } | null> {
-  const sku = String(input.sku ?? '').trim()
   const qty = Math.max(0, Math.floor(num(input.qty)))
-  if (!sku || qty <= 0) return null
+  if (qty <= 0) return null
 
-  const resolved = await resolveStockSku(input.tx, sku)
+  let resolved: StockSkuResolution | null = null
+  const shopifyVariantId = String(input.shopifyVariantId ?? '').trim()
+  if (shopifyVariantId) {
+    const [variant] = await input.tx
+      .select({ id: schema.productVariants.id, productId: schema.productVariants.productId })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.shopifyVariantId, shopifyVariantId))
+      .limit(1)
+    if (variant) {
+      const [parent] = await input.tx
+        .select({ id: schema.products.id, sku: schema.products.sku })
+        .from(schema.products)
+        .where(eq(schema.products.id, variant.productId))
+        .limit(1)
+      if (parent?.sku) resolved = { productId: parent.id, ledgerSku: parent.sku, variantId: variant.id }
+    }
+  }
+  if (!resolved) {
+    const sku = String(input.sku ?? '').trim()
+    if (!sku) return null
+    resolved = await resolveStockSku(input.tx, sku)
+  }
   if (!resolved) return null
 
   await applyStockMovement({
@@ -1053,6 +1178,7 @@ export async function restoreOrderLineStock(input: {
     qty,
     type: 'sale_return_in',
     refType: input.refType ?? 'sales_order',
+    refId: input.refId,
     locationId: input.locationId,
     tx: input.tx,
   })

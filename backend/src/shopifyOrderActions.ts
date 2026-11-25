@@ -16,11 +16,11 @@
  * Cancellation is the one genuinely irreversible action: it is only ever
  * performed on an explicit request, with `refund` opt-in (money movement is
  * never a default) and `restock` opt-in. The local cancellation work (status,
- * one-time stock restore, loyalty reversal) is guarded by the cancelled state
- * itself, so the Shopify `orders/cancelled` webhook arriving afterwards — or
- * first — cannot repeat it.
+ * one-time stock restore, loyalty reversal) is guarded by a tagged stock
+ * movement, NOT by the cancelled status: the Shopify webhook may write that
+ * status before this function runs, and must still restore stock.
  */
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { randomUUID } from 'node:crypto'
 import { isConfigured } from './config'
 import { db } from './db/client'
@@ -545,6 +545,7 @@ export async function cancelLocalOrderOnce(
     const [row] = await tx
       .select({
         id: s.salesOrders.id,
+        shopifyId: s.salesOrders.shopifyId,
         status: s.salesOrders.status,
         lineItems: s.salesOrders.lineItems,
         locationId: s.salesOrders.locationId,
@@ -555,23 +556,30 @@ export async function cancelLocalOrderOnce(
       .limit(1)
       .for('update')
     if (!row) return { skipped: true, itemsRestored: 0 }
-    if (!opts.restoreEvenIfCancelled && (row.status === 'cancelled' || row.cancelledAt)) {
-      return { skipped: true, itemsRestored: 0 }
-    }
 
-    const items = Array.isArray(row.lineItems) ? (row.lineItems as Array<{ sku?: string; quantity?: number }>) : []
+    const items = Array.isArray(row.lineItems)
+      ? (row.lineItems as Array<{ sku?: string; quantity?: number; shopifyVariantId?: string | null }>)
+      : []
     const locationId = await resolveMovementLocation(row.locationId as string | null, tx as never)
     let itemsRestored = 0
     for (const li of items) {
       const sku = String(li?.sku ?? '').trim()
       const qty = Math.max(0, Math.floor(Number(li?.quantity ?? 0)))
       if (!sku || qty <= 0) continue
-      const restored = await restoreOrderLineStock({ tx, locationId, sku, qty })
+      const restored = await restoreOrderLineStock({
+        tx,
+        locationId,
+        sku,
+        qty,
+        refType: 'shopify_order_cancel',
+        refId: restockRef,
+        shopifyVariantId: li.shopifyVariantId,
+      })
       if (restored) itemsRestored += qty
     }
     await tx
       .update(s.salesOrders)
-      .set({ status: 'cancelled', cancelledAt: new Date().toISOString() })
+      .set({ status: 'cancelled', cancelledAt: row.cancelledAt ?? new Date().toISOString() })
       .where(eq(s.salesOrders.id, orderId))
     return { skipped: false, itemsRestored }
   })

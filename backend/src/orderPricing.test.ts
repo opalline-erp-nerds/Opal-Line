@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildPricedOrder } from './orderPricing'
+import { buildManualInvoiceLines, buildPricedOrder, fixedPieceRateFor } from './orderPricing'
+import { invoiceTotals } from './invoiceTotals'
 
 // Regression suite for the order-pricing double count: the create handler
 // used to store each line's FULL-quantity ex-GST total in `price`, while the
@@ -148,4 +149,165 @@ test('a manually overridden total weight drives the line pricing', () => {
   )
   assert.equal(freeMaking.lines[0].makingValue, 0, 'explicit zero making charge is honoured')
   assert.equal(freeMaking.lines[0].amount, 600, '10 g × ₹60 silver only')
+})
+
+// ── Order → invoice lines: component rows unchanged, price-only rows fixed ──
+// buildManualInvoiceLines feeds createInvoiceForOrderRow's manual branch —
+// the path a booking convert takes. Component-shaped rows (order form) must
+// bill exactly as before; a price-only row (everything a booking stores) used
+// to fall through to a ₹0 line while its stock was still deducted.
+const round2 = (n: number) => Math.round(n * 100) / 100
+
+test('a price-only line (booking) bills from its price instead of ₹0', () => {
+  // What POST /db/bookings stores: title/sku/quantity/price, nothing else.
+  // `price` is PER-UNIT and GST-inclusive for every sales_orders consumer, so
+  // the taxable value backs the GST out and adding GST returns the booked sum.
+  const [line] = buildManualInvoiceLines([{ title: 'Gold chain', sku: 'GC-1', quantity: 2, price: 5000 }], 3)
+  assert.equal(line.amount, 9708.74, '₹10,000 booked → taxable value at 3% GST')
+  assert.equal(line.silverValue, line.amount, 'the whole taxable amount sits in silverValue (zero-weight convention)')
+  assert.equal(line.makingValue, 0, 'a price-only line has no making component')
+  assert.equal(line.tax, 291.26, 'line GST = 3% of the taxable value')
+  assert.equal(line.qty, 2)
+  assert.equal(line.weight, 0, 'no weight was recorded — never invented')
+
+  // The invoice header maths (invoiceTotals) then reproduces the booking's
+  // own value exactly, which is what the advance clamp and the convert
+  // endpoint's `balance = value − advance` assume.
+  const subtotal = round2(line.silverValue + line.makingValue)
+  const { gstAmount, grandTotal } = invoiceTotals(subtotal, 3, 0)
+  assert.equal(subtotal, 9708.74)
+  assert.equal(gstAmount, 291.26)
+  assert.equal(grandTotal, 10000, 'invoice grand total = the amount that was booked')
+})
+
+test('a booking discount lands on the invoice the same way it lands on the booking value', () => {
+  const lines = buildManualInvoiceLines([{ title: 'Ring', sku: 'R-1', quantity: 1, price: 2060 }], 3)
+  const subtotal = round2(lines.reduce((a, l) => a + l.silverValue + l.makingValue, 0))
+  // Booking value = 2060 − 100 discount; invoice = subtotal + GST − discount.
+  const { grandTotal } = invoiceTotals(subtotal, 3, 100)
+  assert.equal(grandTotal, 1960, 'booked 2060 less a 100 discount → invoice total 1960')
+})
+
+test('component-shaped lines bill exactly from their components — unchanged', () => {
+  // Order-form rows carry their components (buildPricedOrder output): the
+  // stored values win outright, price is never consulted.
+  const [stored] = buildManualInvoiceLines(
+    [{ title: 'Ring', sku: 'SKU-RING', quantity: 2, price: 1339, weight: 20, silverRate: 60, makingCharge: 5, silverValue: 1200, makingValue: 100, amount: 1300 }],
+    3,
+  )
+  assert.equal(stored.amount, 1300)
+  assert.equal(stored.silverValue, 1200)
+  assert.equal(stored.makingValue, 100)
+  assert.equal(stored.tax, 39, 'line GST still runs off the taxable value')
+  assert.equal(stored.weight, 20)
+
+  // Components derived from weight when the stored silver/making are absent.
+  const [derived] = buildManualInvoiceLines(
+    [{ title: 'Ring', sku: 'SKU-RING', quantity: 2, price: 1339, weight: 20, silverRate: 60, makingCharge: 5 }],
+    3,
+  )
+  assert.equal(derived.silverValue, 1200, '20 g × ₹60')
+  assert.equal(derived.makingValue, 100, '20 g × ₹5')
+  assert.equal(derived.amount, 1300)
+})
+
+test('explicit stored components win — an explicit zero is never re-priced from the price', () => {
+  // An order-form row the catalogue could not weight stores zeros; its order
+  // value was computed from those same zeros, so the invoice must agree with
+  // the order rather than inventing an amount from `price`.
+  const [line] = buildManualInvoiceLines(
+    [{ title: 'Mystery', sku: 'NO-CAT', quantity: 2, price: 100, weight: 0, silverValue: 0, makingValue: 0, amount: 0 }],
+    3,
+  )
+  assert.equal(line.amount, 0)
+  assert.equal(line.silverValue, 0)
+  assert.equal(line.makingValue, 0)
+  assert.equal(line.tax, 0)
+})
+
+test('booking lines round to the paisa across a multi-line order', () => {
+  const lines = buildManualInvoiceLines(
+    [
+      { title: 'Chain', sku: 'A', quantity: 3, price: 333.33 },
+      { title: 'Payal', sku: 'B', quantity: 1, price: 1999.5 },
+    ],
+    3,
+  )
+  const subtotal = round2(lines.reduce((a, l) => a + l.silverValue + l.makingValue, 0))
+  const { grandTotal } = invoiceTotals(subtotal, 3, 0)
+  const booked = round2(3 * 333.33 + 1999.5)
+  assert.ok(Math.abs(grandTotal - booked) <= 0.02, `invoice ${grandTotal} within 2 paise of booked ${booked}`)
+})
+
+// ── Piece Rate: the fixed ₹/pc is the price, never weight × (rate + making) ──
+// A ₹2,000/pc toy with a 200 g net weight used to arrive as 200 × (rate + making)
+// on the manual-order screen. The stored unit price stays the catalogue's fixed
+// figure (so Σ price × qty still reproduces the order value on edit) and the
+// taxable amount is that GST-inclusive price backed out.
+
+const PIECE_RATE_PRODUCT = [
+  {
+    sku: 'SKU-TOY',
+    netWeight: 200,
+    makingCharge: 20,
+    pieceRateProduct: true,
+    fixedPieceRate: 2000,
+    sellingPrice: 2000,
+  },
+]
+
+test('a Piece Rate line prices from its fixed ₹/pc, never from weight', () => {
+  const one = buildPricedOrder(
+    [{ title: 'silver toy', sku: 'SKU-TOY', quantity: 1, price: 2000 }],
+    PIECE_RATE_PRODUCT,
+    RATE,
+  )
+  assert.equal(one.lines[0].price, 2000, 'unit price is the fixed rate')
+  assert.equal(one.lines[0].amount, 1941.75, 'taxable value = the GST-inclusive fixed price backed out')
+  assert.equal(one.lines[0].silverRate, 0, 'no silver rate on a fixed-price line')
+  assert.equal(one.lines[0].makingCharge, 0, 'no making charge either')
+  assert.equal(one.lines[0].silverValue, one.lines[0].amount, 'the whole taxable amount sits in silverValue')
+  assert.equal(one.lines[0].makingValue, 0)
+  assert.equal(one.grandTotal, 2000, 'the customer pays qty × fixed')
+  // The weight maths it replaces would have been 200 g × (60 + 5) = 13,000.
+  assert.notEqual(one.lines[0].amount, 13000)
+  assert.equal(one.lines[0].weight, 200, 'the physical weight is still recorded on the line')
+})
+
+test('quantity scales the fixed price: 3 × ₹2,000 = ₹6,000', () => {
+  const three = buildPricedOrder(
+    [{ title: 'silver toy', sku: 'SKU-TOY', quantity: 3, price: 6000 }],
+    PIECE_RATE_PRODUCT,
+    RATE,
+  )
+  assert.equal(three.lines[0].price, 2000, 'the per-unit price never scales with quantity')
+  assert.equal(three.grandTotal, 6000)
+  const reEdit = Math.round(three.lines.reduce((s, li) => s + li.price * li.quantity, 0) * 100) / 100
+  assert.equal(reEdit, three.grandTotal, 're-editing the order reproduces the same value')
+})
+
+test('a variant line takes the parent piece rate through its productSku', () => {
+  // loadOrderProductData answers BOTH codes with the parent's pricing inputs,
+  // which is what makes a variant of a Piece Rate product bill at the rate.
+  const rows = [
+    ...PIECE_RATE_PRODUCT,
+    { ...PIECE_RATE_PRODUCT[0], sku: 'SKU-TOY-RED' },
+  ]
+  const [line] = buildPricedOrder(
+    [{ title: 'silver toy — red', sku: 'SKU-TOY-RED', productSku: 'SKU-TOY', quantity: 1, price: 2000 }],
+    rows,
+    RATE,
+  ).lines
+  assert.equal(line.price, 2000)
+  assert.equal(line.amount, 1941.75)
+})
+
+test('fixedPieceRateFor reads the flag first, falls back to sellingPrice, and never fires for weight-based rows', () => {
+  assert.equal(fixedPieceRateFor({ pieceRateProduct: true, fixedPieceRate: 2000, sellingPrice: 2000 }), 2000)
+  // Rows saved before the fixed_piece_rate column existed carry the same
+  // number in sellingPrice (setPieceRate writes both).
+  assert.equal(fixedPieceRateFor({ pieceRateProduct: true, fixedPieceRate: null, sellingPrice: 1500 }), 1500)
+  assert.equal(fixedPieceRateFor({ pieceRateProduct: false, fixedPieceRate: 2000, sellingPrice: 2000 }), null)
+  assert.equal(fixedPieceRateFor({ pieceRateProduct: true, fixedPieceRate: 0, sellingPrice: 0 }), null)
+  assert.equal(fixedPieceRateFor({}), null)
 })

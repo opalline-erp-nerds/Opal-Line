@@ -8,8 +8,16 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
-import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, DraftOrderResult, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
-import { buildPricedOrder, ORDER_GST_RATE, type ValidatedOrderItem } from './orderPricing'
+import { decryptSecret } from './lib/crypto'
+import {
+  getOrderAutoSyncStatus,
+  getOrderSyncIntervalSeconds,
+  parseOrderSyncIntervalSeconds,
+  startOrderAutoSync,
+  stopOrderAutoSync,
+} from './orderAutoSync'
+import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, DraftOrderResult, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, resolveShopifyVariantTargets, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
+import { buildPricedOrder, fixedPieceRateFor, ORDER_GST_RATE, type OrderCatalogueRow, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
 import { deductOrderLineStock, resolveMovementLocation, restoreOrderLineStock } from './stock'
@@ -322,10 +330,12 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
     return
   }
 
-  // Order / fulfillment events are applied BEFORE acknowledging so Shopify can
-  // retry when the authoritative state could not be persisted. These handlers
-  // are deliberately targeted and idempotent; they never run the order import's
-  // stock deduction path for an already-known order.
+  // Order / fulfillment events are acknowledged IMMEDIATELY. Shopify treats a
+  // delivery as failed after ~5s, and this branch can do a FULL order import
+  // (paging, invoices, email enrichment) — far too slow to keep the connection
+  // open. The background order poll is the backstop for work that fails after
+  // the ack; releasing the delivery id below still allows a genuine Shopify
+  // retry to process the same payload again.
   const ORDER_EVENT_TOPICS = new Set([
     'orders/create',
     'orders/updated',
@@ -337,75 +347,76 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
   ])
   const FULFILLMENT_EVENT_TOPICS = new Set(['fulfillments/create', 'fulfillments/update'])
   if (ORDER_EVENT_TOPICS.has(topic) || FULFILLMENT_EVENT_TOPICS.has(topic)) {
-    try {
-      const pipeline = await import('./shopifyOrderPipeline')
-      const orderPayload = req.body as { id?: number; name?: string; admin_graphql_api_id?: string; cancelled_at?: string | null } | undefined
-      let applied
-      if (FULFILLMENT_EVENT_TOPICS.has(topic)) {
-        applied = await pipeline.applyFulfillmentWebhook(req.body, { actor: 'shopify' })
-      } else {
-        const shopifyId = orderPayload?.name ? `#${String(orderPayload.name).replace(/^#/, '')}` : null
-        applied = await pipeline.applyShopifyOrderPayload(req.body, { actor: 'shopify' })
-        // A new order can arrive before the scheduled/manual import. Import only
-        // when it is not a cancellation, and let the importer own its one-time
-        // stock deduction. Existing rows are updated by the diff-only mapper.
-        if (!applied.found && topic !== 'orders/cancelled') {
-          const { importShopifyOrders } = await import('./shopify')
-          const imported = await importShopifyOrders()
-          applied = await pipeline.applyShopifyOrderPayload(req.body, { actor: 'shopify' })
-          if (imported.ok) {
-            // Redacted API payloads are completed from the notification email
-            // (never redacted) and by a targeted GraphQL enrichment. Both were
-            // part of the previous order-webhook path and must keep running so
-            // new orders do not land with a blank customer.
-            const { kickEmailIngest } = await import('./orderEmailIngest')
-            kickEmailIngest()
-            try {
-              const { enrichOrdersFromShopify } = await import('./shopifyDataEnhance')
-              const enriched = await enrichOrdersFromShopify()
-              logger.info({ enriched: enriched.enriched, failed: enriched.failed }, 'Auto-enrich: orders updated with full customer data')
-            } catch (err) {
-              logger.error({ err }, 'Auto-enrich after order webhook failed')
+    const payload = req.body
+    res.json({ ok: true, accepted: true })
+    void (async () => {
+      try {
+        const pipeline = await import('./shopifyOrderPipeline')
+        const orderPayload = payload as { id?: number; name?: string; admin_graphql_api_id?: string; cancelled_at?: string | null } | undefined
+        let applied
+        if (FULFILLMENT_EVENT_TOPICS.has(topic)) {
+          applied = await pipeline.applyFulfillmentWebhook(payload, { actor: 'shopify' })
+        } else {
+          const shopifyId = orderPayload?.name ? `#${String(orderPayload.name).replace(/^#/, '')}` : null
+          applied = await pipeline.applyShopifyOrderPayload(payload, { actor: 'shopify' })
+          // A new order can arrive before the scheduled/manual import. Import only
+          // when it is not a cancellation, and let the importer own its one-time
+          // stock deduction. Existing rows are updated by the diff-only mapper.
+          if (!applied.found && topic !== 'orders/cancelled') {
+            const imported = await importShopifyOrders()
+            applied = await pipeline.applyShopifyOrderPayload(payload, { actor: 'shopify' })
+            if (imported.ok) {
+              // Redacted API payloads are completed from the notification email
+              // (never redacted) and by a targeted GraphQL enrichment. Both were
+              // part of the previous order-webhook path and must keep running so
+              // new orders do not land with a blank customer.
+              const { kickEmailIngest } = await import('./orderEmailIngest')
+              kickEmailIngest()
+              try {
+                const { enrichOrdersFromShopify } = await import('./shopifyDataEnhance')
+                const enriched = await enrichOrdersFromShopify()
+                logger.info({ enriched: enriched.enriched, failed: enriched.failed }, 'Auto-enrich: orders updated with full customer data')
+              } catch (err) {
+                logger.error({ err }, 'Auto-enrich after order webhook failed')
+              }
             }
           }
-        }
-        // Restock + loyalty reversal hang off the applied cancellation, not the
-        // topic: a cancellation can first surface through `orders/updated` when
-        // the `orders/cancelled` subscription was missing for a period.
-        if (applied.orderId && applied.changed?.includes('cancelled')) {
-          const actions = await import('./shopifyOrderActions')
-          const restored = await actions.cancelLocalOrderOnce(applied.orderId)
-          if (restored.itemsRestored > 0) logger.info({ topic, orderId: applied.orderId, ...restored }, 'Order Pipeline: stock restored after cancellation')
-          if (shopifyId) {
-            const { handleShopifyOrderCancelled } = await import('./shopifyLoyalty')
-            const loyalty = await handleShopifyOrderCancelled(shopifyId)
-            if (loyalty.reversed > 0) logger.info({ topic, shopifyId, ...loyalty }, 'Loyalty: order cancellation reversed points')
+          // Restock + loyalty reversal hang off the applied cancellation, not the
+          // topic: a cancellation can first surface through `orders/updated` when
+          // the `orders/cancelled` subscription was missing for a period.
+          if (applied.orderId && applied.changed?.includes('cancelled')) {
+            const { cancelLocalOrderOnce } = await import('./shopifyOrderActions')
+            const restored = await cancelLocalOrderOnce(applied.orderId)
+            if (restored.itemsRestored > 0) logger.info({ topic, orderId: applied.orderId, ...restored }, 'Order Pipeline: stock restored after cancellation')
+            if (shopifyId) {
+              const { handleShopifyOrderCancelled } = await import('./shopifyLoyalty')
+              const loyalty = await handleShopifyOrderCancelled(shopifyId)
+              if (loyalty.reversed > 0) logger.info({ topic, shopifyId, ...loyalty }, 'Loyalty: order cancellation reversed points')
+            }
+          }
+          if (topic === 'orders/paid') {
+            const { awardLoyaltyForShopifyOrders } = await import('./shopifyLoyalty')
+            await awardLoyaltyForShopifyOrders({ limit: 50 })
           }
         }
-        if (topic === 'orders/paid') {
-          const { awardLoyaltyForShopifyOrders } = await import('./shopifyLoyalty')
-          await awardLoyaltyForShopifyOrders({ limit: 50 })
+        if (!applied.ok) throw new Error(applied.error ?? 'Order update could not be applied')
+        if (applied.orderId && applied.changed?.includes('became-fulfilled')) {
+          const [row] = await db!.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, applied.orderId)).limit(1)
+          if (row) {
+            const { autoInvoiceFulfilledOrder } = await import('./routes/db')
+            const { notifyOrderFulfilled } = await import('./statusNotifications')
+            await autoInvoiceFulfilledOrder(row, { userId: 'shopify' })
+            const { kickEmailIngest } = await import('./orderEmailIngest')
+            kickEmailIngest()
+            void notifyOrderFulfilled({ ...row, trackingId: row.trackingNumber, carrier: row.trackingCompany })
+          }
         }
+        logger.info({ topic, ...applied }, 'Order Pipeline: Shopify event applied')
+      } catch (err) {
+        if (webhookId) await releaseWebhookId(webhookId)
+        logger.error({ topic, webhookId, err: { message: err instanceof Error ? err.message : 'Unknown error' } }, 'Order Pipeline: background webhook processing failed — the order poll will retry')
       }
-      if (!applied.ok) throw new Error(applied.error ?? 'Order update could not be applied')
-      if (applied.orderId && applied.changed?.includes('became-fulfilled')) {
-        const [row] = await db!.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, applied.orderId)).limit(1)
-        if (row) {
-          const { autoInvoiceFulfilledOrder } = await import('./routes/db')
-          const { notifyOrderFulfilled } = await import('./statusNotifications')
-          await autoInvoiceFulfilledOrder(row, { userId: 'shopify' })
-          const { kickEmailIngest } = await import('./orderEmailIngest')
-          kickEmailIngest()
-          void notifyOrderFulfilled({ ...row, trackingId: row.trackingNumber, carrier: row.trackingCompany })
-        }
-      }
-      logger.info({ topic, ...applied }, 'Order Pipeline: Shopify event applied')
-      res.json({ ...applied, ok: true })
-    } catch (err) {
-      if (webhookId) await releaseWebhookId(webhookId)
-      logger.error({ topic, webhookId, err: { message: err instanceof Error ? err.message : 'Unknown error' } }, 'Order Pipeline: webhook failed — Shopify will retry')
-      res.status(500).json({ ok: false, error: 'Order update could not be applied' })
-    }
+    })()
     return
   }
 
@@ -490,17 +501,22 @@ app.use('/api/v1/silver', requireAuth, enforceRbac)
 app.use('/api/v1/gold', requireAuth, enforceRbac)
 
 // Shopify Flow webhook — must be BEFORE requireAuth since it's called from Shopify servers (no browser session)
-app.post('/api/v1/shopify/flow-webhook', express.json({ limit: '1mb' }), async (req, res) => {
+app.post('/api/v1/shopify/flow-webhook', express.json({
+  limit: '1mb',
+  // Shopify signs the exact bytes it sent. Re-stringifying req.body breaks the
+  // signature whenever whitespace/key order differs, so keep the raw payload.
+  verify: (req, _res, buf) => { (req as unknown as express.Request).rawBody = buf },
+}), async (req, res) => {
   try {
     // ── HMAC signature verification ────────────────────────────────────────
-    const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET?.trim()
+    const SHOPIFY_WEBHOOK_SECRET = decryptSecret(process.env.SHOPIFY_WEBHOOK_SECRET?.trim())
     if (SHOPIFY_WEBHOOK_SECRET) {
       const hmacHeader = req.headers['x-shopify-hmac-sha256'] as string | undefined
       if (!hmacHeader) {
         logger.warn('Flow webhook missing X-Shopify-Hmac-SHA256 header')
         return res.status(401).json({ ok: false, error: 'Unauthorized' })
       }
-      const rawBody = JSON.stringify(req.body)
+      const rawBody = req.rawBody ?? Buffer.from(JSON.stringify(req.body ?? {}))
       const expected = createHmac('sha256', SHOPIFY_WEBHOOK_SECRET).update(rawBody).digest('base64')
       const sigBuf = Buffer.from(hmacHeader, 'base64')
       const expBuf = Buffer.from(expected, 'base64')
@@ -1879,6 +1895,38 @@ app.post('/api/v1/shopify/products/auto-sync/interval', requirePermission('shopi
   }
 })
 
+// Order auto-sync: how fresh the Sales Orders feed is, and the interval knob.
+app.get('/api/v1/shopify/orders/auto-sync', requirePermission('shopify', 'view'), async (_req, res) => {
+  try {
+    const intervalSeconds = await getOrderSyncIntervalSeconds()
+    res.json({ ...getOrderAutoSyncStatus(), intervalSeconds, enabled: intervalSeconds > 0 })
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : 'Unknown error' })
+  }
+})
+
+app.post('/api/v1/shopify/orders/auto-sync', requirePermission('shopify', 'edit'), async (req, res) => {
+  try {
+    const raw = (req.body ?? {}).intervalSeconds
+    if (raw === undefined || raw === null || raw === '') {
+      return res.status(400).json({ error: 'intervalSeconds is required (0 disables)' })
+    }
+    const intervalSeconds = parseOrderSyncIntervalSeconds(raw)
+    const { db } = await import('./db/client')
+    const schemaMod = await import('./db/schema')
+    const { eq } = await import('drizzle-orm')
+    if (!db) return res.status(503).json({ error: 'Database unavailable' })
+    const [row] = await db.select({ notificationSettings: schemaMod.settings.notificationSettings }).from(schemaMod.settings).where(eq(schemaMod.settings.id, 'app')).limit(1)
+    const current = (row?.notificationSettings ?? {}) as Record<string, unknown>
+    await db.update(schemaMod.settings).set({ notificationSettings: { ...current, orderAutoSyncIntervalSeconds: intervalSeconds } }).where(eq(schemaMod.settings.id, 'app'))
+    stopOrderAutoSync()
+    if (intervalSeconds > 0) startOrderAutoSync()
+    res.json({ ok: true, intervalSeconds: await getOrderSyncIntervalSeconds(), ...getOrderAutoSyncStatus() })
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : 'Unknown error' })
+  }
+})
+
 // Email (SMTP) connection test
 app.post('/api/v1/settings/test-email', requireAuth, requirePermission('system', 'edit'), async (req, res) => {
   try {
@@ -2048,6 +2096,89 @@ async function linkShopifyOrderToRow(input: {
   }
 }
 
+/**
+ * Catalogue inputs for order lines, answered for WHATEVER code a line carries.
+ *
+ * A variant line sends its parent SKU as `productSku` — and a scan path may
+ * send only the variant's own code — so both are answered from the parent row:
+ * net weight, making charge, and the piece-rate flag a fixed-price line must
+ * bill from. The result carries one entry per code it answers (parent SKU and
+ * every matched variant SKU), which is exactly what `buildPricedOrder`'s
+ * sku map looks up.
+ */
+async function loadOrderProductData(codes: Array<string | null | undefined>): Promise<OrderCatalogueRow[]> {
+  const skus = [...new Set(codes.map((c) => String(c ?? '').trim()).filter(Boolean))]
+  if (skus.length === 0 || !db) return []
+  const variantRows = await db
+    .select({ sku: schema.productVariants.sku, productId: schema.productVariants.productId })
+    .from(schema.productVariants)
+    .where(inArray(schema.productVariants.sku, skus))
+  const parentIds = [...new Set(variantRows.map((v) => v.productId))]
+  const rows = await db
+    .select({
+      id: schema.products.id,
+      sku: schema.products.sku,
+      netWeight: schema.products.netWeight,
+      makingCharge: schema.products.makingCharge,
+      pieceRateProduct: schema.products.pieceRateProduct,
+      fixedPieceRate: schema.products.fixedPieceRate,
+      sellingPrice: schema.products.sellingPrice,
+    })
+    .from(schema.products)
+    .where(
+      parentIds.length > 0
+        ? or(inArray(schema.products.sku, skus), inArray(schema.products.id, parentIds))
+        : inArray(schema.products.sku, skus),
+    )
+  const toRow = (r: (typeof rows)[number]): OrderCatalogueRow => ({
+    sku: r.sku,
+    netWeight: r.netWeight,
+    makingCharge: r.makingCharge,
+    pieceRateProduct: r.pieceRateProduct,
+    fixedPieceRate: r.fixedPieceRate,
+    sellingPrice: r.sellingPrice,
+  })
+  const out = rows.map(toRow)
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  for (const v of variantRows) {
+    const parent = byId.get(v.productId)
+    // The variant's own code answers with the parent's pricing inputs: a
+    // variant carries no weight/charge/flag columns of its own.
+    if (parent) out.push({ ...toRow(parent), sku: v.sku })
+  }
+  return out
+}
+
+/**
+ * Order lines shaped for the Shopify draft: a line that billed a variant must
+ * target THAT Shopify variant (`product_variants.shopify_variant_id`), never
+ * the local row id — wrapping a local UUID in `gid://shopify/ProductVariant/…`
+ * names a variant the shop does not have. A variant with no Shopify id falls
+ * back to the historic title/sku/price line instead of a bogus gid.
+ */
+async function shopifyDraftLines(lines: ReadonlyArray<unknown> | null | undefined): Promise<ReturnType<typeof draftOrderInputLines>> {
+  if (!Array.isArray(lines)) return []
+  const localIds = [
+    ...new Set(
+      lines
+        .map((li) => String((li as { variantId?: unknown } | null)?.variantId ?? '').trim())
+        .filter(Boolean),
+    ),
+  ]
+  const shopifyIds = new Map<string, string>()
+  if (localIds.length > 0 && db) {
+    const rows = await db
+      .select({ id: schema.productVariants.id, shopifyVariantId: schema.productVariants.shopifyVariantId })
+      .from(schema.productVariants)
+      .where(inArray(schema.productVariants.id, localIds))
+    for (const r of rows) {
+      const gid = String(r.shopifyVariantId ?? '').trim()
+      if (gid) shopifyIds.set(r.id, gid)
+    }
+  }
+  return draftOrderInputLines(resolveShopifyVariantTargets(lines, shopifyIds))
+}
+
 // Shopify Flow webhook — receives full order + customer data from a Shopify Flow
 // This bypasses the Admin API PII limitations on development stores.
 // The Flow sends: order name, customer name, email, phone, billing/shipping addresses
@@ -2069,21 +2200,18 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     return res.status(503).json({ error: 'Database unavailable' })
   }
 
-  // Calculate item prices using the current silver rate and product data
-  // Load product data (netWeight, makingCharge) keyed by SKU
-  const productData = await db
-    .select({
-      sku: schema.products.sku,
-      netWeight: schema.products.netWeight,
-      makingCharge: schema.products.makingCharge,
-    })
-    .from(schema.products)
-    .where(inArray(schema.products.sku, items.map((li: { sku?: string; productSku?: string }) => String(li.productSku ?? li.sku ?? '')).filter(Boolean)))
+  // Calculate item prices using the current silver rate and product data.
+  // The catalogue rows answer for the parent SKU AND any variant code the
+  // lines carry, so a variant line prices (and piece-rates) like its parent.
+  const productData = await loadOrderProductData(
+    items.map((li: { sku?: string; productSku?: string }) => li.productSku ?? li.sku),
+  )
   // Price the lines with the authoritative silver rate — canonical invoice
   // formula, extracted so the per-unit convention is unit-testable. Each
   // line's stored price is PER-UNIT and GST-inclusive: every consumer (the
   // edit dialog's subtotal, the print doc, the update handler's value)
-  // multiplies it by quantity exactly once.
+  // multiplies it by quantity exactly once. Piece Rate lines take their fixed
+  // ₹/pc instead (see buildPricedOrder).
   const priced = buildPricedOrder(items as ValidatedOrderItem[], productData, silverRate)
   const itemsWithCalculatedPrice = priced.lines
   const value = priced.grandTotal
@@ -2096,7 +2224,8 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
   // GST-inclusive — exactly what a draft line's originalUnitPrice expects.
   // (Remapping it to the full line total amount × 1.03 made Shopify bill that
   // total per unit, so a qty-3 manual order arrived on Shopify at ~3× its value.)
-  const shopifyLineItems = draftOrderInputLines(itemsWithCalculatedPrice)
+  // A variant line resolves to the shop's own variant id here.
+  const shopifyLineItems = await shopifyDraftLines(itemsWithCalculatedPrice)
 
   if (!db) {
     return res.status(503).json({ error: 'Service temporarily unavailable' })
@@ -2377,25 +2506,10 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       // generator reads weight/silverValue/makingValue/amount straight off
       // manual orders, so an edit must keep that snapshot coherent instead of
       // stripping it to {title, sku, qty, price} and invoicing ₹0 later.
-      const productSkus: string[] = Array.from(
-        new Set<string>(
-          items
-            .map((li: any) => String(li.productSku ?? li.sku ?? '').trim())
-            .filter(Boolean),
-        ),
-      )
-      const productRows = productSkus.length
-        ? await db
-            .select({ sku: schema.products.sku, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge })
-            .from(schema.products)
-            .where(inArray(schema.products.sku, productSkus))
-        : []
-      const productMap = new Map(
-        productRows.map((p) => [
-          String(p.sku ?? '').trim(),
-          { netWeight: Number(p.netWeight ?? 0), makingCharge: Number(p.makingCharge ?? 0) },
-        ]),
-      )
+      // The catalogue rows answer for the parent SKU and any variant code, so
+      // a variant line keeps its parent's piece-rate flag through an edit.
+      const productRows = await loadOrderProductData(items.map((li: any) => li.productSku ?? li.sku))
+      const productMap = new Map(productRows.map((p) => [String(p.sku ?? '').trim(), p]))
       const latestRate = await getLatestSilverRate()
       const currentRate = latestRate && latestRate.rate && latestRate.rate > 0 ? latestRate.rate : 0
 
@@ -2407,11 +2521,14 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
           const price = Number(li.price ?? 0)
           // Same weight rules as create: the form's value wins, the catalogue
           // fills in when the form sent none, total = qty × weight per piece.
-          const product = productMap.get(String(li.productSku ?? sku).trim()) ?? { netWeight: 0, makingCharge: 0 }
+          const product: OrderCatalogueRow = productMap.get(String(li.productSku ?? sku).trim()) ?? { sku: null, netWeight: 0, makingCharge: 0 }
           const formWeightPerPiece = Number(li.netWeight ?? 0)
-          const netWeight = formWeightPerPiece > 0 ? formWeightPerPiece : product.netWeight
+          const netWeight = formWeightPerPiece > 0 ? formWeightPerPiece : Number(product.netWeight ?? 0)
+          const isPieceRate = fixedPieceRateFor(product) != null
           const makingCharge =
-            li.makingCharge === undefined || li.makingCharge === null ? product.makingCharge : Number(li.makingCharge)
+            li.makingCharge === undefined || li.makingCharge === null
+              ? Number(product.makingCharge ?? 0)
+              : Number(li.makingCharge)
           const formTotalWeight = Number(li.weight ?? 0)
           const weight =
             formTotalWeight > 0
@@ -2423,22 +2540,24 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
           // edited order reproduces its order value exactly (amount is the
           // ex-GST half of price × qty; the silver/making split follows the
           // current rate — identical to create's split while the rate holds).
+          // A Piece Rate line has no silver/making split to follow: its whole
+          // taxable amount sits in silverValue, exactly as create stores it.
           const lineTotal = Math.round(price * quantity * 100) / 100
           const amount = Math.round((lineTotal / (1 + ORDER_GST_RATE / 100)) * 100) / 100
           const splitBase = currentRate + Math.max(makingCharge, 0)
-          const silverValue =
-            weight > 0 && currentRate > 0 && splitBase > 0
-              ? Math.round(amount * (currentRate / splitBase) * 100) / 100
-              : amount
-          const makingValue = Math.round((amount - silverValue) * 100) / 100
+          const splitByRate = weight > 0 && currentRate > 0 && splitBase > 0
+          const silverValue = isPieceRate || !splitByRate
+            ? amount
+            : Math.round(amount * (currentRate / splitBase) * 100) / 100
+          const makingValue = isPieceRate ? 0 : Math.round((amount - silverValue) * 100) / 100
           return {
             title,
             sku,
             quantity,
             price,
-            makingCharge,
+            makingCharge: isPieceRate ? 0 : makingCharge,
             ...(netWeight > 0 ? { netWeight } : {}),
-            ...(weight > 0 ? { weight, silverRate: currentRate } : { silverRate: 0 }),
+            ...(weight > 0 ? { weight, silverRate: isPieceRate ? 0 : currentRate } : { silverRate: 0 }),
             ...(weight > 0 ? { silverValue, makingValue } : { silverValue: amount, makingValue: 0 }),
             amount,
             ...(li.variantId !== undefined && li.variantId !== null ? { variantId: li.variantId } : {}),
@@ -2571,7 +2690,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
           shippingAddress: ((shippingAddress ?? updated.shippingAddress) as DraftOrderAddressInput | null | undefined) ?? undefined,
           note: note ? String(note).trim() : undefined,
           tags: 'manual-order',
-          lineItems: draftOrderInputLines(updated.lineItems as ReadonlyArray<unknown> | null),
+          lineItems: await shopifyDraftLines(updated.lineItems as ReadonlyArray<unknown> | null),
         })
         shopifySync = draft
         if (draft.ok) {
@@ -2720,6 +2839,9 @@ async function startServer() {
     void import('./autoBackup').then((m) => m.startBackupVerification())
     // Periodic Shopify product pull (interval from settings; 0 = disabled).
     void import('./productAutoSync').then((m) => m.startProductAutoSync())
+    // Periodic Shopify order pull: webhooks cannot reach the desktop app, and a
+    // sleeping/deploying server misses deliveries. This is the backstop.
+    startOrderAutoSync()
     // Durable ERP → Shopify queue: drains product/price/stock pushes recorded by
     // ERP writes, with retries, so an edit is never waiting on a UI button.
     startShopifyOutboundWorker()
@@ -2730,7 +2852,11 @@ async function startServer() {
     rateLimitPruneTimer.unref()
     // Monthly customer statements (1st, 08:30) and due-date reminders (daily 09:15).
     void import('./monthlyStatements').then((m) => m.startMonthlyStatements())
-    void import('./dueReminders').then((d) => d.startDueReminders())
+    // Arm the durable post-commit side-effect recovery next to the other
+  // schedulers: an invoice whose loyalty/journal/IRN failed AFTER the commit
+  // is repaired here within one interval instead of being lost forever.
+  void import('./invoiceSideEffects').then((m) => m.startSideEffectRecovery())
+  void import('./dueReminders').then((d) => d.startDueReminders())
     // Daily sales follow-up sweep (10:05): lapses quotations, logs what to chase.
     void import('./salesFollowups').then((f) => f.startSalesFollowUps())
     // Daily supplier payables summary (09:20): one email, never per-supplier.
@@ -2813,6 +2939,7 @@ async function startServer() {
     logger.info({ signal }, 'Shutting down gracefully')
     stopOrderEmailIngest()
     stopShopifyOutboundWorker()
+    stopOrderAutoSync()
     server.close(() => {
       shutdownSessions()
       logger.info('Server closed')

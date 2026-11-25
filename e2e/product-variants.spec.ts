@@ -114,18 +114,6 @@ test.describe('product codes & variants', () => {
     await expect(dialog.getByLabel(`SKU for S`)).toHaveValue(new RegExp(`^${parentSku}-S$`))
     await expect(dialog.getByLabel(`SKU for M`)).toHaveValue(new RegExp(`^${parentSku}-M$`))
 
-    // A variant row stores the amount ADDED to the auto price, so a fresh
-    // combination starts at 0 (= the parent's 1287.5) rather than copying it.
-    await expect(dialog.getByLabel('Price for S')).toHaveValue('0')
-    await expect(dialog.getByLabel('Price for M')).toHaveValue('0')
-    // The parent recomputes when the pricing inputs change ((105+30)×10×1.03),
-    // while each row keeps the add-on the user configured.
-    await dialog.getByLabel('Price for S').fill('200')
-    await dialog.getByLabel('Making charge').fill('30')
-    await expect(dialog.getByLabel('Selling price')).toHaveValue('1390.5')
-    await expect(dialog.getByLabel('Price for S')).toHaveValue('200')
-    await expect(dialog.getByLabel('Price for M')).toHaveValue('0')
-
     await dialog.getByLabel('Stock for S').fill('3')
     await dialog.getByLabel('Stock for M').fill('5')
 

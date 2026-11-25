@@ -26,6 +26,7 @@ import { dbApi } from '@/lib/api'
 import { ManualInvoiceDialog } from '@/components/manual-invoice-dialog'
 import { InvoiceReturnDialog } from '@/components/invoice-return-dialog'
 import { exportTable } from '@/lib/export'
+import { isSplitFulfilledInvoice } from '@/lib/invoiceFulfilment'
 import type { Invoice, InvoiceItem } from '@/types'
 import { formatCurrency, formatDate } from '@/lib/format'
 
@@ -68,6 +69,11 @@ export default function SalesInvoicesPage() {
   const [editTarget, setEditTarget] = useState<Invoice | null>(null)
   const [editSaving, setEditSaving] = useState(false)
   const [editError, setEditError] = useState('')
+  // True when the invoice being edited was fulfilled from MULTIPLE stores —
+  // the dialog then explains that fulfilment lines/stores are not editable
+  // here (see openEdit; detected from the items' location_ids).
+  const [editSplit, setEditSplit] = useState(false)
+  const editSplitToken = useRef(0)
   const [editForm, setEditForm] = useState({
     customer: '', customerEmail: '', customerPhone: '', customerAddress: '',
     customerCity: '', customerState: '', customerPincode: '', buyerGstin: '',
@@ -143,6 +149,21 @@ export default function SalesInvoicesPage() {
     setEditForm(next)
     setEditBaseline(JSON.stringify(next))
     setViewInvoice(null)
+    // Is this invoice fulfilled from MULTIPLE stores? The items carry each
+    // line's store; when they span more than one, the dialog explains up
+    // front that fulfilment lines are not editable here (the API requires
+    // every replacement line to name its store) instead of letting the user
+    // meet a refusal after the fact. Token-guarded so a stale response can
+    // never annotate a newer dialog.
+    setEditSplit(false)
+    const token = ++editSplitToken.current
+    dbApi
+      .getInvoiceById(inv.id)
+      .then((full) => {
+        if (editSplitToken.current !== token) return
+        if (isSplitFulfilledInvoice(full?.items)) setEditSplit(true)
+      })
+      .catch(() => undefined)
   }, [])
 
   // The invoice detail page links here with { state: { editInvoiceId } } so
@@ -668,6 +689,14 @@ export default function SalesInvoicesPage() {
         <div className="space-y-3 text-sm">
           {editError ? (
             <div className="rounded-md border border-danger-200 bg-danger-50 px-3 py-2 text-xs text-danger-700">{editError}</div>
+          ) : null}
+          {editSplit ? (
+            <div className="rounded-md border border-warning-200 bg-warning-50 px-3 py-2 text-[11px] leading-relaxed text-warning-700">
+              This invoice was fulfilled from <b>multiple stores</b>. Its line items and their stores are not editable here —
+              saving updates only the header fields (customer, dates, status, discount, GST) and never alters fulfilment
+              records or stock. Store-level item changes go through the API, where every replacement line must name the
+              store it draws from.
+            </div>
           ) : null}
           <Field label="Customer *">
             <Input value={editForm.customer} onChange={(e) => setEditForm((f) => ({ ...f, customer: e.target.value }))} />

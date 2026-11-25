@@ -91,7 +91,8 @@ only a fallback:
 | `SHOPIFY_ACCESS_TOKEN` | `shpat_xxxxxxxxxxxxxxxx` | Custom-app Admin API token |
 | `SHOPIFY_API_VERSION` | `2025-10` | Admin API version |
 | `SHOPIFY_WEBHOOK_SECRET` | random hex | Verifies `/api/v1/webhooks/shopify` + Flow webhook HMAC |
-| `PUBLIC_BASE_URL` | `https://erp.example.com` | When set, order/product/customer webhooks are **auto-registered** at startup to point here |
+| `PUBLIC_BASE_URL` | `https://erp.example.com` | When set, order/product/customer webhooks are **auto-registered** at startup to point here. Unset/localhost is skipped — the order poll covers it |
+| `ORDER_AUTO_SYNC_INTERVAL_SECONDS` | `90` | Background Shopify order pull (30–3600s, `0` disables). Needed because webhooks never reach the desktop app and are dropped while a free-tier server sleeps |
 | `FRONTEND_ORIGIN` | `http://localhost:47195` | Allowed CORS origin (the desktop app default) |
 
 **Steps:**
@@ -507,6 +508,7 @@ TRUST_PROXY=               # only behind a reverse proxy
 # SHOPIFY_API_VERSION=2025-10
 # SHOPIFY_WEBHOOK_SECRET=some-random-hex
 PUBLIC_BASE_URL=           # https://erp.example.com → auto-registers webhooks
+# ORDER_AUTO_SYNC_INTERVAL_SECONDS=90   # background order pull (0 = off)
 
 # ── Order email ingestion (dev-store PII recovery) ──────────────────────
 # ORDER_EMAIL_ADDRESS=orders@yourdomain.com

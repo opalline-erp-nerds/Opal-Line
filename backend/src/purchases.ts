@@ -22,6 +22,10 @@ type Tx = Parameters<Parameters<DbClient['transaction']>[0]>[0]
 export interface PurchaseItemInput {
   product: string
   sku: string
+  /** Catalogue id of the product the line names — NULL on hand-typed lines. */
+  productId?: string | null
+  /** The variant received; NULL/absent = the product itself (flat line). */
+  variantId?: string | null
   qty: number
   weight: number
   rate: number
@@ -30,10 +34,12 @@ export interface PurchaseItemInput {
   amount: number
 }
 
-
-
-
-
+/** Normalise a line's optional catalogue ids (missing/blank → null). */
+function catalogueIds(item: Record<string, unknown>): { productId: string | null; variantId: string | null } {
+  const productId = String(item.productId ?? item.product_id ?? '').trim()
+  const variantId = String(item.variantId ?? item.variant_id ?? '').trim()
+  return { productId: productId || null, variantId: variantId || null }
+}
 /** Normalise + total a set of purchase lines. Cost is rate × weight. */
 export function normalizePurchaseItems(raw: unknown): PurchaseItemInput[] {
   if (!Array.isArray(raw)) return []
@@ -49,6 +55,7 @@ export function normalizePurchaseItems(raw: unknown): PurchaseItemInput[] {
       return {
         product: String(item.product ?? item.title ?? '').trim(),
         sku: String(item.sku ?? '').trim(),
+        ...catalogueIds(item),
         qty,
         weight,
         rate,
@@ -160,7 +167,7 @@ export async function getBusinessGstin(): Promise<string> {
 export async function applyPurchaseStock(
   sku: string,
   qty: number,
-  opts?: { unitValue?: number; locationId?: string | null; tx?: Tx },
+  opts?: { unitValue?: number; locationId?: string | null; tx?: Tx; variantId?: string | null },
 ): Promise<boolean> {
   const delta = Math.floor(Number(qty ?? 0))
   if (!sku || delta === 0) return false
@@ -168,6 +175,11 @@ export async function applyPurchaseStock(
   // which way it moves and whether cost is revalued.
   const result = await applyStockMovement({
     sku,
+    // A stored variant id pins the move to that exact bucket even when the
+    // line's SKU has since been edited or the product gained a new variant
+    // with the same code. Without it the SKU alone would still resolve — but
+    // against whatever the catalogue says TODAY.
+    variantId: opts?.variantId ?? null,
     qty: delta,
     type: delta > 0 ? 'purchase_in' : 'purchase_return_out',
     unitCost: Number(opts?.unitValue ?? 0),
@@ -210,7 +222,8 @@ export async function reversePurchaseStock(invoiceId: string, tx?: Tx): Promise<
   for (const it of items) {
     const sku = String(it.sku ?? '')
     if (!sku) continue
-    if (await applyPurchaseStock(sku, -Math.floor(Number(it.qty ?? 0)), { locationId, tx })) reversed += 1
+    const variantId = (it.variantId as string | null) ?? null
+    if (await applyPurchaseStock(sku, -Math.floor(Number(it.qty ?? 0)), { locationId, tx, variantId })) reversed += 1
   }
   return reversed
 }
@@ -232,7 +245,8 @@ export async function restorePurchaseStock(invoiceId: string, tx?: Tx): Promise<
   for (const it of items) {
     const sku = String(it.sku ?? '')
     if (!sku) continue
-    if (await applyPurchaseStock(sku, Math.floor(Number(it.qty ?? 0)), { locationId, tx })) restored += 1
+    const variantId = (it.variantId as string | null) ?? null
+    if (await applyPurchaseStock(sku, Math.floor(Number(it.qty ?? 0)), { locationId, tx, variantId })) restored += 1
   }
   return restored
 }
@@ -299,6 +313,8 @@ export async function getPurchaseInvoiceWithItems(invoiceId: string): Promise<Pu
     lines: items.map((it) => ({
       product: String(it.product ?? ''),
       sku: String(it.sku ?? ''),
+      productId: (it.productId as string | null) ?? null,
+      variantId: (it.variantId as string | null) ?? null,
       qty: Number(it.qty ?? 0),
       weight: Number(it.weight ?? 0),
       rate: Number(it.rate ?? 0),
@@ -324,6 +340,8 @@ export async function saveInvoiceItems(
       invoiceId,
       product: it.product || null,
       sku: it.sku || null,
+      productId: it.productId ?? null,
+      variantId: it.variantId ?? null,
       qty: it.qty,
       weight: it.weight,
       rate: it.rate,
@@ -338,7 +356,12 @@ export async function saveInvoiceItems(
       opts.addStock &&
       it.sku &&
       it.qty > 0 &&
-      (await applyPurchaseStock(it.sku, it.qty, { unitValue, locationId: opts.locationId ?? null, tx: tx as never }))
+      (await applyPurchaseStock(it.sku, it.qty, {
+        unitValue,
+        locationId: opts.locationId ?? null,
+        variantId: it.variantId ?? null,
+        tx: tx as never,
+      }))
     ) {
       stocked += 1
     }
@@ -351,6 +374,10 @@ export async function saveInvoiceItems(
 export interface PurchaseOrderLineInput {
   product: string
   sku: string
+  /** Catalogue id of the product the line names — NULL on hand-typed lines. */
+  productId?: string | null
+  /** The variant ordered; NULL/absent = the product itself (flat line). */
+  variantId?: string | null
   qty: number
   weight: number
   rate: number
@@ -361,7 +388,8 @@ export interface PurchaseOrderLineInput {
  * Normalise + total purchase-order lines. Amount is qty × weight × rate — the
  * weight column holds the PER-PIECE weight and rate is ₹ per gram (jewellery /
  * bullion pricing), falling back to whatever was sent so a plain "qty only"
- * order still saves.
+ * order — or a Piece Rate line, which sends weight 0 and a fixed amount —
+ * still saves.
  */
 export function normalizeOrderLines(raw: unknown): PurchaseOrderLineInput[] {
   if (!Array.isArray(raw)) return []
@@ -376,6 +404,7 @@ export function normalizeOrderLines(raw: unknown): PurchaseOrderLineInput[] {
       return {
         product: String(item.product ?? item.title ?? '').trim(),
         sku: String(item.sku ?? '').trim(),
+        ...catalogueIds(item),
         qty,
         weight,
         rate,
@@ -414,6 +443,8 @@ export async function saveOrderLines(orderId: string, lines: PurchaseOrderLineIn
       orderId,
       product: l.product || null,
       sku: l.sku || null,
+      productId: l.productId ?? null,
+      variantId: l.variantId ?? null,
       qty: l.qty,
       weight: l.weight,
       rate: l.rate,
@@ -428,6 +459,10 @@ export async function saveOrderLines(orderId: string, lines: PurchaseOrderLineIn
 export interface PurchaseReturnLineInput {
   product: string
   sku: string
+  /** Catalogue id of the product the line names — NULL on hand-typed lines. */
+  productId?: string | null
+  /** The variant returned; NULL/absent = the product itself (flat line). */
+  variantId?: string | null
   qty: number
   weight: number
   rate: number
@@ -447,6 +482,7 @@ export function normalizeReturnLines(raw: unknown): PurchaseReturnLineInput[] {
       return {
         product: String(item.product ?? item.title ?? '').trim(),
         sku: String(item.sku ?? '').trim(),
+        ...catalogueIds(item),
         qty: Math.max(1, Math.floor(Number(item.qty ?? 1) || 1)),
         weight,
         rate,
@@ -491,6 +527,8 @@ export async function saveReturnLines(
       returnId,
       product: l.product || null,
       sku: l.sku || null,
+      productId: l.productId ?? null,
+      variantId: l.variantId ?? null,
       qty: l.qty,
       weight: l.weight,
       rate: l.rate,
@@ -500,7 +538,11 @@ export async function saveReturnLines(
     if (opts.reverseStock && l.sku && l.qty > 0) {
       // Returns must never drive stock negative — you cannot send back metal
       // the shop never received.
-      const ok = await applyPurchaseStock(l.sku, -l.qty, { locationId: opts.locationId ?? null, tx: tx as never })
+      const ok = await applyPurchaseStock(l.sku, -l.qty, {
+        locationId: opts.locationId ?? null,
+        variantId: l.variantId ?? null,
+        tx: tx as never,
+      })
       if (ok) reversed += 1
       else logger.warn({ sku: l.sku, qty: l.qty, returnId }, 'Purchase return skipped: SKU not found')
     }
@@ -528,7 +570,8 @@ export async function restoreReturnStock(returnId: string, tx?: Tx): Promise<num
   for (const l of lines) {
     const sku = String(l.sku ?? '')
     if (!sku) continue
-    if (await applyPurchaseStock(sku, Math.floor(Number(l.qty ?? 0)), { locationId, tx })) restored += 1
+    const variantId = (l.variantId as string | null) ?? null
+    if (await applyPurchaseStock(sku, Math.floor(Number(l.qty ?? 0)), { locationId, tx, variantId })) restored += 1
   }
   return restored
 }
@@ -551,7 +594,8 @@ export async function reverseReturnStock(returnId: string, tx?: Tx): Promise<num
   for (const l of lines) {
     const sku = String(l.sku ?? '')
     if (!sku) continue
-    if (await applyPurchaseStock(sku, -Math.floor(Number(l.qty ?? 0)), { locationId, tx })) reversed += 1
+    const variantId = (l.variantId as string | null) ?? null
+    if (await applyPurchaseStock(sku, -Math.floor(Number(l.qty ?? 0)), { locationId, tx, variantId })) reversed += 1
   }
   return reversed
 }
@@ -940,18 +984,26 @@ export async function ensurePurchaseInvoiceForOrder(orderId: string): Promise<En
   const gstRate = gstRaw == null || gstRaw === '' ? 3 : Number(gstRaw) || 0
 
   // PO line amount is qty × per-piece weight × rate; invoice cost is
-  // total-weight × rate, so the weight must be the line total here.
+  // total-weight × rate, so the weight must be the line total here. A Piece
+  // Rate line has no weight/rate pair at all — its amount IS the price — so
+  // it must survive the conversion at the value the PO agreed, not collapse
+  // to a ₹0 cost.
   const items = normalizePurchaseItems(
     lines.map((l) => {
       const qty = Math.max(1, Math.floor(Number(l.qty ?? 1) || 1))
-      const weight = round2(qty * (Number(l.weight ?? 0) || 0))
-      const cost = round2(weight * (Number(l.rate ?? 0) || 0))
+      const perPieceWeight = Number(l.weight ?? 0) || 0
+      const rate = Number(l.rate ?? 0) || 0
+      const weighted = perPieceWeight > 0 && rate > 0
+      const weight = weighted ? round2(qty * perPieceWeight) : 0
+      const cost = weighted ? round2(weight * rate) : round2(Number(l.amount ?? 0) || 0)
       return {
         product: l.product ?? '',
         sku: l.sku ?? '',
+        productId: (l.productId as string | null) ?? null,
+        variantId: (l.variantId as string | null) ?? null,
         qty,
         weight,
-        rate: Number(l.rate ?? 0) || 0,
+        rate: weighted ? rate : 0,
         cost,
         tax: round2((cost * gstRate) / 100),
       }

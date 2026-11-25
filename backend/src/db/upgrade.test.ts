@@ -63,6 +63,29 @@ const KEY_COLUMNS = [
   // Shopify location mapping: ALTERed onto inventory_locations (the CREATE
   // TABLE statement does not carry it), so the upgrade path must add it too.
   'inventory_locations.shopify_location_id',
+  // Multi-store fulfilment traceability (Phase 4): ALTERed onto existing
+  // tables by BOOKING_FULFILMENT_DDL, so the upgrade path must add them too.
+  'sales_invoice_items.location_id',
+  'sales_invoice_items.booking_line_id',
+  'sales_invoice_items.booking_allocation_id',
+  'booking_allocations.line_id',
+  'booking_allocations.invoice_id',
+  'booking_allocations.fulfilled_at',
+  // Variant identity on an invoice line (ALTERed onto sales_invoice_items by
+  // INVOICE_VARIANT_DDL — the fresh CREATE TABLE does not carry it either),
+  // so a converted booking's invoice keeps naming the variant it drew from.
+  'sales_invoice_items.variant_id',
+  // Catalogue identity on purchase lines (ALTERed onto the three purchase item
+  // tables by PURCHASE_VARIANT_DDL). Those tables are dropped wholesale in the
+  // emulation below, so this is really asserting the ALTER runs AFTER the
+  // CREATE TABLEs in applyUpgrades — the fresh CREATE TABLE does not carry
+  // these columns either.
+  'purchase_order_items.product_id',
+  'purchase_order_items.variant_id',
+  'purchase_invoice_items.product_id',
+  'purchase_invoice_items.variant_id',
+  'purchase_return_items.product_id',
+  'purchase_return_items.variant_id',
 ]
 
 test('upgrade restores the full purchase schema on a pre-purchase database', async (t) => {
@@ -105,6 +128,19 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
       await sql.unsafe('alter table sales_orders drop column if exists location_id')
       // …and one that predates the Shopify location mapping column.
       await sql.unsafe('alter table inventory_locations drop column if exists shopify_location_id')
+      // …and ones that predate multi-store fulfilment traceability (Phase 4):
+      // all ALTERed onto existing tables, so the upgrade must add them back.
+      await sql.unsafe(
+        `alter table sales_invoice_items drop column if exists location_id,
+           drop column if exists booking_line_id,
+           drop column if exists booking_allocation_id,
+           drop column if exists variant_id`,
+      )
+      await sql.unsafe(
+        `alter table booking_allocations drop column if exists line_id,
+           drop column if exists invoice_id,
+           drop column if exists fulfilled_at`,
+      )
       // Emulate an install whose products.created_at is still a DATE
       // (predates the timestamp upgrade): the upgrade must widen it back.
       await sql.unsafe('alter table products alter column created_at type date using created_at::date')

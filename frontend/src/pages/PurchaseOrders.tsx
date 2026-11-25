@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
+import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { DialogFooter } from '@/components/ui/dialog'
 import { AppDialog } from '@/components/ui/app-dialog'
@@ -17,11 +18,28 @@ import { toast } from '@/components/ui/confirm'
 import { exportTable } from '@/lib/export'
 import type { Product, PurchaseOrder, PurchaseOrderReceipt, Supplier } from '@/types'
 import { formatCurrency, formatDate, formatWeight } from '@/lib/format'
+import { flattenPurchasableItems, findSellableBySku, purchasableItemOptions, type SellableItem } from '@/lib/sellableItems'
+import {
+  isPieceRateShaped,
+  pickPurchaseLine,
+  pieceRateAmount,
+  pieceRateFromTotal,
+  purchaseItemName,
+  purchaseLinePricing,
+  unitPrice,
+} from '@/lib/purchaseLines'
 
 /** One editable line on the new-PO form. */
 interface DraftLine {
   sku: string
   product: string
+  /** Catalogue identity — null on hand-typed and legacy lines. */
+  productId: string | null
+  variantId: string | null
+  /** '' = not resolved yet; see {@link purchaseLinePricing}. */
+  pricingType: '' | 'piece_rate' | 'weight_based'
+  /** ₹/pc for a piece-rate line; ignored for weight-based ones. */
+  price: string
   /** True when the row was chosen as "Other / type manually". */
   custom: boolean
   qty: string
@@ -32,14 +50,32 @@ interface DraftLine {
 }
 
 function emptyLine(): DraftLine {
-  return { sku: '', product: '', custom: false, qty: '1', weight: '0', rate: '0', confirmed: false }
+  return {
+    sku: '',
+    product: '',
+    productId: null,
+    variantId: null,
+    pricingType: '',
+    price: '',
+    custom: false,
+    qty: '1',
+    weight: '0',
+    rate: '0',
+    confirmed: false,
+  }
 }
 
 /** A "custom" option lets a line be typed in when the SKU is not in the catalog. */
 const CUSTOM_SKU = '__custom__'
 
-/** Line total: Qty × Weight (g) × Rate (₹/g) — weight is the per-piece weight. */
-function lineAmount(line: DraftLine): number {
+/**
+ * Line total: Qty × Weight (g) × Rate (₹/g) — weight is the PER-PIECE weight,
+ * which is why qty multiplies here and nowhere else. A Piece Rate line has no
+ * grams at all: it is qty × ₹/pc, and running it through the silver formula is
+ * exactly how a ₹500 item arrived as a weight-based figure.
+ */
+function lineAmount(line: DraftLine, sellables: SellableItem[]): number {
+  if (purchaseLinePricing(line, sellables) === 'piece_rate') return pieceRateAmount(line.qty, line.price)
   const qty = Math.max(1, Math.floor(Number(line.qty) || 1))
   const weight = Number(line.weight) || 0
   const rate = Number(line.rate) || 0
@@ -102,15 +138,32 @@ export default function PurchaseOrdersPage() {
     dbApi.getProducts().then(setProducts).catch(() => setProducts([]))
   }, [])
 
+  // Parent AND variants: a legacy parent-SKU line still resolves, while a
+  // variant code like OL-GIF-001-RED becomes selectable in its own right.
+  const sellables = useMemo(() => flattenPurchasableItems(products), [products])
+  const productOptions = useMemo(
+    () => [
+      ...purchasableItemOptions(sellables).filter((o) => o.value !== ''),
+      { value: CUSTOM_SKU, label: 'Other / type manually', subtitle: undefined, keywords: '' },
+    ],
+    [sellables],
+  )
+
   const prefill = useMemo(() => {
     if (!prefillSku) return null
-    const product = products.find((x) => x.sku === prefillSku) ?? null
-    return { sku: prefillSku, qty: prefillQty, product }
-  }, [prefillSku, prefillQty, products])
+    const item = findSellableBySku(sellables, prefillSku)
+    // The parent row still owns the supplier link and the cost basis, even
+    // when the deep link names one of its variants.
+    const product =
+      products.find((x) => x.sku === prefillSku) ??
+      (item ? products.find((x) => x.id === item.productId) : null) ??
+      null
+    return { sku: prefillSku, qty: prefillQty, item, product }
+  }, [prefillSku, prefillQty, sellables, products])
 
   useEffect(() => {
     if (prefill && !dialogOpen) {
-      openDialog({ sku: prefill.sku, qty: prefill.qty, product: prefill.product })
+      openDialog({ sku: prefill.sku, qty: prefill.qty, item: prefill.item, product: prefill.product })
     }
     // Only fire on a fresh prefill target; openDialog closes over the catalog
     // state, hence the disable.
@@ -130,7 +183,12 @@ export default function PurchaseOrdersPage() {
     }
   }, [])
 
-  const openDialog = (prefill?: { sku?: string; qty?: number; product?: Product | null }) => {
+  const openDialog = (prefill?: {
+    sku?: string
+    qty?: number
+    item?: SellableItem | null
+    product?: Product | null
+  }) => {
     const nextForm = {
       supplier: '',
       supplierId: '',
@@ -142,14 +200,22 @@ export default function PurchaseOrdersPage() {
     if (prefill?.sku) {
       // Preselect the line coming from a reorder hand-off: product + qty (plus
       // the piece weight / cost basis when the catalog row is known).
+      const item = prefill.item ?? null
       const p = prefill.product ?? products.find((x) => x.sku === prefill.sku) ?? null
+      const pieceRate = item?.pricingType === 'piece_rate'
       nextLines[0] = {
         sku: prefill.sku,
-        product: p?.name ?? '',
+        product: item ? purchaseItemName(item) : (p?.name ?? ''),
+        productId: item?.productId ?? null,
+        variantId: item?.variantId ?? null,
+        pricingType: item?.pricingType ?? '',
+        price: '',
         custom: false,
         qty: String(Math.max(1, Math.floor(Number(prefill.qty) || 1))),
-        weight: p ? String(p.netWeight ?? 0) : '0',
-        rate: p?.costPrice != null ? String(p.costPrice) : '0',
+        // A piece-rate item has no grams to fill in — putting netWeight here
+        // is what priced it as silver in the first place.
+        weight: pieceRate ? '0' : p ? String(p.netWeight ?? 0) : '0',
+        rate: pieceRate ? '' : p?.costPrice != null ? String(p.costPrice) : '0',
         confirmed: true,
       }
       if (p?.supplierId) nextForm.supplierId = p.supplierId ?? ''
@@ -180,6 +246,13 @@ export default function PurchaseOrdersPage() {
         ? po.lines!.map((l) => ({
             sku: l.sku ?? '',
             product: l.product ?? '',
+            productId: l.productId ?? null,
+            variantId: l.variantId ?? null,
+            // Resolved from the catalogue on demand — see purchaseLinePricing.
+            pricingType: '' as const,
+            // Per-piece price, so a piece-rate line reopens at the exact money
+            // it already stored instead of being repriced by the catalogue.
+            price: pieceRateFromTotal(l.amount, l.qty),
             custom: !(l.sku ?? '') && !!(l.product ?? ''),
             qty: String(l.qty ?? 1),
             weight: l.weight != null ? String(l.weight) : '0',
@@ -205,8 +278,12 @@ export default function PurchaseOrdersPage() {
         if (i !== index) return l
         if (sku === '') return { ...l, sku: '', custom: false, product: '', confirmed: false }
         if (sku === CUSTOM_SKU) return { ...l, sku: '', custom: true, product: '', confirmed: false }
-        const p = products.find((x) => x.sku === sku)
-        return { ...l, sku, custom: false, product: p?.name ?? l.product, weight: p ? String(p.netWeight ?? '') : l.weight }
+        // Re-picking the code already on the line must not touch anything typed
+        // after it — the agreed weight, rate and price used to be rewritten here.
+        if (l.sku === sku && !l.custom) return l
+        const pick = pickPurchaseLine(sellables, sku)
+        // An unknown code keeps the line's own name so a hand-typed row survives.
+        return pick ? { ...l, ...pick, custom: false } : { ...l, sku, custom: false }
       }),
     )
   }
@@ -260,9 +337,9 @@ export default function PurchaseOrdersPage() {
       count: added.length,
       qty: added.reduce((a, l) => a + (Math.max(1, Math.floor(Number(l.qty) || 1))), 0),
       weight: Math.round(added.reduce((a, l) => a + (Number(l.qty) || 1) * (Number(l.weight) || 0), 0) * 100) / 100,
-      value: Math.round(added.reduce((a, l) => a + lineAmount(l), 0) * 100) / 100,
+      value: Math.round(added.reduce((a, l) => a + lineAmount(l, sellables), 0) * 100) / 100,
     }
-  }, [lines])
+  }, [lines, sellables])
 
   // Live GST breakdown — same math as the server (poMoneyTotals). Discount,
   // notes and status are not part of this form any more.
@@ -290,13 +367,22 @@ export default function PurchaseOrdersPage() {
       return
     }
     const added = lines.filter((l) => l.confirmed && (l.sku.trim() !== '' || l.product.trim() !== ''))
-    const linePayload = added.map((l) => ({
-      product: l.product.trim(),
-      sku: l.sku.trim(),
-      qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
-      weight: Number(l.weight) || 0,
-      rate: Number(l.rate) || 0,
-    }))
+    const linePayload = added.map((l) => {
+      const pieceRate = purchaseLinePricing(l, sellables) === 'piece_rate'
+      return {
+        product: l.product.trim(),
+        sku: l.sku.trim(),
+        productId: l.productId,
+        variantId: l.variantId,
+        qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
+        // A piece-rate line has no weight/rate pair: it sends zeros and its
+        // fixed ₹/pc total, which the server takes as the amount instead of
+        // re-deriving it from grams of silver.
+        weight: pieceRate ? 0 : Number(l.weight) || 0,
+        rate: pieceRate ? 0 : Number(l.rate) || 0,
+        amount: lineAmount(l, sellables),
+      }
+    })
     setSaving(true)
     setError('')
     try {
@@ -596,15 +682,26 @@ export default function PurchaseOrdersPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {(viewPo.lines ?? []).map((l, i) => (
+                      {(viewPo.lines ?? []).map((l, i) => {
+                        const pieceRate = isPieceRateShaped(l.weight, l.rate, l.amount)
+                        return (
                         <tr key={`${l.sku}-${i}`} className="border-b border-border/40 last:border-0">
-                          <td className="px-3 py-2">{l.product || '—'}</td>
+                          <td className="px-3 py-2">
+                            {l.product || '—'}
+                            {pieceRate ? (
+                              // No grams on a piece-rate line — say the ₹/pc out loud.
+                              <span className="block text-[11px] text-muted-foreground">
+                                ₹{unitPrice(l.amount, l.qty).toFixed(2)}/pc
+                              </span>
+                            ) : null}
+                          </td>
                           <td className="px-3 py-2 font-mono text-xs">{l.sku || '—'}</td>
                           <td className="px-3 py-2 text-right tabular-nums">{l.qty}</td>
-                          <td className="px-3 py-2 text-right tabular-nums">{formatWeight(l.weight)}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{l.weight > 0 ? formatWeight(l.weight) : '—'}</td>
                           <td className="px-3 py-2 text-right font-medium tabular-nums">{formatCurrency(l.amount)}</td>
                         </tr>
-                      ))}
+                        )
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -770,7 +867,8 @@ export default function PurchaseOrdersPage() {
 
               <div className="space-y-2.5">
                 {lines.map((line, index) => {
-                  const amount = lineAmount(line)
+                  const amount = lineAmount(line, sellables)
+                  const pieceRate = purchaseLinePricing(line, sellables) === 'piece_rate'
                   return (
                     <div
                       key={index}
@@ -780,15 +878,10 @@ export default function PurchaseOrdersPage() {
                     >
                       <div className="space-y-1.5">
                         <ColLabel>Product</ColLabel>
-                        <Select
-                          options={[
-                            { value: '', label: 'Select product' },
-                            ...products.map((p) => ({ value: p.sku, label: `${p.name} (${p.sku})` })),
-                            { value: CUSTOM_SKU, label: 'Other / type manually' },
-                          ]}
+                        <SearchableSelect
+                          options={productOptions}
                           value={line.custom ? CUSTOM_SKU : line.sku}
                           onValueChange={(v) => pickProduct(index, v)}
-                          className="h-9 rounded-lg border border-gray-200 dark:border-border text-[14px] text-foreground"
                         />
                         {line.custom ? (
                           <Input
@@ -808,28 +901,6 @@ export default function PurchaseOrdersPage() {
                             min="1"
                             value={line.qty}
                             onChange={(e) => setLine(index, { qty: e.target.value })}
-                            className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <ColLabel>Weight (g)</ColLabel>
-                          <Input
-                            type="number"
-                            min="0"
-                            step="0.001"
-                            value={line.weight}
-                            onChange={(e) => setLine(index, { weight: e.target.value })}
-                            className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <ColLabel>Rate (₹/g)</ColLabel>
-                          <Input
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            value={line.rate}
-                            onChange={(e) => setLine(index, { rate: e.target.value })}
                             className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
                           />
                         </div>

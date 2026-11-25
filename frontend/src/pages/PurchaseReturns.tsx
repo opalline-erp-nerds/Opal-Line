@@ -23,12 +23,15 @@ import { Select } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
+import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { DialogFooter } from '@/components/ui/dialog'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
-import type { Product, PurchaseReturn, Supplier } from '@/types'
+import type { Product, PurchaseInvoice, PurchaseReturn, Supplier } from '@/types'
 import { formatCurrency, formatDate, formatWeight } from '@/lib/format'
+import { flattenPurchasableItems, purchasableItemOptions, type SellableItem } from '@/lib/sellableItems'
+import { pieceRateAmount, isPieceRateShaped, lineTotalWeight, pickPurchaseLine, purchaseLinePricing, unitPrice } from '@/lib/purchaseLines'
 
 const statusBadge: Record<PurchaseReturn['status'], { label: string; variant: 'success' | 'warning' | 'info' | 'muted' }> = {
   pending: { label: 'Pending', variant: 'warning' },
@@ -42,18 +45,41 @@ const statusBadge: Record<PurchaseReturn['status'], { label: string; variant: 's
 interface DraftLine {
   product: string
   sku: string
+  /** Catalogue identity — null on hand-typed and legacy lines. */
+  productId: string | null
+  variantId: string | null
+  /** '' = not resolved yet; see {@link purchaseLinePricing}. */
+  pricingType: '' | 'piece_rate' | 'weight_based'
+  /** ₹/pc for a piece-rate line; ignored for weight-based ones. */
+  price: string
   qty: string
   weight: string
   rate: string
 }
 
 function emptyLine(): DraftLine {
-  return { product: '', sku: '', qty: '1', weight: '', rate: '' }
+  return {
+    product: '',
+    sku: '',
+    productId: null,
+    variantId: null,
+    pricingType: '',
+    price: '',
+    qty: '1',
+    weight: '',
+    rate: '',
+  }
 }
 
 const CUSTOM_SKU = '__custom__'
 
-function lineAmount(line: DraftLine): number {
+/**
+ * Line total. Weight-based is `weight × rate` (the stored weight is the
+ * line's TOTAL grams); Piece Rate is `qty × ₹/pc` and must never fall back to
+ * a weight it does not have.
+ */
+function lineAmount(line: DraftLine, sellables: SellableItem[]): number {
+  if (purchaseLinePricing(line, sellables) === 'piece_rate') return pieceRateAmount(line.qty, line.price)
   const weight = Number(line.weight) || 0
   const rate = Number(line.rate) || 0
   return Math.round(weight * rate * 100) / 100
@@ -63,6 +89,7 @@ export default function PurchaseReturnsPage() {
   const [returns, setReturns] = useState<PurchaseReturn[]>([])
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [products, setProducts] = useState<Product[]>([])
+  const [invoices, setInvoices] = useState<PurchaseInvoice[]>([])
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
@@ -71,7 +98,7 @@ export default function PurchaseReturnsPage() {
   const [formOpen, setFormOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState('')
-  const [header, setHeader] = useState({ number: '', supplier: '', receiveNow: false })
+  const [header, setHeader] = useState({ number: '', supplier: '', invoiceId: '', receiveNow: false })
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()])
   // Snapshot of the create form as it opened, for the close guard.
   const [formBaseline, setFormBaseline] = useState('')
@@ -92,6 +119,10 @@ export default function PurchaseReturnsPage() {
   useEffect(() => {
     dbApi.getSuppliers().then(setSuppliers).catch(() => setSuppliers([]))
     dbApi.getProducts().then(setProducts).catch(() => setProducts([]))
+    // Which supplier invoice this is going back against. The server reads the
+    // STORE off that invoice, so linking one is what stops a return from a
+    // branch deducting the Main Store instead.
+    dbApi.getPurchaseInvoices().then(setInvoices).catch(() => setInvoices([]))
   }, [])
 
   /**
@@ -135,10 +166,19 @@ export default function PurchaseReturnsPage() {
   }, [returns, query, statusFilter])
 
   const totalWeight = returns.reduce((a, r) => a + r.weight, 0)
-  const knownSkus = useMemo(() => products.map((p) => p.sku), [products])
+  // Parent AND variants, so a legacy parent-SKU line still resolves while a
+  // variant code like OL-GIF-001-RED becomes selectable in its own right.
+  const sellables = useMemo(() => flattenPurchasableItems(products), [products])
+  const productOptions = useMemo(
+    () => [
+      ...purchasableItemOptions(sellables).filter((o) => o.value !== ''),
+      { value: CUSTOM_SKU, label: 'Other / type manually', subtitle: undefined, keywords: '' },
+    ],
+    [sellables],
+  )
 
   const openDialog = () => {
-    const nextHeader = { number: `PR-${new Date().getFullYear()}-${String(returns.length + 1).padStart(4, '0')}`, supplier: '', receiveNow: false }
+    const nextHeader = { number: `PR-${new Date().getFullYear()}-${String(returns.length + 1).padStart(4, '0')}`, supplier: '', invoiceId: '', receiveNow: false }
     const nextLines = [emptyLine()]
     setHeader(nextHeader)
     setLines(nextLines)
@@ -152,8 +192,16 @@ export default function PurchaseReturnsPage() {
       prev.map((l, i) => {
         if (i !== index) return l
         if (sku === CUSTOM_SKU) return { ...l, sku: '' }
-        const p = products.find((x) => x.sku === sku)
-        return { ...l, sku, product: p?.name ?? l.product, weight: p ? String(p.netWeight ?? '') : l.weight }
+        // Re-picking the code already on the line must not touch anything typed
+        // after it — an agreed weight or rate used to be rewritten here.
+        if (l.sku === sku) return l
+        const pick = pickPurchaseLine(sellables, sku)
+        // An unknown code keeps the line's own name so a hand-typed row survives.
+        if (!pick) return { ...l, sku }
+        // This table's Weight column is the line's TOTAL grams (the server
+        // costs it as weight × rate), while the catalogue knows per-piece
+        // grams — so a qty-3 line opens at 3 × netWeight, not one piece.
+        return { ...l, ...pick, weight: lineTotalWeight(pick.weight, l.qty) }
       }),
     )
   }
@@ -171,9 +219,9 @@ export default function PurchaseReturnsPage() {
     return {
       count: usable.length,
       weight: Math.round(usable.reduce((a, l) => a + (Number(l.weight) || 0), 0) * 100) / 100,
-      amount: Math.round(usable.reduce((a, l) => a + lineAmount(l), 0) * 100) / 100,
+      amount: Math.round(usable.reduce((a, l) => a + lineAmount(l, sellables), 0) * 100) / 100,
     }
-  }, [lines])
+  }, [lines, sellables])
 
   const submit = async () => {
     if (!header.number.trim()) {
@@ -195,14 +243,27 @@ export default function PurchaseReturnsPage() {
       const res = await dbApi.createPurchaseReturn({
         number: header.number.trim(),
         supplier: header.supplier.trim(),
+        // Ties the return to the receipt it came from: the server resolves the
+        // store from that invoice and deducts the variant bucket it credited.
+        invoiceId: header.invoiceId || null,
         status: header.receiveNow ? 'received' : 'pending',
-        items: usable.map((l) => ({
-          product: l.product.trim(),
-          sku: l.sku.trim(),
-          qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
-          weight: Number(l.weight) || 0,
-          rate: Number(l.rate) || 0,
-        })),
+        items: usable.map((l) => {
+          const pieceRate = purchaseLinePricing(l, sellables) === 'piece_rate'
+          return {
+            product: l.product.trim(),
+            sku: l.sku.trim(),
+            productId: l.productId,
+            variantId: l.variantId,
+            qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
+            // A piece-rate line has no weight/rate pair: it sends zeros and its
+            // fixed ₹/pc total, which the server takes as-is instead of
+            // re-deriving it from grams of silver. Weight-based lines still
+            // send their own total as the fallback the server already honours.
+            weight: pieceRate ? 0 : Number(l.weight) || 0,
+            rate: pieceRate ? 0 : Number(l.rate) || 0,
+            amount: lineAmount(l, sellables),
+          }
+        }),
       })
       toast.success(
         header.receiveNow
@@ -469,6 +530,12 @@ export default function PurchaseReturnsPage() {
                 </div>
                 <div className="flex justify-between"><span className="text-muted-foreground">Weight</span><span>{formatWeight(viewReturn.weight)}</span></div>
                 <div className="flex justify-between"><span className="text-muted-foreground">Amount</span><span className="font-semibold">{formatCurrency(viewReturn.amount)}</span></div>
+                {viewReturn.invoiceId ? (
+                  <div className="col-span-2 flex justify-between">
+                    <span className="text-muted-foreground">Against invoice</span>
+                    <span>{invoices.find((inv) => inv.id === viewReturn.invoiceId)?.number ?? viewReturn.invoiceId}</span>
+                  </div>
+                ) : null}
               </div>
 
               <div className="overflow-hidden rounded-md border border-border/60">
@@ -485,10 +552,18 @@ export default function PurchaseReturnsPage() {
                   <tbody>
                     {(viewReturn.lines ?? []).map((l, i) => (
                       <tr key={`${l.sku}-${i}`} className="border-b border-border/40 last:border-0">
-                        <td className="px-3 py-2">{l.product || '—'}</td>
+                        <td className="px-3 py-2">
+                          {l.product || '—'}
+                          {isPieceRateShaped(l.weight, l.rate, l.amount) ? (
+                            // No grams on a piece-rate line — say the ₹/pc out loud.
+                            <span className="block text-[11px] text-muted-foreground">
+                              ₹{unitPrice(l.amount, l.qty).toFixed(2)}/pc
+                            </span>
+                          ) : null}
+                        </td>
                         <td className="px-3 py-2 font-mono text-xs">{l.sku || '—'}</td>
                         <td className="px-3 py-2 text-right tabular-nums">{l.qty}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{formatWeight(l.weight)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{l.weight > 0 ? formatWeight(l.weight) : '—'}</td>
                         <td className="px-3 py-2 text-right font-medium tabular-nums">{formatCurrency(l.amount)}</td>
                       </tr>
                     ))}
@@ -545,6 +620,31 @@ export default function PurchaseReturnsPage() {
                   onValueChange={(v) => setHeader((h) => ({ ...h, supplier: v }))}
                 />
               </Field>
+              <Field label="Against purchase invoice (optional)">
+                <Select
+                  options={[
+                    { value: '', label: 'Not linked to an invoice' },
+                    ...invoices.map((inv) => ({
+                      value: inv.id,
+                      label: `${inv.number} · ${inv.supplier}`,
+                    })),
+                  ]}
+                  value={header.invoiceId}
+                  onValueChange={(v) =>
+                    setHeader((h) => ({
+                      ...h,
+                      invoiceId: v,
+                      // Picking the receipt fills the supplier it was bought
+                      // from, so the two halves cannot disagree.
+                      supplier: v ? (invoices.find((inv) => inv.id === v)?.supplier ?? h.supplier) : h.supplier,
+                    }))
+                  }
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  A linked return takes the goods back out of the store that received them. Without one it deducts
+                  the main store.
+                </p>
+              </Field>
             </div>
 
             <div>
@@ -567,21 +667,20 @@ export default function PurchaseReturnsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {lines.map((line, index) => (
+                    {lines.map((line, index) => {
+                      const pieceRate = purchaseLinePricing(line, sellables) === 'piece_rate'
+                      return (
                       <tr key={index} className="border-b border-border/40 last:border-0">
                         <td className="px-2 py-1.5">
-                          <Select
-                            options={[
-                              { value: '', label: 'Select a product…' },
-                              ...knownSkus.map((sku) => {
-                                const p = products.find((x) => x.sku === sku)
-                                return { value: sku, label: `${p?.name ?? sku} (${sku})` }
-                              }),
-                              { value: CUSTOM_SKU, label: 'Other / type manually' },
-                            ]}
+                          <SearchableSelect
+                            options={productOptions}
                             value={line.sku === '' ? (line.product ? CUSTOM_SKU : '') : line.sku}
                             onValueChange={(v) => pickProduct(index, v)}
+                            placeholder="Select a product…"
+                            searchPlaceholder="Search name, SKU or variant…"
+                            emptyText="No matching product or variant"
                             className="h-8 text-xs"
+                            compact
                           />
                           <Input
                             value={line.product}
@@ -593,20 +692,44 @@ export default function PurchaseReturnsPage() {
                         <td className="px-2 py-1.5">
                           <Input type="number" min="1" value={line.qty} onChange={(e) => setLine(index, { qty: e.target.value })} className="h-8 text-right text-xs" />
                         </td>
-                        <td className="px-2 py-1.5">
-                          <Input type="number" min="0" step="0.001" value={line.weight} onChange={(e) => setLine(index, { weight: e.target.value })} className="h-8 text-right text-xs" />
-                        </td>
-                        <td className="px-2 py-1.5">
-                          <Input type="number" min="0" step="0.01" value={line.rate} onChange={(e) => setLine(index, { rate: e.target.value })} className="h-8 text-right text-xs" />
-                        </td>
-                        <td className="px-2 py-1.5 text-right tabular-nums text-xs">{formatCurrency(lineAmount(line))}</td>
+                        {pieceRate ? (
+                          // A piece-rate item has no grams: one wide cell carries
+                          // the ₹/pc price instead of a weight × rate pair.
+                          <td className="px-2 py-1.5" colSpan={2}>
+                            <div className="flex items-center justify-end gap-1.5">
+                              <span className="text-[11px] text-muted-foreground">Price</span>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.01"
+                                value={line.price}
+                                onChange={(e) => setLine(index, { price: e.target.value })}
+                                placeholder="0.00"
+                                aria-label="Price per piece"
+                                className="h-8 w-24 text-right text-xs"
+                              />
+                              <span className="text-[11px] text-muted-foreground">₹/pc</span>
+                            </div>
+                          </td>
+                        ) : (
+                          <>
+                            <td className="px-2 py-1.5">
+                              <Input type="number" min="0" step="0.001" value={line.weight} onChange={(e) => setLine(index, { weight: e.target.value })} className="h-8 text-right text-xs" />
+                            </td>
+                            <td className="px-2 py-1.5">
+                              <Input type="number" min="0" step="0.01" value={line.rate} onChange={(e) => setLine(index, { rate: e.target.value })} className="h-8 text-right text-xs" />
+                            </td>
+                          </>
+                        )}
+                        <td className="px-2 py-1.5 text-right tabular-nums text-xs">{formatCurrency(lineAmount(line, sellables))}</td>
                         <td className="px-2 py-1.5 text-right">
                           <Button variant="ghost" size="icon-sm" onClick={() => removeLine(index)} aria-label="Remove line">
                             <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
                           </Button>
                         </td>
                       </tr>
-                    ))}
+                      )
+                    })}
                   </tbody>
                 </table>
               </div>

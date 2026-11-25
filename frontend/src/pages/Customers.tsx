@@ -25,7 +25,7 @@ import {
 import { backupApi, dbApi, shopifyApi } from '@/lib/api'
 import { describeSyncResult } from '@/lib/syncResult'
 import { exportTable } from '@/lib/export'
-import type { Customer, Invoice, LoyaltyEntry, SalesOrder } from '@/types'
+import type { Customer, Customer360, Invoice, LoyaltyEntry, SalesOrder } from '@/types'
 import { formatCurrency, formatDate, formatNumber } from '@/lib/format'
 import { initials } from '@/lib/utils'
 
@@ -55,6 +55,10 @@ export default function CustomersPage() {
   const [viewCustomer, setViewCustomer] = useState<Customer | null>(null)
   const [customerOrders, setCustomerOrders] = useState<SalesOrder[]>([])
   const [customerInvoices, setCustomerInvoices] = useState<Invoice[]>([])
+  // Server-computed outstanding (grandTotal − collected, Phase 5.2): the one
+  // number the Dues page and the payment endpoint also use, so this dialog
+  // can never quote more than the customer actually owes.
+  const [custSummary, setCustSummary] = useState<Customer360 | null>(null)
   const [loyaltyBalance, setLoyaltyBalance] = useState<number | null>(null)
   const [loyaltyEntries, setLoyaltyEntries] = useState<LoyaltyEntry[]>([])
   const [adjustingPoints, setAdjustingPoints] = useState(false)
@@ -66,6 +70,7 @@ export default function CustomersPage() {
       queueMicrotask(() => {
         setCustomerOrders([])
         setCustomerInvoices([])
+        setCustSummary(null)
         setLoyaltyBalance(null)
         setLoyaltyEntries([])
       })
@@ -73,6 +78,9 @@ export default function CustomersPage() {
     }
     let cancelled = false
     // Resolve by id: Shopify-created customers can have a blank name.
+    dbApi.customer360(viewCustomer.name)
+      .then((r) => { if (!cancelled) setCustSummary(r) })
+      .catch(() => undefined)
     dbApi.loyaltyBalance(viewCustomer.id)
       .then((r) => { if (!cancelled) setLoyaltyBalance(r.found ? (r.balance ?? 0) : null) })
       .catch(() => undefined)
@@ -667,12 +675,19 @@ export default function CustomersPage() {
               <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Statement</p>
               {(() => {
                 const totalInvoiced = customerInvoices.reduce((a, inv) => a + (inv.grandTotal ?? 0), 0)
-                const totalPaid = customerInvoices
-                  .filter((inv) => inv.paymentStatus === 'paid')
+                const billedActive = customerInvoices
+                  .filter((inv) => inv.status !== 'cancelled' && inv.status !== 'refunded')
                   .reduce((a, inv) => a + (inv.grandTotal ?? 0), 0)
-                const outstanding = customerInvoices
-                  .filter((inv) => inv.paymentStatus !== 'paid' && inv.status !== 'cancelled' && inv.status !== 'refunded')
-                  .reduce((a, inv) => a + (inv.grandTotal ?? 0), 0)
+                // Outstanding = grandTotal − collected, per invoice, computed
+                // by the server (Phase 5.2) — a booking advance credited at
+                // conversion or any partial payment reduces it. The gross
+                // open-invoice sum is only the pre-summary-load fallback.
+                const outstanding = custSummary
+                  ? custSummary.outstanding
+                  : customerInvoices
+                      .filter((inv) => inv.paymentStatus !== 'paid' && inv.status !== 'cancelled' && inv.status !== 'refunded')
+                      .reduce((a, inv) => a + (inv.grandTotal ?? 0), 0)
+                const totalPaid = Math.max(0, Math.round((billedActive - outstanding) * 100) / 100)
                 return (
                   <div>
                     <div className="mb-2 grid grid-cols-3 gap-2">

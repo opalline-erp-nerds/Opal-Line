@@ -11,7 +11,8 @@ import { round2 } from '@/lib/utils'
  * instead of drifting the way the old flat-making-charge maths did.
  *
  * Keep the two in sync:
- *   line amount = weight × (silverRatePerGram + makingChargePerGram)
+ *   line amount = qty × pieceRate            (Piece Rate lines)
+ *              = weight × (silverRatePerGram + makingChargePerGram)  (weight-based)
  *   GST is charged on the subtotal (pre-discount); discount comes off the total.
  */
 
@@ -23,10 +24,23 @@ export interface InvoiceLineInput {
   silverRatePerGram: number
   /** Making charge PER GRAM (not a flat line fee). */
   makingChargePerGram: number
+  /**
+   * Fixed ₹/pc for a Piece Rate line; 0/absent = a weight-based line. When set
+   * the line bills `qty × fixed` and the weight/rate/making inputs are ignored —
+   * the same rule `applyPieceRateItems` applies server-side, so a ₹2,000/pc
+   * toy is never re-priced by silver weight here.
+   */
+  pieceRate?: number
+  /** Whole pieces; only read when `pieceRate` applies. */
+  qty?: number
 }
 
 /** Line amount exactly as the backend computes it, rounded to the paisa. */
 export function lineAmount(line: InvoiceLineInput): number {
+  if (line.pieceRate != null && line.pieceRate > 0) {
+    const qty = Math.max(1, Math.floor(line.qty ?? 1))
+    return round2(line.pieceRate * qty)
+  }
   const weight = line.weight
   if (weight <= 0) return 0
   return round2(weight * (line.silverRatePerGram + line.makingChargePerGram))
@@ -34,11 +48,13 @@ export function lineAmount(line: InvoiceLineInput): number {
 
 /** Silver component of a line, for the breakdown row. */
 export function lineSilverValue(line: InvoiceLineInput): number {
+  if (line.pieceRate != null && line.pieceRate > 0) return 0
   return round2(line.weight * line.silverRatePerGram)
 }
 
 /** Making-charge component of a line, for the breakdown row. */
 export function lineMakingValue(line: InvoiceLineInput): number {
+  if (line.pieceRate != null && line.pieceRate > 0) return 0
   return round2(line.weight * line.makingChargePerGram)
 }
 
