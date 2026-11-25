@@ -4429,6 +4429,12 @@ export interface ShopifyOrdersImportResult {
   message?: string
   /** Present when Shopify redacted customer PII on the REST payloads (plan-gated). */
   piiRedacted?: { count: number; example: string; message: string } | null
+  /**
+   * This caller joined an import that was already running (webhook, timer and
+   * manual Sync Orders overlap constantly) and received its result instead of
+   * starting a second pass.
+   */
+  coalesced?: boolean
 }
 
 function mapImportedPayment(status: string | null | undefined): string {
@@ -4470,7 +4476,140 @@ function mapImportedStatus(raw: any): string {
   return 'imported'
 }
 
+type ShopifyStockClient = Pick<NonNullable<typeof db>, 'select'>
+
+type ResolvedOrderStockTarget = {
+  /** The PARENT sku — stock movements are ledgered under it. */
+  sku: string
+  productId: string
+  productStock: number
+  variantId: string | null
+  variantStock: number | null
+}
+
+/**
+ * Resolve one Shopify line to the stock bucket that actually sold.
+ *
+ * `shopify_variant_id` is immutable; SKUs get renamed. It therefore wins over
+ * any SKU match, including a Shopify SKU that happens to equal a parent SKU.
+ * SKU is only a fallback (variant SKU first, then parent SKU), and a blank SKU
+ * is fine when a variant id resolves — the parent's SKU is returned so the
+ * ledger movement and later cancellation restock still have a usable key.
+ */
+async function resolveOrderStockTarget(
+  client: ShopifyStockClient,
+  line: { sku: string; shopifyVariantId: string | null },
+): Promise<ResolvedOrderStockTarget | null> {
+  const rawSku = String(line.sku ?? '').trim()
+  const shopifyVariantId = String(line.shopifyVariantId ?? '').trim()
+  let variant: { id: string; productId: string; stock: number } | null = null
+
+  if (shopifyVariantId) {
+    const [byId] = await client
+      .select({ id: schema.productVariants.id, productId: schema.productVariants.productId, stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.shopifyVariantId, shopifyVariantId))
+      .limit(1)
+    variant = byId ?? null
+  }
+  if (!variant && rawSku) {
+    const [bySku] = await client
+      .select({ id: schema.productVariants.id, productId: schema.productVariants.productId, stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.sku, rawSku))
+      .limit(1)
+    variant = bySku ?? null
+  }
+
+  if (variant) {
+    const [parent] = await client
+      .select({ id: schema.products.id, sku: schema.products.sku, stock: schema.products.stock })
+      .from(schema.products)
+      .where(eq(schema.products.id, variant.productId))
+      .limit(1)
+    if (!parent?.sku) return null
+    return {
+      sku: parent.sku,
+      productId: parent.id,
+      productStock: Number(parent.stock ?? 0),
+      variantId: variant.id,
+      variantStock: Number(variant.stock ?? 0),
+    }
+  }
+
+  if (!rawSku) return null
+  const [product] = await client
+    .select({ id: schema.products.id, sku: schema.products.sku, stock: schema.products.stock })
+    .from(schema.products)
+    .where(eq(schema.products.sku, rawSku))
+    .limit(1)
+  if (!product?.sku) return null
+  return {
+    sku: product.sku,
+    productId: product.id,
+    productStock: Number(product.stock ?? 0),
+    variantId: null,
+    variantStock: null,
+  }
+}
+
+/** Lock parent-then-variant (the same order as every other stock writer) and refresh balances. */
+async function lockOrderStockTarget(
+  tx: ShopifyStockClient,
+  target: ResolvedOrderStockTarget,
+): Promise<ResolvedOrderStockTarget | null> {
+  const [product] = await tx
+    .select({ sku: schema.products.sku, stock: schema.products.stock })
+    .from(schema.products)
+    .where(eq(schema.products.id, target.productId))
+    .limit(1)
+    .for('update')
+  if (!product?.sku) return null
+  let variantStock: number | null = null
+  if (target.variantId) {
+    const [variant] = await tx
+      .select({ stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.id, target.variantId))
+      .limit(1)
+      .for('update')
+    if (!variant) return null
+    variantStock = Number(variant.stock ?? 0)
+  }
+  return { ...target, sku: product.sku, productStock: Number(product.stock ?? 0), variantStock }
+}
+
+/**
+ * Shared order import.
+ *
+ * Every path — the Shopify webhook, the background order poll and the manual
+ * Sync Orders button — lands here, and any of them can fire while another is
+ * still running. Two concurrent passes both see an order as unknown and race
+ * the insert (the transaction guard stops the double deduction, but the loser
+ * reports a confusing duplicate error). Coalescing makes the second caller
+ * await the in-flight pass and reuse its result: one import at a time, and a
+ * deterministic answer for every caller.
+ */
+let ordersImportInFlight: Promise<ShopifyOrdersImportResult> | null = null
+
+export function isOrderImportInProgress(): boolean {
+  return ordersImportInFlight !== null
+}
+
 export async function importShopifyOrders(options?: { updatedAtMin?: string | null }): Promise<ShopifyOrdersImportResult> {
+  if (ordersImportInFlight) {
+    const shared = await ordersImportInFlight.catch(() => null)
+    if (shared) return { ...shared, coalesced: true }
+  }
+  let run: Promise<ShopifyOrdersImportResult>
+  run = importShopifyOrdersUncoalesced(options).finally(() => {
+    if (ordersImportInFlight === run) ordersImportInFlight = null
+  })
+  ordersImportInFlight = run
+  return run
+}
+
+async function importShopifyOrdersUncoalesced(options?: { updatedAtMin?: string | null }): Promise<ShopifyOrdersImportResult> {
   if (!isConfigured()) {
     return { ok: false, imported: 0, updated: 0, errors: ['Shopify is not configured. Set SHOPIFY_STORE_URL and SHOPIFY_ACCESS_TOKEN in server/.env'], message: 'Shopify is not configured' }
   }
@@ -4562,6 +4701,10 @@ export async function importShopifyOrders(options?: { updatedAtMin?: string | nu
             // insert so the deduction — and every later reversal — lands on the
             // same balance; kept on the row for auditability.
             locationId: li.location_id != null ? String(li.location_id) : null,
+            // Shopify sells VARIANTS: the line's SKU is usually a variant SKU,
+            // so its Shopify variant id is what pins the local variant when a
+            // store renames SKUs.
+            shopifyVariantId: li.variant_id != null ? String(li.variant_id) : null,
           }))
           .filter((li: { title: string }) => li.title) ?? []
       const tags = String(o.tags ?? '').trim() || null
@@ -4662,6 +4805,15 @@ export async function importShopifyOrders(options?: { updatedAtMin?: string | nu
         updated++
       } else {
         try {
+          // Resolve stock buckets BEFORE inserting the order. The stored
+          // lineItems then carry the parent SKU even when Shopify sent a blank
+          // SKU, so a later cancellation restock can find the same bucket.
+          const stockTargets: Array<ResolvedOrderStockTarget | null> = []
+          for (const li of lineItems) {
+            const target = await resolveOrderStockTarget(db!, li)
+            stockTargets.push(target)
+            if (target) li.sku = target.sku
+          }
           // The order's Shopify location, mapped to an ERP stock location by
           // ID (never by name). Unmapped or absent → null, which resolves to
           // the default store — where the old rollup-only deduction landed.
@@ -4679,32 +4831,19 @@ export async function importShopifyOrders(options?: { updatedAtMin?: string | nu
           let deductionLocation: string | null = null
           if (erpLocationId) {
             deductionLocation = erpLocationId
-            for (const li of lineItems) {
-              const sku = String(li.sku ?? '').trim()
+            for (let i = 0; i < lineItems.length; i++) {
+              const li = lineItems[i]!
+              const target = stockTargets[i]
               const qty = Math.floor(Number(li.quantity ?? 0))
-              if (!sku || qty <= 0) continue
-              const [p] = await db!
-                .select({ id: schema.products.id })
-                .from(schema.products)
-                .where(eq(schema.products.sku, sku))
-                .limit(1)
-              // Shopify sells VARIANTS, so the line SKU usually belongs to
-              // product_variants — resolve through it rather than treating a
-              // variant line as "no product" and keeping the mapped location.
-              let productId = p?.id ?? null
-              if (!productId) {
-                const [variant] = await db!
-                  .select({ productId: schema.productVariants.productId })
-                  .from(schema.productVariants)
-                  .where(eq(schema.productVariants.sku, sku))
-                  .limit(1)
-                productId = variant?.productId ?? null
-              }
-              if (!productId) continue
+              if (!target || qty <= 0) continue
               const [lvl] = await db!
                 .select({ locationId: schema.stockLevels.locationId })
                 .from(schema.stockLevels)
-                .where(eq(schema.stockLevels.productId, productId))
+                .where(
+                  target.variantId
+                    ? and(eq(schema.stockLevels.productId, target.productId), eq(schema.stockLevels.variantId, target.variantId))
+                    : eq(schema.stockLevels.productId, target.productId),
+                )
                 .limit(1)
               if (!lvl) {
                 deductionLocation = null
@@ -4764,13 +4903,18 @@ export async function importShopifyOrders(options?: { updatedAtMin?: string | nu
             insertedRow = true
 
             const targetLocation = deductionLocation ?? (await resolveMovementLocation(null, tx))
-            for (const li of lineItems) {
-              const sku = String(li.sku ?? '').trim()
+            for (let i = 0; i < lineItems.length; i++) {
+              const li = lineItems[i]!
               const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-              if (!sku || qty <= 0) continue
-              const [product] = await tx.select({ id: schema.products.id, stock: schema.products.stock }).from(schema.products).where(eq(schema.products.sku, sku)).limit(1).for('update')
-              if (!product) continue
-              const current = Number(product.stock ?? 0)
+              const preResolved = stockTargets[i]
+              if (qty <= 0 || !preResolved) continue
+              // Re-lock under the transaction and refresh balances: another
+              // order may have consumed stock since the pre-insert resolution.
+              const target = await lockOrderStockTarget(tx as ShopifyStockClient, preResolved)
+              if (!target) continue
+              const current = target.variantId
+                ? Number(target.variantStock ?? 0)
+                : Number(target.productStock ?? 0)
               if (current - qty < 0) continue
               // Through the ledger now: the movement posts at the order's
               // chosen location and recomputes the rollup from the levels —
@@ -4779,7 +4923,8 @@ export async function importShopifyOrders(options?: { updatedAtMin?: string | nu
               // guard above keeps it exactly-once for concurrent syncs and
               // webhook retries.
               await applyStockMovement({
-                sku,
+                sku: target.sku,
+                variantId: target.variantId,
                 qty: -qty,
                 type: 'sale_out',
                 refType: 'shopify_order',

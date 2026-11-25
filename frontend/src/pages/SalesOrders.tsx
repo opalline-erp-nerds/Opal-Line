@@ -50,6 +50,8 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { dbApi, shopifyApi, printTemplatesApi, formatApiError } from '@/lib/api'
 import { computeLineStockErrors, stockErrorsFromApiError } from '@/lib/orderStock'
+import { useOrderAutoRefresh } from '@/hooks/use-order-auto-refresh'
+import { newOrdersMessage } from '@/lib/orderAutoRefresh'
 import { productVariants, variantOptions } from '@/lib/productVariants'
 import {
   flattenSellableItems,
@@ -352,6 +354,22 @@ export default function SalesOrdersPage() {
   const reload = useCallback(() => {
     dbApi.getSalesOrders().then(setOrders).catch(() => {})
   }, [])
+
+  // Shopify orders also arrive from the server's background poll (webhooks
+  // cannot reach the desktop app), so the list refreshes itself. Search,
+  // filters, sort and pagination are untouched, and every dialog suspends the
+  // refresh so an order being typed or viewed is never reset underneath.
+  const autoRefreshPaused =
+    dialogOpen || custEditOpen || viewOrder !== null || viewDialogOpen || newProductLineKey !== null
+  useOrderAutoRefresh({
+    paused: autoRefreshPaused,
+    fetchOrders: useCallback(() => dbApi.getSalesOrders(), []),
+    onOrders: setOrders,
+    onNewShopifyOrders: (fresh) => {
+      const message = newOrdersMessage(fresh.length)
+      if (message) toast.info(message)
+    },
+  })
 
   const bulkInvoice = async () => {
     if (selectedOrders.length === 0) return

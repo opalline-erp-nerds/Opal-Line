@@ -8,6 +8,14 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
+import { decryptSecret } from './lib/crypto'
+import {
+  getOrderAutoSyncStatus,
+  getOrderSyncIntervalSeconds,
+  parseOrderSyncIntervalSeconds,
+  startOrderAutoSync,
+  stopOrderAutoSync,
+} from './orderAutoSync'
 import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, DraftOrderResult, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, resolveShopifyVariantTargets, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
 import { buildPricedOrder, fixedPieceRateFor, ORDER_GST_RATE, type OrderCatalogueRow, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
@@ -322,10 +330,12 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
     return
   }
 
-  // Order / fulfillment events are applied BEFORE acknowledging so Shopify can
-  // retry when the authoritative state could not be persisted. These handlers
-  // are deliberately targeted and idempotent; they never run the order import's
-  // stock deduction path for an already-known order.
+  // Order / fulfillment events are acknowledged IMMEDIATELY. Shopify treats a
+  // delivery as failed after ~5s, and this branch can do a FULL order import
+  // (paging, invoices, email enrichment) — far too slow to keep the connection
+  // open. The background order poll is the backstop for work that fails after
+  // the ack; releasing the delivery id below still allows a genuine Shopify
+  // retry to process the same payload again.
   const ORDER_EVENT_TOPICS = new Set([
     'orders/create',
     'orders/updated',
@@ -337,75 +347,76 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
   ])
   const FULFILLMENT_EVENT_TOPICS = new Set(['fulfillments/create', 'fulfillments/update'])
   if (ORDER_EVENT_TOPICS.has(topic) || FULFILLMENT_EVENT_TOPICS.has(topic)) {
-    try {
-      const pipeline = await import('./shopifyOrderPipeline')
-      const orderPayload = req.body as { id?: number; name?: string; admin_graphql_api_id?: string; cancelled_at?: string | null } | undefined
-      let applied
-      if (FULFILLMENT_EVENT_TOPICS.has(topic)) {
-        applied = await pipeline.applyFulfillmentWebhook(req.body, { actor: 'shopify' })
-      } else {
-        const shopifyId = orderPayload?.name ? `#${String(orderPayload.name).replace(/^#/, '')}` : null
-        applied = await pipeline.applyShopifyOrderPayload(req.body, { actor: 'shopify' })
-        // A new order can arrive before the scheduled/manual import. Import only
-        // when it is not a cancellation, and let the importer own its one-time
-        // stock deduction. Existing rows are updated by the diff-only mapper.
-        if (!applied.found && topic !== 'orders/cancelled') {
-          const { importShopifyOrders } = await import('./shopify')
-          const imported = await importShopifyOrders()
-          applied = await pipeline.applyShopifyOrderPayload(req.body, { actor: 'shopify' })
-          if (imported.ok) {
-            // Redacted API payloads are completed from the notification email
-            // (never redacted) and by a targeted GraphQL enrichment. Both were
-            // part of the previous order-webhook path and must keep running so
-            // new orders do not land with a blank customer.
-            const { kickEmailIngest } = await import('./orderEmailIngest')
-            kickEmailIngest()
-            try {
-              const { enrichOrdersFromShopify } = await import('./shopifyDataEnhance')
-              const enriched = await enrichOrdersFromShopify()
-              logger.info({ enriched: enriched.enriched, failed: enriched.failed }, 'Auto-enrich: orders updated with full customer data')
-            } catch (err) {
-              logger.error({ err }, 'Auto-enrich after order webhook failed')
+    const payload = req.body
+    res.json({ ok: true, accepted: true })
+    void (async () => {
+      try {
+        const pipeline = await import('./shopifyOrderPipeline')
+        const orderPayload = payload as { id?: number; name?: string; admin_graphql_api_id?: string; cancelled_at?: string | null } | undefined
+        let applied
+        if (FULFILLMENT_EVENT_TOPICS.has(topic)) {
+          applied = await pipeline.applyFulfillmentWebhook(payload, { actor: 'shopify' })
+        } else {
+          const shopifyId = orderPayload?.name ? `#${String(orderPayload.name).replace(/^#/, '')}` : null
+          applied = await pipeline.applyShopifyOrderPayload(payload, { actor: 'shopify' })
+          // A new order can arrive before the scheduled/manual import. Import only
+          // when it is not a cancellation, and let the importer own its one-time
+          // stock deduction. Existing rows are updated by the diff-only mapper.
+          if (!applied.found && topic !== 'orders/cancelled') {
+            const imported = await importShopifyOrders()
+            applied = await pipeline.applyShopifyOrderPayload(payload, { actor: 'shopify' })
+            if (imported.ok) {
+              // Redacted API payloads are completed from the notification email
+              // (never redacted) and by a targeted GraphQL enrichment. Both were
+              // part of the previous order-webhook path and must keep running so
+              // new orders do not land with a blank customer.
+              const { kickEmailIngest } = await import('./orderEmailIngest')
+              kickEmailIngest()
+              try {
+                const { enrichOrdersFromShopify } = await import('./shopifyDataEnhance')
+                const enriched = await enrichOrdersFromShopify()
+                logger.info({ enriched: enriched.enriched, failed: enriched.failed }, 'Auto-enrich: orders updated with full customer data')
+              } catch (err) {
+                logger.error({ err }, 'Auto-enrich after order webhook failed')
+              }
             }
           }
-        }
-        // Restock + loyalty reversal hang off the applied cancellation, not the
-        // topic: a cancellation can first surface through `orders/updated` when
-        // the `orders/cancelled` subscription was missing for a period.
-        if (applied.orderId && applied.changed?.includes('cancelled')) {
-          const actions = await import('./shopifyOrderActions')
-          const restored = await actions.cancelLocalOrderOnce(applied.orderId)
-          if (restored.itemsRestored > 0) logger.info({ topic, orderId: applied.orderId, ...restored }, 'Order Pipeline: stock restored after cancellation')
-          if (shopifyId) {
-            const { handleShopifyOrderCancelled } = await import('./shopifyLoyalty')
-            const loyalty = await handleShopifyOrderCancelled(shopifyId)
-            if (loyalty.reversed > 0) logger.info({ topic, shopifyId, ...loyalty }, 'Loyalty: order cancellation reversed points')
+          // Restock + loyalty reversal hang off the applied cancellation, not the
+          // topic: a cancellation can first surface through `orders/updated` when
+          // the `orders/cancelled` subscription was missing for a period.
+          if (applied.orderId && applied.changed?.includes('cancelled')) {
+            const { cancelLocalOrderOnce } = await import('./shopifyOrderActions')
+            const restored = await cancelLocalOrderOnce(applied.orderId)
+            if (restored.itemsRestored > 0) logger.info({ topic, orderId: applied.orderId, ...restored }, 'Order Pipeline: stock restored after cancellation')
+            if (shopifyId) {
+              const { handleShopifyOrderCancelled } = await import('./shopifyLoyalty')
+              const loyalty = await handleShopifyOrderCancelled(shopifyId)
+              if (loyalty.reversed > 0) logger.info({ topic, shopifyId, ...loyalty }, 'Loyalty: order cancellation reversed points')
+            }
+          }
+          if (topic === 'orders/paid') {
+            const { awardLoyaltyForShopifyOrders } = await import('./shopifyLoyalty')
+            await awardLoyaltyForShopifyOrders({ limit: 50 })
           }
         }
-        if (topic === 'orders/paid') {
-          const { awardLoyaltyForShopifyOrders } = await import('./shopifyLoyalty')
-          await awardLoyaltyForShopifyOrders({ limit: 50 })
+        if (!applied.ok) throw new Error(applied.error ?? 'Order update could not be applied')
+        if (applied.orderId && applied.changed?.includes('became-fulfilled')) {
+          const [row] = await db!.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, applied.orderId)).limit(1)
+          if (row) {
+            const { autoInvoiceFulfilledOrder } = await import('./routes/db')
+            const { notifyOrderFulfilled } = await import('./statusNotifications')
+            await autoInvoiceFulfilledOrder(row, { userId: 'shopify' })
+            const { kickEmailIngest } = await import('./orderEmailIngest')
+            kickEmailIngest()
+            void notifyOrderFulfilled({ ...row, trackingId: row.trackingNumber, carrier: row.trackingCompany })
+          }
         }
+        logger.info({ topic, ...applied }, 'Order Pipeline: Shopify event applied')
+      } catch (err) {
+        if (webhookId) await releaseWebhookId(webhookId)
+        logger.error({ topic, webhookId, err: { message: err instanceof Error ? err.message : 'Unknown error' } }, 'Order Pipeline: background webhook processing failed — the order poll will retry')
       }
-      if (!applied.ok) throw new Error(applied.error ?? 'Order update could not be applied')
-      if (applied.orderId && applied.changed?.includes('became-fulfilled')) {
-        const [row] = await db!.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, applied.orderId)).limit(1)
-        if (row) {
-          const { autoInvoiceFulfilledOrder } = await import('./routes/db')
-          const { notifyOrderFulfilled } = await import('./statusNotifications')
-          await autoInvoiceFulfilledOrder(row, { userId: 'shopify' })
-          const { kickEmailIngest } = await import('./orderEmailIngest')
-          kickEmailIngest()
-          void notifyOrderFulfilled({ ...row, trackingId: row.trackingNumber, carrier: row.trackingCompany })
-        }
-      }
-      logger.info({ topic, ...applied }, 'Order Pipeline: Shopify event applied')
-      res.json({ ...applied, ok: true })
-    } catch (err) {
-      if (webhookId) await releaseWebhookId(webhookId)
-      logger.error({ topic, webhookId, err: { message: err instanceof Error ? err.message : 'Unknown error' } }, 'Order Pipeline: webhook failed — Shopify will retry')
-      res.status(500).json({ ok: false, error: 'Order update could not be applied' })
-    }
+    })()
     return
   }
 
@@ -490,17 +501,22 @@ app.use('/api/v1/silver', requireAuth, enforceRbac)
 app.use('/api/v1/gold', requireAuth, enforceRbac)
 
 // Shopify Flow webhook — must be BEFORE requireAuth since it's called from Shopify servers (no browser session)
-app.post('/api/v1/shopify/flow-webhook', express.json({ limit: '1mb' }), async (req, res) => {
+app.post('/api/v1/shopify/flow-webhook', express.json({
+  limit: '1mb',
+  // Shopify signs the exact bytes it sent. Re-stringifying req.body breaks the
+  // signature whenever whitespace/key order differs, so keep the raw payload.
+  verify: (req, _res, buf) => { (req as unknown as express.Request).rawBody = buf },
+}), async (req, res) => {
   try {
     // ── HMAC signature verification ────────────────────────────────────────
-    const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET?.trim()
+    const SHOPIFY_WEBHOOK_SECRET = decryptSecret(process.env.SHOPIFY_WEBHOOK_SECRET?.trim())
     if (SHOPIFY_WEBHOOK_SECRET) {
       const hmacHeader = req.headers['x-shopify-hmac-sha256'] as string | undefined
       if (!hmacHeader) {
         logger.warn('Flow webhook missing X-Shopify-Hmac-SHA256 header')
         return res.status(401).json({ ok: false, error: 'Unauthorized' })
       }
-      const rawBody = JSON.stringify(req.body)
+      const rawBody = req.rawBody ?? Buffer.from(JSON.stringify(req.body ?? {}))
       const expected = createHmac('sha256', SHOPIFY_WEBHOOK_SECRET).update(rawBody).digest('base64')
       const sigBuf = Buffer.from(hmacHeader, 'base64')
       const expBuf = Buffer.from(expected, 'base64')
@@ -1872,6 +1888,38 @@ app.post('/api/v1/shopify/products/auto-sync/interval', requirePermission('shopi
   }
 })
 
+// Order auto-sync: how fresh the Sales Orders feed is, and the interval knob.
+app.get('/api/v1/shopify/orders/auto-sync', requirePermission('shopify', 'view'), async (_req, res) => {
+  try {
+    const intervalSeconds = await getOrderSyncIntervalSeconds()
+    res.json({ ...getOrderAutoSyncStatus(), intervalSeconds, enabled: intervalSeconds > 0 })
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : 'Unknown error' })
+  }
+})
+
+app.post('/api/v1/shopify/orders/auto-sync', requirePermission('shopify', 'edit'), async (req, res) => {
+  try {
+    const raw = (req.body ?? {}).intervalSeconds
+    if (raw === undefined || raw === null || raw === '') {
+      return res.status(400).json({ error: 'intervalSeconds is required (0 disables)' })
+    }
+    const intervalSeconds = parseOrderSyncIntervalSeconds(raw)
+    const { db } = await import('./db/client')
+    const schemaMod = await import('./db/schema')
+    const { eq } = await import('drizzle-orm')
+    if (!db) return res.status(503).json({ error: 'Database unavailable' })
+    const [row] = await db.select({ notificationSettings: schemaMod.settings.notificationSettings }).from(schemaMod.settings).where(eq(schemaMod.settings.id, 'app')).limit(1)
+    const current = (row?.notificationSettings ?? {}) as Record<string, unknown>
+    await db.update(schemaMod.settings).set({ notificationSettings: { ...current, orderAutoSyncIntervalSeconds: intervalSeconds } }).where(eq(schemaMod.settings.id, 'app'))
+    stopOrderAutoSync()
+    if (intervalSeconds > 0) startOrderAutoSync()
+    res.json({ ok: true, intervalSeconds: await getOrderSyncIntervalSeconds(), ...getOrderAutoSyncStatus() })
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : 'Unknown error' })
+  }
+})
+
 // Email (SMTP) connection test
 app.post('/api/v1/settings/test-email', requireAuth, requirePermission('system', 'edit'), async (req, res) => {
   try {
@@ -2718,6 +2766,9 @@ async function startServer() {
     void import('./autoBackup').then((m) => m.startBackupVerification())
     // Periodic Shopify product pull (interval from settings; 0 = disabled).
     void import('./productAutoSync').then((m) => m.startProductAutoSync())
+    // Periodic Shopify order pull: webhooks cannot reach the desktop app, and a
+    // sleeping/deploying server misses deliveries. This is the backstop.
+    startOrderAutoSync()
     // Durable ERP → Shopify queue: drains product/price/stock pushes recorded by
     // ERP writes, with retries, so an edit is never waiting on a UI button.
     startShopifyOutboundWorker()
@@ -2815,6 +2866,7 @@ async function startServer() {
     logger.info({ signal }, 'Shutting down gracefully')
     stopOrderEmailIngest()
     stopShopifyOutboundWorker()
+    stopOrderAutoSync()
     server.close(() => {
       shutdownSessions()
       logger.info('Server closed')

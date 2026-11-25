@@ -203,13 +203,16 @@ async function runInternal(manual: boolean, allowRemovals: boolean): Promise<Pro
     await recordSuccessfulProductAutoSync(result.synced, fullCatalog)
     if (!manual) {
       try {
-        const { importShopifyOrders, importShopifyCustomers } = await import('./shopify')
+        // Orders are NOT pulled here: they have their own short-interval
+        // scheduler (orderAutoSync) with an order-specific watermark. Riding on
+        // the catalog interval left new orders waiting up to six hours when no
+        // webhook could reach this instance.
+        const { importShopifyCustomers } = await import('./shopify')
         const { flushOutboundShopifyJobs } = await import('./shopifyOutbound')
-        await importShopifyOrders({ updatedAtMin })
         await importShopifyCustomers({ updatedAtMin })
         await flushOutboundShopifyJobs()
       } catch (err) {
-        logger.warn({ err }, 'Scheduled order/customer sync or outbound flush failed')
+        logger.warn({ err }, 'Scheduled customer sync or outbound flush failed')
       }
     }
     logger.info(

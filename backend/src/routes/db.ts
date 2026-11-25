@@ -6403,6 +6403,11 @@ dbRouter.put('/settings/connections', requirePermission('system', 'edit'), async
     // Reload secrets into runtime config
     const { loadSecretsFromDb } = await import('../config')
     await loadSecretsFromDb()
+    // The order poll is started at boot, when DB credentials may not have
+    // existed yet. Starting here is a no-op if it is already running, and it
+    // makes credentials saved through Connections take effect immediately.
+    const { startOrderAutoSync } = await import('../orderAutoSync')
+    startOrderAutoSync()
 
     // Persist Shopify config to the .env file (encrypted) so it drives the app on next start too
     if (typeof shopifyStoreUrl === 'string' && shopifyStoreUrl.length > 0 && !isMasked(shopifyStoreUrl)) {

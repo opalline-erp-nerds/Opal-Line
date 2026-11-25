@@ -1136,12 +1136,40 @@ export async function restoreOrderLineStock(input: {
   sku: string
   qty: number
   refType?: string
+  refId?: string
+  /**
+   * Shopify's immutable variant id from the saved line. When present it beats
+   * SKU resolution: a Shopify order may carry the PARENT sku (blank or renamed
+   * variant), and restoring a parent sku on a multi-variant product would split
+   * the return across variants instead of returning it to the one sold.
+   */
+  shopifyVariantId?: string | null
 }): Promise<{ productId: string } | null> {
-  const sku = String(input.sku ?? '').trim()
   const qty = Math.max(0, Math.floor(num(input.qty)))
-  if (!sku || qty <= 0) return null
+  if (qty <= 0) return null
 
-  const resolved = await resolveStockSku(input.tx, sku)
+  let resolved: StockSkuResolution | null = null
+  const shopifyVariantId = String(input.shopifyVariantId ?? '').trim()
+  if (shopifyVariantId) {
+    const [variant] = await input.tx
+      .select({ id: schema.productVariants.id, productId: schema.productVariants.productId })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.shopifyVariantId, shopifyVariantId))
+      .limit(1)
+    if (variant) {
+      const [parent] = await input.tx
+        .select({ id: schema.products.id, sku: schema.products.sku })
+        .from(schema.products)
+        .where(eq(schema.products.id, variant.productId))
+        .limit(1)
+      if (parent?.sku) resolved = { productId: parent.id, ledgerSku: parent.sku, variantId: variant.id }
+    }
+  }
+  if (!resolved) {
+    const sku = String(input.sku ?? '').trim()
+    if (!sku) return null
+    resolved = await resolveStockSku(input.tx, sku)
+  }
   if (!resolved) return null
 
   await applyStockMovement({
@@ -1150,6 +1178,7 @@ export async function restoreOrderLineStock(input: {
     qty,
     type: 'sale_return_in',
     refType: input.refType ?? 'sales_order',
+    refId: input.refId,
     locationId: input.locationId,
     tx: input.tx,
   })

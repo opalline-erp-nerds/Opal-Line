@@ -30,6 +30,8 @@ import { dbApi } from '@/lib/api'
 import { formatCurrency } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { confirmDialog, toast } from '@/components/ui/confirm'
+import { useOrderAutoRefresh } from '@/hooks/use-order-auto-refresh'
+import { newOrdersMessage } from '@/lib/orderAutoRefresh'
 import type { OrderSyncStatus, PipelineStage, SalesOrder, ShopifyOrderState } from '@/types'
 
 const COLUMNS: Array<{ key: SalesOrder['status']; label: string; accent: string }> = [
@@ -159,6 +161,18 @@ export default function OrderBoard() {
       void load()
     })
   }, [])
+
+  // New Shopify orders land here too, without a manual sync. Any open action
+  // dialog or side panel pauses the refresh so nothing is reset mid-edit.
+  useOrderAutoRefresh({
+    paused: Boolean(fulfillFor || cancelFor || trackFor || panelOrder),
+    fetchOrders: dbApi.getSalesOrders,
+    onOrders: setOrders,
+    onNewShopifyOrders: (fresh) => {
+      const message = newOrdersMessage(fresh.length)
+      if (message) toast.info(message)
+    },
+  })
 
   const refreshSync = async () => {
     try {
