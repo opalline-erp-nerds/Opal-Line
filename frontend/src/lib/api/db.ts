@@ -857,7 +857,19 @@ export const dbApi = {
     supplier: string
     invoiceId?: string | null
     status?: string
-    items: Array<{ product: string; sku: string; qty: number; weight: number; rate: number }>
+    items: Array<{
+      product: string
+      sku: string
+      /** Catalogue identity — null on hand-typed and legacy lines. */
+      productId?: string | null
+      /** The variant returned; null = the product itself (flat line). */
+      variantId?: string | null
+      qty: number
+      weight: number
+      rate: number
+      /** Line total; a piece-rate line sends this with weight/rate at 0. */
+      amount?: number
+    }>
   }): Promise<PurchaseReturn & { linesSaved: number; reversedSkus: number }> =>
     request('/db/purchase-returns', { method: 'POST', body: JSON.stringify(payload) }),
   /** Receiving a return takes the goods out of stock; leaving that state puts them back. */

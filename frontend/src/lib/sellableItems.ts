@@ -1,4 +1,4 @@
-import type { LocationStockAvailability, Product } from '@/types'
+import type { LocationStockAvailability, Product, ProductVariant } from '@/types'
 import { isDefaultVariantName, productVariants, variantFinalPrice, variantLabel } from '@/lib/productVariants'
 import { perUnitLinePrice } from '@/lib/orderPricing'
 
@@ -88,6 +88,73 @@ function storesFor(
 }
 
 /**
+ * The product's own row — `variantId: null`, its own label, its own price.
+ *
+ * This is the flat single-SKU row the rest of the ERP has always assumed, and
+ * the row a legacy parent-SKU purchase line resolves back to.
+ */
+function parentSellable(product: Product): SellableItem {
+  // Piece Rate: sellingPrice IS the fixed price for legacy rows that never
+  // got a fixedPieceRate column value, so fall back to it rather than to the
+  // silver-rate maths the flag exists to switch OFF.
+  const fixedPieceRate =
+    product.pieceRateProduct === true ? (positive(product.fixedPieceRate) ?? positive(product.sellingPrice)) : null
+  const pricingType: SellablePricingType = fixedPieceRate != null ? 'piece_rate' : 'weight_based'
+  const base = fixedPieceRate ?? (Number(product.sellingPrice) || null)
+  return {
+    productId: product.id,
+    variantId: null,
+    sku: product.sku ?? '',
+    label: product.sku ? `${product.name} (${product.sku})` : product.name,
+    productName: product.name,
+    variantName: null,
+    price: base,
+    netWeight: positive(product.netWeight),
+    makingCharge: product.makingCharge != null ? Number(product.makingCharge) : null,
+    pricingType,
+    fixedPieceRate,
+    stock: product.stock ?? null,
+    stores: [],
+  }
+}
+
+/** One row for a variant: the parent's pricing inputs, the variant's identity. */
+function variantSellable(product: Product, variant: ProductVariant): SellableItem {
+  const fixedPieceRate =
+    product.pieceRateProduct === true ? (positive(product.fixedPieceRate) ?? positive(product.sellingPrice)) : null
+  const pricingType: SellablePricingType = fixedPieceRate != null ? 'piece_rate' : 'weight_based'
+  const base = fixedPieceRate ?? (Number(product.sellingPrice) || null)
+  return {
+    productId: product.id,
+    variantId: variant.id,
+    sku: variant.sku ?? '',
+    label: variant.sku
+      ? `${product.name} - ${variantLabel(variant)} (${variant.sku})`
+      : `${product.name} - ${variantLabel(variant)}`,
+    productName: product.name,
+    variantName: variantLabel(variant),
+    // Base + add-on, never `variant.sellingPrice ?? product.sellingPrice`:
+    // a fresh variant row stores 0 (no add-on), and `0 ?? base` would bill
+    // a ₹0 line for a real product.
+    price: variantFinalPrice(base, variant.sellingPrice, variant.name),
+    netWeight: positive(product.netWeight),
+    makingCharge: product.makingCharge != null ? Number(product.makingCharge) : null,
+    pricingType,
+    fixedPieceRate,
+    stock: variant.stock ?? product.stock ?? null,
+    stores: [],
+  }
+}
+
+/** The product's variants, minus the Shopify "Default Title" mirror rows. */
+function realVariants(product: Product): ProductVariant[] {
+  // A lone "Default Title" row is the mirror every flat/legacy product carries —
+  // it IS the product, not a second thing to transact on, so it collapses back
+  // to the parent exactly as it did before variants were selectable.
+  return productVariants(product).filter((v) => !isDefaultVariantName(v.name))
+}
+
+/**
  * Flatten the catalogue into one selectable row per sellable thing.
  *
  * A product WITH variants never appears on its own — its variants do, each
@@ -106,62 +173,36 @@ export function flattenSellableItems(
 ): SellableItem[] {
   const out: SellableItem[] = []
   for (const product of products) {
-    // A lone "Default Title" row is the Shopify mirror every flat/legacy
-    // product carries — it IS the product, not a second thing to sell. Emitting
-    // it as its own option would double every plain product in the picker and
-    // hand it a `- Default Title` label, so those rows collapse back to the
-    // parent exactly as they did before variants were selectable.
-    const variants = productVariants(product).filter((v) => !isDefaultVariantName(v.name))
-    // Piece Rate: sellingPrice IS the fixed price for legacy rows that never
-    // got a fixedPieceRate column value, so fall back to it rather than to the
-    // silver-rate maths the flag exists to switch OFF.
-    const fixedPieceRate =
-      product.pieceRateProduct === true ? (positive(product.fixedPieceRate) ?? positive(product.sellingPrice)) : null
-    const pricingType: SellablePricingType = fixedPieceRate != null ? 'piece_rate' : 'weight_based'
-    const base = fixedPieceRate ?? (Number(product.sellingPrice) || null)
-
+    const variants = realVariants(product)
     if (variants.length === 0) {
-      const item: SellableItem = {
-        productId: product.id,
-        variantId: null,
-        sku: product.sku ?? '',
-        label: product.sku ? `${product.name} (${product.sku})` : product.name,
-        productName: product.name,
-        variantName: null,
-        price: base,
-        netWeight: positive(product.netWeight),
-        makingCharge: product.makingCharge != null ? Number(product.makingCharge) : null,
-        pricingType,
-        fixedPieceRate,
-        stock: product.stock ?? null,
-        stores: [],
-      }
+      const item = parentSellable(product)
       out.push({ ...item, stores: storesFor(item, availability) })
       continue
     }
     for (const variant of variants) {
-      const item: SellableItem = {
-        productId: product.id,
-        variantId: variant.id,
-        sku: variant.sku ?? '',
-        label: variant.sku
-          ? `${product.name} - ${variantLabel(variant)} (${variant.sku})`
-          : `${product.name} - ${variantLabel(variant)}`,
-        productName: product.name,
-        variantName: variantLabel(variant),
-        // Base + add-on, never `variant.sellingPrice ?? product.sellingPrice`:
-        // a fresh variant row stores 0 (no add-on), and `0 ?? base` would bill
-        // a ₹0 line for a real product.
-        price: variantFinalPrice(base, variant.sellingPrice, variant.name),
-        netWeight: positive(product.netWeight),
-        makingCharge: product.makingCharge != null ? Number(product.makingCharge) : null,
-        pricingType,
-        fixedPieceRate,
-        stock: variant.stock ?? product.stock ?? null,
-        stores: [],
-      }
+      const item = variantSellable(product, variant)
       out.push({ ...item, stores: storesFor(item, availability) })
     }
+  }
+  return out
+}
+
+/**
+ * Purchase-side flatten: the product itself **and** each of its variants.
+ *
+ * Purchases receive stock for a product exactly as they always have — keyed by
+ * the code on the line — so a legacy PO / Purchase Invoice / Purchase Return
+ * line that points at the PARENT sku must keep resolving to a selectable row.
+ * (A sales picker drops the parent instead: a sale always names the exact
+ * variant that leaves the shelf.) The parent row is also a genuine receiving
+ * target — `applyStockMovement` splits a parent-keyed credit across the
+ * product's variants.
+ */
+export function flattenPurchasableItems(products: Product[]): SellableItem[] {
+  const out: SellableItem[] = []
+  for (const product of products) {
+    out.push(parentSellable(product))
+    for (const variant of realVariants(product)) out.push(variantSellable(product, variant))
   }
   return out
 }
@@ -220,6 +261,32 @@ export function sellableItemOptions(
     subtitle: item.variantId ? undefined : item.sku || undefined,
     keywords: [item.productName, item.sku, item.variantName ?? ''].filter(Boolean).join(' '),
   }))
+}
+
+/**
+ * Dropdown rows for the PURCHASE forms, keyed by the line's own code.
+ *
+ * A purchase line stores its SKU (never a product id) and every saved PO /
+ * Purchase Invoice / Purchase Return line predates variants — so the option
+ * value has to BE that code: a legacy parent SKU keeps resolving, and a
+ * variant row answers with the variant's SKU.
+ */
+export function purchasableItemOptions(
+  items: SellableItem[],
+): Array<{ value: string; label: string; subtitle: string | undefined; keywords: string }> {
+  return items.map((item) => ({
+    value: item.sku,
+    label: item.label,
+    subtitle: item.variantId ? undefined : item.sku || undefined,
+    keywords: [item.productName, item.sku, item.variantName ?? ''].filter(Boolean).join(' '),
+  }))
+}
+
+/** Exact code match (parent or variant SKU) against a flattened catalogue. */
+export function findSellableBySku(items: SellableItem[], sku: string): SellableItem | null {
+  const wanted = sku.trim().toLowerCase()
+  if (!wanted) return null
+  return items.find((item) => (item.sku ?? '').trim().toLowerCase() === wanted) ?? null
 }
 
 /**

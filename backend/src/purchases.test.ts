@@ -190,6 +190,75 @@ describe('normalizeReturnLines / returnLineTotals', () => {
   })
 })
 
+// ── Catalogue identity on purchase lines ─────────────────────────────────────
+// A purchase line stores its SKU (never a product id), so the variant a line
+// received or returned can only be recovered from the ids saved beside it. A
+// blank or absent id is normalised to null — never to the string "undefined" —
+// because the stock layer reads null as "the product itself".
+
+describe('catalogue identity on purchase lines', () => {
+  it('keeps productId/variantId on a purchase invoice line', () => {
+    const [line] = normalizePurchaseItems([
+      {
+        product: 'silver toy - red',
+        sku: 'OL-GIF-001-RED',
+        productId: 'prod-1',
+        variantId: 'var-red',
+        qty: 2,
+        weight: 20,
+        rate: 50,
+      },
+    ])
+    assert.equal(line.productId, 'prod-1')
+    assert.equal(line.variantId, 'var-red')
+    // variant SKU is preserved verbatim — it is what the stock layer resolves on
+    assert.equal(line.sku, 'OL-GIF-001-RED')
+  })
+
+  it('accepts snake_case ids and nulls a blank or missing one', () => {
+    const [snake, blank, absent] = normalizePurchaseItems([
+      { sku: 'A', product_id: 'p1', variant_id: 'v1' },
+      { sku: 'B', productId: '  ', variantId: '' },
+      { sku: 'C' },
+    ])
+    assert.equal(snake.productId, 'p1')
+    assert.equal(snake.variantId, 'v1')
+    assert.equal(blank.productId, null)
+    assert.equal(blank.variantId, null)
+    assert.equal(absent.productId, null)
+    assert.equal(absent.variantId, null)
+  })
+
+  it('keeps the ids on a purchase order line', () => {
+    const [line] = normalizeOrderLines([
+      { product: 'silver toy - red', sku: 'OL-GIF-001-RED', productId: 'prod-1', variantId: 'var-red', qty: 3, weight: 4, rate: 60 },
+    ])
+    assert.equal(line.productId, 'prod-1')
+    assert.equal(line.variantId, 'var-red')
+  })
+
+  it('keeps the ids on a purchase return line', () => {
+    const [line] = normalizeReturnLines([
+      { product: 'silver toy - red', sku: 'OL-GIF-001-RED', productId: 'prod-1', variantId: 'var-red', qty: 1, weight: 10, rate: 50 },
+    ])
+    assert.equal(line.productId, 'prod-1')
+    assert.equal(line.variantId, 'var-red')
+  })
+
+  it('a Piece Rate line keeps the money it was given instead of re-deriving it', () => {
+    // weight/rate are deliberately absent: the fixed ₹/pc IS the price, and
+    // deriving from 0 grams is what turned a ₹1,500 line into a ₹0 cost.
+    const [invoice] = normalizePurchaseItems([{ sku: 'PR-1', variantId: 'v1', qty: 3, cost: 1500 }])
+    assert.equal(invoice.weight, 0)
+    assert.equal(invoice.rate, 0)
+    assert.equal(invoice.cost, 1500)
+    assert.equal(invoice.amount, 1500)
+
+    const [order] = normalizeOrderLines([{ sku: 'PR-1', variantId: 'v1', qty: 3, weight: 0, rate: 0, amount: 1500 }])
+    assert.equal(order.amount, 1500, 'qty × weight × rate would have been 0')
+  })
+})
+
 describe('bumpPurchaseInvoiceNumber', () => {
   it('bumps the last digit run, preserving width and padding', () => {
     assert.equal(bumpPurchaseInvoiceNumber('INV-005'), 'INV-006')
