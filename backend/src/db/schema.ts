@@ -542,6 +542,14 @@ export const purchaseInvoiceItems = pgTable('purchase_invoice_items', {
   invoiceId: text('invoice_id').notNull(),
   product: text('product'),
   sku: text('sku'),
+  /**
+   * Catalogue identity of the line — so a received/returned unit keeps pointing
+   * at the exact product and, below, the exact variant its stock moved from.
+   * NULL on hand-typed lines and on every historical row.
+   */
+  productId: text('product_id'),
+  /** The variant received/returned; NULL = the product itself (flat line). */
+  variantId: text('variant_id'),
   qty: numericNumber('qty').default(1),
   weight: numericNumber('weight'),
   /** Silver rate per gram this was bought at. */
@@ -562,6 +570,10 @@ export const purchaseOrderItems = pgTable('purchase_order_items', {
   orderId: text('order_id').notNull(),
   product: text('product'),
   sku: text('sku'),
+  /** Catalogue identity of the ordered line (see purchase_invoice_items). */
+  productId: text('product_id'),
+  /** The variant ordered; NULL = the product itself (flat line). */
+  variantId: text('variant_id'),
   qty: numericNumber('qty').default(1),
   weight: numericNumber('weight'),
   rate: numericNumber('rate'),
@@ -836,6 +848,10 @@ export const purchaseReturnItems = pgTable('purchase_return_items', {
   returnId: text('return_id').notNull(),
   product: text('product'),
   sku: text('sku'),
+  /** Catalogue identity of the returned line (see purchase_invoice_items). */
+  productId: text('product_id'),
+  /** The variant returned; NULL = the product itself (flat line). */
+  variantId: text('variant_id'),
   qty: numericNumber('qty').default(1),
   weight: numericNumber('weight'),
   rate: numericNumber('rate'),

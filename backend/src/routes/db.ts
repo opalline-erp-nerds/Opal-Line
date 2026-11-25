@@ -4509,6 +4509,8 @@ dbRouter.get('/purchase-orders/with-items', requirePermission('purchase', 'view'
           id: l.id,
           product: l.product ?? '',
           sku: l.sku ?? '',
+          productId: (l.productId as string | null) ?? null,
+          variantId: (l.variantId as string | null) ?? null,
           qty: Number(l.qty ?? 0),
           weight: Number(l.weight ?? 0),
           rate: Number(l.rate ?? 0),
@@ -4535,6 +4537,8 @@ dbRouter.get('/purchase-orders/:id/with-items', requirePermission('purchase', 'v
         id: l.id,
         product: l.product ?? '',
         sku: l.sku ?? '',
+        productId: (l.productId as string | null) ?? null,
+        variantId: (l.variantId as string | null) ?? null,
         qty: Number(l.qty ?? 0),
         weight: Number(l.weight ?? 0),
         rate: Number(l.rate ?? 0),
@@ -4731,6 +4735,8 @@ dbRouter.get('/purchase-returns/with-lines', requirePermission('purchase', 'view
           id: l.id,
           product: l.product ?? '',
           sku: l.sku ?? '',
+          productId: (l.productId as string | null) ?? null,
+          variantId: (l.variantId as string | null) ?? null,
           qty: Number(l.qty ?? 0),
           weight: Number(l.weight ?? 0),
           rate: Number(l.rate ?? 0),
@@ -4906,6 +4912,12 @@ dbRouter.get('/inventory/locations/stock-summary', requirePermission('inventory'
  * location — the ERP maps to what the store already has.
  */
 dbRouter.get('/inventory/locations/shopify', requirePermission('inventory', 'view'), async (_req, res) => {
+  // A fresh install has no Shopify credentials: there is nothing to map to and
+  // nothing to fail. Answering 502 here made the Stock Locations page log a
+  // console error on EVERY load (the mapping column says "Not mapped" either
+  // way), which is a browser-visible failure for a state that is simply "no
+  // store connected". Real upstream failures below still report 502.
+  if (!isShopifyConfigured()) return res.json({ locations: [] })
   try {
     const locations = await fetchStoreLocations()
     res.json({ locations })

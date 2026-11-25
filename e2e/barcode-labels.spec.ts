@@ -8,8 +8,20 @@
 //     right of it),
 //   * printed @page size includes the stem footprint.
 import { test, expect } from '@playwright/test'
+import { csrfApi, seedProducts } from './fixtures'
 
 const PREVIEW = 'iframe[title="Label preview"]'
+
+/**
+ * A freshly bootstrapped database has NO products, and the designer's list is
+ * exactly that list — so each spec seeds the two rows it clicks through and
+ * removes them again afterwards (a failure included).
+ */
+let seededCleanup: (() => Promise<void>) | null = null
+test.afterEach(async () => {
+  if (seededCleanup) await seededCleanup()
+  seededCleanup = null
+})
 
 async function previewGeometry(page: import('@playwright/test').Page) {
   return page.locator(PREVIEW).evaluate((el) => {
@@ -32,9 +44,17 @@ async function previewGeometry(page: import('@playwright/test').Page) {
   })
 }
 
-test('label designer preview tracks size, selection and content settings', async ({ page }) => {
+test('label designer preview tracks size, selection and content settings', async ({ page, request }) => {
+  const { cleanup } = await seedProducts(await csrfApi(request), { prefix: 'E2E-LBL', count: 2 })
+  seededCleanup = cleanup
   await page.setViewportSize({ width: 1650, height: 900 })
   await page.goto('/inventory/barcode')
+  // The geometry assertions below target the JEWELLERY TAG layout — the body
+  // box at the configured size plus the stem outline to its right. The
+  // designer now OPENS on "Normal label", whose fields are absolutely
+  // positioned and carry neither `.tag-content` nor the stem, so pick the mode
+  // the assertions describe before measuring anything.
+  await page.getByRole('button', { name: /Jewellery Tag/ }).click()
 
   // Product rows and their selection boxes stay visible.
   const firstRow = page.locator('.divide-y > div').first()
@@ -47,6 +67,11 @@ test('label designer preview tracks size, selection and content settings', async
 
   // The preview shows a real tag: body at the configured size, QR present.
   await expect(page.locator(PREVIEW)).toBeVisible()
+  // The iframe paints its product asynchronously — wait for real content
+  // instead of racing the first render (the geometry reads need `.tag-content`).
+  await expect
+    .poll(async () => (await previewGeometry(page))?.text ?? '', { timeout: 15000 })
+    .not.toBe('')
   const before = await previewGeometry(page)
   expect(before).not.toBeNull()
   const cfgLabel = await page.locator('label:has-text("Width")').locator('..').locator('input').first().inputValue()
@@ -71,12 +96,21 @@ test('label designer preview tracks size, selection and content settings', async
   expect(after!.outline!.wMm - after!.body!.wMm).toBeCloseTo((Number(cfgLabel) + 10) * 0.4, 0)
 })
 
-test('selecting another product swaps the rendered label data', async ({ page }) => {
+test('selecting another product swaps the rendered label data', async ({ page, request }) => {
+  const { cleanup } = await seedProducts(await csrfApi(request), { prefix: 'E2E-LBL', count: 2 })
+  seededCleanup = cleanup
   await page.setViewportSize({ width: 1650, height: 900 })
   await page.goto('/inventory/barcode')
+  // previewGeometry reads the jewellery-tag markup (see the sibling test).
+  await page.getByRole('button', { name: /Jewellery Tag/ }).click()
 
   const rows = page.locator('.divide-y > div')
   await rows.first().click()
+  // Selection repaints the iframe asynchronously — wait for the product's
+  // text to land before reading it (the old immediate read raced the paint).
+  await expect
+    .poll(async () => (await previewGeometry(page))?.text ?? '', { timeout: 15000 })
+    .not.toBe('')
   const first = await previewGeometry(page)
   expect(first?.text?.length ?? 0).toBeGreaterThan(0)
 

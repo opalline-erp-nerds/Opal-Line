@@ -2,8 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { LocationStockAvailability, Product } from '@/types'
 import {
+  findSellableBySku,
+  flattenPurchasableItems,
   flattenSellableItems,
   parseSellableValue,
+  purchasableItemOptions,
   resolveSellableByCode,
   searchSellableItems,
   sellableItemOptions,
@@ -200,6 +203,70 @@ test('resolveSellableByCode matches a variant name or a product name', () => {
   const items = flattenSellableItems([withVariants(), product({ id: 'p-2', name: 'Silver Bangle', sku: 'OL-BNG-004' })])
   assert.equal(resolveSellableByCode(items, 'red')?.variantId, 'v-red', 'the variant name on its own resolves')
   assert.equal(resolveSellableByCode(items, 'Silver Bangle')?.productId, 'p-2', 'a flat product resolves by name')
+})
+
+// ── Purchase-side flattening ──────────────────────────────────────────────────
+// Purchase documents store the SKU on the line (never a product id) and every
+// saved PO / Purchase Invoice / Purchase Return predates variants. So the
+// purchase picker offers the parent AND its variants, and keys each option by
+// the code the line actually carries.
+
+test('the purchase flatten keeps the parent row alongside every variant', () => {
+  const items = flattenPurchasableItems([withVariants()])
+  assert.deepEqual(
+    items.map((i) => [i.variantId, i.sku]),
+    [
+      [null, 'OL-GIF-001'],
+      ['v-red', 'OL-GIF-001-RED'],
+      ['v-whi', 'OL-GIF-001-WHI'],
+    ],
+  )
+  // A parent-keyed credit is a real receiving target, so the parent row still
+  // answers for its own code even when the product has variants.
+  assert.equal(items[0]!.productId, 'p-1')
+  assert.equal(items[0]!.pricingType, 'weight_based')
+  assert.equal(items[1]!.stock, 4, "a variant row reports the variant's own count")
+})
+
+test('the purchase flatten collapses a Default Title mirror but keeps the parent', () => {
+  const mirrored = product({
+    options: [{ name: 'Title', values: ['Default Title'] }],
+    variants: [{ id: 'v-1', name: 'Default Title', sku: 'OL-GIF-001', sellingPrice: 2100, stock: 7 }],
+  })
+  const items = flattenPurchasableItems([mirrored])
+  assert.equal(items.length, 1, 'the mirror IS the product — not a second row')
+  assert.equal(items[0]!.variantId, null)
+  assert.equal(items[0]!.price, 1287.5)
+})
+
+test('a flat product is one purchase row with a null variant', () => {
+  const items = flattenPurchasableItems([product()])
+  assert.equal(items.length, 1)
+  assert.equal(items[0]!.variantId, null)
+  assert.equal(items[0]!.sku, 'OL-GIF-001')
+})
+
+test('purchase options use the line code as their value, not a product/variant pair', () => {
+  const options = purchasableItemOptions(flattenPurchasableItems([withVariants()]))
+  assert.deepEqual(
+    options.map((o) => o.value),
+    ['OL-GIF-001', 'OL-GIF-001-RED', 'OL-GIF-001-WHI'],
+  )
+  // The variant's code is already in its label, so there is no subtitle to
+  // repeat it; the parent keeps its code underneath the name.
+  assert.equal(options[0]!.subtitle, 'OL-GIF-001')
+  assert.equal(options[1]!.subtitle, undefined)
+  assert.ok(options[1]!.keywords.includes('silver toy'))
+  assert.ok(options[1]!.keywords.includes('red'))
+})
+
+test('findSellableBySku resolves a parent or a variant code, in any case', () => {
+  const items = flattenPurchasableItems([withVariants(), product({ id: 'p-2', name: 'bangle', sku: 'OL-BNG-004' })])
+  assert.equal(findSellableBySku(items, 'ol-gif-001-red')?.variantId, 'v-red')
+  assert.equal(findSellableBySku(items, '  OL-GIF-001  ')?.variantId, null)
+  assert.equal(findSellableBySku(items, 'OL-BNG-004')?.productId, 'p-2')
+  assert.equal(findSellableBySku(items, 'not-here'), null)
+  assert.equal(findSellableBySku(items, ''), null)
 })
 
 test('an ambiguous product name resolves to nothing — the picker must choose', () => {

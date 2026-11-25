@@ -1,4 +1,5 @@
 import { expect, request, test } from '@playwright/test'
+import { ensureSilverRate } from './fixtures'
 
 /**
  * Authenticated, CSRF-carrying API client for building fixtures.
@@ -270,6 +271,8 @@ test.describe('invoice mutations round-trip', () => {
   test('sales invoice cancel & reissue raises a fresh invoice for the order', async ({ page }) => {
     const stamp = Date.now()
     const apiClient = await api()
+    // Raising an invoice needs a managed silver rate (see ensureSilverRate).
+    await ensureSilverRate(apiClient)
     const orderResp = await apiClient.post('/api/v1/db/sales-orders', {
       shopifyId: `#E2E-REINV-${stamp}`,
       customer: 'E2E Reissue Customer',
@@ -320,6 +323,8 @@ test.describe('invoice mutations round-trip', () => {
   test('sales invoice delete removes it for good', async ({ page }) => {
     const stamp = Date.now()
     const apiClient = await api()
+    // Raising the invoice that gets deleted needs a managed silver rate.
+    await ensureSilverRate(apiClient)
     const orderResp = await apiClient.post('/api/v1/db/sales-orders', {
       shopifyId: `#E2E-DEL-${stamp}`,
       customer: 'E2E Delete Customer',
@@ -363,6 +368,9 @@ test.describe('invoice mutations round-trip', () => {
     const itemName = `E2E Manual Ring ${stamp}`
 
     const apiClient = await api()
+    // The dialog refuses to bill without a managed silver rate — seed one so
+    // the flow is exercised on a fresh install too.
+    await ensureSilverRate(apiClient)
     try {
       await page.goto('/sales/invoices')
       await expect(page.getByRole('heading', { level: 1 }).first()).toBeVisible({ timeout: 20000 })

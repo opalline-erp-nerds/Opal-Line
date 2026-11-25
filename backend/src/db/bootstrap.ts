@@ -125,6 +125,26 @@ const INVOICE_VARIANT_DDL: string[] = [
 ]
 
 /**
+ * Catalogue identity on purchase line items (order / invoice / return).
+ *
+ * Added by `applyUpgrades` ONLY, and deliberately not from createSchema's
+ * statement loop: that loop runs before `purchase_return_items` exists (the
+ * fresh path creates it inside applyUpgrades itself), so an ALTER there would
+ * abort a brand-new bootstrap. applyUpgrades runs on EVERY boot — fresh
+ * installs included — immediately after the schema is created and before the
+ * server accepts a request, so both populations gain the columns from the one
+ * idempotent list. NULL on hand-typed and historical lines.
+ */
+const PURCHASE_VARIANT_DDL: string[] = [
+  `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS product_id text`,
+  `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS variant_id text`,
+  `ALTER TABLE purchase_invoice_items ADD COLUMN IF NOT EXISTS product_id text`,
+  `ALTER TABLE purchase_invoice_items ADD COLUMN IF NOT EXISTS variant_id text`,
+  `ALTER TABLE purchase_return_items ADD COLUMN IF NOT EXISTS product_id text`,
+  `ALTER TABLE purchase_return_items ADD COLUMN IF NOT EXISTS variant_id text`,
+]
+
+/**
  * Per-location stock balances and the append-only movement ledger.
  *
  * Declared once and applied from both createSchema (fresh installs) and
@@ -2337,6 +2357,12 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
          FROM sales_orders o
         WHERE r.currency IS NULL AND o.shopify_id = r.order
           AND o.currency IS NOT NULL AND btrim(o.currency) <> ''`,
+    // AFTER every CREATE TABLE above: the purchase item tables are created in
+    // this same list, so an ALTER placed with the other DDL spreads at the top
+    // would run against a table that does not exist yet — and the per-statement
+    // catch below would log and skip it, leaving the columns missing on a
+    // fresh install forever.
+    ...PURCHASE_VARIANT_DDL,
     ]
     for (const stmt of upgrades) {
       // Failures are swallowed so one impossible-to-apply statement cannot

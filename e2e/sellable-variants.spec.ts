@@ -1,4 +1,5 @@
 import { expect, request, test, type Locator, type Page } from '@playwright/test'
+import { ensureSilverRate } from './fixtures'
 
 /**
  * Sales Invoices (New Sales Invoice) and Sales Orders (Create Manual Order)
@@ -108,6 +109,10 @@ test.describe('sellable variants on invoices and manual orders', () => {
     const stamp = Date.now()
     const customer = `E2E SV Invoice ${stamp}`
     const apiClient = await api()
+    // A fresh install has no managed silver rate and the dialog refuses to
+    // bill without one — seed it BEFORE the fixture is built so the rate's
+    // reprice pass never sees our Piece Rate product.
+    await ensureSilverRate(apiClient)
     const toy = await createVariantToy(apiClient, stamp)
 
     try {
@@ -194,6 +199,9 @@ test.describe('sellable variants on invoices and manual orders', () => {
     const stamp = Date.now()
     const customer = `E2E SV Order ${stamp}`
     const apiClient = await api()
+    // Saving an order needs a managed silver rate (see ensureSilverRate) —
+    // seeded before the fixture so its reprice pass never sees our product.
+    await ensureSilverRate(apiClient)
     const toy = await createVariantToy(apiClient, stamp)
 
     try {

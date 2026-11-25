@@ -1378,6 +1378,10 @@ export interface PurchaseInvoiceItem {
   id?: string
   product: string
   sku: string
+  /** Catalogue identity of the line — null on hand-typed and legacy rows. */
+  productId?: string | null
+  /** The variant received; null = the product itself (flat line). */
+  variantId?: string | null
   qty: number
   weight: number
   rate: number
@@ -1438,12 +1442,20 @@ export interface PurchaseInvoiceInput {
   supplierGstin?: string | null
   /** 0 disables TCS; otherwise a percentage of the pre-tax value. */
   tcsRate?: number
+  /** The store the goods were received into; absent = the main store. */
+  locationId?: string
   items: Array<{
     product: string
     sku: string
+    /** Catalogue identity — null on hand-typed and legacy lines. */
+    productId?: string | null
+    /** The variant received; null = the product itself (flat line). */
+    variantId?: string | null
     qty: number
     weight: number
     rate: number
+    /** Line cost before GST; the server derives it from weight × rate when absent. */
+    cost?: number
     tax: number
   }>
 }
@@ -1525,6 +1537,10 @@ export interface PurchaseOrderItem {
   id?: string
   product: string
   sku: string
+  /** Catalogue identity of the line — null on hand-typed and legacy rows. */
+  productId?: string | null
+  /** The variant ordered; null = the product itself (flat line). */
+  variantId?: string | null
   qty: number
   weight: number
   rate: number
@@ -1651,6 +1667,10 @@ export interface PurchaseReturnItem {
   id?: string
   product: string
   sku: string
+  /** Catalogue identity of the line — null on hand-typed and legacy rows. */
+  productId?: string | null
+  /** The variant returned; null = the product itself (flat line). */
+  variantId?: string | null
   qty: number
   weight: number
   rate: number

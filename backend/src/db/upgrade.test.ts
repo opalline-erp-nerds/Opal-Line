@@ -75,6 +75,17 @@ const KEY_COLUMNS = [
   // INVOICE_VARIANT_DDL — the fresh CREATE TABLE does not carry it either),
   // so a converted booking's invoice keeps naming the variant it drew from.
   'sales_invoice_items.variant_id',
+  // Catalogue identity on purchase lines (ALTERed onto the three purchase item
+  // tables by PURCHASE_VARIANT_DDL). Those tables are dropped wholesale in the
+  // emulation below, so this is really asserting the ALTER runs AFTER the
+  // CREATE TABLEs in applyUpgrades — the fresh CREATE TABLE does not carry
+  // these columns either.
+  'purchase_order_items.product_id',
+  'purchase_order_items.variant_id',
+  'purchase_invoice_items.product_id',
+  'purchase_invoice_items.variant_id',
+  'purchase_return_items.product_id',
+  'purchase_return_items.variant_id',
 ]
 
 test('upgrade restores the full purchase schema on a pre-purchase database', async (t) => {
