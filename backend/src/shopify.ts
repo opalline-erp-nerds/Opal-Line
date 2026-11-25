@@ -4467,6 +4467,148 @@ function mapImportedFulfillment(status: string | null | undefined): string {
       return 'unfulfilled'
   }
 }
+
+// NOTE: the old `mapImportedStatus(raw)` helper is intentionally gone. Both
+// import call sites (row status and the cancelled-before-invoicing check) now
+// derive from the canonical parsed snapshot via `importedErpStatus`, so a
+// `financial_status=voided` payload no longer cancels an order on its own —
+// only a parsed Shopify cancellation timestamp does (see
+// shopifyOrderPipeline.test.ts).
+
+type ShopifyStockClient = Pick<NonNullable<typeof db>, 'select'>
+
+type ResolvedOrderStockTarget = {
+  /** The PARENT sku — stock movements are ledgered under it. */
+  sku: string
+  productId: string
+  productStock: number
+  variantId: string | null
+  variantStock: number | null
+}
+
+/**
+ * Resolve one Shopify line to the stock bucket that actually sold.
+ *
+ * `shopify_variant_id` is immutable; SKUs get renamed. It therefore wins over
+ * any SKU match, including a Shopify SKU that happens to equal a parent SKU.
+ * SKU is only a fallback (variant SKU first, then parent SKU), and a blank SKU
+ * is fine when a variant id resolves — the parent's SKU is returned so the
+ * ledger movement and later cancellation restock still have a usable key.
+ */
+async function resolveOrderStockTarget(
+  client: ShopifyStockClient,
+  line: { sku: string; shopifyVariantId: string | null },
+): Promise<ResolvedOrderStockTarget | null> {
+  const rawSku = String(line.sku ?? '').trim()
+  const shopifyVariantId = String(line.shopifyVariantId ?? '').trim()
+  let variant: { id: string; productId: string; stock: number } | null = null
+
+  if (shopifyVariantId) {
+    const [byId] = await client
+      .select({ id: schema.productVariants.id, productId: schema.productVariants.productId, stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.shopifyVariantId, shopifyVariantId))
+      .limit(1)
+    variant = byId ?? null
+  }
+  if (!variant && rawSku) {
+    const [bySku] = await client
+      .select({ id: schema.productVariants.id, productId: schema.productVariants.productId, stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.sku, rawSku))
+      .limit(1)
+    variant = bySku ?? null
+  }
+
+  if (variant) {
+    const [parent] = await client
+      .select({ id: schema.products.id, sku: schema.products.sku, stock: schema.products.stock })
+      .from(schema.products)
+      .where(eq(schema.products.id, variant.productId))
+      .limit(1)
+    if (!parent?.sku) return null
+    return {
+      sku: parent.sku,
+      productId: parent.id,
+      productStock: Number(parent.stock ?? 0),
+      variantId: variant.id,
+      variantStock: Number(variant.stock ?? 0),
+    }
+  }
+
+  if (!rawSku) return null
+  const [product] = await client
+    .select({ id: schema.products.id, sku: schema.products.sku, stock: schema.products.stock })
+    .from(schema.products)
+    .where(eq(schema.products.sku, rawSku))
+    .limit(1)
+  if (!product?.sku) return null
+  return {
+    sku: product.sku,
+    productId: product.id,
+    productStock: Number(product.stock ?? 0),
+    variantId: null,
+    variantStock: null,
+  }
+}
+
+/** Lock parent-then-variant (the same order as every other stock writer) and refresh balances. */
+async function lockOrderStockTarget(
+  tx: ShopifyStockClient,
+  target: ResolvedOrderStockTarget,
+): Promise<ResolvedOrderStockTarget | null> {
+  const [product] = await tx
+    .select({ sku: schema.products.sku, stock: schema.products.stock })
+    .from(schema.products)
+    .where(eq(schema.products.id, target.productId))
+    .limit(1)
+    .for('update')
+  if (!product?.sku) return null
+  let variantStock: number | null = null
+  if (target.variantId) {
+    const [variant] = await tx
+      .select({ stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.id, target.variantId))
+      .limit(1)
+      .for('update')
+    if (!variant) return null
+    variantStock = Number(variant.stock ?? 0)
+  }
+  return { ...target, sku: product.sku, productStock: Number(product.stock ?? 0), variantStock }
+}
+
+/**
+ * Shared order import.
+ *
+ * Every path — the Shopify webhook, the background order poll and the manual
+ * Sync Orders button — lands here, and any of them can fire while another is
+ * still running. Two concurrent passes both see an order as unknown and race
+ * the insert (the transaction guard stops the double deduction, but the loser
+ * reports a confusing duplicate error). Coalescing makes the second caller
+ * await the in-flight pass and reuse its result: one import at a time, and a
+ * deterministic answer for every caller.
+ */
+let ordersImportInFlight: Promise<ShopifyOrdersImportResult> | null = null
+
+export function isOrderImportInProgress(): boolean {
+  return ordersImportInFlight !== null
+}
+
+export async function importShopifyOrders(options?: { updatedAtMin?: string | null }): Promise<ShopifyOrdersImportResult> {
+  if (ordersImportInFlight) {
+    const shared = await ordersImportInFlight.catch(() => null)
+    if (shared) return { ...shared, coalesced: true }
+  }
+  let run: Promise<ShopifyOrdersImportResult>
+  run = importShopifyOrdersUncoalesced(options).finally(() => {
+    if (ordersImportInFlight === run) ordersImportInFlight = null
+  })
+  ordersImportInFlight = run
+  return run
+}
+
+async function importShopifyOrdersUncoalesced(options?: { updatedAtMin?: string | null }): Promise<ShopifyOrdersImportResult> {
   if (!isConfigured()) {
     return { ok: false, imported: 0, updated: 0, errors: ['Shopify is not configured. Set SHOPIFY_STORE_URL and SHOPIFY_ACCESS_TOKEN in server/.env'], message: 'Shopify is not configured' }
   }

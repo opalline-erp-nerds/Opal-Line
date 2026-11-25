@@ -2792,6 +2792,24 @@ dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), a
     const status = String(req.body?.status ?? '').trim()
     const allowed = ['imported', 'confirmed', 'processing', 'fulfilled', 'cancelled']
     if (!allowed.includes(status)) return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` })
+    // Cancellation is an explicit lifecycle action: a Shopify-linked order is
+    // cancelled in Shopify first (and restocked once), an ERP order locally.
+    // It is a STATUS, not a refund (Phase 5.1 correction): this endpoint never
+    // writes to the advance ledger — the collection stays intact and the
+    // booking merely becomes refundable until an operator explicitly records
+    // the money going back (POST /bookings/:id/refund-advance).
+    if (status === 'cancelled') {
+      const { cancelOrderLifecycle } = await import('../shopifyOrderActions')
+      const cancelled = await cancelOrderLifecycle(routeParam(req.params.id))
+      if (!cancelled.ok) return res.status(502).json({ error: cancelled.error ?? 'Order could not be cancelled' })
+    }
+    // Keep `cancelled_at` in step with the stage: the dashboard treats either
+    // marker as cancelled, and reopening an order must clear it or the order
+    // (and its invoice) would stay excluded from sales forever.
+    const [row] = await db!.update(s.salesOrders)
+      .set({ status, cancelledAt: status === 'cancelled' ? new Date().toISOString() : null })
+      .where(eq(s.salesOrders.id, routeParam(req.params.id)))
+      .returning()
     if (!row) return res.status(404).json({ error: 'Order not found' })
     const actor = actorFromRequest(req)
     await insertOrderEvent(row.id, 'Status Change', `Status moved to ${status}`, actor.userId ?? 'system')

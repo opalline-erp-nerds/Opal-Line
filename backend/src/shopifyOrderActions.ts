@@ -556,6 +556,25 @@ export async function cancelLocalOrderOnce(
       .limit(1)
       .for('update')
     if (!row) return { skipped: true, itemsRestored: 0 }
+    // There is deliberately no `status === 'cancelled'` early return: the
+    // webhook path applies Shopify's cancelled state first, then calls this
+    // function, and keying idempotence on the status meant the restock NEVER
+    // ran. A tagged movement is the honest marker: one restock per order,
+    // whichever path (ERP action or webhook) gets here first. `opts` is kept
+    // because callers such as a manual order created as cancelled pass it, but
+    // the tagged-movement check below is what prevents a double restore.
+    void opts
+    const restockRef = row.shopifyId ?? row.id
+    const [alreadyRestocked] = await tx
+      .select({ id: s.stockMovements.id })
+      .from(s.stockMovements)
+      .where(and(
+        eq(s.stockMovements.type, 'sale_return_in'),
+        eq(s.stockMovements.refType, 'shopify_order_cancel'),
+        eq(s.stockMovements.refId, restockRef),
+      ))
+      .limit(1)
+    if (alreadyRestocked) return { skipped: true, itemsRestored: 0 }
 
     const items = Array.isArray(row.lineItems)
       ? (row.lineItems as Array<{ sku?: string; quantity?: number; shopifyVariantId?: string | null }>)

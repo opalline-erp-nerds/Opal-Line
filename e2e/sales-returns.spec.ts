@@ -32,6 +32,12 @@ test.describe('sales returns', () => {
   test('the search box filters the list once it has loaded', async ({ page }) => {
     await page.goto('/sales/returns')
     await expect(page.getByRole('heading', { name: 'Returns & Refunds' })).toBeVisible({ timeout: 20000 })
+    await page.getByPlaceholder('Search return, order, customer…').fill('zzz-no-such-return')
+    // A search with no matches reports that honestly — the table's own empty
+    // message — rather than erroring or leaving stale rows on screen.
+    await expect(
+      page.getByText('No returns yet — create one from an order that has items coming back.'),
+    ).toBeVisible({ timeout: 15000 })
     await expect(page.getByText('Something went wrong')).toHaveCount(0)
   })
 })

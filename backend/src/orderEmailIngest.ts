@@ -885,6 +885,20 @@ type FulfilmentItem = InvoiceArtifacts['items'][number] & {
 }
 
 /**
+ * Is this row an ERP-created manual order rather than a Shopify one?
+ *
+ * A manual order that was pushed to Shopify and imported back keeps the
+ * `manual-order` tag but its imported lines no longer carry the ERP amount /
+ * weight fields. It is a Shopify order now: its Shopify total is authoritative,
+ * otherwise the manual branch recomputes ₹0 and never repairs the invoice.
+ */
+function isErpManualOrder(order: typeof schema.salesOrders.$inferSelect): boolean {
+  const fromShopify = Boolean(order.shopifyGid) || (order.shopifyId ?? '').startsWith('#')
+  return !fromShopify
+    && ((order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#'))
+}
+
+/**
  * The money half of an invoice raise: line items + header totals for ONE order
  * row, computed with the exact pre-existing rules (manual/booking component
  * vs price lines, Shopify billed-total spread). Extracted as a pure function so
@@ -897,7 +911,8 @@ function buildInvoiceArtifacts(
   scalars: { gstRate: number; silverRate: number; productMap: Record<string, { netWeight: number; makingCharge: number }> },
 ): InvoiceArtifacts | null {
   const rawLineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
-
+  const isManualOrder = isErpManualOrder(order)
+  const orderValue = round2(Number(order.value ?? 0))
   const lineItems: OrderEmailData['items'] = rawLineItems.length > 0
     ? rawLineItems
     : !isManualOrder && orderValue > 0
@@ -1028,7 +1043,7 @@ export async function raiseInvoiceForOrder(
 
   const rawLineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
   // Detect manual orders (created via ERP, not imported from Shopify)
-  const isManualOrder = (order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#')
+  const isManualOrder = isErpManualOrder(order)
   const orderValue = round2(Number(order.value ?? 0))
 
   // An invoiced order is normally left alone. The one exception is an invoice
@@ -1038,11 +1053,23 @@ export async function raiseInvoiceForOrder(
   // the order they belong to instead of being skipped forever.
   if (order.invoice) {
     const [linked] = await db
-      .select({ grandTotal: schema.salesInvoices.grandTotal })
+      .select({ grandTotal: schema.salesInvoices.grandTotal, paymentStatus: schema.salesInvoices.paymentStatus })
       .from(schema.salesInvoices)
       .where(eq(schema.salesInvoices.number, order.invoice))
       .limit(1)
-    if (!linked || Number(linked.grandTotal ?? 0) > 0 || orderValue <= 0) return { number: order.invoice, claimed: false }
+    if (!linked) {
+      // The invoice was deleted but the order kept its number. Leaving the
+      // stale reference made every future "Create invoice" click return a
+      // non-existent invoice number forever. Clear it and raise a real one.
+      await db.update(schema.salesOrders).set({ invoice: null }).where(eq(schema.salesOrders.id, order.id))
+      order = { ...order, invoice: null }
+    } else if (
+      Number(linked.grandTotal ?? 0) > 0 &&
+      (orderValue <= 0 || Math.abs(Number(linked.grandTotal ?? 0) - orderValue) <= 0.01) &&
+      String(linked.paymentStatus ?? '').toLowerCase() === String(order.payment ?? '').toLowerCase()
+    ) {
+      return { number: order.invoice, claimed: false }
+    }
   }
 
   // Older Shopify rows were imported without line items. Their order total is
@@ -1304,7 +1331,19 @@ export async function raiseInvoiceForOrder(
         gst: lockedGstRate,
         gstAmount: lockedArt.gstAmount,
         discount: storedDiscount,
-
+        grandTotal: lockedArt.grandTotal,
+        paymentMethod: lockedArt.payment,
+        paymentStatus: fresh.payment,
+        // The LOCKED row is authoritative (a concurrent edit must not leak a
+        // stale status); refunded is a real status, not just paid/issued.
+        status:
+          fresh.payment === 'paid'
+            ? 'paid'
+            : fresh.payment === 'refunded'
+              ? 'refunded'
+              : 'issued',
+        currency: fresh.currency ?? 'INR',
+        date: fresh.date ?? new Date().toISOString(),
       })
       // 5. Items + ONE location-correct deduction per item. Split parts carry
       //    their own store and their exact source line/allocation; unsplit

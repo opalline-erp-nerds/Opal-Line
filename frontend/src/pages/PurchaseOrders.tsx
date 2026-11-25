@@ -882,6 +882,10 @@ export default function PurchaseOrdersPage() {
                           options={productOptions}
                           value={line.custom ? CUSTOM_SKU : line.sku}
                           onValueChange={(v) => pickProduct(index, v)}
+                          placeholder="Select product"
+                          searchPlaceholder="Search name, SKU or variant…"
+                          emptyText="No matching product or variant"
+                          className="h-9 rounded-lg border border-gray-200 dark:border-border text-[14px] text-foreground"
                         />
                         {line.custom ? (
                           <Input
@@ -904,6 +908,47 @@ export default function PurchaseOrdersPage() {
                             className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
                           />
                         </div>
+                        {pieceRate ? (
+                          // A piece-rate item has no grams: one wide cell carries
+                          // the ₹/pc price instead of a weight × rate pair.
+                          <div className="col-span-2 space-y-1.5">
+                            <ColLabel>Price (₹ per piece)</ColLabel>
+                            <Input
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              value={line.price}
+                              onChange={(e) => setLine(index, { price: e.target.value })}
+                              placeholder="0.00"
+                              className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
+                            />
+                          </div>
+                        ) : (
+                          <>
+                            <div className="space-y-1.5">
+                              <ColLabel>Weight (g)</ColLabel>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.001"
+                                value={line.weight}
+                                onChange={(e) => setLine(index, { weight: e.target.value })}
+                                className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
+                              />
+                            </div>
+                            <div className="space-y-1.5">
+                              <ColLabel>Rate (₹/g)</ColLabel>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.01"
+                                value={line.rate}
+                                onChange={(e) => setLine(index, { rate: e.target.value })}
+                                className="h-9 rounded-lg border border-gray-200 dark:border-border text-right text-[14px] text-foreground"
+                              />
+                            </div>
+                          </>
+                        )}
                       </div>
 
                       <div className="flex items-end justify-between gap-2">
