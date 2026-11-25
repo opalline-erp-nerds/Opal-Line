@@ -1,13 +1,23 @@
 import { expect, test } from '@playwright/test'
+import { csrfApi, seedProducts } from './fixtures'
 
 /**
- * TEMPORARY diagnostic — reproduces the reported failure exactly like a user:
- * focus, type characters one by one, watch dropdown, pick a product, read
- * net-weight / line total / grand total, capture console errors and failed
- * network responses. Deleted after the investigation.
+ * Interaction smoke test for the quotation form: focus, type characters one by
+ * one, watch the dropdown, pick a product, read net-weight / line total /
+ * grand total, and capture console errors and failed network responses along
+ * the way (logged for diagnosis — the assertions are that the flow completes).
+ *
+ * Self-contained: a freshly bootstrapped install has an EMPTY catalogue, so the
+ * product it picks is seeded here and removed afterwards.
  */
 
-test('debug: quotation form interaction with console/network capture', async ({ page, request }) => {
+let seededCleanup: (() => Promise<void>) | null = null
+test.afterEach(async () => {
+  if (seededCleanup) await seededCleanup()
+  seededCleanup = null
+})
+
+test('quotation form interaction (type → pick → totals) with console/network capture', async ({ page, request }) => {
   const consoleErrors: string[] = []
   const pageErrors: string[] = []
   const failedResponses: string[] = []
@@ -21,18 +31,16 @@ test('debug: quotation form interaction with console/network capture', async ({ 
     }
   })
 
+  // The form's product list is whatever the catalogue holds — a freshly
+  // bootstrapped install has none, so seed the row this interaction picks
+  // (cleanup runs in afterEach, pass or fail).
+  const { products, cleanup } = await seedProducts(await csrfApi(request), { prefix: 'E2E-QUO', count: 2 })
+  seededCleanup = cleanup
+  const pick = products[0]
+
   const productsRes = await request.get('/api/v1/db/products?limit=200')
-  const prodsBody = (await productsRes.json()) as { data?: Array<{
-    name: string
-    sku: string
-    netWeight: number | null
-    makingCharge: number | null
-    pieceRateProduct: boolean | null
-    stock: number | null
-  }> }
-  const catalogue = prodsBody.data ?? []
-  const pick = catalogue.find((p) => !p.pieceRateProduct && Number(p.netWeight) > 0) ?? catalogue[0]
-  console.log('CATALOGUE SIZE:', catalogue.length)
+  const prodsBody = (await productsRes.json()) as { data?: unknown[] }
+  console.log('CATALOGUE SIZE:', (prodsBody.data ?? []).length)
   console.log('PICK:', JSON.stringify(pick))
 
   const silverRes = await request.get('/api/v1/silver/rate')

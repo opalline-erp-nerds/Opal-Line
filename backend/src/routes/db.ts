@@ -11,7 +11,8 @@ import {
 } from '../scanCode'
 import { findProductsBySku, generateUniqueSku, productCodeSettings } from '../lib/skuIdentity'
 import { isGenericSku, migrationWarnings, planSkuMigration, type SkuReferences } from '../lib/skuMigration'
-import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, levelAt, resolveMovementLocation, setStockTotalTo, type Tx } from '../stock'
+import { DEFAULT_LOCATION_ID, applyStockMovement, assertStockAvailable, availableAtLocation, ensureDefaultLocation, InsufficientStockError, levelAt, resolveMovementLocation, setStockTotalTo, type StockSkuResolution, type Tx } from '../stock'
+import { collectedByInvoice, invoiceOutstanding } from '../outstanding'
 import { applyInvoiceReturn, aggregateReturnedBySku, nextInvoiceStatus, summarizeReturnLines } from '../invoiceReturn'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
@@ -40,6 +41,7 @@ import {
   type AgingBucketKey,
 } from '../lib/stockAging'
 import { invoiceTotals } from '../invoiceTotals'
+import { fixedPieceRateFor } from '../orderPricing'
 import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
 import { splitQtyAcrossVariants } from '../lib/variantSplit'
 import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
@@ -390,6 +392,36 @@ const listOf = (table: any, orderCol?: any) =>
     }
   }
 
+/** One `product_variants` row, as the catalogue endpoints return it. */
+type ProductVariantRow = typeof s.productVariants.$inferSelect
+
+/**
+ * Attach each product's `product_variants` rows to the product rows themselves.
+ *
+ * Every catalogue picker (Bookings, New Sales Invoice, Create Manual Order)
+ * flattens `product.variants` into one selectable row per variant, and all of
+ * them read ONLY these endpoints — a list without variants silently degrades
+ * each picker back to parent-only selection, which is how variant SKUs became
+ * unsearchable while the variant feature itself was fully built. One query per
+ * page (never N+1); a product with no variant rows gets `variants: null`, the
+ * "flat single-SKU product" the whole app already treats as the default.
+ */
+async function withVariants<T extends { id: string }>(rows: T[]): Promise<Array<T & { variants: ProductVariantRow[] | null }>> {
+  if (rows.length === 0) return []
+  const variantRows = await db!
+    .select()
+    .from(s.productVariants)
+    .where(inArray(s.productVariants.productId, rows.map((r) => r.id)))
+    .orderBy(s.productVariants.sku, s.productVariants.id)
+  const byProduct = new Map<string, typeof variantRows>()
+  for (const v of variantRows) {
+    const list = byProduct.get(v.productId)
+    if (list) list.push(v)
+    else byProduct.set(v.productId, [v])
+  }
+  return rows.map((r) => ({ ...r, variants: byProduct.get(r.id) ?? null }))
+}
+
 const oneOf = (table: any, idCol: any) =>
     async (req: Request, res: Response) => {
     if (!requireDb(res)) return
@@ -407,7 +439,20 @@ const s = schema
 
 // Newest products first: orderedColumn descends *_at columns automatically,
 // so the list opens on the latest creations (column headers still re-sort).
-dbRouter.get('/products', listOf(s.products, s.products.createdAt))
+// Products carry their variant rows so the sales pickers can offer every
+// variant SKU as its own selectable line (see withVariants).
+dbRouter.get('/products', async (req: Request, res: Response) => {
+  if (!requireDb(res)) return
+  try {
+    const result = await paginate(s.products, req.query, s.products.createdAt, req)
+    const rows = result.data.map(stripHash) as Array<{ id: string }>
+    result.data = await withVariants(rows)
+    res.json(result)
+  } catch (err) {
+    logger.error({ err }, 'products list failed')
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
 
 // ─── SKU identity helpers ─────────────────────────────────────────────
 // SKUs are the only product identifier: generated per category under an
@@ -1343,16 +1388,29 @@ dbRouter.get('/products/search', async (req, res) => {
     const q = String(req.query.q ?? '').trim()
     if (!q) return res.json({ data: [] })
     const pattern = `%${escapeLike(q)}%`
+    // A picker types the CODE it is holding: variant SKUs and variant names
+    // must land on their parent product exactly like the product's own name
+    // and SKU do, otherwise `OL-GIF-001-RED` never resolves from the server.
+    const variantMatches = db!
+      .select({ productId: s.productVariants.productId })
+      .from(s.productVariants)
+      .where(or(
+        ilike(s.productVariants.sku, pattern),
+        ilike(s.productVariants.title, pattern),
+      ))
     const rows = await db!
       .select()
       .from(s.products)
       .where(or(
         ilike(s.products.name, pattern),
         ilike(s.products.sku, pattern),
+        inArray(s.products.id, variantMatches),
       ))
       .orderBy(s.products.name)
       .limit(SEARCH_LIMIT)
-    res.json({ data: rows.map(stripHash) })
+    // Same shape as the list endpoint: pickers search by VARIANT sku/name, so
+    // the rows they hit here must carry their variants too.
+    res.json({ data: (await withVariants(rows.map(stripHash) as Array<{ id: string }>)) })
   } catch (err) {
     logger.error({ err }, 'product search failed')
     res.status(500).json({ error: 'Internal server error' })
@@ -1608,20 +1666,37 @@ export function round2(value: number): number {
  * manual invoice never reduced what the app treats as shoppable stock, and
  * the rollup silently drifted from the ledger. The historical oversell guard
  * (row lock + insufficient-stock error) is preserved.
+ *
+ * `variantId` names the exact variant when the line billed one: the movement
+ * is pinned to that variant's bucket instead of being inferred from the SKU
+ * string, and the ledger row records it — the parent rollup is re-derived as
+ * the sum of its variants either way.
  */
-async function applyStockDelta(tx: any, sku: string, delta: number): Promise<void> {
+async function applyStockDelta(
+  tx: any,
+  sku: string,
+  delta: number,
+  locationId?: string | null,
+  variantId?: string | null,
+): Promise<void> {
   if (!sku || !delta) return
   if (delta < 0) {
     // Centralised guard: one code path owns the "would this go negative?"
     // decision, so manual create/update and the duplicate/convert relays all
-    // surface the same structured error the UI highlights.
-    await assertStockAvailable(tx, [{ sku, qty: Math.abs(delta) }])
+    // surface the same structured error the UI highlights. Measured WHERE the
+    // deduction will land whenever the item knows its fulfilment store.
+    await assertStockAvailable(tx, [{ sku, qty: Math.abs(delta) }], locationId ? { locationId } : {})
   }
   await applyStockMovement({
     sku,
+    ...(variantId ? { variantId } : {}),
     qty: delta,
     type: delta < 0 ? 'sale_out' : 'sale_return_in',
     refType: 'invoice',
+    // Phase 4: reversals go back to the store the line was fulfilled from —
+    // the ORIGINAL ITEM'S location is the source of truth. No location means
+    // a historical invoice: exactly the legacy default-store behaviour.
+    ...(locationId ? { locationId } : {}),
     tx,
   })
 }
@@ -1631,14 +1706,16 @@ async function applyStockDelta(tx: any, sku: string, delta: number): Promise<voi
  *
  * Returns true when it handled the error, so callers can `catch` and fall
  * through to their generic 400/500 only for anything else. The payload carries
- * the per-product detail the client uses to highlight the offending lines.
+ * the per-product detail the client uses to highlight the offending lines, and
+ * (when the check was location-scoped) the store it ran against.
  */
-function respondInsufficientStock(res: Response, err: unknown): boolean {
+function respondInsufficientStock(res: Response, err: unknown, location?: { id: string; name: string }): boolean {
   if (!(err instanceof InsufficientStockError)) return false
   res.status(409).json({
     error: 'Insufficient Stock',
     code: 'INSUFFICIENT_STOCK',
     message: err.message,
+    ...(location ? { location } : {}),
     products: err.products,
   })
   return true
@@ -1652,8 +1729,18 @@ export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number):
       const row = sanitize(item, s.salesInvoiceItems)
       delete row.id
       delete row.invoiceId
+      // Fulfilment provenance is SERVER-ASSIGNED: a client can never fabricate
+      // a booking line/allocation reference on an invoice it raises itself
+      // (only the conversion transaction writes those). `locationId` passes
+      // through on purpose — a manual line may legitimately name its store.
+      delete row.bookingLineId
+      delete row.bookingAllocationId
       row.product = String(item.product ?? item.title ?? '').trim()
       row.sku = String(item.sku ?? '').trim()
+      // The exact variant the line billed (NULL on flat lines): carried into
+      // sales_invoice_items so an invoice keeps naming the variant its stock
+      // was drawn from, not just a SKU string.
+      row.variantId = String(item.variantId ?? '').trim() || null
       row.qty = Math.max(1, Math.floor(num(item.qty, 1)))
       row.weight = num(item.weight, 0)
       // The rate from Silver Rate Management is AUTHORITATIVE whenever one is
@@ -1706,9 +1793,47 @@ export function applyPieceRateItems<T extends Record<string, unknown>>(
 }
 
 /**
+ * Fixed piece rates for a set of codes, keyed by LOWERCASED code.
+ *
+ * A code resolves to a Piece Rate Product either directly (it IS the
+ * product's SKU) or through a variant row (the SKU belongs to a variant of a
+ * Piece Rate Product — the path `OL-GIF-001-RED` takes). The rate itself comes
+ * from the SAME rule the client's `sellableItemPrice` uses, so the preview and
+ * the stored line can never disagree. Pure by design: the resolution rule is
+ * unit-testable without a database.
+ */
+export function pieceRateMapFor(
+  codes: string[],
+  products: Array<{
+    id: string
+    sku: string | null
+    pieceRateProduct?: boolean | null
+    fixedPieceRate?: number | string | null
+    sellingPrice?: number | string | null
+  }>,
+  variants: Array<{ sku: string | null; productId: string | null }>,
+): Map<string, number> {
+  const wanted = new Set(codes.map((c) => String(c).trim().toLowerCase()).filter(Boolean))
+  const byId = new Map(products.map((p) => [p.id, p]))
+  const rates = new Map<string, number>()
+  const consider = (code: string | null | undefined, product: (typeof products)[number] | undefined) => {
+    const key = String(code ?? '').trim().toLowerCase()
+    if (!key || !wanted.has(key) || rates.has(key) || !product) return
+    const rate = fixedPieceRateFor(product)
+    if (rate != null) rates.set(key, rate)
+  }
+  for (const p of products) consider(p.sku, p)
+  for (const v of variants) consider(v.sku, v.productId ? byId.get(v.productId) : undefined)
+  return rates
+}
+
+/**
  * Loads the fixed piece rates for an invoice's SKUs and rewrites every line
- * that belongs to a Piece Rate Product. Returns the items untouched when no
- * line maps to one, so ordinary invoices never pay for the lookup.
+ * that belongs to a Piece Rate Product — the product's own SKU or, through
+ * `product_variants`, a VARIANT's SKU, which is how a piece-rate product's
+ * variants bill at their fixed ₹/pc instead of the silver-weight maths.
+ * Returns the items untouched when no line maps to one, so ordinary invoices
+ * never pay for the lookups.
  */
 export async function applyPieceRateInvoiceItems<T extends Record<string, unknown>>(
   items: T[],
@@ -1717,16 +1842,31 @@ export async function applyPieceRateInvoiceItems<T extends Record<string, unknow
   if (items.length === 0 || !client) return items
   const skus = [...new Set(items.map((it) => String(it.sku ?? '').trim()).filter(Boolean))]
   if (skus.length === 0) return items
+  // Typed explicitly: the shared client is `any`, and an untyped callback
+  // parameter is exactly how an `any` silently becomes an untestable `any`.
+  type VariantCodeRow = { sku: string | null; productId: string | null }
+  const variants: VariantCodeRow[] = await client
+    .select({ sku: s.productVariants.sku, productId: s.productVariants.productId })
+    .from(s.productVariants)
+    .where(inArray(s.productVariants.sku, skus))
+  const parentIds: string[] = [
+    ...new Set(variants.map((v) => v.productId).filter((id): id is string => Boolean(id))),
+  ]
   const rows = await client
-    .select({ sku: s.products.sku, fixedPieceRate: s.products.fixedPieceRate })
+    .select({
+      id: s.products.id,
+      sku: s.products.sku,
+      pieceRateProduct: s.products.pieceRateProduct,
+      fixedPieceRate: s.products.fixedPieceRate,
+      sellingPrice: s.products.sellingPrice,
+    })
     .from(s.products)
-    .where(and(inArray(s.products.sku, skus), eq(s.products.pieceRateProduct, true)))
-  const rates = new Map<string, number>()
-  for (const r of rows) {
-    const rate = Number(r.fixedPieceRate)
-    if (Number.isFinite(rate) && rate > 0) rates.set(String(r.sku ?? '').trim().toLowerCase(), rate)
-  }
-  return applyPieceRateItems(items, rates)
+    .where(
+      parentIds.length > 0
+        ? or(inArray(s.products.sku, skus), inArray(s.products.id, parentIds))
+        : inArray(s.products.sku, skus),
+    )
+  return applyPieceRateItems(items, pieceRateMapFor(skus, rows, variants))
 }
 
 // Duplicate an existing invoice into a fresh draft (same items/customer, new number, no payment)
@@ -1776,7 +1916,10 @@ dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), a
         date: new Date().toISOString(),
       }).returning()
       for (const it of sourceItems) {
-        const { id: _oldId, invoiceId: _oldInvoiceId, ...itemData } = it
+        // A duplicate is a NEW document: it copies the money and the store the
+        // goods came from, but never the booking provenance — only the
+        // original conversion fulfilled that booking's line and allocation.
+        const { id: _oldId, invoiceId: _oldInvoiceId, bookingLineId: _oldLine, bookingAllocationId: _oldAlloc, ...itemData } = it
         await tx.insert(s.salesInvoiceItems).values({ ...itemData, id: randomUUID(), invoiceId: newId })
       }
       return created
@@ -1865,7 +2008,7 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
         .returning()
       for (const it of items) {
         await tx.insert(s.salesInvoiceItems).values({ ...it, id: randomUUID(), invoiceId: id })
-        await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0))
+        await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0), undefined, String(it.variantId ?? '') || null)
       }
       return invoice
     })
@@ -1928,10 +2071,25 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
       if (!existing) return null
       const items = await applyPieceRateInvoiceItems(normalizeInvoiceItems(body.items, silverRate), tx)
       if (items.length > 0) {
-        // First, restore old stock
+        // First, restore old stock — each line back to THE STORE IT WAS
+        // FULFILLED FROM (Phase 4); historical items (NULL location) restore
+        // exactly as before (default store).
         const oldItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
         for (const oi of oldItems) {
-          await applyStockDelta(tx, String(oi.sku ?? ''), num(oi.qty, 0))
+          await applyStockDelta(tx, String(oi.sku ?? ''), num(oi.qty, 0), oi.locationId, oi.variantId ?? null)
+        }
+        // Where the REPLACEMENT lines may draw from: the invoice's own
+        // fulfilment stores. One store → reuse it; none stored (historical
+        // invoice) → the unchanged legacy default-store behaviour; a SPLIT
+        // invoice whose new line names no store → refuse rather than guess a
+        // store or borrow the default one.
+        const oldLocations = [...new Set(oldItems.map((oi) => oi.locationId).filter((v): v is string => Boolean(v)))]
+        const locationFor = (it: Record<string, unknown>): string | null | undefined => {
+          const sent = String(it.locationId ?? '').trim()
+          if (sent) return sent
+          if (oldLocations.length === 0) return undefined
+          if (oldLocations.length === 1) return oldLocations[0]!
+          return null
         }
         // Old stock is back, so the new basket is validated against the
         // restored headroom — as a whole, so duplicate lines cannot oversell.
@@ -1943,10 +2101,24 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         )
         // Delete old items
         await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
-        // Insert new items and deduct stock
+        // Insert new items and deduct stock — at the store each line draws
+        // from (its own if sent, the invoice's single store otherwise; the
+        // legacy default only for historical invoices with no stored store).
         for (const it of items) {
-          await tx.insert(s.salesInvoiceItems).values({ ...it, id: randomUUID(), invoiceId: routeParam(req.params.id) })
-          await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0))
+          const loc = locationFor(it)
+          if (loc === null) {
+            throw Object.assign(
+              new Error('This invoice was fulfilled from multiple stores — name the store each replacement line draws from'),
+              { code: 'LOCATION_REQUIRED' },
+            )
+          }
+          await tx.insert(s.salesInvoiceItems).values({
+            ...it,
+            id: randomUUID(),
+            invoiceId: routeParam(req.params.id),
+            ...(loc ? { locationId: loc } : {}),
+          })
+          await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0), loc, String(it.variantId ?? '') || null)
         }
         const gst = num(body.gst, num(existing.gst, 3))
         const subtotal = round2(items.reduce((a, it) => a + num(it.amount, 0), 0))
@@ -2002,6 +2174,12 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     res.json(stripHash(row))
   } catch (err) {
     if (respondInsufficientStock(res, err)) return
+    // A split invoice whose replacement lines named no store: a clear 400,
+    // never a silent default-store deduction (the transaction already rolled
+    // back, so the old items and their stock are untouched).
+    if (err instanceof Error && (err as { code?: string }).code === 'LOCATION_REQUIRED') {
+      return res.status(400).json({ error: err.message })
+    }
     res.status(400).json({ error: 'Failed to update invoice' })
   }
 })
@@ -2014,7 +2192,9 @@ dbRouter.delete('/invoices/:id', requirePermission('sales', 'delete'), async (re
       if (!existing) return null
       const items = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
       for (const it of items) {
-        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0))
+        // Each line goes back to ITS fulfilment store (Phase 4); historical
+        // items (NULL location) keep the legacy default-store behaviour.
+        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0), it.locationId, it.variantId ?? null)
       }
       await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
       await tx.delete(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id)))
@@ -2078,6 +2258,13 @@ dbRouter.post('/sales-orders/:id/create-invoice', requirePermission('sales', 'cr
     }
     res.json({ created: Boolean(invoiceNumber) && !existing, invoiceNumber })
   } catch (err) {
+    // Same stock contract as invoice creation: the shortfall is refused inside
+    // the conversion transaction, so nothing was raised and no stock moved.
+    if (respondInsufficientStock(res, err)) return
+    // Incomplete/mismatched booking allocations refuse the raise the same way.
+    if (err instanceof Error && (err as { code?: string }).code === 'ALLOCATION_INCOMPLETE') {
+      return res.status(400).json({ error: err.message, details: (err as { details?: unknown }).details })
+    }
     logger.error({ err }, 'create-invoice for order failed')
     res.status(500).json({ error: 'Failed to create invoice from order' })
   }
@@ -2111,7 +2298,12 @@ dbRouter.post('/sales-orders/by-invoice/:invoice/reinvoice', requirePermission('
       if (!existing) return null
       const items = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, existing.id))
       for (const it of items) {
-        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0))
+        // Reverse each line AT ITS FULFILMENT STORE (Phase 4) — the original
+        // item's location is the source of truth; NULL = historical invoice,
+        // legacy default-store behaviour unchanged. The re-raise that follows
+        // re-consumes the booking's allocations at the same stores (the plan
+        // is applied automatically), so stock lands exactly where it came from.
+        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0), it.locationId, it.variantId ?? null)
       }
       await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, existing.id))
       await tx.delete(s.salesInvoices).where(eq(s.salesInvoices.id, existing.id))
@@ -2139,10 +2331,21 @@ dbRouter.post('/sales-orders/by-invoice/:invoice/reinvoice', requirePermission('
     const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
     const invoiceNumber = await createInvoiceForOrderRow(freshOrder!)
     if (!invoiceNumber) return res.status(500).json({ error: 'Re-invoice failed: no new invoice was created' })
+    // Re-point every payment recorded against the replaced invoice: the new
+    // number stands in for the old one 1:1 for the same order, so paid amount
+    // and outstanding stay exactly what they were — the booking's advance
+    // (collected once) can never be counted twice or lost to an orphan row.
+    await db!.update(s.payments).set({ invoice: invoiceNumber }).where(eq(s.payments.invoice, cancelledNumber))
     recordCrud('sales-orders', 'Updated', req, { id: order.id, invoice: invoiceNumber })
     await insertOrderEvent(order.id, 'Invoice Reissued', `Invoice ${cancelledNumber} cancelled and reissued as ${invoiceNumber}`, actorFromRequest(req).userId ?? 'system')
     res.json({ ok: true, cancelled: cancelledNumber, invoiceNumber })
   } catch (err) {
+    // Incomplete/mismatched booking allocations refuse the re-raise inside
+    // the transaction — nothing was re-created (the old invoice's reversal
+    // above did commit, so the order can be re-invoiced once the plan is fixed).
+    if (err instanceof Error && (err as { code?: string }).code === 'ALLOCATION_INCOMPLETE') {
+      return res.status(400).json({ error: err.message, details: (err as { details?: unknown }).details })
+    }
     logger.error({ err }, 'reinvoice for order failed')
     res.status(500).json({ error: 'Failed to cancel and reissue invoice' })
   }
@@ -2591,6 +2794,10 @@ dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), a
     if (!allowed.includes(status)) return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` })
     // Cancellation is an explicit lifecycle action: a Shopify-linked order is
     // cancelled in Shopify first (and restocked once), an ERP order locally.
+    // It is a STATUS, not a refund (Phase 5.1 correction): this endpoint never
+    // writes to the advance ledger — the collection stays intact and the
+    // booking merely becomes refundable until an operator explicitly records
+    // the money going back (POST /bookings/:id/refund-advance).
     if (status === 'cancelled') {
       const { cancelOrderLifecycle } = await import('../shopifyOrderActions')
       const cancelled = await cancelOrderLifecycle(routeParam(req.params.id))
@@ -2738,40 +2945,336 @@ dbRouter.get('/invoices/:id/return-status', requirePermission('sales', 'view'), 
 })
 
 // ─── Booking orders: advance payment, convert to invoice on completion ──────
+// Contact/header/item parsing, the customer link and the convert workflow all
+// live in ../bookings so both the routes and the scratch-database tests share
+// one implementation.
+
+// The bookings list: ONLY booking rows. The page used to download every sales
+// order and filter in the browser; this serves the same predicate the UI used
+// (is_booking, plus legacy rows carrying the booking tag), newest first.
+dbRouter.get('/bookings', requirePermission('sales', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!
+      .select()
+      .from(s.salesOrders)
+      .where(or(eq(s.salesOrders.isBooking, true), ilike(s.salesOrders.tags, '%booking%')))
+      .orderBy(desc(s.salesOrders.date))
+    // Allocation totals per booking (one grouped query) — the list shows the
+    // Unallocated / Partial / Fully status without N+1 requests. Legacy rows
+    // answer 0 → their status derives as Unallocated, never invented.
+    const ids = rows.map((r) => r.id)
+    const allocatedByOrder = new Map<string, number>()
+    if (ids.length > 0) {
+      const agg = await db!
+        .select({ orderId: s.bookingAllocations.orderId, total: sql<number>`coalesce(sum(${s.bookingAllocations.quantity}), 0)` })
+        .from(s.bookingAllocations)
+        .where(inArray(s.bookingAllocations.orderId, ids))
+        .groupBy(s.bookingAllocations.orderId)
+      for (const r of agg) allocatedByOrder.set(r.orderId, Number(r.total ?? 0))
+    }
+    // Advance CASH per booking (one grouped query) — Phase 5.1 correction:
+    //   • `advanceCollected` is ACTUAL cash the ledger holds (collections
+    //     minus real refunds); bookings from before the ledger fall back to
+    //     their field value, which is the only record of that collection;
+    //   • `advanceRefundable` is what a CANCELLED booking still holds and an
+    //     operator may refund explicitly — ledger-only, so a phantom refund
+    //     can never be offered against un-ledgered history, and a converted
+    //     booking never shows one (its money is invoice-scoped).
+    const refToOrder = new Map<string, string>()
+    for (const r of rows) {
+      if (r.internalId) refToOrder.set(r.internalId, r.id)
+      refToOrder.set(r.id, r.id)
+    }
+    const cashByOrder = new Map<string, { collected: number; refunded: number }>()
+    if (refToOrder.size > 0) {
+      const advanceRows = await db!
+        .select({ ref: s.payments.ref, amount: s.payments.amount })
+        .from(s.payments)
+        .where(and(
+          inArray(s.payments.ref, [...refToOrder.keys()]),
+          eq(s.payments.gateway, 'booking'),
+          inArray(s.payments.method, ['Advance', 'Advance Refund']),
+        ))
+      for (const p of advanceRows) {
+        const orderId = refToOrder.get(String(p.ref ?? ''))
+        if (!orderId) continue
+        const agg = cashByOrder.get(orderId) ?? { collected: 0, refunded: 0 }
+        const amount = Number(p.amount ?? 0)
+        if (amount >= 0) agg.collected += amount
+        else agg.refunded += -amount
+        cashByOrder.set(orderId, agg)
+      }
+    }
+    res.json({
+      data: rows.map((r) => {
+        const cash = cashByOrder.get(r.id)
+        const net = cash ? cash.collected - cash.refunded : 0
+        const cancelled = String(r.status ?? '').toLowerCase() === 'cancelled'
+        return {
+          ...stripHash(r),
+          allocated: allocatedByOrder.get(r.id) ?? 0,
+          advanceCollected: cash ? Math.round(net * 100) / 100 : Number(r.advancePaid ?? 0),
+          advanceRefundable: cancelled && !r.invoice && net > 0 ? Math.round(net * 100) / 100 : 0,
+        }
+      }),
+      total: rows.length,
+    })
+  } catch (err) {
+    logger.error({ err }, 'bookings list failed')
+    res.status(500).json({ error: 'Failed to load bookings' })
+  }
+})
+
+/**
+ * Location-wise availability for ONE booking line (Bookings Phase 1 —
+ * visibility only).
+ *
+ * Answers with every store's balance for the selected product/variant, read
+ * through the SAME availability logic the conversion guard uses
+ * (availableAtLocation: variant-scoped levelAt plus the default store's
+ * pre-ledger adoption), so what the form shows is exactly what a later
+ * convert will validate — never the global product rollup.
+ *
+ * `combined` is the sum of the returned locations and is INFORMATIONAL ONLY:
+ * bookings do not allocate across stores (that is a later phase), so no
+ * caller may treat it as stock spendable at any one store. Read-only —
+ * nothing is reserved, deducted or written.
+ */
+dbRouter.get('/bookings/stock-by-location', requirePermission('sales', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const productId = String(req.query.productId ?? '').trim()
+    if (!productId) return res.status(400).json({ error: 'productId is required' })
+    const variantId = String(req.query.variantId ?? '').trim() || null
+
+    const [product] = await db!
+      .select({ id: s.products.id, name: s.products.name, sku: s.products.sku })
+      .from(s.products)
+      .where(eq(s.products.id, productId))
+      .limit(1)
+    if (!product) return res.status(404).json({ error: 'Product not found' })
+    if (variantId) {
+      const [variant] = await db!
+        .select({ id: s.productVariants.id })
+        .from(s.productVariants)
+        .where(and(eq(s.productVariants.id, variantId), eq(s.productVariants.productId, productId)))
+        .limit(1)
+      if (!variant) return res.status(404).json({ error: 'Variant not found for this product' })
+    }
+
+    const resolved: StockSkuResolution = {
+      productId: product.id,
+      ledgerSku: product.sku,
+      ...(variantId ? { variantId } : {}),
+    }
+    const locations = await db!.select().from(s.inventoryLocations)
+    // Default store first — it is where a booking without an explicit
+    // location sells from — then alphabetical.
+    locations.sort((a, b) =>
+      a.id === DEFAULT_LOCATION_ID ? -1 : b.id === DEFAULT_LOCATION_ID ? 1 : a.name.localeCompare(b.name),
+    )
+    const perLocation: Array<{ locationId: string; name: string; available: number }> = []
+    for (const loc of locations) {
+      perLocation.push({ locationId: loc.id, name: loc.name, available: await availableAtLocation(db!, resolved, loc.id) })
+    }
+    res.json({
+      locations: perLocation,
+      combined: perLocation.reduce((a, l) => a + l.available, 0),
+    })
+  } catch (err) {
+    logger.error({ err }, 'booking stock-by-location failed')
+    res.status(500).json({ error: 'Failed to load stock by location' })
+  }
+})
+
+/**
+ * The allocation plan for ONE booking (Bookings Phase 3): derived status per
+ * line, the stored rows, and CURRENT availability for every row — which is how
+ * a shortage that opened up after allocation gets surfaced for correction.
+ * Read-only; legacy bookings answer with empty rows (never invented).
+ */
+dbRouter.get('/bookings/:id/allocations', requirePermission('sales', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const orderId = routeParam(req.params.id)
+    const [booking] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, orderId)).limit(1)
+    if (!booking) return res.status(404).json({ error: 'Booking not found' })
+
+    const allocations = await db!
+      .select()
+      .from(s.bookingAllocations)
+      .where(eq(s.bookingAllocations.orderId, orderId))
+      .orderBy(s.bookingAllocations.lineIndex, s.bookingAllocations.locationId)
+
+    const { buildAllocationSummary } = await import('../bookings')
+    const summary = buildAllocationSummary(booking, allocations)
+
+    const availability: Array<{ allocationId: string; available: number }> = []
+    for (const a of allocations) {
+      availability.push({
+        allocationId: a.id,
+        available: await availableAtLocation(
+          db!,
+          { productId: a.productId, ledgerSku: a.sku, ...(a.variantId ? { variantId: a.variantId } : {}) },
+          a.locationId,
+        ),
+      })
+    }
+
+    res.json({
+      ...summary,
+      allocations,
+      availability,
+      // Prefill HINT for a never-allocated booking: the store it sells from
+      // today (legacy NULL → default). Nothing is written until the user
+      // saves, so historical bookings are never silently converted.
+      suggestedLocationId: booking.locationId ?? DEFAULT_LOCATION_ID,
+    })
+  } catch (err) {
+    logger.error({ err }, 'booking allocations load failed')
+    res.status(500).json({ error: 'Failed to load allocations' })
+  }
+})
+
+/**
+ * Replace a booking's allocation set (edit / redistribute / clear). Planning
+ * only: the transaction validates against each store's real availability and
+ * never touches the ledger. See putBookingAllocations for the rules.
+ */
+dbRouter.put('/bookings/:id/allocations', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const orderId = routeParam(req.params.id)
+    const { putBookingAllocations } = await import('../bookings')
+    const result = await putBookingAllocations(orderId, req.body?.items)
+    if (!result.ok) {
+      // Structured shortfall → the standard 409 payload the UI renders.
+      if (result.stock && respondInsufficientStock(res, result.stock)) return
+      return res.status(result.status).json({
+        error: result.error,
+        ...(result.details !== undefined ? { details: result.details } : {}),
+      })
+    }
+    recordCrud('sales-orders', 'Updated', req, { id: orderId, allocations: true })
+    const storeCount = new Set(result.allocations.map((a) => a.locationId)).size
+    await insertOrderEvent(
+      orderId,
+      'Allocations Updated',
+      `${result.allocations.reduce((a, l) => a + l.quantity, 0)} unit(s) across ${storeCount} store(s) — ${result.status}`,
+      actorFromRequest(req).userId ?? 'system',
+    )
+    res.json(result)
+  } catch (err) {
+    logger.error({ err }, 'booking allocations save failed')
+    res.status(500).json({ error: 'Failed to save allocations' })
+  }
+})
+
+/** Store-wide GST rate — what a booking falls back to when it carries none. */
+async function settingsGstRate(): Promise<number> {
+  if (!db) return 3
+  const [row] = await db.select().from(s.settings).where(eq(s.settings.id, 'app')).limit(1)
+  return Number(row?.gstRate ?? 3)
+}
+
 dbRouter.post('/bookings', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
   try {
     const customer = String(req.body?.customer ?? '').trim()
-    const rawItems: Array<{ product?: unknown; sku?: unknown; qty?: unknown; price?: unknown }> = Array.isArray(req.body?.items) ? req.body.items : []
     if (!customer) return res.status(400).json({ error: 'customer is required' })
-    const items = rawItems
-      .map((it) => ({ title: String(it.product ?? ''), sku: String(it.sku ?? ''), quantity: Number(it.qty ?? 0), price: Number(it.price ?? 0) }))
-      .filter((it) => it.title && it.quantity > 0)
-    if (items.length === 0) return res.status(400).json({ error: 'at least one item with product + qty is required' })
-    const discount = toNum(req.body?.discount) ?? 0
-    const value = Math.round((items.reduce((a, it) => a + it.price * it.quantity, 0) - discount) * 100) / 100
+    const {
+      parseBookingContact,
+      parseBookingHeader,
+      normalizeBookingItems,
+      assignBookingLineIds,
+      computeBookingTotals,
+      ensureBookingLocation,
+      ensureBookingCustomer,
+    } = await import('../bookings')
+
+    const contact = parseBookingContact(req.body)
+    if ('error' in contact) return res.status(400).json({ error: contact.error })
+    const header = parseBookingHeader(req.body)
+    if ('error' in header) return res.status(400).json({ error: header.error })
+    // The single store this booking sells from: an explicit id must exist; no
+    // id at all (plain API clients — and what every legacy booking carries)
+    // resolves to the default store, exactly as conversion has always done.
+    const location = await ensureBookingLocation(header.locationId)
+    if ('error' in location) return res.status(400).json({ error: location.error })
+    const parsed = normalizeBookingItems(req.body?.items)
+    if ('error' in parsed) return res.status(400).json({ error: parsed.error })
+    // Stable line identity from birth: every catalogue-tracked line gets its
+    // id on create (hand-typed lines carry none — nothing to allocate).
+    const items = assignBookingLineIds(null, parsed.items)
+
+    const discount = Math.max(toNum(req.body?.discount) ?? 0, 0)
+    // The rate the customer was shown is STORED with the booking (form value,
+    // else the store-wide rate) so the invoice later bills at exactly it.
+    const gstRate = header.gst !== undefined && header.gst !== null ? header.gst : await settingsGstRate()
+    const totals = computeBookingTotals(items, gstRate, discount)
+    const preDiscount = round2(totals.taxable + totals.gstAmount)
+    if (discount > preDiscount) return res.status(400).json({ error: 'discount cannot exceed the booking total' })
+    const value = totals.value
+    // A ₹0 booking would convert to a ₹0 invoice — refuse it at the door.
+    if (!(value > 0)) return res.status(400).json({ error: 'booking total must be greater than 0' })
     const advancePaid = Math.min(Math.max(toNum(req.body?.advanceAmount) ?? 0, 0), value)
 
     const now = new Date()
     const ym = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`
     const internalId = `BK${ym}-${Math.floor(100000 + Math.random() * 900000)}`
-    const [row] = await db!.insert(s.salesOrders).values({
-      id: randomUUID(),
-      internalId,
-      customer,
-      value,
-      payment: advancePaid >= value && value > 0 ? 'paid' : 'pending',
-      fulfillment: 'pending',
-      status: 'confirmed',
-      date: now.toISOString(),
-      items: items.reduce((a, it) => a + it.quantity, 0),
-      tags: 'booking',
-      currency: 'INR',
-      discount,
-      lineItems: items,
-      isBooking: true,
-      advancePaid,
-    }).returning()
+    // The booking row AND its advance ledger row commit together (Phase 5.1):
+    // a collected advance is a `payments` record from the moment it exists —
+    // Accounts sees it before any conversion — and a failed ledger write can
+    // never leave a booking that claims money the payment side cannot see.
+    const row = await db!.transaction(async (tx) => {
+      const [inserted] = await tx
+        .insert(s.salesOrders)
+        .values({
+          id: randomUUID(),
+          internalId,
+          customer,
+          ...(contact.email ? { customerEmail: contact.email } : {}),
+          ...(contact.phone ? { customerPhone: contact.phone } : {}),
+          value,
+          payment: advancePaid >= value && value > 0 ? 'paid' : 'pending',
+          fulfillment: 'pending',
+          status: 'confirmed',
+          date: header.date ?? now.toISOString(),
+          locationId: location.locationId,
+          expectedDelivery: header.expectedDate ?? null,
+          gst: gstRate,
+          note: header.note ?? null,
+          items: items.reduce((a, it) => a + it.quantity, 0),
+          tags: 'booking',
+          currency: 'INR',
+          discount,
+          lineItems: items,
+          isBooking: true,
+          advancePaid,
+        })
+        .returning()
+      const { syncBookingAdvanceLedger } = await import('../bookings')
+      await syncBookingAdvanceLedger(tx, inserted.id)
+      return inserted
+    })
+
+    // A real customer relationship, not just text on the row.
+    await ensureBookingCustomer({
+      name: customer,
+      email: contact.email,
+      phone: contact.phone,
+      customerId: String(req.body?.customerId ?? '').trim() || null,
+    })
+    // Best-effort: derived customer stats (orders / total spent), same as the
+    // manual-order flow — a failure must not undo a good booking.
+    try {
+      const { recountCustomerStats } = await import('../customerStats')
+      await recountCustomerStats('orders')
+    } catch (err) {
+      logger.warn({ err }, 'customer stats recount after booking create failed')
+    }
+
     recordCrud('sales-orders', 'Created', req, row)
     await insertOrderEvent(row.id, 'Booking Created', `Booking ${internalId} — ${items.reduce((a, it) => a + it.quantity, 0)} item(s), value ₹${value.toLocaleString('en-IN')}, advance ₹${advancePaid.toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
     res.json(row)
@@ -2794,6 +3297,15 @@ dbRouter.patch('/bookings/:id', requirePermission('sales', 'edit'), async (req, 
 
     const body = req.body ?? {}
     const patch: Partial<typeof s.salesOrders.$inferInsert> = {}
+    const {
+      parseBookingContact,
+      parseBookingHeader,
+      normalizeBookingItems,
+      assignBookingLineIds,
+      computeBookingTotals,
+      ensureBookingLocation,
+      ensureBookingCustomer,
+    } = await import('../bookings')
 
     if (body.customer !== undefined) {
       const customer = String(body.customer ?? '').trim()
@@ -2801,26 +3313,133 @@ dbRouter.patch('/bookings/:id', requirePermission('sales', 'edit'), async (req, 
       patch.customer = customer
     }
 
-    let items = (Array.isArray(booking.lineItems) ? booking.lineItems : []) as Array<{ title?: string; sku?: string; quantity?: number; price?: number }>
+    // Contact travels with the booking: an empty field clears the stored
+    // value (`null`), a filled one replaces it — same rules as create.
+    if (body.email !== undefined || body.phone !== undefined) {
+      const contact = parseBookingContact(body)
+      if ('error' in contact) return res.status(400).json({ error: contact.error })
+      if (body.email !== undefined) patch.customerEmail = contact.email || null
+      if (body.phone !== undefined) patch.customerPhone = contact.phone || null
+    }
+
+    // Booking form header: date, expected delivery, GST rate, note, and the
+    // only two status transitions a form may perform (`fulfilled` belongs to
+    // Convert, `cancelled` to the cancel action).
+    const header = parseBookingHeader(body)
+    if ('error' in header) return res.status(400).json({ error: header.error })
+    if (header.date !== undefined) patch.date = header.date
+    if (header.expectedDate !== undefined) patch.expectedDelivery = header.expectedDate
+    if (header.note !== undefined) patch.note = header.note
+    if (header.status !== undefined && header.status !== booking.status) patch.status = header.status
+
+    // The rate that shapes this booking's value: an explicit form value wins
+    // (an explicit null resets to the store rate); otherwise the booking keeps
+    // its own — and a legacy row that predates the column gets backfilled, so
+    // the rate is always on the row the invoice will be built from.
+    let gstRate: number
+    if (header.gst !== undefined) {
+      gstRate = header.gst ?? (await settingsGstRate())
+      patch.gst = gstRate
+    } else if (booking.gst != null) {
+      gstRate = Number(booking.gst)
+    } else {
+      gstRate = await settingsGstRate()
+      patch.gst = gstRate
+    }
+
+    // The selling store changes ONLY when the form actually sends one: a
+    // legacy booking (location_id NULL) keeps its NULL — the default store it
+    // has always converted against — until a genuinely different store is
+    // picked, so historical rows are never rewritten to a default id.
+    if (header.locationId !== undefined) {
+      const location = await ensureBookingLocation(header.locationId)
+      if ('error' in location) return res.status(400).json({ error: location.error })
+      patch.locationId = location.locationId
+    }
+
+    let items = (Array.isArray(booking.lineItems) ? booking.lineItems : []) as Array<{ title?: string; sku?: string; quantity: number; price: number }>
     let discount = num(booking.discount, 0)
     if (body.items !== undefined) {
-      const rawItems: Array<{ product?: unknown; sku?: unknown; qty?: unknown; price?: unknown }> = Array.isArray(body.items) ? body.items : []
-      const parsed = rawItems
-        .map((it) => ({ title: String(it.product ?? ''), sku: String(it.sku ?? ''), quantity: Number(it.qty ?? 0), price: Number(it.price ?? 0) }))
-        .filter((it) => it.title && it.quantity > 0)
-      if (parsed.length === 0) return res.status(400).json({ error: 'at least one item with product + qty is required' })
-      items = parsed
-      patch.lineItems = parsed
-      patch.items = parsed.reduce((a, it) => a + it.quantity, 0)
+      const parsed = normalizeBookingItems(body.items)
+      if ('error' in parsed) return res.status(400).json({ error: parsed.error })
+      // Stable line identity (Phase 4): ids are INHERITED when the line is
+      // still the same product/variant/SKU — supported edits (quantity,
+      // price, customer…) keep the id — while a genuinely different line
+      // gets a fresh one. Never a silent remap onto another product.
+      const identified = assignBookingLineIds(
+        Array.isArray(booking.lineItems)
+          ? (booking.lineItems as Parameters<typeof assignBookingLineIds>[0])
+          : null,
+        parsed.items,
+      )
+      items = identified as typeof items
+      patch.lineItems = identified
+      patch.items = identified.reduce((a, it) => a + it.quantity, 0)
+
+      // Allocations pin EXACT lines: a line edit that would invalidate them is
+      // refused with "reallocate first" (a vanished line, a different product
+      // / variant / SKU, or a shrink below what is already allocated). Phase-4
+      // rows resolve by their stable line_id — the line must still EXIST,
+      // never remapped; Phase-3 rows (line_id NULL) keep the positional
+      // identity check. Without this guard a booking could end up allocating
+      // stock it no longer books.
+      const allocs = await db!.select().from(s.bookingAllocations).where(eq(s.bookingAllocations.orderId, booking.id))
+      if (allocs.length > 0) {
+        const resolvedIdx: number[] = []
+        for (const a of allocs) {
+          if (a.lineId) {
+            const found = (identified as Array<{ id?: string }>).findIndex((l) => l.id === a.lineId)
+            if (found === -1) return res.status(400).json({ error: 'Line items changed — adjust the booking allocations first' })
+            resolvedIdx.push(found)
+          } else {
+            resolvedIdx.push(a.lineIndex)
+          }
+        }
+        for (let i = 0; i < allocs.length; i++) {
+          const a = allocs[i]
+          const line = items[resolvedIdx[i]!] as
+            | { sku?: string; quantity?: number; productId?: string; variantId?: string }
+            | undefined
+          const lineVariant = String(line?.variantId ?? '').trim() || null
+          if (
+            !line ||
+            String(line?.productId ?? '') !== a.productId ||
+            lineVariant !== (a.variantId ?? null) ||
+            String(line?.sku ?? '') !== a.sku
+          ) {
+            return res.status(400).json({ error: 'Line items changed — adjust the booking allocations first' })
+          }
+        }
+        const allocatedPerLine = new Map<number, number>()
+        allocs.forEach((a, i) => {
+          const idx = resolvedIdx[i]!
+          allocatedPerLine.set(idx, (allocatedPerLine.get(idx) ?? 0) + a.quantity)
+        })
+        for (const [lineIndex, allocated] of allocatedPerLine) {
+          const required = Math.max(0, Math.floor(Number(items[lineIndex]?.quantity ?? 0)))
+          if (allocated > required) {
+            return res.status(400).json({
+              error: `Line ${lineIndex + 1} is allocated ${allocated} but would only book ${required} — adjust the allocations first`,
+              details: [{ lineIndex, required, allocated }],
+            })
+          }
+        }
+      }
     }
     if (body.discount !== undefined) {
       discount = Math.max(toNum(body.discount) ?? 0, 0)
       patch.discount = discount
     }
 
-    if (body.items !== undefined || body.discount !== undefined) {
-      const value = Math.round((items.reduce((a, it) => a + Number(it.price ?? 0) * Number(it.quantity ?? 0), 0) - discount) * 100) / 100
-      const advancePaid = Math.min(Math.max(toNum(body.advanceAmount) ?? num(booking.advancePaid, 0), 0), Math.max(value, 0))
+    if (body.items !== undefined || body.discount !== undefined || body.gst !== undefined) {
+      // Recomputed with the SAME formula as create (and as the invoice the
+      // booking will become), so a rate edit moves the value with it.
+      const totals = computeBookingTotals(items, gstRate, discount)
+      const preDiscount = round2(totals.taxable + totals.gstAmount)
+      if (discount > preDiscount) return res.status(400).json({ error: 'discount cannot exceed the booking total' })
+      const value = totals.value
+      if (!(value > 0)) return res.status(400).json({ error: 'booking total must be greater than 0' })
+      const advancePaid = Math.min(Math.max(toNum(body.advanceAmount) ?? num(booking.advancePaid, 0), 0), value)
       patch.value = value
       patch.advancePaid = advancePaid
       patch.payment = advancePaid >= value && value > 0 ? 'paid' : 'pending'
@@ -2832,9 +3451,54 @@ dbRouter.patch('/bookings/:id', requirePermission('sales', 'edit'), async (req, 
     }
 
     if (Object.keys(patch).length === 0) return res.json(booking)
-    const [updated] = await db!.update(s.salesOrders).set(patch).where(eq(s.salesOrders.id, routeParam(req.params.id))).returning()
+    // Atomic re-check: a conversion may have claimed this booking between the
+    // read above and this write (both sides touch the same row, so the
+    // update blocks on the conversion's lock and re-evaluates after it). An
+    // edit must never land on a converted booking — its invoice already
+    // reflects the lines it fulfilled. The advance ledger row moves WITH the
+    // edit in the same transaction (Phase 5.1): the SAME payment record is
+    // updated in place when the amount changes — never a duplicate, never a
+    // delete — and a failed ledger write rolls the edit back with it.
+    const updated = await db!.transaction(async (tx) => {
+      const [u] = await tx
+        .update(s.salesOrders)
+        .set(patch)
+        .where(and(
+          eq(s.salesOrders.id, routeParam(req.params.id)),
+          sql`(${s.salesOrders.invoice} IS NULL OR ${s.salesOrders.invoice} = '')`,
+        ))
+        .returning()
+      if (!u) return null
+      if (patch.advancePaid !== undefined) {
+        const { syncBookingAdvanceLedger } = await import('../bookings')
+        await syncBookingAdvanceLedger(tx, u.id)
+      }
+      return u
+    })
+    if (!updated) return res.status(409).json({ error: 'Booking was converted while editing — reload it before saving' })
+
+    // Keep the customer relationship in step with what the form shows — the
+    // same identity rules as create (never a blind name merge).
+    if (body.customer !== undefined || body.email !== undefined || body.phone !== undefined || body.customerId !== undefined) {
+      await ensureBookingCustomer({
+        name: updated.customer ?? '',
+        email: patch.customerEmail !== undefined ? patch.customerEmail : (updated.customerEmail ?? null),
+        phone: patch.customerPhone !== undefined ? patch.customerPhone : (updated.customerPhone ?? null),
+        customerId: String(body.customerId ?? '').trim() || null,
+      })
+    }
+    // Best-effort derived customer stats (orders / total spent), same as the
+    // manual-order flow.
+    try {
+      const { recountCustomerStats } = await import('../customerStats')
+      await recountCustomerStats('orders')
+    } catch (err) {
+      logger.warn({ err }, 'customer stats recount after booking edit failed')
+    }
+
     recordCrud('sales-orders', 'Updated', req, updated)
-    await insertOrderEvent(updated.id, 'Booking Edited', `Booking ${updated.internalId ?? updated.id} — customer ${updated.customer}, value ₹${num(updated.value, 0).toLocaleString('en-IN')}, advance ₹${num(updated.advancePaid, 0).toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
+    const statusNote = patch.status ? `; status ${booking.status} → ${patch.status}` : ''
+    await insertOrderEvent(updated.id, 'Booking Edited', `Booking ${updated.internalId ?? updated.id} — customer ${updated.customer}, value ₹${num(updated.value, 0).toLocaleString('en-IN')}, advance ₹${num(updated.advancePaid, 0).toLocaleString('en-IN')}${statusNote}`, actorFromRequest(req).userId ?? 'system')
     res.json(updated)
   } catch (err) {
     logger.error({ err }, 'booking update failed')
@@ -2869,36 +3533,159 @@ dbRouter.post('/bookings/:id/payment-link', requirePermission('sales', 'edit'), 
   }
 })
 
-dbRouter.post('/bookings/:id/convert', requirePermission('sales', 'create'), async (req, res) => {
+/**
+ * Record an ACTUAL advance refund on a cancelled booking (Phase 5.1
+ * correction). Cancellation itself never moves money — this endpoint is the
+ * ONLY place an `Advance Refund` entry is written, and only when an operator
+ * confirms the cash really went back to the customer.
+ *
+ * The refund is capped at what the ledger still holds for the booking
+ * (collections − refunds), so an over-refund — including a duplicate of an
+ * already-full refund — is refused with a clear 400 instead of double-paying.
+ * Partial refunds are supported (send `amount`); omitting it refunds the
+ * whole remaining balance. The collection rows are never touched: history is
+ * preserved and net cash is corrected by adding the compensating entry.
+ */
+dbRouter.post('/bookings/:id/refund-advance', requirePermission('sales', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
-    if (!order) return res.status(404).json({ error: 'Booking not found' })
-    if (order.invoice) return res.status(400).json({ error: `Already converted to invoice ${order.invoice}` })
-    const value = Number(order.value ?? 0)
-    const advancePaid = Number(order.advancePaid ?? 0)
-    const fullyPaid = advancePaid >= value && value > 0
-    await db!.update(s.salesOrders).set({ payment: fullyPaid ? 'paid' : 'pending' }).where(eq(s.salesOrders.id, order.id))
-    const [fresh] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, order.id)).limit(1)
-    const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
-    const invoiceNumber = await createInvoiceForOrderRow(fresh!)
-    if (!invoiceNumber) return res.status(400).json({ error: 'Conversion failed: booking has no convertible line items' })
-    await db!.update(s.salesOrders).set({ invoice: invoiceNumber, status: 'fulfilled' }).where(eq(s.salesOrders.id, order.id))
-    if (advancePaid > 0) {
-      const advPaymentId = randomUUID()
-      await db!.insert(s.payments).values({
-        id: advPaymentId, ref: order.internalId ?? order.id, invoice: invoiceNumber, customer: order.customer,
-        amount: advancePaid, method: 'Advance', gateway: 'booking', status: 'paid', date: new Date().toISOString(),
-      } as any)
-      void import('../accounting/postings').then(({ postPaymentJournal }) => postPaymentJournal(advPaymentId, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId: advPaymentId }, 'Failed to auto-post booking advance payment journal'))
-    }
-    recordCrud('sales-orders', 'Updated', req, { id: order.id, invoice: invoiceNumber })
-    await insertOrderEvent(order.id, 'Booking Converted', `Converted to invoice ${invoiceNumber}; advance applied ₹${advancePaid.toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
-    res.json({ invoiceNumber, advanceApplied: advancePaid, balance: Math.round((value - advancePaid) * 100) / 100 })
+    const orderId = routeParam(req.params.id)
+    const outcome = await db!.transaction(async (tx) => {
+      const [booking] = await tx
+        .select()
+        .from(s.salesOrders)
+        .where(eq(s.salesOrders.id, orderId))
+        .limit(1)
+        .for('update')
+      if (!booking) return { status: 404 as const, error: 'Booking not found' }
+      if (!booking.isBooking) return { status: 400 as const, error: 'Order is not a booking' }
+      if (booking.invoice) {
+        return { status: 400 as const, error: 'This booking was converted — its advance belongs to the invoice; refund through the invoice flow' }
+      }
+      if (String(booking.status ?? '').toLowerCase() !== 'cancelled') {
+        return { status: 400 as const, error: 'An advance is refundable only on a cancelled booking' }
+      }
+      const ref = booking.internalId ?? booking.id
+      const rows = await tx
+        .select()
+        .from(s.payments)
+        .where(and(
+          eq(s.payments.ref, ref),
+          eq(s.payments.gateway, 'booking'),
+          inArray(s.payments.method, ['Advance', 'Advance Refund']),
+        ))
+      const net = rows.reduce((a, p) => a + Number(p.amount ?? 0), 0)
+      const refundable = Math.round(net * 100) / 100
+      if (refundable <= 0) {
+        return {
+          status: 400 as const,
+          error: 'Nothing refundable — this booking’s advance is already fully refunded (or never entered the ledger)',
+        }
+      }
+      const raw = req.body?.amount
+      let amount: number
+      if (raw === undefined || raw === null || raw === '') {
+        amount = refundable
+      } else {
+        amount = Math.round(Number(raw) * 100) / 100
+        if (!Number.isFinite(amount) || amount <= 0) {
+          return { status: 400 as const, error: 'amount must be a positive number' }
+        }
+        if (amount > refundable + 0.01) {
+          return { status: 400 as const, error: `Amount exceeds the refundable advance (${refundable.toFixed(2)})` }
+        }
+      }
+      const reason = String(req.body?.reason ?? '').trim().slice(0, 200)
+      const paymentId = randomUUID()
+      await tx.insert(s.payments).values({
+        id: paymentId,
+        ref,
+        invoice: null,
+        customer: booking.customer,
+        amount: -amount,
+        method: 'Advance Refund',
+        gateway: 'booking',
+        status: 'refunded',
+        date: new Date().toISOString(),
+      })
+      return {
+        status: 200 as const,
+        paymentId,
+        amount,
+        refundable: Math.round((refundable - amount) * 100) / 100,
+        reason,
+        customer: booking.customer,
+        internalId: booking.internalId ?? booking.id,
+      }
+    })
+    if (outcome.status !== 200) return res.status(outcome.status).json({ error: outcome.error })
+    const actor = actorFromRequest(req)
+    await insertOrderEvent(
+      orderId,
+      'Advance Refunded',
+      `Advance refund of ₹${outcome.amount!.toLocaleString('en-IN')} recorded — money returned to the customer${outcome.reason ? ` (${outcome.reason})` : ''}`,
+      actor.userId ?? 'system',
+    )
+    recordCrud('sales-orders', 'Advance refunded', req, { id: orderId, amount: outcome.amount })
+    void recordActivity({
+      action: 'Recorded Advance Refund',
+      module: 'sales',
+      entity: outcome.internalId,
+      details: `Refund ₹${outcome.amount!.toLocaleString('en-IN')}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json({ ok: true, amount: outcome.amount, refundable: outcome.refundable })
   } catch (err) {
-    logger.error({ err }, 'booking convert failed')
-    res.status(500).json({ error: 'Failed to convert booking' })
+    logger.error({ err }, 'booking advance refund failed')
+    res.status(500).json({ error: 'Failed to record advance refund' })
   }
+})
+
+dbRouter.post('/bookings/:id/convert', requirePermission('sales', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  // The workflow itself (invoice claim, status/fulfillment transition, the
+  // advance payment row, the timeline event) lives in ../bookings so a
+  // scratch-database test can pin it; this handler keeps RBAC, the audit
+  // record and the HTTP mapping.
+  const { convertBookingToInvoice } = await import('../bookings')
+  const result = await convertBookingToInvoice(routeParam(req.params.id), {
+    actor: actorFromRequest(req).userId ?? 'system',
+  })
+  if (!result.ok) {
+    // Stock refusal → the standard 409 with per-product detail (product,
+    // variant, required, available, shortage) PLUS each entry's OWN store:
+    // a multi-store conversion can be short at several stores at once, so
+    // every shortfall's location id/name is resolved individually — one
+    // product's store is never copied onto another's entry. Nothing was
+    // written: the conversion transaction already rolled back.
+    if (result.stock) {
+      const locIds = [...new Set(result.stock.products.map((p) => p.locationId).filter((v): v is string => Boolean(v)))]
+      const locs = locIds.length > 0
+        ? await db!.select().from(s.inventoryLocations).where(inArray(s.inventoryLocations.id, locIds))
+        : []
+      const nameById = new Map(locs.map((l) => [l.id, l.name]))
+      const enriched = new InsufficientStockError(
+        result.stock.products.map((p) => ({
+          ...p,
+          ...(p.locationId && nameById.has(p.locationId) ? { location: nameById.get(p.locationId)! } : {}),
+        })),
+      )
+      // A single-store refusal keeps the top-level `location` hint the UI
+      // shows beside the message; multi-store refusals carry per-entry stores.
+      const single = enriched.products.length === 1 ? enriched.products[0] : null
+      const location = single?.locationId && single.location ? { id: single.locationId, name: single.location } : undefined
+      if (respondInsufficientStock(res, enriched, location)) return
+    }
+    // Incomplete allocation (400): per-line detail so the UI can point at
+    // the exact line to fix. The whole conversion transaction rolled back.
+    return res.status(result.status).json({
+      error: result.error,
+      ...(result.details ? { details: result.details } : {}),
+    })
+  }
+  recordCrud('sales-orders', 'Updated', req, { id: result.orderId, invoice: result.invoiceNumber })
+  res.json({ invoiceNumber: result.invoiceNumber, advanceApplied: result.advanceApplied, balance: result.balance })
 })
 
 // ─── Order events timeline ───────────────────────────────────────────────────
@@ -2954,7 +3741,12 @@ dbRouter.get('/customers/:name/summary', requirePermission('sales', 'view'), asy
       db!.select().from(s.payments).where(eq(s.payments.customer, customer)).orderBy(desc(s.payments.date)).limit(15),
     ])
     const lifetimeValue = Math.round(orders.reduce((a, o) => a + Number(o.value ?? 0), 0) * 100) / 100
-    const outstanding = Math.round(dues.reduce((a, i) => a + Number(i.grandTotal ?? 0), 0) * 100) / 100
+    // What this customer actually still owes (Phase 5.2): per invoice,
+    // grandTotal − collected — a booking advance credited at conversion and
+    // every partial payment reduce it (same rule as the Dues page and the
+    // dashboard receivables, so the three can never disagree).
+    const paidByInvoice = await collectedByInvoice()
+    const outstanding = Math.round(dues.reduce((a, i) => a + invoiceOutstanding(i, paidByInvoice), 0) * 100) / 100
     res.json({
       customer,
       totalOrders: orders.length,
@@ -3041,7 +3833,16 @@ dbRouter.post('/sales-orders/bulk-invoice', requirePermission('sales', 'create')
         } else { failed++; errors.push(`${order.internalId ?? order.id}: no convertible line items`) }
       } catch (e) {
         failed++
-        errors.push(`${order.internalId ?? order.id}: ${e instanceof Error ? e.message : 'failed'}`)
+        // A stock refusal names every short product (and its shortage) so the
+        // bulk result explains WHY that order could not be invoiced.
+        if (e instanceof InsufficientStockError) {
+          const detail = e.products
+            .map((p) => `${p.name} (${p.sku}) short by ${p.shortage} — ${p.available} of ${p.requested}`)
+            .join('; ')
+          errors.push(`${order.internalId ?? order.id}: Insufficient stock — ${detail}`)
+        } else {
+          errors.push(`${order.internalId ?? order.id}: ${e instanceof Error ? e.message : 'failed'}`)
+        }
       }
     }
     recordCrud('sales-orders', 'Updated', req, { bulkInvoice: true, created })
@@ -3795,6 +4596,8 @@ dbRouter.get('/purchase-orders/with-items', requirePermission('purchase', 'view'
           id: l.id,
           product: l.product ?? '',
           sku: l.sku ?? '',
+          productId: (l.productId as string | null) ?? null,
+          variantId: (l.variantId as string | null) ?? null,
           qty: Number(l.qty ?? 0),
           weight: Number(l.weight ?? 0),
           rate: Number(l.rate ?? 0),
@@ -3821,6 +4624,8 @@ dbRouter.get('/purchase-orders/:id/with-items', requirePermission('purchase', 'v
         id: l.id,
         product: l.product ?? '',
         sku: l.sku ?? '',
+        productId: (l.productId as string | null) ?? null,
+        variantId: (l.variantId as string | null) ?? null,
         qty: Number(l.qty ?? 0),
         weight: Number(l.weight ?? 0),
         rate: Number(l.rate ?? 0),
@@ -4017,6 +4822,8 @@ dbRouter.get('/purchase-returns/with-lines', requirePermission('purchase', 'view
           id: l.id,
           product: l.product ?? '',
           sku: l.sku ?? '',
+          productId: (l.productId as string | null) ?? null,
+          variantId: (l.variantId as string | null) ?? null,
           qty: Number(l.qty ?? 0),
           weight: Number(l.weight ?? 0),
           rate: Number(l.rate ?? 0),
@@ -4192,6 +4999,12 @@ dbRouter.get('/inventory/locations/stock-summary', requirePermission('inventory'
  * location — the ERP maps to what the store already has.
  */
 dbRouter.get('/inventory/locations/shopify', requirePermission('inventory', 'view'), async (_req, res) => {
+  // A fresh install has no Shopify credentials: there is nothing to map to and
+  // nothing to fail. Answering 502 here made the Stock Locations page log a
+  // console error on EVERY load (the mapping column says "Not mapped" either
+  // way), which is a browser-visible failure for a state that is simply "no
+  // store connected". Real upstream failures below still report 502.
+  if (!isShopifyConfigured()) return res.json({ locations: [] })
   try {
     const locations = await fetchStoreLocations()
     res.json({ locations })
@@ -5677,6 +6490,11 @@ dbRouter.put('/settings/connections', requirePermission('system', 'edit'), async
     // Reload secrets into runtime config
     const { loadSecretsFromDb } = await import('../config')
     await loadSecretsFromDb()
+    // The order poll is started at boot, when DB credentials may not have
+    // existed yet. Starting here is a no-op if it is already running, and it
+    // makes credentials saved through Connections take effect immediately.
+    const { startOrderAutoSync } = await import('../orderAutoSync')
+    startOrderAutoSync()
 
     // Persist Shopify config to the .env file (encrypted) so it drives the app on next start too
     if (typeof shopifyStoreUrl === 'string' && shopifyStoreUrl.length > 0 && !isMasked(shopifyStoreUrl)) {
@@ -6672,47 +7490,85 @@ dbRouter.post('/dues/pay', requirePermission('sales', 'edit'), async (req, res) 
         sql`${schema.salesInvoices.customer} = ${customer} and ${schema.salesInvoices.paymentStatus} is distinct from 'paid' and ${schema.salesInvoices.status} is distinct from 'cancelled' and ${schema.salesInvoices.status} is distinct from 'refunded'`,
       )
       .orderBy(sql`${schema.salesInvoices.date} asc`)
-    const outstanding = open.reduce((a, inv) => a + Number(inv.grandTotal ?? 0), 0)
     if (open.length === 0) return res.status(400).json({ error: 'No outstanding invoices for this customer' })
+
+    // What this customer ACTUALLY still owes (Phase 5.2): per invoice,
+    // grandTotal − collectedAmount — a booking advance credited at conversion
+    // and every earlier partial payment reduce it. The old sum of gross
+    // grandTotals let us collect the same money twice.
+    const paidByInvoice = await collectedByInvoice()
+    const dueById = new Map<string, number>()
+    let outstanding = 0
+    for (const inv of open) {
+      const due = invoiceOutstanding(inv, paidByInvoice)
+      dueById.set(inv.id, due)
+      outstanding = Math.round((outstanding + due) * 100) / 100
+    }
+    if (outstanding <= 0) return res.status(400).json({ error: 'No outstanding invoices for this customer' })
+    // There is no supported overpayment workflow: recording more cash than is
+    // owed is refused, not silently accepted.
     if (amount > outstanding + 0.01) return res.status(400).json({ error: `Amount exceeds outstanding (${outstanding.toFixed(2)})` })
 
-    // Allocation: explicit invoice list or FIFO across oldest first
+    // Allocation: explicit invoice list or FIFO across oldest first — applied
+    // against each invoice's TRUE due, never its gross total.
     let remaining = amount
     const settled: string[] = []
-    const touched: Array<{ inv: typeof open[number]; applied: number }> = []
+    const applied: Array<{ inv: typeof open[number]; amount: number }> = []
     const plan = allocate
       ? open.filter((inv) => allocate.map(String).includes(inv.id))
       : open
     for (const inv of plan) {
       if (remaining <= 0) break
-      const due = Number(inv.grandTotal ?? 0)
-      const applied = Math.min(due, remaining)
-      if (applied <= 0) continue
-      remaining = Math.round((remaining - applied) * 100) / 100
-      touched.push({ inv, applied })
-      if (applied >= due - 0.01) {
+      const due = dueById.get(inv.id) ?? 0
+      if (due <= 0) continue
+      const use = Math.min(due, remaining)
+      if (use <= 0) continue
+      remaining = Math.round((remaining - use) * 100) / 100
+      applied.push({ inv, amount: use })
+      if (use >= due - 0.01) {
         await db.update(schema.salesInvoices).set({ paymentStatus: 'paid', status: 'paid' }).where(eq(schema.salesInvoices.id, inv.id))
         settled.push(inv.number)
       } else {
         await db.update(schema.salesInvoices).set({ paymentStatus: 'partial' }).where(eq(schema.salesInvoices.id, inv.id))
       }
     }
+    if (allocate && remaining > 0.01) {
+      // The chosen invoices cannot absorb the amount — refuse rather than
+      // record cash that no invoice's outstanding reflects.
+      return res.status(400).json({ error: `Allocated invoices only cover ${(Math.round((amount - remaining) * 100) / 100).toFixed(2)} of ${amount.toFixed(2)}` })
+    }
+    if (remaining > 0 && remaining <= 0.01 && applied.length > 0) {
+      // Float dust from the tolerance above: fold it into the last row so the
+      // payment rows always sum to exactly what was received.
+      applied[applied.length - 1].amount = Math.round((applied[applied.length - 1].amount + remaining) * 100) / 100
+      remaining = 0
+    }
 
+    // ONE payment row PER invoice the money was applied to (Phase 5.2): each
+    // invoice's collected amount must equal the cash it actually received, or
+    // its outstanding would stay inflated and the next dues run could collect
+    // the same money again. The shared `ref` still groups them as one payment.
     const ref = `PAY-${Date.now().toString(36).toUpperCase()}`
-    const paymentId = randomUUID()
-    await db.insert(schema.payments).values({
-      id: paymentId,
-      ref,
-      invoice: touched[0]?.inv.number ?? null,
-      customer,
-      amount,
-      method,
-      gateway: method === 'razorpay' ? 'razorpay' : null,
-      status: 'success',
-      date: new Date().toISOString(),
-      reconciled: true,
-    } as any)
-    void import('../accounting/postings').then(({ postPaymentJournal }) => postPaymentJournal(paymentId, req.userId ?? null)).catch((err) => logger.warn({ err, paymentId }, 'Failed to auto-post dues payment journal'))
+    const paymentIds: string[] = []
+    for (const a of applied) {
+      const paymentId = randomUUID()
+      paymentIds.push(paymentId)
+      await db.insert(schema.payments).values({
+        id: paymentId,
+        ref,
+        invoice: a.inv.number,
+        customer,
+        amount: a.amount,
+        method,
+        gateway: method === 'razorpay' ? 'razorpay' : null,
+        status: 'success',
+        date: new Date().toISOString(),
+        reconciled: true,
+      } as any)
+    }
+    void import('../accounting/postings')
+      .then(({ postPaymentJournal }) => Promise.all(paymentIds.map((id) => postPaymentJournal(id, req.userId ?? null))))
+      .catch((err) => logger.warn({ err, ref, paymentIds }, 'Failed to auto-post dues payment journal'))
     const actor = actorFromRequest(req)
     void recordActivity({
       action: 'Recorded Payment',
@@ -6722,8 +7578,8 @@ dbRouter.post('/dues/pay', requirePermission('sales', 'edit'), async (req, res) 
       userId: actor.userId,
       ip: actor.ip,
     })
-    logger.info({ ref, customer, amount, method, settled }, 'Payment recorded from Dues page')
-    res.json({ ok: true, ref, settled, remainingOutstanding: Math.round((outstanding - amount) * 100) / 100 })
+    logger.info({ ref, customer, amount, method, settled, paymentCount: paymentIds.length }, 'Payment recorded from Dues page')
+    res.json({ ok: true, ref, settled, remainingOutstanding: Math.max(0, Math.round((outstanding - amount) * 100) / 100) })
   } catch (err) {
     logger.error({ err }, 'Record payment failed')
     res.status(500).json({ error: 'Failed to record payment' })

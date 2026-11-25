@@ -57,6 +57,40 @@ test('totals round GST to two decimals', () => {
   assert.equal(t.grandTotal, 102.99)
 })
 
+// ── Piece Rate ────────────────────────────────────────────────────────────────
+// A Piece Rate Product bills qty × its fixed ₹/pc; the silver-weight maths
+// never applies to it. Mirrors `applyPieceRateItems` (routes/db.ts), which
+// rewrites the line the same way on the way into the database.
+
+test('a Piece Rate line bills qty × fixed price, never weight × (rate + making)', () => {
+  assert.equal(lineAmount({ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 1 }), 2000)
+  // Even with weight/rates present on the line, the fixed price wins — that is
+  // the whole point of the flag.
+  assert.equal(
+    lineAmount({ weight: 200, silverRatePerGram: 105, makingChargePerGram: 20, pieceRate: 2000, qty: 1 }),
+    2000,
+  )
+  // Quantity scales the FIXED price, not the weight.
+  assert.equal(lineAmount({ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 3 }), 6000)
+})
+
+test('a Piece Rate line carries no silver or making component', () => {
+  const line = { weight: 200, silverRatePerGram: 105, makingChargePerGram: 20, pieceRate: 2000, qty: 1 }
+  assert.equal(lineSilverValue(line), 0)
+  assert.equal(lineMakingValue(line), 0)
+})
+
+test('totals put GST on top of a Piece Rate subtotal', () => {
+  const t = invoiceTotalsPreview(
+    [{ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 1 }],
+    3,
+    0,
+  )
+  assert.equal(t.subtotal, 2000)
+  assert.equal(t.gstAmount, 60)
+  assert.equal(t.grandTotal, 2060)
+})
+
 function round2(n: number): number {
   return Math.round((n + Number.EPSILON) * 100) / 100
 }

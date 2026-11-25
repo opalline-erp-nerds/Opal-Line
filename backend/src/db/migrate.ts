@@ -6,15 +6,15 @@ import * as schema from './schema'
 import { defaultRolePermissions } from '../rbac'
 import { roleNames } from './seedData'
 
-const databaseUrl = process.env.DATABASE_URL
+const databaseUrl = process.env.DIRECT_URL?.trim() || process.env.DATABASE_URL
 
 if (!databaseUrl) {
-  console.error('DATABASE_URL is not set.')
+  console.error('DIRECT_URL or DATABASE_URL is not set.')
   process.exit(1)
 }
 
 async function main() {
-  const client = postgres(databaseUrl!, { max: 1 })
+  const client = postgres(databaseUrl!, { max: 1, prepare: false, idle_timeout: 20, connect_timeout: 30 })
   const db = drizzle(client, { schema })
 
   console.log('Ensuring roles table and users.permissions column...')

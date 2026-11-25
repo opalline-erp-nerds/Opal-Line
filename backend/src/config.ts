@@ -65,6 +65,17 @@ export async function loadSecretsFromDb() {
         if (row.shopifyApiVersion) {
           config.apiVersion = row.shopifyApiVersion
         }
+        // Webhook HMAC middleware reads process.env directly (and Shopify's
+        // secret is NOT part of `config`). Connections saves it encrypted in
+        // this row and also to .env, but on Render .env is read-only: without
+        // this assignment a UI-saved secret never reaches the verifier and
+        // every webhook is rejected until a manual env-var change + restart.
+        if (row.webhookSecretEncrypted) {
+          try {
+            const secret = decrypt(row.webhookSecretEncrypted)
+            if (secret) process.env.SHOPIFY_WEBHOOK_SECRET = secret
+          } catch { /* keep the env value */ }
+        }
 
         if (row.dbHostEncrypted && row.dbPasswordEncrypted && row.dbUserEncrypted) {
           try {

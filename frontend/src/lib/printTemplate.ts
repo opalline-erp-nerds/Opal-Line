@@ -765,6 +765,10 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
   // invoice screen does, instead of printing a misleading ₹0.00 / 0%.
   // `tax` holds a MONEY amount (the per-line GST), never a percentage.
   const money = (v: unknown) => (Number(v) > 0 ? `₹${fmt(Number(v))}` : '—')
+  // A Piece Rate purchase line has no grams at all — printing "0.00" under a
+  // Weight (g) header claims a weighed line that does not exist, so it dashes
+  // exactly like the ₹/g rate beside it.
+  const weightCell = (v: unknown) => (Number(v) > 0 ? Number(v).toFixed(2) : '—')
 
   const itemRows = items
     .map((i, idx) => {
@@ -789,7 +793,7 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
           ${imgCell}
           <td style="padding:7px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
           <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
-          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
+          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${weightCell(i.weight)}</td>` : ''}
           ${c.showRate ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.rate)}</td>` : ''}
           ${c.showTax ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.tax)}</td>` : ''}
           <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(lineAmount)}</td>

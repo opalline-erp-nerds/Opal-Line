@@ -16,7 +16,7 @@
  * code-sign ~20,000 files one at a time (a >1 hour build), so it is pruned.
  */
 
-const { execSync } = require('child_process')
+const { execFileSync, execSync } = require('child_process')
 const fs = require('fs')
 const path = require('path')
 const https = require('https')
@@ -75,11 +75,18 @@ function extractPortablePostgresZip(zipPath, pgDir, { log = console.log } = {}) 
   fs.mkdirSync(tmpRoot, { recursive: true })
   try {
     log('  Extracting…')
-    // PowerShell Expand-Archive keeps the top-level pgsql/ folder.
-    execSync(
-      `powershell -NoProfile -Command "Expand-Archive -Force -LiteralPath '${zipPath}' -DestinationPath '${tmpRoot}'"`,
-      { stdio: 'inherit', timeout: 10 * 60 * 1000 },
-    )
+    const extractOptions = { stdio: 'inherit', timeout: 10 * 60 * 1000 }
+    try {
+      execFileSync('tar', ['-xf', zipPath, '-C', tmpRoot], extractOptions)
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err
+      log('  tar unavailable; falling back to pwsh Expand-Archive.')
+      const quotePowerShell = (value) => `'${value.replace(/'/g, "''")}'`
+      const command =
+        `Expand-Archive -Path ${quotePowerShell(zipPath)} ` +
+        `-DestinationPath ${quotePowerShell(tmpRoot)} -Force`
+      execFileSync('pwsh', ['-NoProfile', '-Command', command], extractOptions)
+    }
     const extracted = path.join(tmpRoot, 'pgsql')
     if (!fs.existsSync(path.join(extracted, 'bin', 'pg_ctl.exe'))) {
       throw new Error('unexpected archive layout (no pgsql/bin/pg_ctl.exe inside)')

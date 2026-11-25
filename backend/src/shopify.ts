@@ -875,6 +875,8 @@ export interface SyncProductsToDbOptions {
    */
   allowRemovals?: boolean
   mergeVariants?: boolean
+  /** Copy newer Shopify catalogue fields onto ERP rows that have no queued ERP edit. */
+  mirrorFromShopify?: boolean
   updatedAtMin?: string | null
   /** When set, skips Shopify catalog fetch and applies only these rows. */
   liveProducts?: SyncProduct[]
@@ -977,6 +979,8 @@ export interface CatalogRow {
    */
   collectionId?: string | null
   categoryId?: string | null
+  sellingPrice?: number | null
+  pieceRateProduct?: boolean | null
 }
 
 /** Insert payload built by the pull — exactly what `insert(schema.products).values()` takes. */
@@ -1002,6 +1006,8 @@ export interface CatalogPatch {
   productType: string | null
   description: string | null
   compareAtPrice: number | null
+  /** Present only on a two-way mirror of a non-piece-rate product. */
+  sellingPrice?: number | null
   image: string | null
   images: string[] | null
   netWeight: number | null
@@ -1058,6 +1064,12 @@ export interface ApplyLiveCatalogOptions {
    * ERP values: it never writes them, whatever this flag says.
    */
   pendingProductIds?: ReadonlySet<string>
+  /**
+   * Two-way mirror: when the ERP has no newer outbound edit queued, copy
+   * Shopify name, description, images, price and stock onto the ERP row.
+   * Piece-rate prices stay local. Default off so a normal pull never overwrites.
+   */
+  mirrorFromShopify?: boolean
 }
 
 export async function applyLiveCatalog(
@@ -1109,17 +1121,14 @@ export async function applyLiveCatalog(
       if (hasLiveVariants && io.saveVariants) await io.saveVariants(productId, p.options, p.variants)
     }
     if (existing) {
-      // ERP is the source of truth for every catalogue field. An inbound pull
-      // may DISCOVER a product (the insert path below) and refresh the link to
-      // one it already knows, but it never writes the store's copy over the
-      // ERP row: the next push would export that stale value straight back and
-      // the edit would be gone for good. This is what "sync overwrote my
-      // product" looked like from the outside — the flags that used to guard
-      // price/stock were opt-in and defaulted off, and name, description,
-      // vendor, product type and images were never guarded at all.
+      // Default pull only refreshes the Shopify link. A two-way mirror copies
+      // the store's newer catalogue onto the ERP row, unless an ERP edit is
+      // still queued to be pushed (that edit is newer).
       const pendingOutbound = options.pendingProductIds?.has(existing.id) === true
+      const mirror = options.mirrorFromShopify === true && !pendingOutbound
+      const pieceRate = existing.pieceRateProduct === true
       const patch: CatalogPatch = {
-        name: existing.name,
+        name: mirror && p.title ? p.title : existing.name,
         // A blank ERP barcode is a gap, not a value: filling it from the
         // listing is not an overwrite, so that much still happens here.
         barcode:
@@ -1128,22 +1137,22 @@ export async function applyLiveCatalog(
             : p.barcode ?? existing.barcode,
         category: existing.category,
         collection: existing.collection,
-        // No `stock` here on purpose: the pull never writes stock — not even
-        // back its own previous value (see CatalogPatch.stock).
         shopifyId: String(p.id),
         shopifyStatus: 'synced',
         status: existing.status ?? 'active',
-        vendor: existing.vendor,
-        productType: existing.productType,
-        description: existing.description,
-        compareAtPrice: existing.compareAtPrice,
-        image: existing.image,
-        images: existing.images as string[] | null,
+        vendor: mirror ? p.vendor || existing.vendor : existing.vendor,
+        productType: mirror ? p.productType || existing.productType : existing.productType,
+        description: mirror ? (p.description ? p.description : existing.description) : existing.description,
+        compareAtPrice: mirror ? (effectiveCompareAt ?? existing.compareAtPrice) : existing.compareAtPrice,
+        image: mirror ? (p.image ?? existing.image) : existing.image,
+        images: mirror ? mergeImages(existing.images as string[] | null, p.images) : (existing.images as string[] | null),
         netWeight: existing.netWeight,
         makingCharge: existing.makingCharge,
         silverRate: existing.silverRate,
         chargeOnTax: existing.chargeOnTax,
       }
+      if (mirror && Number.isFinite(p.inventoryQuantity)) patch.stock = p.inventoryQuantity
+      if (mirror && !pieceRate && price > 0) patch.sellingPrice = price
       await io.update(existing, patch)
       // The option/variant set is ERP-owned as well: the pull only records
       // which listing variant each ERP row points at, so the outbound push can
@@ -1482,10 +1491,23 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
     const applied = await applyLiveCatalog(live, rows, pricingRate, {
       insert: async (values) => (await database.insert(schema.products).values(values).returning())[0],
       update: async (existing, patch) => {
-        // The pull never changes stock, so this is always a plain write: no
-        // `shopify_sync` ledger movement is generated, and an inbound run can
-        // therefore never double-count or deduct inventory. (Stock only moves
-        // through applyStockMovement from an ERP document.)
+        const sku = String(existing.sku ?? '').trim()
+        const nextStock = patch.stock
+        const prevStock = Number(existing.stock ?? 0)
+        if (sku && nextStock != null && Number.isFinite(nextStock) && Number(nextStock) !== prevStock) {
+          const delta = Number(nextStock) - prevStock
+          const { stock: _stock, ...rest } = patch
+          await applyStockMovement({
+            sku,
+            qty: delta,
+            type: 'shopify_sync',
+            refType: 'shopify_pull',
+            note: `Two-way sync → ${Number(nextStock)} on Shopify`,
+            createdBy: 'system',
+          })
+          await database.update(schema.products).set(rest).where(eq(schema.products.id, existing.id))
+          return
+        }
         await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
       },
       // Replace-all: the listing owns the option/variant set, exactly like
@@ -1628,7 +1650,7 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
           bySid.set(sid, row)
         }
       },
-    }, { pendingProductIds })
+    }, { pendingProductIds, mirrorFromShopify: options.mirrorFromShopify === true })
     created = applied.created
     updated = applied.updated
 
@@ -3853,6 +3875,12 @@ export interface DraftOrderLineInput {
   sku?: string
   /** Shopify ProductVariant id (numeric or gid:// form) when the line was billed against a specific variant. */
   variantId?: string | number
+  /**
+   * The shop's own id for the variant the line sold, resolved from
+   * `product_variants.shopify_variant_id`. Wins over `variantId`: a local row
+   * id wrapped in a gid names a variant the shop does not have.
+   */
+  shopifyVariantId?: string | number
 }
 
 /**
@@ -3878,13 +3906,17 @@ export function draftOrderInputLines(
       const quantity = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
       if (!title || quantity <= 0) return null
       const price = Number(li.price)
+      // The shop's own variant id wins; a bare `variantId` is only trusted
+      // when the caller already resolved it to a Shopify id (see
+      // shopifyDraftLines in index.ts — a local row id is not one).
+      const variantTarget = li.shopifyVariantId ?? li.variantId
       return {
         title,
         quantity,
         price: Number.isFinite(price) ? Math.round(price * 100) / 100 : null,
         ...(li.sku != null && String(li.sku).trim() !== '' ? { sku: String(li.sku).trim() } : {}),
-        ...(li.variantId != null && String(li.variantId).trim() !== ''
-          ? { variantId: li.variantId as string | number }
+        ...(variantTarget != null && String(variantTarget).trim() !== ''
+          ? { variantId: variantTarget as string | number }
           : {}),
       }
     })
@@ -3898,24 +3930,52 @@ export function toShopifyVariantGid(variantId: string | number): string {
 }
 
 /**
+ * Swap LOCAL `product_variants.id` values for the shop's own ids before a
+ * draft is built.
+ *
+ * The order form stores the local row id on the line; wrapping THAT in a gid
+ * names a variant the shop does not have, so the caller resolves the map from
+ * `product_variants.shopify_variant_id` and hands it here. A variant with no
+ * Shopify id loses its target entirely — the line falls back to the historic
+ * title/sku/price shape instead of shipping a bogus gid.
+ */
+export function resolveShopifyVariantTargets(
+  lines: ReadonlyArray<unknown>,
+  shopifyIdByVariantId: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> {
+  return (lines ?? []).map((raw) => {
+    const li = (raw ?? null) as Record<string, unknown> | null
+    if (!li) return {}
+    const localId = String(li.variantId ?? '').trim()
+    if (!localId) return li
+    const resolved = shopifyIdByVariantId.get(localId)
+    const rest = { ...li }
+    delete rest.variantId
+    return resolved ? { ...rest, variantId: resolved } : rest
+  })
+}
+
+/**
  * Draft-order line mapping, kept pure so the variant plumbing is testable:
- * a line with a variantId targets that exact Shopify variant (so multi-variant
- * products sync the right SKU/price), while flat lines keep the historic
- * title/sku/price shape.
+ * a line with a variant target (the shop's resolved `shopifyVariantId`, or a
+ * plain `variantId` the caller already translated) targets that exact Shopify
+ * variant so multi-variant products sync the right SKU/price, while flat lines
+ * keep the historic title/sku/price shape.
  */
 export function buildDraftOrderLineItems(lineItems: DraftOrderLineInput[]): Array<Record<string, unknown>> {
   return (lineItems ?? [])
     .filter((li) => li.title && li.quantity > 0)
-    .map((li) => ({
-      ...(li.variantId != null && String(li.variantId).trim() !== ''
-        ? { variantId: toShopifyVariantGid(li.variantId) }
-        : {}),
-      title: li.title,
-      quantity: li.quantity,
-      sku: li.sku || undefined,
-      originalUnitPrice:
-        li.price != null && Number.isFinite(li.price) && li.price >= 0 ? li.price.toFixed(2) : '0.00',
-    }))
+    .map((li) => {
+      const target = li.shopifyVariantId ?? li.variantId
+      return {
+        ...(target != null && String(target).trim() !== '' ? { variantId: toShopifyVariantGid(target) } : {}),
+        title: li.title,
+        quantity: li.quantity,
+        sku: li.sku || undefined,
+        originalUnitPrice:
+          li.price != null && Number.isFinite(li.price) && li.price >= 0 ? li.price.toFixed(2) : '0.00',
+      }
+    })
 }
 
 export interface DraftOrderAddressInput {
@@ -4370,6 +4430,12 @@ export interface ShopifyOrdersImportResult {
   message?: string
   /** Present when Shopify redacted customer PII on the REST payloads (plan-gated). */
   piiRedacted?: { count: number; example: string; message: string } | null
+  /**
+   * This caller joined an import that was already running (webhook, timer and
+   * manual Sync Orders overlap constantly) and received its result instead of
+   * starting a second pass.
+   */
+  coalesced?: boolean
 }
 
 function mapImportedPayment(status: string | null | undefined): string {
@@ -4402,7 +4468,147 @@ function mapImportedFulfillment(status: string | null | undefined): string {
   }
 }
 
-export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> {
+// NOTE: the old `mapImportedStatus(raw)` helper is intentionally gone. Both
+// import call sites (row status and the cancelled-before-invoicing check) now
+// derive from the canonical parsed snapshot via `importedErpStatus`, so a
+// `financial_status=voided` payload no longer cancels an order on its own —
+// only a parsed Shopify cancellation timestamp does (see
+// shopifyOrderPipeline.test.ts).
+
+type ShopifyStockClient = Pick<NonNullable<typeof db>, 'select'>
+
+type ResolvedOrderStockTarget = {
+  /** The PARENT sku — stock movements are ledgered under it. */
+  sku: string
+  productId: string
+  productStock: number
+  variantId: string | null
+  variantStock: number | null
+}
+
+/**
+ * Resolve one Shopify line to the stock bucket that actually sold.
+ *
+ * `shopify_variant_id` is immutable; SKUs get renamed. It therefore wins over
+ * any SKU match, including a Shopify SKU that happens to equal a parent SKU.
+ * SKU is only a fallback (variant SKU first, then parent SKU), and a blank SKU
+ * is fine when a variant id resolves — the parent's SKU is returned so the
+ * ledger movement and later cancellation restock still have a usable key.
+ */
+async function resolveOrderStockTarget(
+  client: ShopifyStockClient,
+  line: { sku: string; shopifyVariantId: string | null },
+): Promise<ResolvedOrderStockTarget | null> {
+  const rawSku = String(line.sku ?? '').trim()
+  const shopifyVariantId = String(line.shopifyVariantId ?? '').trim()
+  let variant: { id: string; productId: string; stock: number } | null = null
+
+  if (shopifyVariantId) {
+    const [byId] = await client
+      .select({ id: schema.productVariants.id, productId: schema.productVariants.productId, stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.shopifyVariantId, shopifyVariantId))
+      .limit(1)
+    variant = byId ?? null
+  }
+  if (!variant && rawSku) {
+    const [bySku] = await client
+      .select({ id: schema.productVariants.id, productId: schema.productVariants.productId, stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.sku, rawSku))
+      .limit(1)
+    variant = bySku ?? null
+  }
+
+  if (variant) {
+    const [parent] = await client
+      .select({ id: schema.products.id, sku: schema.products.sku, stock: schema.products.stock })
+      .from(schema.products)
+      .where(eq(schema.products.id, variant.productId))
+      .limit(1)
+    if (!parent?.sku) return null
+    return {
+      sku: parent.sku,
+      productId: parent.id,
+      productStock: Number(parent.stock ?? 0),
+      variantId: variant.id,
+      variantStock: Number(variant.stock ?? 0),
+    }
+  }
+
+  if (!rawSku) return null
+  const [product] = await client
+    .select({ id: schema.products.id, sku: schema.products.sku, stock: schema.products.stock })
+    .from(schema.products)
+    .where(eq(schema.products.sku, rawSku))
+    .limit(1)
+  if (!product?.sku) return null
+  return {
+    sku: product.sku,
+    productId: product.id,
+    productStock: Number(product.stock ?? 0),
+    variantId: null,
+    variantStock: null,
+  }
+}
+
+/** Lock parent-then-variant (the same order as every other stock writer) and refresh balances. */
+async function lockOrderStockTarget(
+  tx: ShopifyStockClient,
+  target: ResolvedOrderStockTarget,
+): Promise<ResolvedOrderStockTarget | null> {
+  const [product] = await tx
+    .select({ sku: schema.products.sku, stock: schema.products.stock })
+    .from(schema.products)
+    .where(eq(schema.products.id, target.productId))
+    .limit(1)
+    .for('update')
+  if (!product?.sku) return null
+  let variantStock: number | null = null
+  if (target.variantId) {
+    const [variant] = await tx
+      .select({ stock: schema.productVariants.stock })
+      .from(schema.productVariants)
+      .where(eq(schema.productVariants.id, target.variantId))
+      .limit(1)
+      .for('update')
+    if (!variant) return null
+    variantStock = Number(variant.stock ?? 0)
+  }
+  return { ...target, sku: product.sku, productStock: Number(product.stock ?? 0), variantStock }
+}
+
+/**
+ * Shared order import.
+ *
+ * Every path — the Shopify webhook, the background order poll and the manual
+ * Sync Orders button — lands here, and any of them can fire while another is
+ * still running. Two concurrent passes both see an order as unknown and race
+ * the insert (the transaction guard stops the double deduction, but the loser
+ * reports a confusing duplicate error). Coalescing makes the second caller
+ * await the in-flight pass and reuse its result: one import at a time, and a
+ * deterministic answer for every caller.
+ */
+let ordersImportInFlight: Promise<ShopifyOrdersImportResult> | null = null
+
+export function isOrderImportInProgress(): boolean {
+  return ordersImportInFlight !== null
+}
+
+export async function importShopifyOrders(options?: { updatedAtMin?: string | null }): Promise<ShopifyOrdersImportResult> {
+  if (ordersImportInFlight) {
+    const shared = await ordersImportInFlight.catch(() => null)
+    if (shared) return { ...shared, coalesced: true }
+  }
+  let run: Promise<ShopifyOrdersImportResult>
+  run = importShopifyOrdersUncoalesced(options).finally(() => {
+    if (ordersImportInFlight === run) ordersImportInFlight = null
+  })
+  ordersImportInFlight = run
+  return run
+}
+
+async function importShopifyOrdersUncoalesced(options?: { updatedAtMin?: string | null }): Promise<ShopifyOrdersImportResult> {
   if (!isConfigured()) {
     return { ok: false, imported: 0, updated: 0, errors: ['Shopify is not configured. Set SHOPIFY_STORE_URL and SHOPIFY_ACCESS_TOKEN in server/.env'], message: 'Shopify is not configured' }
   }
@@ -4411,7 +4617,11 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
   }
 
   try {
-    const raw = await paginate<any>('orders', 'status=any&fulfillment_status=any')
+    const since = options?.updatedAtMin?.trim()
+    const orderQuery = since
+      ? `status=any&updated_at_min=${encodeURIComponent(since)}`
+      : 'status=any&fulfillment_status=any'
+    const raw = await paginate<any>('orders', orderQuery)
     const existing = await db
       .select({
         id: schema.salesOrders.id,
@@ -4490,6 +4700,10 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             // insert so the deduction — and every later reversal — lands on the
             // same balance; kept on the row for auditability.
             locationId: li.location_id != null ? String(li.location_id) : null,
+            // Shopify sells VARIANTS: the line's SKU is usually a variant SKU,
+            // so its Shopify variant id is what pins the local variant when a
+            // store renames SKUs.
+            shopifyVariantId: li.variant_id != null ? String(li.variant_id) : null,
           }))
           .filter((li: { title: string }) => li.title) ?? []
       const tags = String(o.tags ?? '').trim() || null
@@ -4590,6 +4804,15 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
         updated++
       } else {
         try {
+          // Resolve stock buckets BEFORE inserting the order. The stored
+          // lineItems then carry the parent SKU even when Shopify sent a blank
+          // SKU, so a later cancellation restock can find the same bucket.
+          const stockTargets: Array<ResolvedOrderStockTarget | null> = []
+          for (const li of lineItems) {
+            const target = await resolveOrderStockTarget(db!, li)
+            stockTargets.push(target)
+            if (target) li.sku = target.sku
+          }
           // The order's Shopify location, mapped to an ERP stock location by
           // ID (never by name). Unmapped or absent → null, which resolves to
           // the default store — where the old rollup-only deduction landed.
@@ -4607,32 +4830,19 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           let deductionLocation: string | null = null
           if (erpLocationId) {
             deductionLocation = erpLocationId
-            for (const li of lineItems) {
-              const sku = String(li.sku ?? '').trim()
+            for (let i = 0; i < lineItems.length; i++) {
+              const li = lineItems[i]!
+              const target = stockTargets[i]
               const qty = Math.floor(Number(li.quantity ?? 0))
-              if (!sku || qty <= 0) continue
-              const [p] = await db!
-                .select({ id: schema.products.id })
-                .from(schema.products)
-                .where(eq(schema.products.sku, sku))
-                .limit(1)
-              // Shopify sells VARIANTS, so the line SKU usually belongs to
-              // product_variants — resolve through it rather than treating a
-              // variant line as "no product" and keeping the mapped location.
-              let productId = p?.id ?? null
-              if (!productId) {
-                const [variant] = await db!
-                  .select({ productId: schema.productVariants.productId })
-                  .from(schema.productVariants)
-                  .where(eq(schema.productVariants.sku, sku))
-                  .limit(1)
-                productId = variant?.productId ?? null
-              }
-              if (!productId) continue
+              if (!target || qty <= 0) continue
               const [lvl] = await db!
                 .select({ locationId: schema.stockLevels.locationId })
                 .from(schema.stockLevels)
-                .where(eq(schema.stockLevels.productId, productId))
+                .where(
+                  target.variantId
+                    ? and(eq(schema.stockLevels.productId, target.productId), eq(schema.stockLevels.variantId, target.variantId))
+                    : eq(schema.stockLevels.productId, target.productId),
+                )
                 .limit(1)
               if (!lvl) {
                 deductionLocation = null
@@ -4695,13 +4905,18 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
             insertedRow = true
 
             const targetLocation = deductionLocation ?? (await resolveMovementLocation(null, tx))
-            for (const li of lineItems) {
-              const sku = String(li.sku ?? '').trim()
+            for (let i = 0; i < lineItems.length; i++) {
+              const li = lineItems[i]!
               const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-              if (!sku || qty <= 0) continue
-              const [product] = await tx.select({ id: schema.products.id, stock: schema.products.stock }).from(schema.products).where(eq(schema.products.sku, sku)).limit(1).for('update')
-              if (!product) continue
-              const current = Number(product.stock ?? 0)
+              const preResolved = stockTargets[i]
+              if (qty <= 0 || !preResolved) continue
+              // Re-lock under the transaction and refresh balances: another
+              // order may have consumed stock since the pre-insert resolution.
+              const target = await lockOrderStockTarget(tx as ShopifyStockClient, preResolved)
+              if (!target) continue
+              const current = target.variantId
+                ? Number(target.variantStock ?? 0)
+                : Number(target.productStock ?? 0)
               if (current - qty < 0) continue
               // Through the ledger now: the movement posts at the order's
               // chosen location and recomputes the rollup from the levels —
@@ -4710,7 +4925,8 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
               // guard above keeps it exactly-once for concurrent syncs and
               // webhook retries.
               await applyStockMovement({
-                sku,
+                sku: target.sku,
+                variantId: target.variantId,
                 qty: -qty,
                 type: 'sale_out',
                 refType: 'shopify_order',
@@ -4994,7 +5210,7 @@ export interface ShopifyCustomersImportResult {
   message?: string
 }
 
-export async function importShopifyCustomers(): Promise<ShopifyCustomersImportResult> {
+export async function importShopifyCustomers(options?: { updatedAtMin?: string | null }): Promise<ShopifyCustomersImportResult> {
   if (!isConfigured()) {
     return { ok: false, imported: 0, updated: 0, errors: ['Shopify is not configured'], message: 'Shopify is not configured' }
   }
@@ -5003,7 +5219,9 @@ export async function importShopifyCustomers(): Promise<ShopifyCustomersImportRe
   }
 
   try {
-    const raw = await paginate<any>('customers', 'limit=250')
+    const since = options?.updatedAtMin?.trim()
+    const customerQuery = since ? `limit=250&updated_at_min=${encodeURIComponent(since)}` : 'limit=250'
+    const raw = await paginate<any>('customers', customerQuery)
     const existing = await db.select().from(schema.customers)
     const knownByShopifyId = new Map(existing.filter((r) => r.shopifyId).map((r) => [r.shopifyId!, r]))
     const knownByEmail = new Map(existing.filter((r) => r.email).map((r) => [r.email!, r]))
