@@ -1,4 +1,5 @@
 import { expect, request, test } from '@playwright/test'
+import { ensureSilverRate } from './fixtures'
 
 /**
  * End-to-end regression spec for the Dispatch page.
@@ -36,6 +37,10 @@ async function api() {
 
 async function createOrder(stamp: number) {
   const client = await api()
+  // Dispatch auto-invoices the order (dispatch.ts → raiseInvoiceForOrder),
+  // which refuses to price without a managed silver rate — seed one first so
+  // the flow works on a fresh install too.
+  await ensureSilverRate(client)
   const res = await client.post('/api/v1/db/sales-orders', {
     shopifyId: `#E2E-DSP-${stamp}`,
     customer: `E2E Dispatch ${stamp}`,

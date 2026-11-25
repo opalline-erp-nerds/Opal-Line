@@ -1,4 +1,5 @@
 import { expect, request, test, type Locator, type Page } from '@playwright/test'
+import { ensureSilverRate } from './fixtures'
 
 /**
  * Sales Orders — quantity → weight calculation, persistence through save and
@@ -163,6 +164,8 @@ test.describe('sales order weight & customer editing', () => {
     const editedEmail = `edited.${stamp}@example.com`
     const editedPhone = '+91 98765 43210'
     const apiClient = await api()
+    // Saving an order needs a managed silver rate (see ensureSilverRate).
+    await ensureSilverRate(apiClient)
 
     // Fixture: a customer to edit (must be updated in place — no duplicates).
     const custResp = await apiClient.post('/api/v1/db/customers', {
