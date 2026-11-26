@@ -8,6 +8,7 @@ import { recordActivity } from '../activity'
 import { actorFromRequest } from '../activity'
 import { applyPieceRateInvoiceItems, num, round2 } from './db'
 import { invoiceComponentTotals, weightTaxableAmount } from '../variantPricing'
+import { normalizeInvoicePayment } from '../invoicePayment'
 import { routeParam } from '../lib/routeParams'
 import { applyStockMovement, assertStockAvailable, InsufficientStockError } from '../stock'
 
@@ -528,9 +529,7 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
           gstAmount,
           discount,
           grandTotal,
-          paymentMethod: 'Pending',
-          paymentStatus: 'pending',
-          status: 'issued',
+          ...normalizeInvoicePayment({ paymentStatus: 'pending', status: 'issued' }),
           date: new Date().toISOString(),
         })
         for (const it of invoiceItems) {

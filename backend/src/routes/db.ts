@@ -41,6 +41,7 @@ import {
   type AgingBucketKey,
 } from '../lib/stockAging'
 import { invoiceTotals } from '../invoiceTotals'
+import { normalizeInvoicePayment, normalizeInvoicePaymentPatch } from '../invoicePayment'
 import { fixedPieceRateFor } from '../orderPricing'
 import {
   invoiceComponentTotals,
@@ -1908,9 +1909,7 @@ dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), a
         gstAmount: source.gstAmount,
         discount: source.discount,
         grandTotal: source.grandTotal,
-        paymentMethod: 'Pending',
-        paymentStatus: 'pending',
-        status: 'draft',
+        ...normalizeInvoicePayment({ paymentStatus: 'pending', status: 'draft' }),
         date: new Date().toISOString(),
       }).returning()
       for (const it of sourceItems) {
@@ -1961,6 +1960,9 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     const clean = sanitize(body, s.salesInvoices)
     delete clean.id
     delete clean.items
+    // Never copy a status word into payment_method; map every payment field
+    // (including a real Razorpay id) through the shared normaliser.
+    Object.assign(clean, normalizeInvoicePayment(body))
     // Manual (dialog-raised) invoices carry no number — mint one on the server
     // using the same settings-driven prefix and stamp as order-raised invoices,
     // so both flows share one numbering scheme and the client never invents it.
@@ -2071,6 +2073,10 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     const row = await db!.transaction(async (tx) => {
       const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
       if (!existing) return null
+      // A PATCH only touches payment columns the caller actually sent. Passing
+      // the locked row lets a refund/status change update the state without
+      // erasing a real method or gateway id that was saved earlier.
+      Object.assign(clean, normalizeInvoicePaymentPatch(body, existing))
       const items = await applyPieceRateInvoiceItems(normalizeInvoiceItems(body.items, silverRate), tx)
       if (items.length > 0) {
         // First, restore old stock — each line back to THE STORE IT WAS
