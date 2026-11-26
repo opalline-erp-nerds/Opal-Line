@@ -244,8 +244,8 @@ export const dbApi = {
     request(filterPath(rangePath('/db/dashboard/recent-invoices', range), { source })),
   getProductMargins: (months = 12): Promise<{ months: number; rows: Array<{ sku: string; name: string; qty: number; revenue: number; cost: number; profit: number; marginPct: number }>; totals: { revenue: number; cost: number; profit: number; marginPct: number } }> =>
     request(`/db/reports/product-margins?months=${months}`),
-  getProfitAnalytics: (months = 12): Promise<ProfitAnalytics> =>
-    request(`/db/dashboard/profit?months=${months}`),
+  getProfitAnalytics: (months = 12, locationId?: string): Promise<ProfitAnalytics> =>
+    request(filterPath('/db/dashboard/profit', { months: String(months), locationId })),
   getPaymentStatus: (range?: DashboardRangeInput, source?: 'all' | 'shopify' | 'erp'): Promise<{ segments: PaymentStatusSegment[]; total: number }> =>
     request(filterPath(rangePath('/db/dashboard/payment-status', range), { source })),
   getReceivablesAging: (): Promise<ReceivablesAging> => request('/db/dashboard/aging'),
