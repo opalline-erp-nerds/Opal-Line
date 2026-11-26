@@ -123,6 +123,29 @@ test('variant price is base + add-on, so a 0 add-on never bills ₹0', () => {
   assert.equal(white!.price, 1387.5, 'a configured add-on is added to the base')
 })
 
+test('the durable add-on travels with the sellable row, separate from the effective price', () => {
+  const priced = product({
+    variants: [
+      {
+        id: 'v-red',
+        productId: 'p-1',
+        name: 'red',
+        sku: 'OL-GIF-001-RED',
+        sellingPrice: 1487.5,
+        priceAdjustment: 200,
+        stock: 4,
+      },
+    ],
+  })
+  const [item] = flattenSellableItems([priced])
+  assert.equal(item!.basePrice, 1287.5, 'the parent base is kept apart from the effective price')
+  assert.equal(item!.priceAdjustment, 200)
+  assert.equal(item!.price, 1487.5)
+  // A live silver-rate change rebuilds the BASE and re-adds the same delta.
+  assert.equal(sellableItemPrice(item!, { silverRate: 105 }), 1487.5)
+  assert.equal(sellableItemPrice(item!, { silverRate: 115 }), 1590.5)
+})
+
 test('search matches variant SKU, variant name and parent name — case-insensitively', () => {
   const items = flattenSellableItems([withVariants(), product({ id: 'p-2', name: 'Silver Bangle', sku: 'OL-BNG-004' })])
   assert.deepEqual(searchSellableItems(items, 'ol-gif-001-red').map((i) => i.variantId), ['v-red'])
@@ -158,6 +181,15 @@ test('Piece Rate autofills the fixed price — never the silver-weight maths', (
   assert.equal(item!.fixedPieceRate, 2000)
   // 12 g × (₹105 + ₹0) + 3% would be ₹1289.80 — the fixed rate must win.
   assert.equal(sellableItemPrice(item!, { silverRate: 105 }), 2000)
+})
+
+test('Piece Rate adds the variant add-on once, on top of the fixed price', () => {
+  const priced = pieceRateProduct()
+  priced.variants = [
+    { id: 'v-red', productId: 'p-1', name: 'red', sku: 'OL-GIF-001-RED', sellingPrice: 2200, priceAdjustment: 200, stock: 4 },
+  ]
+  const [item] = flattenSellableItems([priced])
+  assert.equal(sellableItemPrice(item!, { silverRate: 105 }), 2200, 'base 2000 + add-on 200')
 })
 
 test('weight-based autofill uses the managed silver rate calculation', () => {

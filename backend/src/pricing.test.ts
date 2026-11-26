@@ -107,30 +107,51 @@ describe('normalizeInvoiceItems (invoice line pricing)', () => {
     )
     assert.equal(zeroManaged[0].silverRate, 92.5)
   })
+
+  test('the GST-inclusive variant add-on enters the taxable amount once', () => {
+    const [row] = dbRoutes.normalizeInvoiceItems([
+      { product: 'Ring', sku: 'R-ADD', qty: 2, weight: 10, silverRate: 100, makingCharge: 0, priceAdjustment: 200 },
+    ])
+    assert.equal(row.priceAdjustment, 200)
+    // 10 g × ₹100 + (2 × ₹200 ÷ 1.03) = 1000 + 388.35.
+    assert.equal(row.amount, 1388.35)
+    // 3% GST puts exactly the ₹400 add-on back on top of the base.
+    assert.equal(quotations.computeTotals([row], 3, 0).grandTotal, 1430)
+  })
 })
 
 describe('applyPieceRateItems (piece-rate invoice lines)', () => {
-  test('bills the fixed piece rate × qty instead of weight x rate + making', () => {
+  test('bills the fixed piece rate × qty backed out of GST, not weight x rate + making', () => {
     const rows = dbRoutes.applyPieceRateItems(
       [{ product: 'Bangle', sku: 'BLG-001', qty: 3, weight: 12, silverRate: 92.5, makingCharge: 200, amount: 1310 }],
-      new Map([['blg-001', 450]]),
+      new Map([['blg-001', { fixed: 450, addOn: 0 }]]),
     )
-    assert.equal(rows[0].amount, 1350) // 450 x 3 — not the silver-rate total
+    assert.equal(rows[0].amount, 1310.68) // (450 × 3) ÷ 1.03
     assert.equal(rows[0].silverRate, 0)
     assert.equal(rows[0].makingCharge, 0)
   })
 
-  test('matches the SKU case-insensitively and rounds to two decimals', () => {
+  test('matches the SKU case-insensitively and backs GST out once', () => {
     const rows = dbRoutes.applyPieceRateItems(
       [{ product: 'Ring', sku: ' RNG-9 ', qty: 1, amount: 999 }],
-      new Map([['rng-9', 333.335]]),
+      new Map([['rng-9', { fixed: 333.335, addOn: 0 }]]),
     )
-    assert.equal(rows[0].amount, 333.34)
+    assert.equal(rows[0].amount, 323.63)
+  })
+
+  test('folds the GST-inclusive add-on into the fixed price before backing out GST', () => {
+    const rows = dbRoutes.applyPieceRateItems(
+      [{ product: 'Bangle', sku: 'BLG-002', qty: 3, weight: 12, silverRate: 92.5, makingCharge: 200, amount: 1310 }],
+      new Map([['blg-002', { fixed: 450, addOn: 100 }]]),
+    )
+    assert.equal(rows[0].priceAdjustment, 100)
+    assert.equal(rows[0].amount, 1601.94) // (450 + 100) × 3 ÷ 1.03
+    assert.equal(quotations.computeTotals(rows, 3, 0).grandTotal, 1650)
   })
 
   test('leaves non piece-rate lines untouched', () => {
     const items = [{ product: 'Chain', sku: 'CHN-1', qty: 2, weight: 10, silverRate: 92.5, makingCharge: 100, amount: 1950 }]
-    const rows = dbRoutes.applyPieceRateItems(items, new Map([['other-sku', 500]]))
+    const rows = dbRoutes.applyPieceRateItems(items, new Map([['other-sku', { fixed: 500, addOn: 0 }]]))
     assert.deepEqual(rows, items)
     assert.equal(rows[0].amount, 1950)
   })
@@ -143,7 +164,7 @@ describe('applyPieceRateItems (piece-rate invoice lines)', () => {
   test('a zero or invalid fixed rate falls back to the line as sent', () => {
     const rows = dbRoutes.applyPieceRateItems(
       [{ product: 'Pin', sku: 'PIN-2', qty: 2, amount: 300 }],
-      new Map([['pin-2', 0]]),
+      new Map([['pin-2', { fixed: 0, addOn: 0 }]]),
     )
     assert.equal(rows[0].amount, 300)
   })
@@ -156,26 +177,33 @@ describe('pieceRateMapFor (variant SKU resolution)', () => {
     { id: 'p-legacy', sku: 'OL-OLD-001', pieceRateProduct: true, fixedPieceRate: null, sellingPrice: 1500 },
   ]
   const variants = [
-    { sku: 'OL-GIF-001-RED', productId: 'p-toy' },
-    { sku: 'OL-GIF-001-WHI', productId: 'p-toy' },
-    { sku: 'OL-CHN-001-L', productId: 'p-chain' },
+    { sku: 'OL-GIF-001-RED', productId: 'p-toy', title: 'Red', optionValues: ['Red'], sellingPrice: 2200, priceAdjustment: 200 },
+    { sku: 'OL-GIF-001-WHI', productId: 'p-toy', title: 'White', optionValues: ['White'], sellingPrice: 2200, priceAdjustment: null },
+    { sku: 'OL-GIF-001-DEF', productId: 'p-toy', title: 'Default Title', optionValues: ['Default Title'], sellingPrice: 4800, priceAdjustment: null },
+    { sku: 'OL-CHN-001-L', productId: 'p-chain', title: 'Large', optionValues: ['Large'], sellingPrice: 5000, priceAdjustment: null },
   ]
 
-  test("a variant's SKU resolves to its PARENT's piece rate", () => {
+  test("a variant's SKU resolves to its PARENT's piece rate and own add-on", () => {
     const rates = dbRoutes.pieceRateMapFor(['OL-GIF-001-RED'], products, variants)
-    assert.equal(rates.get('ol-gif-001-red'), 2000, 'the variant bills the fixed ₹/pc of its product')
+    assert.deepEqual(rates.get('ol-gif-001-red'), { fixed: 2000, addOn: 200 }, 'the variant bills the fixed ₹/pc plus its add-on')
+  })
+
+  test('legacy effective prices and Default-Title mirrors resolve safely', () => {
+    const rates = dbRoutes.pieceRateMapFor(['OL-GIF-001-WHI', 'OL-GIF-001-DEF'], products, variants)
+    assert.deepEqual(rates.get('ol-gif-001-whi'), { fixed: 2000, addOn: 200 }, '2200 effective − ₹2000 fixed')
+    assert.deepEqual(rates.get('ol-gif-001-def'), { fixed: 2000, addOn: 0 }, 'absolute mirror rows add nothing')
   })
 
   test("the product's own SKU resolves too, and weight-based rows never enter the map", () => {
     const rates = dbRoutes.pieceRateMapFor(['OL-GIF-001', 'OL-CHN-001', 'OL-CHN-001-L'], products, variants)
-    assert.equal(rates.get('ol-gif-001'), 2000)
+    assert.deepEqual(rates.get('ol-gif-001'), { fixed: 2000, addOn: 0 })
     assert.equal(rates.has('ol-chn-001'), false, 'a non Piece Rate product is never rewritten')
     assert.equal(rates.has('ol-chn-001-l'), false, 'nor is its variant')
   })
 
   test('legacy rows fall back to sellingPrice; unknown codes stay absent', () => {
     const rates = dbRoutes.pieceRateMapFor(['OL-OLD-001', 'NOPE'], products, variants)
-    assert.equal(rates.get('ol-old-001'), 1500, 'fixed_piece_rate was null — sellingPrice carries the rate')
+    assert.deepEqual(rates.get('ol-old-001'), { fixed: 1500, addOn: 0 }, 'fixed_piece_rate was null — sellingPrice carries the rate')
     assert.equal(rates.has('nope'), false, 'an unknown code resolves to nothing')
   })
 
@@ -195,7 +223,8 @@ describe('pieceRateMapFor (variant SKU resolution)', () => {
       ],
       rates,
     )
-    assert.equal(row.amount, 4000, '2 × ₹2,000 — never 400 g × (105 + 20)')
+    assert.equal(row.amount, 4271.84, '(₹2,000 + ₹200) × 2 ÷ 1.03 — never 400 g × (105 + 20)')
+    assert.equal(row.priceAdjustment, 200)
     assert.equal(row.silverRate, 0)
     assert.equal(row.makingCharge, 0)
   })
@@ -211,6 +240,15 @@ describe('quotation normalization and totals', () => {
     ])
     assert.equal(rows[0].amount, 2546.25)
     assert.equal(rows[0].makingCharge, 150)
+  })
+
+  test('preserves the GST-inclusive add-on on weight lines', () => {
+    const [row] = quotations.normalizeQuotationItems([
+      { product: 'Ring', sku: 'R-ADD', qty: 1, weight: 10.5, silverRate: 92.5, makingCharge: 150, priceAdjustment: 200 },
+    ])
+    assert.equal(row.priceAdjustment, 200)
+    assert.equal(row.amount, 2740.42, '2546.25 + 200 ÷ 1.03')
+    assert.equal(quotations.computeTotals([row], 3, 0).grandTotal, 2822.63)
   })
 
   test('rounds once at the end for both paths with the new formula', () => {

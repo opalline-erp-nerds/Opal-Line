@@ -31,11 +31,13 @@ interface DraftLine {
   /** Making charge PER GRAM (from the catalogue, editable). */
   makingCharge: string
   /**
-   * Fixed ₹/pc when the picked row is a Piece Rate product, else ''. A line
-   * carrying it bills `qty × fixed` and never touches the silver maths — the
-   * rule `applyPieceRateItems` applies server-side, so preview and store agree.
+   * Fixed GST-inclusive ₹/pc when the picked row is a Piece Rate product,
+   * else ''. A line carrying it bills `(fixed + addOn) × qty ÷ 1.03` and never
+   * touches the silver maths — `applyPieceRateItems` applies this server-side.
    */
   pieceRate: string
+  /** GST-inclusive variant "Add to price (₹)" snapshotted from the picked row. */
+  priceAdjustment: string
 }
 
 function emptyLine(): DraftLine {
@@ -48,6 +50,7 @@ function emptyLine(): DraftLine {
     netWeight: '',
     makingCharge: '',
     pieceRate: '',
+    priceAdjustment: '',
   }
 }
 
@@ -214,14 +217,14 @@ export function ManualInvoiceDialog({
     setLines((prev) => (prev.length === 1 ? [emptyLine()] : prev.filter((_, i) => i !== index)))
 
   /**
-   * Picking a row prefills its identity and the numbers that drive the price.
-   * A Piece Rate row switches the line onto its fixed ₹/pc — no weight, no
-   * making charge — so the amount is `qty × fixed` instead of
-   * `net wt × (silver rate + making)`, exactly as a quotation submits it.
+   * Picking a row prefills its identity and the numbers that drive the price,
+   * including the variant's GST-inclusive add-on. A Piece Rate row switches the
+   * line onto its fixed ₹/pc — no weight, no making charge — so the taxable
+   * amount is `(fixed + addOn) × qty ÷ 1.03`, exactly as the server stores it.
    */
   const pickProduct = (index: number, value: string) => {
     if (value === CUSTOM_SKU) {
-      setLine(index, { sku: '', product: '', productId: '', variantId: '', netWeight: '', makingCharge: '', pieceRate: '' })
+      setLine(index, { sku: '', product: '', productId: '', variantId: '', netWeight: '', makingCharge: '', pieceRate: '', priceAdjustment: '' })
       return
     }
     // The row may have come from the loaded catalogue or from a server search.
@@ -238,6 +241,7 @@ export function ManualInvoiceDialog({
       netWeight: pieceRate ? '' : item.netWeight != null ? String(item.netWeight) : '',
       makingCharge: pieceRate ? '' : item.makingCharge != null ? String(item.makingCharge) : '',
       pieceRate: pieceRate ? String(item.fixedPieceRate) : '',
+      priceAdjustment: item.priceAdjustment ? String(item.priceAdjustment) : '',
     })
   }
 
@@ -258,10 +262,11 @@ export function ManualInvoiceDialog({
         weight: lineTotalWeight(l),
         silverRatePerGram: ratePerGram,
         makingChargePerGram: Number(l.makingCharge) || 0,
-        // A Piece Rate line bills qty × fixed; weight and rates are ignored
-        // there (the server applies the same rule to what we submit).
+        // A Piece Rate line bills (fixed + addOn) × qty ÷ 1.03; weight and
+        // rates are ignored there (the server applies the same rule).
         pieceRate: isPieceRateLine(l) ? Number(l.pieceRate) : undefined,
         qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
+        priceAdjustment: Number(l.priceAdjustment) || 0,
       }))
     return invoiceTotalsPreview(priced, Number(form.gst) || 0, Number(form.discount) || 0)
   }, [lines, form.gst, form.discount, ratePerGram])
@@ -305,6 +310,10 @@ export function ManualInvoiceDialog({
             // column that survives; productId is dropped server-side).
             productId: l.productId || undefined,
             variantId: l.variantId || undefined,
+            // Durable GST-inclusive delta from the picked variant. The server
+            // snapshots it on the invoice line and backs it out of the taxable
+            // amount once — never add it to the picked effective price again.
+            priceAdjustment: Number(l.priceAdjustment) || 0,
             qty,
             weight,
             // The server overwrites the rate with the managed value; sending it
@@ -318,6 +327,7 @@ export function ManualInvoiceDialog({
               makingChargePerGram: making,
               pieceRate: piece ? Number(l.pieceRate) : undefined,
               qty,
+              priceAdjustment: Number(l.priceAdjustment) || 0,
             }),
           }
         }),
@@ -395,12 +405,14 @@ export function ManualInvoiceDialog({
                   const weight = lineTotalWeight(line)
                   const piece = isPieceRateLine(line)
                   const qty = Math.max(1, Math.floor(Number(line.qty) || 1))
+                  const addOn = Number(line.priceAdjustment) || 0
                   const preview = lineAmount({
                     weight,
                     silverRatePerGram: ratePerGram,
                     makingChargePerGram: Number(line.makingCharge) || 0,
                     pieceRate: piece ? Number(line.pieceRate) : undefined,
                     qty,
+                    priceAdjustment: addOn,
                   })
                   return (
                     <tr key={index} className="border-b border-border/40 last:border-0">
@@ -419,6 +431,7 @@ export function ManualInvoiceDialog({
                               netWeight: '',
                               makingCharge: '',
                               pieceRate: '',
+                              priceAdjustment: '',
                             })
                             setProductQuery(v)
                           }}
@@ -469,6 +482,9 @@ export function ManualInvoiceDialog({
                         {piece
                           ? <span className="text-emerald-700">₹{Number(line.pieceRate)} / pc</span>
                           : ratePerGram > 0 ? ratePerGram.toFixed(2) : '—'}
+                        {addOn > 0 ? (
+                          <span className="mt-0.5 block text-[10px] font-semibold text-violet-700">+₹{addOn} add-on</span>
+                        ) : null}
                       </td>
                       <td className="px-2 py-1.5">
                         <Input type="number" min="0" step="0.01" value={piece ? '' : line.makingCharge} disabled={piece} onChange={(e) => setLine(index, { makingCharge: e.target.value })} aria-label={`Making charge for line ${index + 1} (₹/g)`} className="h-8 text-right text-xs" />
@@ -477,8 +493,10 @@ export function ManualInvoiceDialog({
                         className="px-2 py-1.5 text-right tabular-nums text-xs"
                         title={
                           piece
-                            ? `${qty} × ₹${Number(line.pieceRate)} (fixed piece rate)`
-                            : weight > 0 ? `${weight.toFixed(3)} gm × (₹${ratePerGram.toFixed(2)} + making)` : undefined
+                            ? `${qty} × (₹${Number(line.pieceRate)}${addOn > 0 ? ` + ₹${addOn} add-on` : ''}) ÷ 1.03 (fixed piece rate)`
+                            : weight > 0
+                              ? `${weight.toFixed(3)} gm × (₹${ratePerGram.toFixed(2)} + making)${addOn > 0 ? ` + ${qty} × ₹${addOn} ÷ 1.03 add-on` : ''}`
+                              : undefined
                         }
                       >
                         {formatCurrency(preview)}
@@ -495,9 +513,10 @@ export function ManualInvoiceDialog({
             </table>
           </div>
           <p className="mt-1.5 text-[11px] text-muted-foreground">
-            Rate / gm is locked to the managed silver rate; a Piece Rate product bills qty × its fixed price instead
-            (weight and making are not part of that calculation). Amount = total weight (net wt × qty) × (rate + making
-            per gm) for weight-based lines.
+            Rate / gm is locked to the managed silver rate; a Piece Rate product bills its fixed ₹/pc instead (weight
+            and making are not part of that calculation). A picked variant's "Add to price (₹)" is GST-INCLUSIVE: the
+            taxable amount includes add-on × qty ÷ 1.03 (or fixed + add-on for Piece Rate), and the 3% GST puts
+            exactly the add-on back once.
           </p>
         </div>
 

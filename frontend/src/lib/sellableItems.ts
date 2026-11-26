@@ -1,6 +1,13 @@
 import type { LocationStockAvailability, Product, ProductVariant } from '@/types'
-import { isDefaultVariantName, productVariants, variantFinalPrice, variantLabel } from '@/lib/productVariants'
+import {
+  isDefaultVariantName,
+  productVariants,
+  variantAddOn,
+  variantEffectivePrice,
+  variantLabel,
+} from '@/lib/productVariants'
 import { perUnitLinePrice } from '@/lib/orderPricing'
+import { round2 } from '@/lib/utils'
 
 /**
  * One flattened, selectable line item: a product, or ONE OF ITS VARIANTS.
@@ -37,6 +44,10 @@ export interface SellableItem {
   label: string
   productName: string
   variantName: string | null
+  /** Catalogue base price for ONE piece, before the variant add-on. */
+  basePrice: number | null
+  /** The variant "Add to price (₹)" delta; 0 on flat/parent rows. */
+  priceAdjustment: number
   /**
    * Catalogue price for ONE piece: a variant's base + its configured add-on
    * (the push rule — a 0 add-on must never zero the row), else the product's
@@ -108,6 +119,8 @@ function parentSellable(product: Product): SellableItem {
     label: product.sku ? `${product.name} (${product.sku})` : product.name,
     productName: product.name,
     variantName: null,
+    basePrice: base,
+    priceAdjustment: 0,
     price: base,
     netWeight: positive(product.netWeight),
     makingCharge: product.makingCharge != null ? Number(product.makingCharge) : null,
@@ -133,10 +146,11 @@ function variantSellable(product: Product, variant: ProductVariant): SellableIte
       : `${product.name} - ${variantLabel(variant)}`,
     productName: product.name,
     variantName: variantLabel(variant),
-    // Base + add-on, never `variant.sellingPrice ?? product.sellingPrice`:
-    // a fresh variant row stores 0 (no add-on), and `0 ?? base` would bill
-    // a ₹0 line for a real product.
-    price: variantFinalPrice(base, variant.sellingPrice, variant.name),
+    // The delta is kept apart from the effective price so a live-rate reprice
+    // can rebuild the line without ever re-adding the add-on.
+    basePrice: base,
+    priceAdjustment: variantAddOn(variant),
+    price: variantEffectivePrice(base, variant),
     netWeight: positive(product.netWeight),
     makingCharge: product.makingCharge != null ? Number(product.makingCharge) : null,
     pricingType,
@@ -292,11 +306,12 @@ export function findSellableBySku(items: SellableItem[], sku: string): SellableI
 /**
  * The price a freshly picked line should open at, honouring the pricing mode:
  *
- *  - **Piece Rate** — the fixed ₹/pc. It must NEVER fall through to
- *    `netWeight × (silverRate + making)`, which is exactly how a ₹2,000 piece
- *    arrived as a weight-based figure on the billing screens.
- *  - **Weight-Based** — the managed silver rate calculation, falling back to
- *    the catalogue price when the rate or the weight is not known yet.
+ *  - **Piece Rate** — the fixed ₹/pc plus the variant's add-on. It must NEVER
+ *    fall through to `netWeight × (silverRate + making)`, which is exactly how
+ *    a ₹2,000 piece arrived as a weight-based figure on the billing screens.
+ *  - **Weight-Based** — the managed silver rate calculation plus the add-on,
+ *    falling back to the catalogue BASE price when the rate or weight is not
+ *    known yet. The add-on is GST-inclusive, like the base selling price.
  *
  * Both stay editable: this only decides what the field opens with.
  */
@@ -304,14 +319,18 @@ export function sellableItemPrice(
   item: SellableItem,
   opts: { silverRate: number | null | undefined },
 ): number | undefined {
+  const addOn = item.priceAdjustment ?? 0
   if (item.pricingType === 'piece_rate') {
-    const fixed = item.fixedPieceRate ?? item.price
-    return fixed != null ? fixed : undefined
+    // `basePrice` is the fixed ₹/pc; `price` already includes the add-on, so
+    // using it as the base here would add ₹200 twice.
+    const fixed = item.basePrice ?? item.fixedPieceRate ?? item.price
+    return fixed == null ? undefined : round2(fixed + addOn)
   }
-  return perUnitLinePrice({
+  const base = perUnitLinePrice({
     silverRate: opts.silverRate,
     netWeight: item.netWeight,
     makingCharge: item.makingCharge,
-    fallback: item.price,
+    fallback: item.basePrice,
   })
+  return base == null ? undefined : round2(base + addOn)
 }

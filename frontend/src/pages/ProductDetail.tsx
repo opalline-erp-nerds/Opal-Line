@@ -29,7 +29,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Skeleton } from '@/components/ui/skeleton'
 import { ProductDialog } from '@/components/product-dialog'
 import { productImageGallery } from '@/lib/product-image'
-import { variantFinalPrice } from '@/lib/productVariants'
+import { variantEffectivePrice } from '@/lib/productVariants'
 import { rowLocationLabel } from '@/lib/locations'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { describeSyncResult } from '@/lib/syncResult'
@@ -257,10 +257,10 @@ export default function ProductDetailPage() {
                       <TableCell className="font-medium text-foreground">{v.title}</TableCell>
                       <TableCell className="font-mono text-xs">{v.sku}</TableCell>
                       <TableCell className="text-right tabular-nums">
-                        {/* Base selling price + the row's additional amount —
-                            the same number the push sends to Shopify. A
-                            Default-Title mirror row shows the base alone. */}
-                        {formatCurrency(variantFinalPrice(product.sellingPrice, v.sellingPrice, v.name))}
+                        {/* Base selling price + the durable add-on — the same
+                            number the push sends to Shopify. A Default-Title
+                            mirror row shows the base alone. */}
+                        {formatCurrency(variantEffectivePrice(product.sellingPrice, v))}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{Math.floor(Number(v.stock) || 0)} pcs</TableCell>
                     </TableRow>

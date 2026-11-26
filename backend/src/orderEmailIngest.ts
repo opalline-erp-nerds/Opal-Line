@@ -84,6 +84,8 @@ export interface OrderEmailData {
     silverValue?: number
     makingValue?: number
     amount?: number
+    variantId?: string | null
+    priceAdjustment?: number | null
   }>
   paymentMethod: string
   date: string
@@ -861,6 +863,8 @@ type InvoiceArtifacts = {
     makingValue?: number
     /** The variant the line sold, when the order named one. */
     variantId?: string | null
+    /** Variant "Add to price (₹)" already folded into the line's price. */
+    priceAdjustment?: number | null
   }>
   payment: string
   subtotal: number
@@ -976,6 +980,7 @@ function buildInvoiceArtifacts(
         makingCharge: priced.makingCharge,
         tax: priced.tax,
         amount: priced.amount,
+        ...(li.priceAdjustment != null ? { priceAdjustment: li.priceAdjustment } : {}),
       }
     })
     subtotal = amounts.subtotal

@@ -32,11 +32,11 @@ test('qty multiplies the per-piece net weight before pricing', () => {
   assert.equal(quotationLineWeight({ qty: 2, netWeight: 3.2 }), 6.4)
 })
 
-test('piece-rate lines bill fixed rate × qty with the rate components zeroed', () => {
-  // Applies applyPieceRateItems server-side: 450 × 3 = 1350 — NOT weight math.
+test('piece-rate lines bill the GST-inclusive fixed rate × qty backed out of tax', () => {
+  // Applies applyPieceRateItems server-side: 450 × 3 ÷ 1.03 = 1310.68 — NOT weight math.
   assert.equal(
     quotationLineAmount({ qty: 3, netWeight: 12, silverRatePerGram: 92.5, makingChargePerGram: 200, fixedPieceRate: 450 }),
-    1350,
+    1310.68,
   )
 })
 
@@ -70,14 +70,46 @@ test('totals: GST on the subtotal, discount off the grand total, no double-appli
 test('totals with piece-rate and silver-rate lines mixed', () => {
   const totals = quotationTotals(
     [
-      { qty: 2, netWeight: 0, silverRatePerGram: 0, makingChargePerGram: 0, fixedPieceRate: 450 }, // 900
+      { qty: 2, netWeight: 0, silverRatePerGram: 0, makingChargePerGram: 0, fixedPieceRate: 450 }, // 900 ÷ 1.03 = 873.79
       { qty: 1, netWeight: 10.5, silverRatePerGram: 92.5, makingChargePerGram: 150, fixedPieceRate: 0 }, // 2546.25
     ],
     3,
     0,
   )
-  assert.equal(totals.subtotal, 3446.25)
-  assert.equal(totals.grandTotal, 3549.64) // 3446.25 × 1.03 = 3549.6375 → .64
+  assert.equal(totals.subtotal, 3420.04)
+  assert.equal(totals.grandTotal, 3522.64) // 3420.04 × 1.03 = 3522.6412 → .64
+})
+
+test('a variant add-on is GST-inclusive on a weight line', () => {
+  const amount = quotationLineAmount({
+    qty: 1, netWeight: 10.5, silverRatePerGram: 92.5,
+    makingChargePerGram: 150, fixedPieceRate: 0, priceAdjustment: 200,
+  })
+  assert.equal(amount, 2740.42) // 2546.25 + 200 ÷ 1.03
+  assert.equal(quotationTotals([{
+    qty: 1, netWeight: 10.5, silverRatePerGram: 92.5,
+    makingChargePerGram: 150, fixedPieceRate: 0, priceAdjustment: 200,
+  }], 3, 0).grandTotal, 2822.63)
+})
+
+test('a piece-rate add-on folds into the fixed rate before backing out GST', () => {
+  assert.equal(
+    quotationLineAmount({
+      qty: 3, netWeight: 12, silverRatePerGram: 92.5,
+      makingChargePerGram: 200, fixedPieceRate: 450, priceAdjustment: 200,
+    }),
+    1893.20, // (450 + 200) × 3 ÷ 1.03
+  )
+})
+
+test('an add-on alone still cannot price a weight line', () => {
+  assert.deepEqual(
+    quotationLineIssues({
+      qty: 1, netWeight: 0, silverRatePerGram: 0,
+      makingChargePerGram: 0, fixedPieceRate: 0, priceAdjustment: 200,
+    }),
+    ['weight per piece is required', 'silver rate or making charge is required to price the line'],
+  )
 })
 
 test('parseQuotationQty accepts blank as 1 and rejects zero/negative/fraction junk', () => {

@@ -311,3 +311,70 @@ test('fixedPieceRateFor reads the flag first, falls back to sellingPrice, and ne
   assert.equal(fixedPieceRateFor({ pieceRateProduct: true, fixedPieceRate: 0, sellingPrice: 0 }), null)
   assert.equal(fixedPieceRateFor({}), null)
 })
+
+// ── Variant "Add to price (₹)": GST-inclusive, survives a rate change ─────────
+// The add-on rides on top of a GST-inclusive selling price. In the taxable
+// amount it is addOn × qty ÷ 1.03; totals put the 3% back, so the customer pays
+// exactly base + add-on. It must never be lost by a weight-driven reprice.
+
+test('weight-based variant add-on is backed out of tax and returned by the 3% total', () => {
+  const priced = buildPricedOrder(
+    [{ title: 'Ring — Large', sku: 'SKU-RING-L', productSku: 'SKU-RING', quantity: 2, price: 1339, priceAdjustment: 200 }],
+    PRODUCTS,
+    RATE,
+  )
+  const [line] = priced.lines
+  // 20 g × ₹65 = 1300 taxable base; 2 × 200 ÷ 1.03 = 388.35 taxable add-on.
+  assert.equal(line.priceAdjustment, 200)
+  // silverValue carries the silver + the taxable add-on; making stays in its
+  // own component (20 g × ₹5 = ₹100), so the header sums to the line amount.
+  assert.equal(line.silverValue, 1588.35)
+  assert.equal(line.makingValue, 100)
+  assert.equal(line.amount, 1688.35)
+  assert.equal(line.price, 869.5, 'per-unit GST-inclusive = (650 + 200), not 650')
+  assert.equal(priced.grandTotal, 1739.0, '2 × (669.50 + 200)')
+  const reEdit = round2(line.price * line.quantity)
+  assert.equal(reEdit, priced.grandTotal, 're-edit does not add the add-on twice')
+})
+
+test('a scanned variant SKU gets the add-on from its catalogue alias', () => {
+  const rows = [
+    ...PRODUCTS,
+    { ...PRODUCTS[0], sku: 'SKU-RING-L', priceAdjustment: 200 },
+  ]
+  const [line] = buildPricedOrder(
+    [{ title: 'Ring — Large', sku: 'SKU-RING-L', quantity: 1, price: 869.5 }],
+    rows,
+    RATE,
+  ).lines
+  assert.equal(line.priceAdjustment, 200)
+  assert.equal(line.price, 869.5)
+  assert.equal(line.amount, 844.17, '650 + 200 ÷ 1.03, rounded to the paisa')
+})
+
+test('Piece Rate add-on folds into the fixed price and stays out of the weight maths', () => {
+  const rows = [
+    ...PIECE_RATE_PRODUCT,
+    { ...PIECE_RATE_PRODUCT[0], sku: 'SKU-TOY-RED', priceAdjustment: 200 },
+  ]
+  const [line] = buildPricedOrder(
+    [{ title: 'toy — red', sku: 'SKU-TOY-RED', quantity: 1, price: 2200 }],
+    rows,
+    RATE,
+  ).lines
+  assert.equal(line.price, 2200, 'fixed 2000 + add-on 200')
+  assert.equal(line.priceAdjustment, 200)
+  assert.equal(line.amount, 2135.92, '(2000 + 200) ÷ 1.03')
+  assert.equal(line.makingValue, 0, 'making charge stays zero on a piece-rate line')
+  assert.equal(line.silverRate, 0)
+})
+
+test('buildManualInvoiceLines carries the variant add-on onto the invoice line', () => {
+  const [line] = buildManualInvoiceLines(
+    [{ title: 'Ring — Large', sku: 'SKU-RING-L', quantity: 1, price: 869.5, priceAdjustment: 200 }],
+    3,
+  )
+  assert.equal(line.priceAdjustment, 200)
+  assert.equal(line.amount, 844.17, 'price-only line backs the whole GST-inclusive price out once')
+  assert.equal(line.tax, 25.33)
+})

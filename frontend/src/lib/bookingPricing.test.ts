@@ -15,6 +15,17 @@ test('a booked total round-trips: taxable + GST returns exactly what was entered
   assert.equal(t.grandTotal, 4500)
 })
 
+test('a variant add-on already in the per-unit price round-trips once', () => {
+  // The picker prices this as base 669.50 + ₹200 add-on = ₹869.50 per unit.
+  // The totals helper sees only the GST-inclusive price, so it must never add
+  // the durable add-on a second time (mirrors backend/src/bookings.test.ts).
+  const t = bookingPricing([{ price: 869.5, qty: 2 }], 3, 0, 0)
+  assert.equal(t.linesTotal, 1739)
+  assert.equal(t.taxable, 1688.35)
+  assert.equal(t.gstAmount, 50.65)
+  assert.equal(t.grandTotal, 1739)
+})
+
 test('discount and advance drive the grand total and the outstanding balance', () => {
   const t = bookingPricing([{ price: 2000, qty: 2 }], 5, 250, 500)
   assert.equal(t.taxable, 3809.52)

@@ -10,7 +10,10 @@ import {
   normalizeVariant,
   productHasVariants,
   productVariants,
+  variantAddOn,
+  variantEffectivePrice,
   variantFinalPrice,
+  variantIsDefaultRow,
   variantLabel,
   variantOptions,
 } from './productVariants'
@@ -75,6 +78,7 @@ test('variants are exposed with their sku, price, stock and Shopify id', () => {
     name: '16in',
     sku: 'RING-42-16',
     sellingPrice: 1200,
+    priceAdjustment: null,
     stock: 3,
     barcode: '8900000000100',
     shopifyVariantId: 111,
@@ -187,4 +191,46 @@ test('hasRealOptions ignores the single-variant placeholder', () => {
   assert.equal(hasRealOptions(undefined), false)
   assert.equal(hasRealOptions([{ name: 'Size', values: ['S', 'M'] }]), true)
   assert.equal(hasRealOptions([...placeholder, { name: 'Size', values: ['S'] }]), true)
+})
+
+// ── Durable priceAdjustment (the "Add to price (₹)" column) ───────────────────
+// selling_price is now the EFFECTIVE price. The add-on lives in its own column;
+// legacy rows without it still store the add-on in selling_price.
+
+test('normalizeVariant carries the explicit add-on through the wire shape', () => {
+  const v = normalizeVariant({
+    id: 'v-1',
+    sku: 'OL-SIL-001-RED-LAR',
+    title: 'Red / Large',
+    sellingPrice: 4526,
+    priceAdjustment: 200,
+  })
+  assert.ok(v)
+  assert.equal(v.sellingPrice, 4526, 'effective price survives normalization')
+  assert.equal(v.priceAdjustment, 200, 'the durable delta survives normalization')
+})
+
+test('variantAddOn reads priceAdjustment and falls back to legacy selling_price', () => {
+  assert.equal(variantAddOn({ title: 'Red', priceAdjustment: 200, sellingPrice: 4526 }), 200)
+  assert.equal(variantAddOn({ title: 'Red', sellingPrice: 200 }), 200, 'pre-column row')
+  assert.equal(variantAddOn({ name: 'Red', priceAdjustment: 0, sellingPrice: 4526 }), 0)
+  assert.equal(variantAddOn({ title: 'Red', priceAdjustment: null, sellingPrice: null }), 0)
+})
+
+test('variantIsDefaultRow works on the raw catalogue title shape', () => {
+  // The catalogue endpoints return `title`, not `name`; reading only `name`
+  // made every real row look like a Default-Title mirror.
+  assert.equal(variantIsDefaultRow({ title: 'Red', optionValues: ['Red'] }), false)
+  assert.equal(variantIsDefaultRow({ name: 'Red', optionValues: ['Red'] }), false)
+  assert.equal(variantIsDefaultRow({ title: 'Default Title', optionValues: ['Default Title'] }), true)
+  assert.equal(variantAddOn({ title: 'Default Title', sellingPrice: 4800 }), 0)
+})
+
+test('variantEffectivePrice re-derives base + add-on without compounding', () => {
+  const row = { title: 'Red', priceAdjustment: 200, sellingPrice: 4526 }
+  assert.equal(variantEffectivePrice(4326, row), 4526)
+  assert.equal(variantEffectivePrice(4326, row), 4526, 'a second read does not add 200 twice')
+  assert.equal(variantEffectivePrice(5000, row), 5200, 'a silver-rate reprice keeps +200 above the new base')
+  assert.equal(variantEffectivePrice(5000, { title: 'Red', sellingPrice: 200 }), 5200, 'legacy row')
+  assert.equal(variantEffectivePrice(4326, { title: 'Default Title', sellingPrice: 4326 }), 4326)
 })
