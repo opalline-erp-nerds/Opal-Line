@@ -82,6 +82,8 @@ export function parseBookingContact(body: unknown): { email: string; phone: stri
 export interface BookingLineInput {
   price: number
   quantity: number
+  /** Variant add-on already folded into `price` — informational only here. */
+  priceAdjustment?: number | null
 }
 
 export interface BookingTotals {
@@ -138,6 +140,8 @@ export interface StoredBookingLine {
   quantity: number
   /** PER-UNIT price, GST-inclusive — the sales_orders convention (orderPricing.ts). */
   price: number
+  /** Variant "Add to price (₹)" already folded into `price`; kept for breakdowns. */
+  priceAdjustment?: number | null
   /** Catalogue relationship, so the booking keeps pointing at the real product… */
   productId?: string
   /** …and, when the customer picked one, at the exact variant. */
@@ -169,12 +173,17 @@ export function normalizeBookingItems(raw: unknown): { items: StoredBookingLine[
     const productId = String(it?.productId ?? '').trim()
     const variantId = String(it?.variantId ?? '').trim()
     const id = String(it?.id ?? '').trim()
+    const rawAddOn = Number(it?.priceAdjustment ?? 0)
+    const priceAdjustment = Number.isFinite(rawAddOn) && rawAddOn > 0
+      ? Math.round(rawAddOn * 100) / 100
+      : null
     items.push({
       ...(id ? { id } : {}),
       title,
       sku,
       quantity,
       price: Math.round(price * 100) / 100,
+      ...(priceAdjustment != null ? { priceAdjustment } : {}),
       ...(productId ? { productId } : {}),
       ...(variantId ? { variantId } : {}),
     })
@@ -593,6 +602,8 @@ export interface PreparedInvoiceLine {
   makingValue?: number
   /** The variant the booked line sold, when it had one. */
   variantId?: string | null
+  /** The variant add-on folded into the booked per-unit price. */
+  priceAdjustment?: number | null
 }
 
 /** One invoice line as the fulfilment write emits it. */
@@ -756,6 +767,7 @@ export function buildBookingFulfilmentPlan(input: {
         // Every split part keeps naming the variant its units came from — the
         // stock guard, the deduction and the stored invoice line all key off it.
         ...(base.variantId ? { variantId: base.variantId } : {}),
+        ...(base.priceAdjustment != null ? { priceAdjustment: base.priceAdjustment } : {}),
         ...(lineId ? { bookingLineId: lineId } : {}),
         locationId: r.locationId,
         bookingAllocationId: r.id,

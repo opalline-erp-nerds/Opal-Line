@@ -60,11 +60,11 @@ test('booking contact: blank clears, a real address passes, a malformed one is r
 })
 
 // ── Booking form payload rules: pure, no database. ──────────────────────────
-test('booking items: whole pieces only, sane prices, product and variant ids kept', async () => {
+test('booking items: whole pieces only, sane prices, product/variant ids and add-on kept', async () => {
   const { normalizeBookingItems } = await import('./bookings')
 
   const ok = normalizeBookingItems([
-    { product: '  Silver Ring ', sku: ' RING-1 ', qty: 2.9, price: 1234.567, productId: 'p1', variantId: 'v1' },
+    { product: '  Silver Ring ', sku: ' RING-1 ', qty: 2.9, price: 1234.567, priceAdjustment: 200, productId: 'p1', variantId: 'v1' },
     { product: 'Chain', qty: '3', price: '500' },
     // Invalid rows are dropped, exactly as the old inline filter did.
     { product: '', qty: 1, price: 10 },
@@ -77,6 +77,7 @@ test('booking items: whole pieces only, sane prices, product and variant ids kep
     sku: 'RING-1',
     quantity: 2,
     price: 1234.57,
+    priceAdjustment: 200,
     productId: 'p1',
     variantId: 'v1',
   }, 'trimmed, floored, rounded to the paisa, relationship kept')
@@ -165,6 +166,16 @@ test('booking totals use the invoice formula, so preview and stored invoice agre
   // Negative or junk inputs can never produce a negative booking.
   const clamped = computeBookingTotals([{ price: 100, quantity: 1 }], -5, -20)
   assert.equal(clamped.value, 100, 'a negative rate/discount is clamped, never inverted')
+})
+
+test('a booked variant add-on is already in the per-unit price and is not added twice', async () => {
+  const { computeBookingTotals } = await import('./bookings')
+  // Base 669.50 + ₹200 add-on = ₹869.50 per unit, qty 2.
+  const totals = computeBookingTotals([{ price: 869.5, quantity: 2, priceAdjustment: 200 }], 3, 0)
+  assert.equal(totals.linesTotal, 1739, 'the GST-inclusive price including the add-on is the booked value')
+  assert.equal(totals.taxable, 1688.35, 'backed out of GST exactly once')
+  assert.equal(totals.gstAmount, 50.65)
+  assert.equal(totals.value, 1739, 'no second add-on appears in the booking value')
 })
 
 test(

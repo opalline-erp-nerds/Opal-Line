@@ -115,6 +115,11 @@ test.describe('quotation workflow', () => {
     const lineAmount = dialog.getByText(/^Line \(/).first()
     await expect(lineAmount).toBeVisible()
     await expect(lineAmount).toContainText(/×/)
+    if (isPieceRate) {
+      // The fixed ₹/pc is GST-INCLUSIVE: the preview is the taxable value,
+      // (fixed × qty) ÷ 1.03 — the header's 3% puts the GST back once.
+      await expect(lineAmount).toContainText(currency.format(round2(Number(product.fixedPieceRate) / 1.03)))
+    }
 
     await dialog.getByRole('button', { name: 'Create Quotation' }).click()
     await expect(dialog).toHaveCount(0, { timeout: 10000 })
@@ -155,6 +160,9 @@ test.describe('quotation workflow', () => {
     const piece = catalogue.find((p) => p.pieceRateProduct === true && Number(p.fixedPieceRate) > 0)
     test.skip(!piece, 'no piece-rate product in the catalogue')
     const product = piece as ProductRow
+    // The fixed ₹/pc is GST-INCLUSIVE: the stored line is taxable, and the
+    // header's 3% adds the GST back to give fixed × qty exactly.
+    const taxable = round2((Number(product.fixedPieceRate) * 2) / 1.03)
 
     const res = await request.post('/api/v1/db/quotations', {
       headers: await csrfHeaders(request),
@@ -168,7 +176,7 @@ test.describe('quotation workflow', () => {
             weight: 0,
             silverRate: 0,
             makingCharge: 0,
-            amount: Number(product.fixedPieceRate) * 2,
+            amount: taxable,
           },
         ],
       },
@@ -176,11 +184,112 @@ test.describe('quotation workflow', () => {
     expect(res.ok(), await res.text()).toBeTruthy()
     const created = (await res.json()) as {
       items?: Array<{ amount: number; silverRate: number; makingCharge: number }>
+      grandTotal?: number
     }
     const line = created.items?.[0]
-    expect(line?.amount).toBe(Number(product.fixedPieceRate) * 2)
+    expect(Number(line?.amount)).toBe(taxable)
     expect(line?.silverRate).toBe(0)
     expect(line?.makingCharge).toBe(0)
+    expect(Math.abs(Number(created.grandTotal) - Number(product.fixedPieceRate) * 2)).toBeLessThanOrEqual(
+      0.02,
+      'fixed × qty with the add-on (here zero) counted exactly once',
+    )
+  })
+
+  test('picked variant add-on is backed out of the line and added back once', async ({ page, request }) => {
+    const stamp = Date.now()
+    const name = `E2E Quote Toy ${stamp}`
+    const sku = `E2E-QT-${stamp}`
+    const redSku = `${sku}-RED`
+    const headers = await csrfHeaders(request)
+    let productId = ''
+
+    // A Piece Rate product (₹2,000/pc) whose red variant carries a durable
+    // ₹200 add-on. NEW fixtures send `priceAdjustment`, with `sellingPrice`
+    // kept as the EFFECTIVE ₹2,200.
+    const created = await request.post('/api/v1/db/products', {
+      headers,
+      data: {
+        name,
+        sku,
+        category: 'Silver Jewels',
+        sellingPrice: 2000,
+        pieceRateProduct: true,
+        fixedPieceRate: 2000,
+        netWeight: 200,
+        makingCharge: 20,
+        gst: 3,
+        hsn: '71131130',
+        purity: 92.5,
+        grossWeight: 0,
+        stoneWeight: 0,
+        supplier: '',
+        silverRate: 0,
+        stock: 0,
+        status: 'active',
+        shopifyStatus: 'not-listed',
+        createdAt: new Date().toISOString(),
+      },
+    })
+    expect(created.status(), `create fixture product: ${await created.text()}`).toBe(201)
+    productId = ((await created.json()) as { id: string }).id
+    const variants = await request.put(`/api/v1/db/products/${productId}/variants`, {
+      headers,
+      data: {
+        options: [{ name: 'color', values: ['red', 'white'] }],
+        variants: [
+          { title: 'red', optionValues: ['red'], sku: redSku, sellingPrice: 2200, priceAdjustment: 200, stock: 2 },
+          { title: 'white', optionValues: ['white'], sku: `${sku}-WHI`, sellingPrice: 2000, priceAdjustment: 0, stock: 2 },
+        ],
+      },
+    })
+    expect(variants.status(), `create fixture variants: ${await variants.text()}`).toBe(200)
+
+    try {
+      await page.goto('/sales/quotations')
+      await page.getByRole('button', { name: 'New Quotation' }).click()
+      const dialog = page.getByRole('dialog')
+      await expect(dialog).toBeVisible()
+      await dialog.getByLabel('Customer name *').fill(`${MARKER} variant`)
+
+      // Pick the VARIANT row by its own SKU (the parent row only carries the
+      // base SKU, which is not a match for `${sku}-RED`).
+      await dialog.getByPlaceholder('Search name or SKU…').fill(redSku)
+      // Match the ↳ variant row, not the "use as custom line" button which
+      // also echoes the query text.
+      const hit = dialog.getByRole('button', {
+        name: new RegExp(`↳ red[\\s\\S]*${redSku.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+      })
+      await expect(hit, 'the variant must be its own selectable row').toBeVisible({ timeout: 10000 })
+      await hit.click()
+      await expect(dialog.getByText('+₹200 variant add-on (GST inclusive)')).toBeVisible()
+
+      const taxable = round2((2000 + 200) / 1.03) // ₹2,135.92
+      const lineText = dialog.getByText(/^Line \(/).first()
+      await expect(lineText).toContainText('(₹2000 + ₹200) × 1 ÷ 1.03')
+      await expect(lineText).toContainText(currency.format(taxable))
+      // Default header GST is 3%: the add-on comes back exactly once, so the
+      // customer pays ₹2,200 — not ₹2,000 (dropped) nor ₹2,266 (counted twice).
+      await expect(dialog.getByText('Grand total').locator('..')).toContainText(currency.format(2200))
+
+      await dialog.getByRole('button', { name: 'Create Quotation' }).click()
+      await expect(dialog).toHaveCount(0, { timeout: 10000 })
+
+      const listRes = await request.get('/api/v1/db/quotations')
+      expect(listRes.ok()).toBeTruthy()
+      const listBody = (await listRes.json()) as {
+        data?: Array<Record<string, unknown> & { items?: Array<Record<string, unknown>> }>
+      }
+      const stored = (listBody.data ?? []).find(isQuotationRow)
+      expect(stored, 'the quotation must persist').toBeTruthy()
+      const item = (stored?.items ?? []).find((it) => it.sku === redSku)
+      expect(item, 'the picked variant must be the stored line').toBeTruthy()
+      expect(Number(item?.priceAdjustment)).toBe(200, 'quotation_items.price_adjustment snapshots the add-on')
+      expect(Number(item?.amount)).toBe(taxable, 'the taxable amount includes addOn ÷ 1.03 once')
+      expect(Number(stored?.grandTotal)).toBe(2200, 'the customer pays ₹2,000 + ₹200 once')
+    } finally {
+      if (productId) await request.delete(`/api/v1/db/products/${productId}`, { headers })
+    }
   })
 
   test('convert to invoice: one invoice, one stock movement, clean delete rollback', async ({ request }) => {
@@ -345,7 +454,9 @@ test.describe('quotation workflow', () => {
     // 3dp on pick, line weight rounded to the paisa, then priced.
     const line1 = round2(round2(2 * round3(Number(silverProduct.netWeight))) * (rate + making))
 
-    // Line 2: piece-rate product at its fixed rate.
+    // Line 2: piece-rate product at its fixed rate. The ₹/pc is GST-INCLUSIVE,
+    // so the taxable line amount is (fixed × qty) ÷ 1.03; the header's GST
+    // (5% in this test) adds it back to the correct grand total.
     await dialog.getByRole('button', { name: 'Add line' }).click()
     const search2 = dialog.getByPlaceholder('Search name or SKU…').nth(1)
     await search2.fill(pieceProduct.name.slice(0, 6))
@@ -354,7 +465,7 @@ test.describe('quotation workflow', () => {
       .first()
       .click()
     await dialog.getByLabel('Qty for line 2').fill('3')
-    const line2 = round2(3 * Number(pieceProduct.fixedPieceRate))
+    const line2 = round2((3 * Number(pieceProduct.fixedPieceRate)) / 1.03)
 
     // GST on the subtotal, discount off the grand total — the ERP convention.
     const subtotal = round2(line1 + line2)

@@ -50,6 +50,7 @@ export function normalizeVariant(raw: unknown): ProductVariant | null {
     name: asText(v.name) ?? asText(v.title) ?? asText(v.label) ?? optionsLabel(v),
     sku,
     sellingPrice: asNumber(v.sellingPrice) ?? asNumber(v.price),
+    priceAdjustment: asNumber(v.priceAdjustment),
     stock: asNumber(v.stock) ?? asNumber(v.inventoryQuantity),
     barcode: asText(v.barcode),
     shopifyVariantId: asNumber(v.shopifyVariantId) ?? asNumber(v.variantId) ?? asNumber(v.id),
@@ -79,6 +80,56 @@ export function variantLabel(v: ProductVariant): string {
 export function isDefaultVariantName(name: string | null | undefined): boolean {
   const t = String(name ?? '').trim().toLowerCase()
   return t === '' || t === 'default title'
+}
+
+/** The fields needed to price a variant row (both normalized and raw API shapes). */
+export interface VariantPriceFields {
+  /** Normalized adapter field. */
+  name?: string | null
+  /** Raw `product_variants` field from the catalogue endpoints. */
+  title?: string | null
+  optionValues?: string[] | null
+  /** EFFECTIVE price on new rows; the legacy ADD-ON on rows predating the column. */
+  sellingPrice?: number | string | null
+  /** The canonical "Add to price (₹)" delta (0 = base price). */
+  priceAdjustment?: number | string | null
+}
+
+/**
+ * Default-Title detection that works on BOTH wire shapes. The catalogue
+ * endpoints return `title` (not `name`), so calling `isDefaultVariantName(v.name)
+ * on a raw row read as "default" and silently dropped its add-on — the exact
+ * reason a saved +₹200 still rendered as the base price on Product Detail.
+ */
+export function variantIsDefaultRow(v: VariantPriceFields): boolean {
+  const values = Array.isArray(v.optionValues) ? v.optionValues : []
+  if (values.some((x) => String(x ?? '').trim().toLowerCase() !== 'default title')) return false
+  return isDefaultVariantName(v.name ?? v.title)
+}
+
+/**
+ * The "Add to price (₹)" amount for a row. New rows carry `priceAdjustment`;
+ * older rows stored the add-on in `sellingPrice`, which is kept as a fallback
+ * so a product saved before the dedicated column still prices correctly.
+ */
+export function variantAddOn(v: VariantPriceFields): number {
+  if (variantIsDefaultRow(v)) return 0
+  const raw = v.priceAdjustment != null ? v.priceAdjustment : v.sellingPrice
+  const n = Number(raw)
+  return Number.isFinite(n) && n !== 0 ? Math.round(n * 100) / 100 : 0
+}
+
+/**
+ * Price to show/charge for a variant: base + add-on. Never reads `sellingPrice`
+ * when an explicit add-on exists — the stored effective price must not be
+ * added a second time on re-open/re-save.
+ */
+export function variantEffectivePrice(
+  basePrice: number | null | undefined,
+  variant: VariantPriceFields,
+): number {
+  const base = Number.isFinite(Number(basePrice)) ? Number(basePrice) : 0
+  return Math.round((base + variantAddOn(variant)) * 100) / 100
 }
 
 /**

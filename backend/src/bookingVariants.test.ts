@@ -96,8 +96,8 @@ test(
         stock: 0,
       })
       await db!.insert(schema.productVariants).values([
-        { id: redId, productId, title: 'red', optionValues: ['red'], sku: redSku, stock: 0 },
-        { id: whiteId, productId, title: 'white', optionValues: ['white'], sku: whiteSku, stock: 0 },
+        { id: redId, productId, title: 'red', optionValues: ['red'], sku: redSku, sellingPrice: 2200, priceAdjustment: 200, stock: 0 },
+        { id: whiteId, productId, title: 'white', optionValues: ['white'], sku: whiteSku, sellingPrice: 2000, priceAdjustment: 0, stock: 0 },
       ])
       // Seed each variant's own balance through the ledger (a variant SKU
       // resolves to that variant alone), so the parent rollup is 5 + 3.
@@ -129,7 +129,7 @@ test(
         id,
         internalId: `BK${marker}-${id}`,
         customer: `${marker} Buyer`,
-        value: 2000 * quantity,
+        value: 2200 * quantity,
         payment: 'pending',
         fulfillment: 'pending',
         status: 'confirmed',
@@ -143,7 +143,8 @@ test(
             title: 'silver toy — red',
             sku: redSku,
             quantity,
-            price: 2000,
+            price: 2200,
+            priceAdjustment: 200,
             productId,
             variantId: redId,
           },
@@ -185,9 +186,10 @@ test(
       assert.equal(items.length, 1, 'one invoice line per booked line')
       assert.equal(items[0]!.variantId, redId, 'the invoice line names the EXACT variant it billed')
       assert.equal(items[0]!.sku, redSku, 'and carries the variant SKU, not the parent one')
-      // Booked ₹2,000/pc: taxable = 2000 ÷ 1.03 = 1941.75 — the fixed piece
-      // rate as booked, never 200 g × (rate + making).
-      assert.equal(Number(items[0]!.amount), 1941.75, 'the booked piece rate reaches the invoice untouched')
+      // Booked ₹2,200/pc (fixed ₹2,000 + ₹200 add-on): taxable = 2200 ÷ 1.03
+      // = 2135.92 — never 200 g × (rate + making), and never a second add-on.
+      assert.equal(Number(items[0]!.priceAdjustment), 200, 'the durable add-on reaches the invoice line')
+      assert.equal(Number(items[0]!.amount), 2135.92, 'the inclusive booked price is backed out once')
 
       assert.equal(await variantStock(redId), 4, 'red alone was deducted')
       assert.equal(await variantStock(whiteId), 3, 'the sibling variant is untouched')

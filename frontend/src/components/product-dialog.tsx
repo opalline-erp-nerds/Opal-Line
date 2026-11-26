@@ -9,7 +9,7 @@ import { Switch } from '@/components/ui/switch'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { toast } from '@/components/ui/confirm'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
-import { hasRealOptions } from '@/lib/productVariants'
+import { hasRealOptions, variantAddOn } from '@/lib/productVariants'
 import { formatLocationLabel, rowLocationLabel } from '@/lib/locations'
 import {
   CATEGORY_PREFIX,
@@ -423,7 +423,9 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
             title: v.title ?? '',
             optionValues: Array.isArray(v.optionValues) ? v.optionValues : [],
             sku: v.sku ?? '',
-            price: v.sellingPrice != null ? String(v.sellingPrice) : '',
+            // Re-open on the ADD-ON, never on the effective price stored in
+            // sellingPrice — otherwise a second Save would add ₹200 twice.
+            price: String(variantAddOn(v)),
             compareAtPrice: v.compareAtPrice != null ? String(v.compareAtPrice) : '',
             stock: String(Math.floor(Number(v.stock) || 0)),
           })),
@@ -961,15 +963,22 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       if (hasVariants) {
         const res = await dbApi.saveProductVariants(saved.id, {
           options: options.map((o) => ({ name: o.name.trim(), values: o.values.map((v) => v.trim()).filter(Boolean) })),
-          variants: variants.map((v) => ({
-            id: v.id,
-            title: v.title,
-            optionValues: v.optionValues,
-            sku: v.sku.trim(),
-            sellingPrice: parseFloat(v.price) || undefined,
-            compareAtPrice: parseFloat(v.compareAtPrice) || undefined,
-            stock: Math.max(0, Math.floor(parseInt(v.stock, 10) || 0)),
-          })),
+          variants: variants.map((v) => {
+            // The input is the ADD-ON, not the final price. Persist both the
+            // durable delta and the effective price so every consumer (detail,
+            // Shopify, sales) reads one unambiguous number.
+            const addOn = Math.max(0, Math.round((parseFloat(v.price) || 0) * 100) / 100)
+            return {
+              id: v.id,
+              title: v.title,
+              optionValues: v.optionValues,
+              sku: v.sku.trim(),
+              priceAdjustment: addOn,
+              sellingPrice: Math.round((sellingPrice + addOn) * 100) / 100,
+              compareAtPrice: parseFloat(v.compareAtPrice) || undefined,
+              stock: Math.max(0, Math.floor(parseInt(v.stock, 10) || 0)),
+            }
+          }),
         })
         saved = { ...saved, stock: res.stock, options: res.options }
       } else if (mode === 'edit' && product) {

@@ -189,7 +189,18 @@ export const productVariants = pgTable('product_variants', {
   sku: text('sku').notNull(),
   barcode: text('barcode'),
   shopifyVariantId: text('shopify_variant_id'),
+  /**
+   * The variant's EFFECTIVE price (base selling price + priceAdjustment), kept
+   * in sync by the variant save and every silver-rate reprice. A Default-Title
+   * mirror row keeps its legacy absolute value here.
+   */
   sellingPrice: numericNumber('selling_price'),
+  /**
+   * The Shopify-style "Add to price (₹)" amount: 0 = the product's base price,
+   * 200 = base + ₹200. Stored separately from `sellingPrice` so a rate change
+   * can rebuild the effective price without ever losing the delta.
+   */
+  priceAdjustment: numericNumber('price_adjustment'),
   compareAtPrice: numericNumber('compare_at_price'),
   costPrice: numericNumber('cost_price'),
   grossWeight: numericNumber('gross_weight'),
@@ -432,6 +443,8 @@ export const salesInvoiceItems = pgTable('sales_invoice_items', {
    * SKU", never a fabricated variant.
    */
   variantId: text('variant_id'),
+  /** The variant "Add to price (₹)" amount carried on this line, when any. */
+  priceAdjustment: numericNumber('price_adjustment'),
   qty: integer('qty'),
   weight: numericNumber('weight'),
   silverRate: numericNumber('silver_rate'),
@@ -1381,6 +1394,8 @@ export const quotationItems = pgTable('quotation_items', {
   quotationId: text('quotation_id').notNull(),
   product: text('product'),
   sku: text('sku'),
+  /** GST-inclusive variant "Add to price (₹)" carried onto the quotation line. */
+  priceAdjustment: numericNumber('price_adjustment'),
   qty: integer('qty'),
   weight: numericNumber('weight'),
   silverRate: numericNumber('silver_rate'),

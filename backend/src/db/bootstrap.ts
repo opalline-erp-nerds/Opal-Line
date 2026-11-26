@@ -122,6 +122,9 @@ const BOOKING_FULFILMENT_DDL: string[] = [
  */
 const INVOICE_VARIANT_DDL: string[] = [
   `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS variant_id text`,
+  // The "Add to price (₹)" amount carried by the variant line, so the invoice
+  // breakdown can show it after a reload. NULL on historical/flat lines.
+  `ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS price_adjustment numeric`,
 ]
 
 /**
@@ -253,6 +256,7 @@ const STOCK_LEDGER_DDL: string[] = [
     sku text NOT NULL,
     barcode text,
     selling_price numeric,
+    price_adjustment numeric,
     compare_at_price numeric,
     cost_price numeric,
     gross_weight numeric,
@@ -268,6 +272,9 @@ const STOCK_LEDGER_DDL: string[] = [
   `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS title text`,
   `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS option_values jsonb`,
   `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS selling_price numeric`,
+  // Shopify-style per-variant "Add to price (₹)". Kept apart from the effective
+  // price in selling_price so a silver-rate reprice can rebuild base + add-on.
+  `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS price_adjustment numeric`,
   `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS compare_at_price numeric`,
   `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS cost_price numeric`,
   `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS gross_weight numeric`,
@@ -302,6 +309,25 @@ const STOCK_LEDGER_DDL: string[] = [
           SET selling_price = price
         WHERE selling_price IS NULL AND price IS NOT NULL;
      END IF;
+     -- One-time migration to the explicit add-on column. Before this column
+     -- existed, selling_price held the ADD-ON for a real option row. Seed the
+     -- new column from it, then materialise the EFFECTIVE price in selling_price
+     -- (base + add-on). The price_adjustment IS NULL guard makes this safe to
+     -- re-run on every boot and on installs that already use the new shape.
+     UPDATE product_variants
+        SET price_adjustment = COALESCE(selling_price, 0)
+      WHERE price_adjustment IS NULL
+        AND COALESCE(lower(btrim(title)), '') NOT IN ('', 'default title');
+     UPDATE product_variants
+        SET price_adjustment = 0
+      WHERE price_adjustment IS NULL;
+     UPDATE product_variants v
+        SET selling_price = ROUND((COALESCE(p.selling_price, 0) + COALESCE(v.price_adjustment, 0))::numeric, 2)
+       FROM products p
+      WHERE p.id = v.product_id
+        AND COALESCE(lower(btrim(v.title)), '') NOT IN ('', 'default title')
+        AND ROUND((COALESCE(p.selling_price, 0) + COALESCE(v.price_adjustment, 0))::numeric, 2)
+            IS DISTINCT FROM v.selling_price;
    END $$`,
   `CREATE UNIQUE INDEX IF NOT EXISTS product_variants_sku_idx ON product_variants (sku)`,
   `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS shopify_variant_id text`,
@@ -714,6 +740,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         invoice_id text NOT NULL,
         product text,
         sku text,
+        price_adjustment numeric,
         qty integer,
         weight numeric,
         silver_rate numeric,
@@ -861,12 +888,14 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         quotation_id text NOT NULL,
         product text,
         sku text,
+        price_adjustment numeric,
         qty integer,
         weight numeric,
         silver_rate numeric,
         making_charge numeric,
         amount numeric
       )`)
+    await tx.unsafe(`ALTER TABLE quotation_items ADD COLUMN IF NOT EXISTS price_adjustment numeric`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS quotation_items_quotation_id_idx ON quotation_items (quotation_id)`)
 
     // ── Purchases & stock ─────────────────────────────────────────────────
@@ -1685,6 +1714,9 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
     ...SHOPIFY_OUTBOUND_DDL,
     ...BOOKING_FULFILMENT_DDL,
     ...INVOICE_VARIANT_DDL,
+      // Quotations carry the same durable variant add-on as invoices. Existing
+      // installs need the column too, or a saved add-on is silently dropped.
+      `ALTER TABLE quotation_items ADD COLUMN IF NOT EXISTS price_adjustment numeric`,
       // Accounting: store the journal source so unified/Shopify filtering is exact.
       `ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS source text`,
       // Duplicate prevention at the database level: one journal per source record.
@@ -1790,6 +1822,7 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
         quotation_id text NOT NULL,
         product text,
         sku text,
+        price_adjustment numeric,
         qty integer,
         weight numeric,
         silver_rate numeric,

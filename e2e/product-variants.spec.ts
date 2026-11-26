@@ -117,18 +117,20 @@ test.describe('product codes & variants', () => {
     // Each variant price is an ADD-ON over the product's selling price — the
     // dialog says so verbatim ("0 sends the base price, 200 sends base + ₹200")
     // and the field is labelled "Additional price for …". A freshly minted
-    // combination therefore starts at 0: the base price, no add-on. (It used to
-    // mirror the full price, which the base/add-on split replaced.)
+    // combination starts at 0: the base price, no add-on. Configure S = ₹200
+    // and M = ₹400 here so persistence can be proved after the round-trip.
     await expect(dialog.getByLabel('Additional price for S')).toHaveValue('0')
     await expect(dialog.getByLabel('Additional price for M')).toHaveValue('0')
+    await dialog.getByLabel('Additional price for S').fill('200')
+    await dialog.getByLabel('Additional price for M').fill('400')
 
     // Recomputing the base ((105 + 30) × 10g × 1.03) changes the PARENT's
     // selling price but must never be copied into the add-ons — each row keeps
     // whatever the user configured (mirroring would double every variant).
     await dialog.getByLabel('Making charge').fill('30')
     await expect(dialog.getByLabel('Selling price')).toHaveValue('1390.5')
-    await expect(dialog.getByLabel('Additional price for S')).toHaveValue('0')
-    await expect(dialog.getByLabel('Additional price for M')).toHaveValue('0')
+    await expect(dialog.getByLabel('Additional price for S')).toHaveValue('200')
+    await expect(dialog.getByLabel('Additional price for M')).toHaveValue('400')
 
     await dialog.getByLabel('Stock for S').fill('3')
     await dialog.getByLabel('Stock for M').fill('5')
@@ -155,6 +157,32 @@ test.describe('product codes & variants', () => {
     await expect(variantsTable.getByRole('cell', { name: 'M', exact: true })).toBeVisible()
     // Parent stock is the sum of the variant stocks (3 + 5).
     await expect(page.getByText('8 pcs', { exact: true }).first()).toBeVisible()
+    // The detail table shows each variant's EFFECTIVE price (base + add-on):
+    // ₹1,390.50 + ₹200 = ₹1,590.50 for S, + ₹400 = ₹1,790.50 for M.
+    // Filter by the row's SKU text: a nested `has:` locator rooted at the table
+    // does not compose into a row-relative locator and matches no cells.
+    const sRow = variantsTable.getByRole('row').filter({ hasText: `${parentSku}-S` })
+    const mRow = variantsTable.getByRole('row').filter({ hasText: `${parentSku}-M` })
+    await expect(sRow.getByRole('cell').nth(2)).toHaveText('₹1,590.5')
+    await expect(mRow.getByRole('cell').nth(2)).toHaveText('₹1,790.5')
+
+    // Stored shape: the durable delta is on `priceAdjustment`, `sellingPrice`
+    // is the effective mirror, and the PARENT's base price absorbed neither.
+    const savedList = (await (await page.request.get('/api/v1/db/products?limit=200')).json()) as {
+      data?: Array<{ id: string; name: string; sellingPrice: number }>
+    }
+    const savedProduct = (savedList.data ?? []).find((p) => p.name === PRODUCT_NAME)
+    expect(savedProduct, 'the product must exist in the API').toBeTruthy()
+    expect(Number(savedProduct!.sellingPrice)).toBe(1390.5, 'the base price must not absorb the add-ons')
+    const storedVariants = (await (
+      await page.request.get(`/api/v1/db/products/${savedProduct!.id}/variants`)
+    ).json()) as { variants?: Array<{ title: string; sellingPrice: number; priceAdjustment: number }> }
+    const storedS = (storedVariants.variants ?? []).find((v) => v.title === 'S')
+    const storedM = (storedVariants.variants ?? []).find((v) => v.title === 'M')
+    expect(Number(storedS?.priceAdjustment)).toBe(200)
+    expect(Number(storedM?.priceAdjustment)).toBe(400)
+    expect(Number(storedS?.sellingPrice)).toBe(1590.5)
+    expect(Number(storedM?.sellingPrice)).toBe(1790.5)
 
     // ── 5. Edit round-trip keeps options, values and variant codes ───────
     await page.getByRole('button', { name: /Edit Product/i }).click()
@@ -163,6 +191,11 @@ test.describe('product codes & variants', () => {
     await expect(editDialog.getByLabel('Values for Size')).toBeVisible()
     await expect(editDialog.getByText('2 variants')).toBeVisible({ timeout: 10000 })
     await expect(editDialog.getByLabel(`SKU for S`)).toHaveValue(new RegExp(`^${parentSku}-S$`))
+    // Add-ons reopen as the ADD-ON values (not the effective mirror), and the
+    // parent's selling price is still the untouched base.
+    await expect(editDialog.getByLabel('Selling price')).toHaveValue('1390.5')
+    await expect(editDialog.getByLabel('Additional price for S')).toHaveValue('200')
+    await expect(editDialog.getByLabel('Additional price for M')).toHaveValue('400')
     // A saved product's SKU is read-only: an edit never rewrites it.
     await expect(editDialog.getByLabel('Product SKU')).toHaveValue(parentSku)
     await expect(editDialog.getByLabel('Product SKU')).toHaveAttribute('readonly', '')

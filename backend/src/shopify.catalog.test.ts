@@ -344,7 +344,7 @@ describe('applyLiveCatalog (variant sync)', () => {
     assert.equal(rows[0].name, existing.name, 'nor the product name')
   })
 
-  test('mirror copies a newer Shopify edit unless an ERP push is still queued', async () => {
+  test('mirror copies a newer Shopify edit but never the final price into the ERP base', async () => {
     const existing = localRow({
       id: 'row-mirror',
       sku: 'MIRROR-1',
@@ -366,7 +366,9 @@ describe('applyLiveCatalog (variant sync)', () => {
     assert.equal(rows[0].name, 'Store name')
     assert.equal(rows[0].description, 'Store text')
     assert.equal(rows[0].stock, 9)
-    assert.equal((rows[0] as { sellingPrice?: number }).sellingPrice, 250)
+    // Shopify's 250 is base + variant add-on; the base stays ERP-owned. The
+    // old mirror wrote 250 here, so the next push compounded to 450, 650, …
+    assert.equal((rows[0] as { sellingPrice?: number }).sellingPrice, 100)
 
     const pending = localRow({ id: 'row-pending', sku: 'MIRROR-2', name: 'ERP name', stock: 3, sellingPrice: 80 })
     const held = fakeCatalog([pending])

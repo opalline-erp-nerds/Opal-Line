@@ -1005,8 +1005,6 @@ export interface CatalogPatch {
   productType: string | null
   description: string | null
   compareAtPrice: number | null
-  /** Present only on a two-way mirror of a non-piece-rate product. */
-  sellingPrice?: number | null
   image: string | null
   images: string[] | null
   netWeight: number | null
@@ -1125,7 +1123,6 @@ export async function applyLiveCatalog(
       // still queued to be pushed (that edit is newer).
       const pendingOutbound = options.pendingProductIds?.has(existing.id) === true
       const mirror = options.mirrorFromShopify === true && !pendingOutbound
-      const pieceRate = existing.pieceRateProduct === true
       const patch: CatalogPatch = {
         name: mirror && p.title ? p.title : existing.name,
         // A blank ERP barcode is a gap, not a value: filling it from the
@@ -1151,7 +1148,10 @@ export async function applyLiveCatalog(
         chargeOnTax: existing.chargeOnTax,
       }
       if (mirror && Number.isFinite(p.inventoryQuantity)) patch.stock = p.inventoryQuantity
-      if (mirror && !pieceRate && price > 0) patch.sellingPrice = price
+      // `p.price` is Shopify's FINAL first-variant price (base + variant
+      // add-on). Writing it into products.selling_price — the BASE — made the
+      // next push/display add the add-on again and compounded on every 10-min
+      // mirror. The ERP base is authoritative; a mirror must never touch it.
       await io.update(existing, patch)
       // The option/variant set is ERP-owned as well: the pull only records
       // which listing variant each ERP row points at, so the outbound push can
@@ -1324,8 +1324,14 @@ export async function mergeProductVariantsFromShopify(
           preserve.barcode && String(prior.barcode ?? '').trim() !== ''
             ? prior.barcode
             : claimUniqueBarcode(v.barcode, takenVariantBarcodes) ?? prior.barcode
+        const adopted = adoptVariantAdditional(basePrice, v.price)
+        const additional = preserve.price && prior.priceAdjustment != null ? prior.priceAdjustment : adopted
         const sellingPrice =
-          preserve.price && prior.sellingPrice != null ? prior.sellingPrice : Number(v.price) || prior.sellingPrice
+          preserve.price && prior.sellingPrice != null
+            ? prior.sellingPrice
+            : adopted == null
+              ? Number(v.price) || prior.sellingPrice
+              : round2(Number(basePrice || 0) + adopted)
         const stock =
           preserve.stock && prior.stock != null
             ? prior.stock
@@ -1338,6 +1344,7 @@ export async function mergeProductVariantsFromShopify(
             sku,
             barcode,
             sellingPrice,
+            priceAdjustment: additional,
             compareAtPrice:
               preserve.price && prior.compareAtPrice != null
                 ? prior.compareAtPrice
@@ -1352,6 +1359,7 @@ export async function mergeProductVariantsFromShopify(
       } else {
         const sku = claimUniqueVariantSku(preferredSku, takenVariantSkus)
         const barcode = claimUniqueBarcode(v.barcode, takenVariantBarcodes)
+        const additional = adoptVariantAdditional(basePrice, v.price)
         await tx.insert(schema.productVariants).values({
           id: randomUUID(),
           productId,
@@ -1360,7 +1368,8 @@ export async function mergeProductVariantsFromShopify(
           sku,
           barcode,
           shopifyVariantId,
-          sellingPrice: adoptVariantAdditional(basePrice, v.price),
+          priceAdjustment: additional,
+          sellingPrice: additional == null ? null : round2(Number(basePrice || 0) + additional),
           compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
           costPrice: null,
           grossWeight: null,
@@ -1558,6 +1567,7 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
                     'Variant barcode already used by another product — stored without a barcode',
                   )
                 }
+                const additional = adoptVariantAdditional(basePrice, v.price)
                 return {
                   id: randomUUID(),
                   productId,
@@ -1566,7 +1576,8 @@ export async function syncProductsToDb(options: SyncProductsToDbOptions = {}): P
                     .filter((x): x is string => Boolean(x) && String(x).trim() !== ''),
                   sku,
                   barcode,
-                  sellingPrice: adoptVariantAdditional(basePrice, v.price),
+                  priceAdjustment: additional,
+                  sellingPrice: additional == null ? null : round2(Number(basePrice || 0) + additional),
                   compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
                   costPrice: null,
                   grossWeight: null,
@@ -1738,6 +1749,7 @@ interface LocalCatalogEntry {
     sku: string
     title: string
     optionValues: string[]
+    /** Durable delta (legacy fallback: the old selling_price add-on). */
     additional: number
   }>
 }
@@ -1761,6 +1773,7 @@ async function getLocalCatalog(): Promise<LocalCatalogEntry[]> {
         title: schema.productVariants.title,
         optionValues: schema.productVariants.optionValues,
         sellingPrice: schema.productVariants.sellingPrice,
+        priceAdjustment: schema.productVariants.priceAdjustment,
         shopifyVariantId: schema.productVariants.shopifyVariantId,
       })
       .from(schema.productVariants)
@@ -1773,7 +1786,9 @@ async function getLocalCatalog(): Promise<LocalCatalogEntry[]> {
         sku: String(v.sku ?? '').trim(),
         title: String(v.title ?? '').trim(),
         optionValues: Array.isArray(v.optionValues) ? (v.optionValues as string[]).map((x) => String(x ?? '')) : [],
-        additional: Number(v.sellingPrice ?? 0) || 0,
+        // New rows carry the delta explicitly; older ones still store it in
+        // selling_price, which the bootstrap backfill migrates once on boot.
+        additional: Number(v.priceAdjustment ?? v.sellingPrice ?? 0) || 0,
       })
       variantsByProduct.set(v.productId, list)
     }
@@ -1968,14 +1983,15 @@ export function exceedsShopifyPriceCap(value: unknown): boolean {
 /**
  * Final price pushed for a variant of a priced product.
  *
- * The ERP-calculated selling price is the BASE for every variant and
- * `product_variants.selling_price` stores only the additional amount
- * configured for that row (base 618 + additional 200 → 818). The two stored
- * numbers are recombined here at push time and the result is never written
- * back, so a repeated edit or sync re-derives the same final price instead of
- * adding the amount a second time. Invalid inputs degrade to whatever is
- * valid (both invalid → 0), matching the "skip a price we cannot read" guards
- * around each call site.
+ * The ERP-calculated selling price is the BASE for every variant. The durable
+ * delta lives in `product_variants.price_adjustment`, and `selling_price` is
+ * now the EFFECTIVE price (base + delta). Rows saved before the dedicated
+ * column still have the delta in `selling_price`, so that legacy shape is
+ * accepted here too (base 618 + additional 200 → 818). The final price is
+ * derived, never written back into the base, so repeated edits/syncs cannot
+ * compound the add-on. Invalid inputs degrade to whatever is valid (both
+ * invalid → 0), matching the "skip a price we cannot read" guards at each
+ * call site.
  */
 export function finalVariantPrice(basePrice: unknown, additionalPrice: unknown): number {
   const base = Number(basePrice)
@@ -2020,21 +2036,31 @@ export function isDefaultVariantRow(title: unknown, optionValues: unknown): bool
  * this rule):
  *   - Default-Title mirror row → the BASE alone (its stored value is a legacy
  *     absolute price; adding it would double the product);
- *   - real option row          → base + the row's configured additional amount.
+ *   - real option row          → base + `priceAdjustment`. Legacy rows without
+ *     that column stored the add-on directly in `sellingPrice`, which is the
+ *     fallback when no explicit delta is present.
  * When the base itself is unusable the stored row value is the only price we
  * have, so it is sent as-is (the old fallback).
  */
 export function variantPushPrice(
   basePrice: unknown,
-  variant: { title?: unknown; optionValues?: unknown; sellingPrice?: unknown },
+  variant: {
+    title?: unknown
+    optionValues?: unknown
+    sellingPrice?: unknown
+    priceAdjustment?: unknown
+  },
 ): number {
   const base = Number(basePrice)
   const b = Number.isFinite(base) ? base : 0
-  const additional = Number(variant.sellingPrice)
+  const legacy = Number(variant.sellingPrice)
+  const stored = Number.isFinite(legacy) ? legacy : 0
+  const explicit = variant.priceAdjustment != null ? Number(variant.priceAdjustment) : NaN
+  const additional = Number.isFinite(explicit) ? explicit : stored
   const a = Number.isFinite(additional) ? additional : 0
   if (isDefaultVariantRow(variant.title, variant.optionValues)) {
     if (b > 0) return Math.round(b * 100) / 100
-    return a > 0 ? Math.round(a * 100) / 100 : 0
+    return stored > 0 ? Math.round(stored * 100) / 100 : 0
   }
   return finalVariantPrice(b, a)
 }
@@ -2289,7 +2315,10 @@ export interface LocalVariantForPush {
   optionValues: string[]
   sku: string
   barcode: string | null
+  /** Effective price (base + add-on) on new rows; legacy add-on on old rows. */
   sellingPrice: number | null
+  /** Durable "Add to price (₹)" delta; absent on legacy rows. */
+  priceAdjustment?: number | null
   compareAtPrice: number | null
   stock: number | null
 }
@@ -2910,6 +2939,7 @@ export async function pushProductsToShopify(ids?: string[]): Promise<ShopifyPush
           sku: v.sku,
           barcode: v.barcode,
           sellingPrice: v.sellingPrice,
+          priceAdjustment: v.priceAdjustment,
           compareAtPrice: v.compareAtPrice,
           stock: v.stock,
         })
@@ -3702,6 +3732,28 @@ export async function applySilverRate(
     const rows = await db
       .select({ id: schema.products.id, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge, sellingPrice: schema.products.sellingPrice, pieceRateProduct: schema.products.pieceRateProduct })
       .from(schema.products)
+    // Variants keep their own add-on across a rate change. Fetch them once for
+    // the whole batch so their EFFECTIVE prices can be rebuilt from the NEW
+    // base instead of leaving a stale ₹618+₹200 = ₹818 behind.
+    const variantRows = rows.length > 0
+      ? await db
+          .select({
+            id: schema.productVariants.id,
+            productId: schema.productVariants.productId,
+            title: schema.productVariants.title,
+            optionValues: schema.productVariants.optionValues,
+            sellingPrice: schema.productVariants.sellingPrice,
+            priceAdjustment: schema.productVariants.priceAdjustment,
+          })
+          .from(schema.productVariants)
+          .where(inArray(schema.productVariants.productId, rows.map((r) => r.id)))
+      : []
+    const variantsByProduct = new Map<string, typeof variantRows>()
+    for (const v of variantRows) {
+      const list = variantsByProduct.get(v.productId) ?? []
+      list.push(v)
+      variantsByProduct.set(v.productId, list)
+    }
 
     const snapshotAt = previous?.updatedAt ?? now
     for (const row of rows) {
@@ -3724,13 +3776,26 @@ export async function applySilverRate(
       const netWeight = Number(row.netWeight)
       const makingCharge = Number(row.makingCharge)
       if (!netWeight || netWeight <= 0) continue
-      const sellingPrice = computeSellingPrice(rate, netWeight, makingCharge)
-      await db.update(schema.products).set({ sellingPrice, silverRate: rate }).where(eq(schema.products.id, row.id))
+      const newBase = computeSellingPrice(rate, netWeight, makingCharge)
+      await db.update(schema.products).set({ sellingPrice: newBase, silverRate: rate }).where(eq(schema.products.id, row.id))
+      const variants = variantsByProduct.get(row.id) ?? []
+      for (const v of variants) {
+        // The add-on is durable in priceAdjustment; legacy rows still have it
+        // in selling_price. Re-derive the effective price on the NEW base and
+        // never add again: base 700 + add-on 200 = ₹900, not 818 + 700.
+        const addOn = isDefaultVariantRow(v.title, v.optionValues)
+          ? 0
+          : round2(Number(v.priceAdjustment ?? v.sellingPrice ?? 0) || 0)
+        await db
+          .update(schema.productVariants)
+          .set({ priceAdjustment: addOn, sellingPrice: round2(newBase + addOn) })
+          .where(eq(schema.productVariants.id, v.id))
+      }
       try {
         await db.insert(schema.productPriceHistory).values({
           id: randomUUID(),
           productId: row.id,
-          sellingPrice,
+          sellingPrice: newBase,
           recordedAt: now,
         })
       } catch { /* history must not block a rate change */ }

@@ -38,6 +38,7 @@ const VARIANT_COLUMNS = [
   'title',
   'option_values',
   'selling_price',
+  'price_adjustment',
   'compare_at_price',
   'cost_price',
   'gross_weight',
@@ -75,6 +76,11 @@ const KEY_COLUMNS = [
   // INVOICE_VARIANT_DDL — the fresh CREATE TABLE does not carry it either),
   // so a converted booking's invoice keeps naming the variant it drew from.
   'sales_invoice_items.variant_id',
+  // Variant "Add to price (₹)" on a line (ALTERed by INVOICE_VARIANT_DDL), so
+  // the invoice breakdown can still name the add-on after a reload.
+  'sales_invoice_items.price_adjustment',
+  // The same durable add-on on quotation lines, added by the upgrade ALTER.
+  'quotation_items.price_adjustment',
   // Catalogue identity on purchase lines (ALTERed onto the three purchase item
   // tables by PURCHASE_VARIANT_DDL). Those tables are dropped wholesale in the
   // emulation below, so this is really asserting the ALTER runs AFTER the
@@ -134,8 +140,10 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
         `alter table sales_invoice_items drop column if exists location_id,
            drop column if exists booking_line_id,
            drop column if exists booking_allocation_id,
-           drop column if exists variant_id`,
+           drop column if exists variant_id,
+           drop column if exists price_adjustment`,
       )
+      await sql.unsafe('alter table quotation_items drop column if exists price_adjustment')
       await sql.unsafe(
         `alter table booking_allocations drop column if exists line_id,
            drop column if exists invoice_id,
@@ -165,6 +173,12 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
           created_at timestamp,
           shopify_status text
         )`)
+      // The parent's base is needed to prove the backfill materialises an
+      // effective price (base + legacy add-on) instead of treating the stored
+      // add-on as the final price.
+      await sql.unsafe(`
+        insert into products (id, name, sku, category, selling_price, status)
+        values ('PROD-LEGACY', 'Upgrade Legacy Ring', 'UPGRADE-LEGACY-PARENT', 'Rings', 1000, 'active')`)
       await sql.unsafe(`
         insert into product_variants
           (id, product_id, colour_name, sku, price, stock, status, is_primary)
@@ -254,11 +268,25 @@ test('upgrade restores the full purchase schema on a pre-purchase database', asy
         assert.equal(rows.length, 1, `upgrade must produce product_variants.${column}`)
       }
       const [legacyVariant] = await sql.unsafe(
-        `select title, option_values, selling_price from product_variants where id = 'VAR-LEGACY'`,
+        `select title, option_values, selling_price, price_adjustment from product_variants where id = 'VAR-LEGACY'`,
       )
       assert.equal(legacyVariant?.title, 'Red')
       assert.deepEqual(legacyVariant?.option_values, ['Red'])
-      assert.equal(Number(legacyVariant?.selling_price), 100)
+      // A pre-add-on row's legacy price becomes the dedicated add-on column,
+      // and selling_price is rebuilt as the EFFECTIVE price above its parent.
+      assert.equal(Number(legacyVariant?.price_adjustment), 100)
+      assert.equal(Number(legacyVariant?.selling_price), 1100)
+
+      // The backfill is guarded by `price_adjustment IS NULL`, so running the
+      // upgrades again on an already-migrated database must not re-read the now
+      // effective price as another add-on.
+      resetBootstrapForTests()
+      await bootstrapDatabase()
+      const [afterSecondBoot] = await sql.unsafe(
+        `select selling_price, price_adjustment from product_variants where id = 'VAR-LEGACY'`,
+      )
+      assert.equal(Number(afterSecondBoot?.price_adjustment), 100, 're-bootstrap must not add the add-on again')
+      assert.equal(Number(afterSecondBoot?.selling_price), 1100, 'the effective price must stay base + add-on')
 
       // …and products.created_at must be widened back to a full timestamp:
       // day granularity tied every same-day product, so "newest first" was
