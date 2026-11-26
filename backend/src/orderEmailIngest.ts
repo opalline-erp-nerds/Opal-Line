@@ -5,6 +5,7 @@ import { and, eq, or, sql } from 'drizzle-orm'
 import { db } from './db/client'
 import * as schema from './db/schema'
 import { invoiceTotals } from './invoiceTotals'
+import { normalizeInvoicePayment } from './invoicePayment'
 import { buildManualInvoiceLines } from './orderPricing'
 import { computeShopifyInvoiceAmounts } from './shopifyInvoiceAmounts'
 import { getLatestSilverRate } from './shopify'
@@ -911,7 +912,10 @@ function buildInvoiceArtifacts(
   if (lineItems.length === 0) return null
 
   const { gstRate, silverRate, productMap } = scalars
-  const payment = order.payment === 'paid' ? 'Online' : order.payment === 'cod' ? 'COD' : 'Pending'
+  // `sales_orders.payment` is a STATE, not a method: only COD actually tells us
+  // how the customer paid. An online Shopify order has no gateway evidence on
+  // the order row, so leave the method empty rather than inventing "Online".
+  const payment = order.payment === 'cod' ? 'cod' : ''
   const discount = Number(order.discount ?? 0)
 
   let items: InvoiceArtifacts['items']
@@ -1299,9 +1303,13 @@ export async function raiseInvoiceForOrder(
         gstAmount: lockedArt.gstAmount,
         discount: storedDiscount,
         grandTotal: lockedArt.grandTotal,
-        paymentMethod: lockedArt.payment,
-        paymentStatus: fresh.payment,
-        status: fresh.payment === 'paid' ? 'paid' : 'issued',
+        // Shopify's `payment` is a state. Only a real method (COD here) goes
+        // into payment_method; a status word can never occupy that column.
+        ...normalizeInvoicePayment({
+          paymentMethod: lockedArt.payment,
+          paymentStatus: fresh.payment,
+          status: fresh.payment === 'paid' ? 'paid' : 'issued',
+        }),
         currency: fresh.currency ?? 'INR',
         date: fresh.date ?? new Date().toISOString(),
       })

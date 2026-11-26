@@ -3,6 +3,8 @@ import QRCode from 'qrcode'
 import { getRawClient } from './db/client'
 import { logger } from './logger'
 import { escapeHtml } from './htmlEscape'
+import { formatIstDate } from './istDate'
+import { normalizeInvoicePayment, paymentMethodLabel, paymentStatusLabel } from './invoicePayment'
 
 export interface InvoiceItem {
   name: string
@@ -174,11 +176,20 @@ export async function generateInvoicePDF(invoiceId: string): Promise<Buffer | nu
       ? Math.round((grandTotal + tdsAmount) * 100) / 100
       : grandTotal
     const hasTds = tdsType !== 'none' && tdsAmount > 0
+    // A PDF must report the SAME persisted payment state as the detail screen:
+    // no default "Online"/"paid" when the row has no real payment evidence.
+    const payment = normalizeInvoicePayment({
+      paymentMethod: inv.payment_method || inv.payment,
+      paymentStatus: inv.payment_status || inv.payment,
+      paymentId: inv.payment_id,
+      paymentGateway: inv.payment_gateway || inv.gateway,
+      status: inv.status,
+    })
 
     const data: InvoiceData = {
       id: inv.id,
       invoiceNumber: inv.number || inv.invoice_number || inv.id,
-      date: inv.date ? new Date(inv.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
+      date: formatIstDate(inv.date || new Date()),
       customerName: inv.customer_name || inv.customer || 'Walk-in Customer',
       customerPhone: inv.customer_phone || inv.phone || undefined,
       customerEmail: inv.customer_email || inv.email || undefined,
@@ -197,8 +208,8 @@ export async function generateInvoicePDF(invoiceId: string): Promise<Buffer | nu
       businessStateCode: '27',
       businessPhone: settings?.phone || '+91 98200 00000',
       businessEmail: settings?.email || 'hello@opalline.in',
-      paymentMethod: inv.payment_method || inv.payment || 'Online',
-      paymentStatus: inv.payment_status || 'paid',
+      paymentMethod: paymentMethodLabel(payment.paymentMethod),
+      paymentStatus: payment.paymentStatus,
       shopifyOrder: inv.shopify_order || inv.shopifyOrder || undefined,
       tdsType,
       tdsRate,
@@ -448,11 +459,16 @@ export async function createPDFBuffer(data: InvoiceData): Promise<Buffer> {
       .text('PAYMENT DETAILS', left + 10, totalsY + 10, { width: payW - 20, lineBreak: false })
     doc.save().moveTo(left + 10, totalsY + 24).lineTo(left + payW - 10, totalsY + 24).lineWidth(0.5).stroke(COLORS.divider).restore()
     doc.fontSize(9).font('Helvetica').fillColor(COLORS.text)
-    doc.text('Method', left + 10, totalsY + 32, { width: 110, lineBreak: false })
+    doc.text('Payment Method', left + 10, totalsY + 32, { width: 110, lineBreak: false })
     doc.font('Helvetica-Bold').text(data.paymentMethod || '—', left + 120, totalsY + 32, { width: payW - 130, align: 'right', lineBreak: false })
-    doc.font('Helvetica').text('Status', left + 10, totalsY + 48, { width: 110, lineBreak: false })
-    doc.font('Helvetica-Bold').fillColor(data.paymentStatus === 'paid' ? COLORS.success : '#dc2626')
-      .text(String(data.paymentStatus || '—').toUpperCase(), left + 120, totalsY + 48, { width: payW - 130, align: 'right', lineBreak: false })
+    doc.text('Payment Status', left + 10, totalsY + 48, { width: 110, lineBreak: false })
+    const statusColor = data.paymentStatus === 'paid'
+      ? COLORS.success
+      : data.paymentStatus === 'failed' || data.paymentStatus === 'cancelled' || data.paymentStatus === 'refunded'
+        ? '#dc2626'
+        : COLORS.text
+    doc.font('Helvetica-Bold').fillColor(statusColor)
+      .text(paymentStatusLabel(data.paymentStatus), left + 120, totalsY + 48, { width: payW - 130, align: 'right', lineBreak: false })
     if (data.customerGstin) {
       doc.font('Helvetica').fillColor(COLORS.text)
         .text('Buyer GSTIN', left + 10, totalsY + 64, { width: 110, lineBreak: false })

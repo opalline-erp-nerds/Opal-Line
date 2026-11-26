@@ -1,4 +1,12 @@
 import { escapeHtml, numberToIndianWords } from '@/lib/utils'
+import {
+  displayInvoiceLines,
+  lineMoney,
+  paymentMethodLabel,
+  paymentStateLabel,
+  invoicePaymentState,
+  reconcileInvoiceLines,
+} from '@/lib/invoicePresentation'
 import type { Invoice, PurchaseInvoiceDetail, PurchaseOrder, Supplier } from '@/types'
 
 /**
@@ -279,6 +287,8 @@ export interface PrintDoc {
   grandTotal: number
   paymentMethod?: string
   paymentStatus?: string
+  /** Invoice document status — used only when paymentStatus is not stored. */
+  status?: string
   date: string
   items?: Array<Record<string, unknown>>
 }
@@ -320,8 +330,9 @@ export function invoicePrintDoc(
     grandTotal: invoice.grandTotal,
     paymentMethod: invoice.paymentMethod,
     paymentStatus: invoice.paymentStatus,
+    status: invoice.status,
     date: invoice.date,
-    items: invoice.items.map((i) => ({
+    items: displayInvoiceLines(invoice).map((i) => ({
       product: i.product,
       sku: i.sku,
       hsn: i.hsn,
@@ -498,11 +509,33 @@ const FONTS: Record<PrintDesignerConfig['font'], string> = {
 
 const fmt = (n: number) => n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
-const fmtDate = (iso: string) => {
+const IST_TIMEZONE = 'Asia/Kolkata'
+
+/**
+ * Print/PDF timestamps must match the invoice screen's IST clock. A bare
+ * toLocaleString used the host timezone (UTC in the desktop renderer), which
+ * is exactly the 5h30m drift seen on SI202611268668. Naive stored timestamps
+ * are UTC, the same convention `lib/format.ts` uses for the UI.
+ */
+function normalizePrintTimestamp(value: string): string {
+  const s = value.trim()
+  if (/(?:Z|[+-]\d{2}:?\d{2})$/i.test(s)) return s
+  const body = s.includes('T') ? s : s.replace(' ', 'T')
+  if (/^\d{4}-\d{2}-\d{2}$/.test(body)) return `${body}T00:00:00Z`
+  return `${body}Z`
+}
+
+export function formatPrintDate(iso: string): string {
   try {
-    return new Date(iso).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
+    const d = new Date(normalizePrintTimestamp(String(iso)))
+    if (Number.isNaN(d.getTime())) return String(iso)
+    return d.toLocaleString('en-IN', {
+      timeZone: IST_TIMEZONE,
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    })
   } catch {
-    return iso
+    return String(iso)
   }
 }
 
@@ -611,43 +644,6 @@ export function buildBarcodeLabelHtml(doc: PrintDoc, config: PrintDesignerConfig
  * Build the complete printable HTML document (A4/Letter, print-CSS ready).
  * The returned string is opened in a print window or embedded in an iframe.
  */
-/**
- * Reconcile per-line GST with the document's stored GST money for invoices
- * whose rows never got a line-level tax snapshot (legacy rows store tax: 0
- * while gstAmount is real — this is why the printed GST column used to dash
- * every line even though the summary showed CGST/SGST).
- *
- * The stored document GST is apportioned across lines by their amount share
- * with largest-remainder rounding, so the printed column sums EXACTLY to the
- * printed Total GST. It only splits what is already stored — it never derives
- * a second GST base, so nothing is added twice. Lines that already carry tax
- * are returned untouched. Only invoices reconcile: orders legitimately dash.
- */
-function applyLineTax(items: Array<Record<string, unknown>>, docGst: number): Array<Record<string, unknown>> {
-  if (!(docGst > 0) || items.length === 0) return items
-  if (items.some((it) => Number(it.tax) > 0)) return items
-  const amounts = items.map((it) => Math.max(0, Number(it.amount) || 0))
-  const base = amounts.reduce((a, b) => a + b, 0)
-  if (!(base > 0)) return items
-  // Largest-remainder: floor every line to paise, then hand leftover cents to
-  // the largest fractional parts so the column adds up to the stored total.
-  const shares = amounts.map((amount) => {
-    const exact = (docGst * amount * 100) / base
-    return { cents: Math.floor(exact), frac: exact - Math.floor(exact) }
-  })
-  let leftover = Math.round(docGst * 100) - shares.reduce((s, sh) => s + sh.cents, 0)
-  shares
-    .map((sh, i) => ({ i, frac: sh.frac }))
-    .sort((a, b) => b.frac - a.frac)
-    .forEach(({ i }) => {
-      if (leftover > 0) {
-        shares[i].cents += 1
-        leftover -= 1
-      }
-    })
-  return items.map((it, i) => ({ ...it, tax: shares[i].cents / 100 }))
-}
-
 export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extras: PrintDocExtras): string {
   if (extras.docType === 'barcode-label') return buildBarcodeLabelHtml(doc, config, extras)
   const c = config
@@ -666,7 +662,7 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
   // Purchase invoices carry a real per-line GST snapshot, but legacy rows get
   // the same fallback so their GST column never prints as a dash.
   const lineTaxDoc = extras.docType === 'invoice' || extras.docType === 'purchase-invoice'
-  const items = lineTaxDoc ? applyLineTax(docItems, totalTax) : docItems
+  const items = lineTaxDoc ? reconcileInvoiceLines(docItems, totalTax) : docItems
   // Supply type: a buyer GSTIN in another state than the business GSTIN means
   // an inter-state supply, taxed as IGST instead of CGST + SGST — the same
   // GSTIN-prefix rule backend/src/purchases.ts uses for the input-tax split.
@@ -729,6 +725,10 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     c.tableHeaderStyle === 'dark' ? `background:#1a1a2e;color:#fff;` : c.tableHeaderStyle === 'accent' ? `background:${c.accent};color:#1a1a2e;` : `background:${accentSoft2};color:#374151;border-bottom:2px solid ${c.accent};`
   const zebra = (idx: number) => (c.tableZebra && idx % 2 === 0 ? `background:#fafafa;` : '')
 
+  // A Piece Rate line has no grams at all — printing "0.00" under Weight (g)
+  // claims a weighed line that does not exist, so it dashes like the ₹/g rate.
+  const weightCell = (v: unknown) => (Number(v) > 0 ? Number(v).toFixed(2) : '—')
+
   // Fulfilment rows: product + SKU + qty (+ weight), with tick boxes on pick
   // lists so staff can mark each line as collected. Optional thumbnails when
   // the caller supplies image URLs per item.
@@ -750,7 +750,7 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
           ${imgCell}
           <td style="padding:7px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
           <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
-          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
+          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${weightCell(i.weight)}</td>` : ''}
         </tr>`
     })
     .join('')
@@ -765,11 +765,6 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
   // invoice screen does, instead of printing a misleading ₹0.00 / 0%.
   // `tax` holds a MONEY amount (the per-line GST), never a percentage.
   const money = (v: unknown) => (Number(v) > 0 ? `₹${fmt(Number(v))}` : '—')
-  // A Piece Rate purchase line has no grams at all — printing "0.00" under a
-  // Weight (g) header claims a weighed line that does not exist, so it dashes
-  // exactly like the ₹/g rate beside it.
-  const weightCell = (v: unknown) => (Number(v) > 0 ? Number(v).toFixed(2) : '—')
-
   const itemRows = items
     .map((i, idx) => {
       const imgSrc = typeof i.image === 'string' && i.image ? i.image : ''
@@ -781,12 +776,13 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
         ? `<td style="padding:6px 8px;${cellBorder}width:56px;">${imgSrc ? `<img src="${escapeHtml(imgSrc)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e5e7eb;" onerror="this.style.display='none'"/>` : ''}</td>`
         : ''
       const lineMakingValue = (Number(i.weight) || 0) * (Number(i.makingCharge) || 0)
-      // AMOUNT column = taxable line amount + that line's GST — the gross the
-      // customer pays for the line (confirmed replacement for the old ex-GST
-      // figure); the GST portion stays separately visible in GST AMOUNT.
-      const lineAmount = (Number(i.amount) || 0) + (Number(i.tax) || 0)
+      // Name both money columns explicitly. The old single "Amount (₹)"
+      // column showed the GST-inclusive figure while the Detail screen showed
+      // the ex-GST one — the same rupee figure meant two different things.
+      // Taxable = ex-GST, Total = taxable + this line's GST.
+      const { taxable, tax, total } = lineMoney(i as { amount: number; tax: number })
       if (purchaseDoc) {
-        // Purchases only have Product, Qty, Weight, Rate, line GST and Amount.
+        // Purchases only have Product, Qty, Weight, Rate, line GST and money.
         // HSN and making charges do not exist on these models, so those
         // columns are never emitted (even if the shared design toggles them).
         return `<tr style="${zebra(idx)}">
@@ -795,8 +791,9 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
           <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
           ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${weightCell(i.weight)}</td>` : ''}
           ${c.showRate ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.rate)}</td>` : ''}
-          ${c.showTax ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.tax)}</td>` : ''}
-          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(lineAmount)}</td>
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">₹${fmt(taxable)}</td>
+          ${c.showTax ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(tax)}</td>` : ''}
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(total)}</td>
         </tr>`
       }
       return `<tr style="${zebra(idx)}">
@@ -804,43 +801,53 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
           <td style="padding:7px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
           ${c.showHsn ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:center;">${escapeHtml(String(i.hsn ?? hsnDisplay))}</td>` : ''}
           <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
-          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
+          ${c.showWeight ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${weightCell(i.weight)}</td>` : ''}
           ${c.showRate ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.silverRate)}</td><td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(lineMakingValue)}</td>` : ''}
-          ${c.showTax ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.tax)}</td>` : ''}
-          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(lineAmount)}</td>
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">₹${fmt(taxable)}</td>
+          ${c.showTax ? `<td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;">${money(tax)}</td>` : ''}
+          <td style="padding:7px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(total)}</td>
         </tr>`
     })
     .join('')
 
+  // Explicit ex-GST and incl-GST money columns: the old single "Amount (₹)"
+  // heading hid the fact that Detail showed taxable money while print showed
+  // the gross. Both screens now expose the same three figures per line.
+  const moneyHeads =
+    `<th style="text-align:right;">Taxable (ex GST) (₹)</th>` +
+    (c.showTax ? `<th style="text-align:right;">GST AMOUNT (₹)</th>` : '') +
+    `<th style="text-align:right;">Total (incl GST) (₹)</th>`
   const headCols = purchaseDoc
     ? (extras.showImages ? `<th style="width:56px;"></th>` : '') +
       `<th>Product</th>` +
       `<th style="text-align:right;">Qty</th>` +
       (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '') +
       (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th>` : '') +
-      (c.showTax ? `<th style="text-align:right;">GST AMOUNT (₹)</th>` : '') +
-      `<th style="text-align:right;">Amount (₹)</th>`
+      moneyHeads
     : (extras.showImages ? `<th style="width:56px;"></th>` : '') +
       `<th>Product</th>` +
       (c.showHsn ? `<th style="text-align:center;">HSN</th>` : '') +
       `<th style="text-align:right;">Qty</th>` +
       (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '') +
       (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making Value (₹)</th>` : '') +
-      (c.showTax ? `<th style="text-align:right;">GST AMOUNT (₹)</th>` : '') +
-      `<th style="text-align:right;">Amount (₹)</th>`
+      moneyHeads
+  const footCell = (value: string, text: string) =>
+    `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:11px;">${value}${text}</td>`
   const footSpans = purchaseDoc
-    ? `<td colspan="${extras.showImages ? 2 : 1}" style="padding:7px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item(s)</td>` +
-      `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalQty}</td>` +
-      (c.showWeight ? `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalWeight.toFixed(2)} g</td>` : '') +
+    ? `<td colspan="${extras.showImages ? 2 : 1}" style="padding:7px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item${totalQty === 1 ? '' : 's'}</td>` +
+      footCell('', `${totalQty}`) +
+      (c.showWeight ? footCell('', `${totalWeight.toFixed(2)} g`) : '') +
       (c.showRate ? `<td></td>` : '') +
-      (c.showTax ? `<td></td>` : '') +
-      `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:11px;">₹${fmt(doc.grandTotal)}</td>`
-    : `<td colspan="${(extras.showImages ? 1 : 0) + (c.showHsn ? 2 : 1)}" style="padding:7px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item(s)</td>` +
-      `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalQty}</td>` +
-      (c.showWeight ? `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:10px;">${totalWeight.toFixed(2)} g</td>` : '') +
+      footCell('', `₹${fmt(doc.subtotal)}`) +
+      (c.showTax ? footCell('', `₹${fmt(totalTax)}`) : '') +
+      footCell('', `₹${fmt(doc.grandTotal)}`)
+    : `<td colspan="${(extras.showImages ? 1 : 0) + (c.showHsn ? 2 : 1)}" style="padding:7px 10px;border-top:2px solid ${c.accent};font-size:10px;">Total: ${totalQty} item${totalQty === 1 ? '' : 's'}</td>` +
+      footCell('', `${totalQty}`) +
+      (c.showWeight ? footCell('', `${totalWeight.toFixed(2)} g`) : '') +
       (c.showRate ? `<td colspan="2"></td>` : '') +
-      (c.showTax ? `<td></td>` : '') +
-      `<td style="padding:7px 10px;border-top:2px solid ${c.accent};text-align:right;font-size:11px;">₹${fmt(doc.grandTotal)}</td>`
+      footCell('', `₹${fmt(doc.subtotal)}`) +
+      (c.showTax ? footCell('', `₹${fmt(totalTax)}`) : '') +
+      footCell('', `₹${fmt(doc.grandTotal)}`)
 
   const logoImg = c.showLogo && c.logoDataUrl ? `<img class="logo" src="${c.logoDataUrl}" alt="logo"/>` : ''
   const logoLeft = c.logoAlign === 'left'
@@ -883,6 +890,12 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
         </div>
       </div>`
 
+  // Never put a status word in the method slot: legacy invoices stored
+  // `Pending` as their payment method, so the old box printed "Pending /
+  // Pending". The status and the real method now have separate labels.
+  const printPaymentState = invoicePaymentState(doc)
+  const showPaymentBox =
+    c.showPayment && (extras.docType === 'invoice' || Boolean(doc.paymentMethod || doc.paymentStatus || doc.status))
   const infoBoxes = c.showContactBoxes
     ? `<div class="header-row">
         <div class="info-row">
@@ -892,9 +905,9 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
           </div>
           <div class="info-box">
             <div class="label">Date</div>
-            <div class="value">${escapeHtml(fmtDate(doc.date))}</div>
+            <div class="value">${escapeHtml(formatPrintDate(doc.date))}</div>
           </div>
-          ${c.showPayment && doc.paymentMethod ? `<div class="info-box"><div class="label">Payment</div><div class="value">${escapeHtml(doc.paymentMethod)}</div><div class="detail">${escapeHtml(doc.paymentStatus ?? '')}</div></div>` : ''}
+          ${showPaymentBox ? `<div class="info-box"><div class="label">Payment Status</div><div class="value">${escapeHtml(paymentStateLabel(printPaymentState))}</div><div class="detail">Payment Method: ${escapeHtml(paymentMethodLabel(doc.paymentMethod))}</div></div>` : ''}
           ${extras.extraBox ? `<div class="info-box"><div class="label">${escapeHtml(extras.extraBox.label)}</div><div class="value">${escapeHtml(extras.extraBox.value)}</div></div>` : ''}
         </div>
       </div>`
@@ -1028,8 +1041,8 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
       </table>
       ${fulfilmentDoc
         ? `<div class="fulfil-note">${extras.docType === 'pick-list'
-            ? `Tick each line as it is collected from stock. ${totalQty} item(s) / ${totalWeight.toFixed(2)} g across ${items.length} line(s).`
-            : `Package contents: ${totalQty} item(s) / ${totalWeight.toFixed(2)} g. Invoice is sent separately; do not include prices in the parcel.`}</div>`
+            ? `Tick each line as it is collected from stock. ${totalQty} item${totalQty === 1 ? '' : 's'} / ${totalWeight.toFixed(2)} g across ${items.length} line${items.length === 1 ? '' : 's'}.`
+            : `Package contents: ${totalQty} item${totalQty === 1 ? '' : 's'} / ${totalWeight.toFixed(2)} g. Invoice is sent separately; do not include prices in the parcel.`}</div>`
         : `<div class="totals-wrap">
         ${qrBlock}
         <div class="totals-box">
