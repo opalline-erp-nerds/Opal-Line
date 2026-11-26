@@ -9,6 +9,14 @@ import { computeUserPermissions } from '../rbac'
 import { routeParam } from '../lib/routeParams'
 import { resolveDashboardRange, enumerateBuckets, type DashboardRange } from '../lib/dashboardRange'
 import { DEFAULT_REORDER_LEVEL, lowStockWhere } from '../lib/lowStock'
+import {
+  buildCostIndex,
+  exGstAmount,
+  lineCogs,
+  parseReturnItems,
+  resolveUnitCost,
+  returnCogs,
+} from '../profitAnalytics'
 
 export const dashboardRouter = Router()
 
@@ -2549,7 +2557,9 @@ dashboardRouter.get('/dashboard/aging/invoices', async (req, res) => {
 dashboardRouter.get('/dashboard/profit', async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const months = Math.min(24, Math.max(3, Number(req.query.months) || 12))
+    const query = req.query as Record<string, unknown>
+    const months = Math.min(24, Math.max(3, Number(query.months) || 12))
+    const locationId = typeof query.locationId === 'string' ? query.locationId.trim() : ''
 
     // Build the last N months (oldest first) keyed by YYYY-MM in IST
     const monthKeys: string[] = []
@@ -2559,32 +2569,220 @@ dashboardRouter.get('/dashboard/profit', async (req, res) => {
       d.setMonth(d.getMonth() - i)
       monthKeys.push(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`)
     }
-    // Aggregated in SQL: monthly revenue/COGS, returns, purchases and the
-    // expense breakdown are grouped server-side, so the profit report no
-    // longer scans every invoice, expense and purchase row in JS.
     const firstMonth = `${monthKeys[0]}-01T00:00:00`
     const lastMonth = monthKeys[monthKeys.length - 1]
+    const [lastYear, lastMonthNumber] = lastMonth.split('-').map(Number)
+    const upperBound = new Date(lastYear, lastMonthNumber, 1)
+    const lastExclusive = `${upperBound.getFullYear()}-${pad(upperBound.getMonth() + 1)}-01T00:00:00`
+
     const invoiceMonth = sql<string>`to_char(${schema.salesInvoices.date}, 'YYYY-MM')`
     const returnMonth = sql<string>`to_char(${schema.salesReturns.date}, 'YYYY-MM')`
     const expenseMonth = sql<string>`to_char(${schema.expenses.date}, 'YYYY-MM')`
     const purchaseMonth = sql<string>`to_char(${schema.purchaseInvoices.date}, 'YYYY-MM')`
 
-    const [invoiceRows, returnRows, expenseRows, purchaseRows] = await Promise.all([
+    // Drafts and voided invoices never sold anything. A purchase invoice is
+    // inventory, NOT a sale: bulk receipts must never appear as negative COGS.
+    const activeInvoice = sql`lower(coalesce(${schema.salesInvoices.status}, '')) not in ('cancelled', 'refunded', 'draft', 'deleted') and lower(coalesce(${schema.salesInvoices.paymentStatus}, '')) <> 'refunded'`
+    const invoiceLocationFilter = locationId
+      ? sql`(
+          exists (select 1 from ${schema.salesInvoiceItems} filter_item where filter_item.invoice_id = ${schema.salesInvoices.id} and filter_item.location_id = ${locationId})
+          or exists (select 1 from ${schema.salesOrders} filter_order where filter_order.shopify_id = ${schema.salesInvoices.shopifyOrder} and filter_order.location_id = ${locationId})
+        )`
+      : undefined
+    const invoiceWhere = and(
+      gte(schema.salesInvoices.date, firstMonth),
+      lt(schema.salesInvoices.date, lastExclusive),
+      activeInvoice,
+      NOT_FOREIGN_SHOPIFY,
+      ...(locationId ? [invoiceLocationFilter] : []),
+    )
+
+    const [invoiceRows, products, variants] = await Promise.all([
       db!
         .select({
-          m: invoiceMonth,
-          revenue: sql<number>`coalesce(sum(grand_total), 0)`,
-          cogs: sql<number>`coalesce(sum(coalesce(silver_value, 0) + coalesce(making_charge, 0)), 0)`,
-          count: sql<number>`count(*)`,
+          id: schema.salesInvoices.id,
+          month: invoiceMonth,
+          subtotal: schema.salesInvoices.subtotal,
+          grandTotal: schema.salesInvoices.grandTotal,
+          discount: schema.salesInvoices.discount,
+          gst: schema.salesInvoices.gst,
+          shopifyOrder: schema.salesInvoices.shopifyOrder,
         })
         .from(schema.salesInvoices)
-        .where(and(gte(schema.salesInvoices.date, firstMonth), sql`${invoiceMonth} <= ${lastMonth}`))
-        .groupBy(invoiceMonth),
+        .where(invoiceWhere),
       db!
-        .select({ m: returnMonth, amount: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)` })
-        .from(schema.salesReturns)
-        .where(gte(schema.salesReturns.date, firstMonth))
-        .groupBy(returnMonth),
+        .select({
+          id: schema.products.id,
+          sku: schema.products.sku,
+          name: schema.products.name,
+          costPrice: schema.products.costPrice,
+          sellingPrice: schema.products.sellingPrice,
+        })
+        .from(schema.products),
+      db!
+        .select({
+          id: schema.productVariants.id,
+          productId: schema.productVariants.productId,
+          sku: schema.productVariants.sku,
+          costPrice: schema.productVariants.costPrice,
+          title: schema.productVariants.title,
+        })
+        .from(schema.productVariants),
+    ])
+
+    const costIndex = buildCostIndex(products, variants)
+    const variantTitles = new Map(variants.map((v) => [v.id, String(v.title ?? '')]))
+    const invoicesById = new Map(invoiceRows.map((r) => [r.id, r]))
+    const invoiceIds = invoiceRows.map((r) => r.id)
+
+    // The store of an old invoice lives on its sales order, not on the header.
+    const orderRefs = [...new Set(invoiceRows.map((r) => String(r.shopifyOrder ?? '')).filter(Boolean))]
+    const orderLocations = orderRefs.length
+      ? new Map(
+          (await db!
+            .select({ shopifyId: schema.salesOrders.shopifyId, locationId: schema.salesOrders.locationId })
+            .from(schema.salesOrders)
+            .where(inArray(schema.salesOrders.shopifyId, orderRefs)))
+            .map((r) => [String(r.shopifyId ?? ''), String(r.locationId ?? '')]),
+        )
+      : new Map<string, string>()
+
+    const itemRows = invoiceIds.length
+      ? await db!
+          .select({
+            invoiceId: schema.salesInvoiceItems.invoiceId,
+            sku: schema.salesInvoiceItems.sku,
+            product: schema.salesInvoiceItems.product,
+            variantId: schema.salesInvoiceItems.variantId,
+            qty: schema.salesInvoiceItems.qty,
+            amount: schema.salesInvoiceItems.amount,
+            locationId: schema.salesInvoiceItems.locationId,
+          })
+          .from(schema.salesInvoiceItems)
+          .where(inArray(schema.salesInvoiceItems.invoiceId, invoiceIds))
+      : []
+
+    // Revenue is ex-GST: line taxable amounts less the invoice's discount
+    // backed out of GST. COGS is ex-GST too: qty × purchased unit cost.
+    const taxableByMonth = new Map<string, number>()
+    const cogsByMonth = new Map<string, number>()
+    const uncostedByMonth = new Map<string, number>()
+    const discountByMonth = new Map<string, number>()
+    const includedInvoices = new Map<string, string>()
+    const bestSellerMap = new Map<string, {
+      sku: string
+      name: string
+      variant: string | null
+      qty: number
+      revenue: number
+      cogs: number
+    }>()
+
+    for (const item of itemRows) {
+      const invoice = invoicesById.get(item.invoiceId)
+      if (!invoice) continue
+      if (locationId) {
+        const itemLocation = String(item.locationId ?? '')
+        const orderLocation = orderLocations.get(String(invoice.shopifyOrder ?? '')) ?? ''
+        if (itemLocation !== locationId && (itemLocation || orderLocation !== locationId)) continue
+      }
+      const month = String(invoice.month ?? '')
+      const qty = num(item.qty)
+      const amount = num(item.amount)
+      const unitCost = resolveUnitCost({ sku: item.sku, variantId: item.variantId }, costIndex)
+      const cogs = lineCogs(qty, unitCost)
+
+      taxableByMonth.set(month, (taxableByMonth.get(month) ?? 0) + amount)
+      cogsByMonth.set(month, (cogsByMonth.get(month) ?? 0) + cogs)
+      uncostedByMonth.set(month, (uncostedByMonth.get(month) ?? 0) + (unitCost > 0 ? 0 : 1))
+      includedInvoices.set(invoice.id, month)
+
+      const sku = String(item.sku ?? '').trim() || String(item.product ?? '').trim()
+      if (!sku) continue
+      const variant = item.variantId ? variantTitles.get(item.variantId) ?? null : null
+      const key = `${sku.toLowerCase()}|${variant ?? ''}`
+      const row = bestSellerMap.get(key) ?? {
+        sku,
+        name: String(item.product ?? sku),
+        variant,
+        qty: 0,
+        revenue: 0,
+        cogs: 0,
+      }
+      row.qty += qty
+      row.revenue += amount
+      row.cogs += cogs
+      bestSellerMap.set(key, row)
+    }
+
+    for (const id of includedInvoices.keys()) {
+      const invoice = invoicesById.get(id)
+      if (!invoice) continue
+      const month = String(invoice.month ?? '')
+      discountByMonth.set(
+        month,
+        (discountByMonth.get(month) ?? 0) + exGstAmount(num(invoice.discount), invoice.gst == null ? 3 : num(invoice.gst)),
+      )
+    }
+
+    const returnLocationFilter = locationId
+      ? sql`(
+          exists (select 1 from ${schema.salesInvoiceItems} return_item where return_item.invoice_id = ${schema.salesReturns.invoiceId} and return_item.location_id = ${locationId})
+          or exists (select 1 from ${schema.salesOrders} return_order where return_order.shopify_id = ${schema.salesReturns.order} and return_order.location_id = ${locationId})
+          or exists (
+            select 1 from ${schema.salesInvoices} credit_invoice
+            join ${schema.salesOrders} credit_order on credit_order.shopify_id = credit_invoice.shopify_order
+            where credit_invoice.id = ${schema.salesReturns.invoiceId} and credit_order.location_id = ${locationId}
+          )
+        )`
+      : undefined
+    const returnRows = await db!
+      .select({
+        month: returnMonth,
+        amount: schema.salesReturns.amount,
+        returnItems: schema.salesReturns.returnItems,
+        invoiceGst: schema.salesInvoices.gst,
+      })
+      .from(schema.salesReturns)
+      .leftJoin(schema.salesInvoices, eq(schema.salesInvoices.id, schema.salesReturns.invoiceId))
+      .where(and(
+        gte(schema.salesReturns.date, firstMonth),
+        lt(schema.salesReturns.date, lastExclusive),
+        sql`lower(coalesce(${schema.salesReturns.status}, '')) <> 'cancelled'`,
+        sql`not (${FOREIGN_RETURN})`,
+        ...(locationId ? [returnLocationFilter] : []),
+      ))
+
+    const returnedRevenueByMonth = new Map<string, number>()
+    const returnedCogsByMonth = new Map<string, number>()
+    for (const ret of returnRows) {
+      const month = String(ret.month ?? '')
+      const gst = ret.invoiceGst == null ? 3 : num(ret.invoiceGst)
+      const netReturn = exGstAmount(num(ret.amount), gst)
+      const returnedCogs = returnCogs(ret.returnItems, costIndex)
+      returnedRevenueByMonth.set(month, (returnedRevenueByMonth.get(month) ?? 0) + netReturn)
+      returnedCogsByMonth.set(month, (returnedCogsByMonth.get(month) ?? 0) + returnedCogs)
+
+      // A credit note reverses the SKU's revenue and the cost of the units it
+      // put back, so the best-seller ranking stays in step with the top KPIs.
+      for (const line of parseReturnItems(ret.returnItems)) {
+        const returnedLineRevenue = line.amount ? exGstAmount(num(line.amount), gst) : 0
+        const returnedLineCogs = lineCogs(line.qty, resolveUnitCost({ sku: line.sku }, costIndex))
+        // One credit-note line belongs to one bucket. Applying it to every
+        // variant bucket sharing a parent SKU would reverse the same sale twice.
+        for (const [key, row] of bestSellerMap) {
+          if (!key.startsWith(`${line.sku}|`)) continue
+          const fallbackRevenue = row.qty > 0 ? (row.revenue / row.qty) * line.qty : 0
+          row.qty -= line.qty
+          row.revenue = round2(row.revenue - (returnedLineRevenue || fallbackRevenue))
+          row.cogs = round2(row.cogs - returnedLineCogs)
+          bestSellerMap.set(key, row)
+          break
+        }
+      }
+    }
+
+    const [expenseRows, purchaseRows] = await Promise.all([
       db!
         .select({
           m: expenseMonth,
@@ -2592,17 +2790,19 @@ dashboardRouter.get('/dashboard/profit', async (req, res) => {
           amount: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)`,
         })
         .from(schema.expenses)
-        .where(gte(schema.expenses.date, firstMonth))
+        .where(and(gte(schema.expenses.date, firstMonth), lt(schema.expenses.date, lastExclusive)))
         .groupBy(expenseMonth, sql`coalesce(${schema.expenses.category}, 'Other')`),
       db!
         .select({ m: purchaseMonth, cost: sql<number>`coalesce(sum(coalesce(cost, 0)), 0)` })
         .from(schema.purchaseInvoices)
-        .where(gte(schema.purchaseInvoices.date, firstMonth))
+        .where(and(
+          gte(schema.purchaseInvoices.date, firstMonth),
+          lt(schema.purchaseInvoices.date, lastExclusive),
+          locationId ? eq(schema.purchaseInvoices.locationId, locationId) : undefined,
+        ))
         .groupBy(purchaseMonth),
     ])
 
-    const invoicesByMonth = new Map(invoiceRows.map((r) => [String(r.m ?? ''), r]))
-    const returnsByMonth = new Map(returnRows.map((r) => [String(r.m ?? ''), num(r.amount)]))
     const purchasesByMonth = new Map(purchaseRows.map((r) => [String(r.m ?? ''), num(r.cost)]))
     const expensesByMonth = new Map<string, number>()
     const expenseByCategory = new Map<string, number>()
@@ -2613,52 +2813,56 @@ dashboardRouter.get('/dashboard/profit', async (req, res) => {
       expenseByCategory.set(cat, (expenseByCategory.get(cat) ?? 0) + num(e.amount))
     }
 
+    const invoiceCountByMonth = new Map<string, number>()
+    for (const invoice of invoiceRows) {
+      const month = String(invoice.month ?? '')
+      invoiceCountByMonth.set(month, (invoiceCountByMonth.get(month) ?? 0) + 1)
+      // Legacy/header-only invoices have no item rows to derive revenue from;
+      // use the stored grand total backed out of GST rather than losing the sale.
+      if (!includedInvoices.has(invoice.id)) {
+        const gst = invoice.gst == null ? 3 : num(invoice.gst)
+        taxableByMonth.set(
+          month,
+          (taxableByMonth.get(month) ?? 0) + exGstAmount(num(invoice.grandTotal), gst),
+        )
+      }
+    }
+
     const monthly = monthKeys.map((m) => {
-      const inv = invoicesByMonth.get(m)
-      const revenue = num(inv?.revenue) - (returnsByMonth.get(m) ?? 0)
-      const cogs = num(inv?.cogs)
+      const revenue = round2(
+        (taxableByMonth.get(m) ?? 0) - (discountByMonth.get(m) ?? 0) - (returnedRevenueByMonth.get(m) ?? 0),
+      )
+      const cogs = round2((cogsByMonth.get(m) ?? 0) - (returnedCogsByMonth.get(m) ?? 0))
       const exp = expensesByMonth.get(m) ?? 0
       const purchases = purchasesByMonth.get(m) ?? 0
       return {
         month: m,
-        revenue: round2(revenue),
-        cogs: round2(cogs),
+        revenue,
+        cogs,
         grossProfit: round2(revenue - cogs),
         grossMargin: revenue > 0 ? round2(((revenue - cogs) / revenue) * 100) : 0,
         expenses: round2(exp),
         purchases: round2(purchases),
+        returns: round2(returnedRevenueByMonth.get(m) ?? 0),
+        uncostedLines: uncostedByMonth.get(m) ?? 0,
         netProfit: round2(revenue - cogs - exp),
-        invoices: Number(inv?.count ?? 0),
+        invoices: invoiceCountByMonth.get(m) ?? 0,
       }
     })
 
-    // Best sellers by profit contribution: grouped in SQL over all invoice
-    // items (key = SKU when present, else the product name); item profit is
-    // amount minus metal value (weight × rate).
-    const itemKey = sql<string>`coalesce(nullif(${schema.salesInvoiceItems.sku}, ''), ${schema.salesInvoiceItems.product}, '')`
-    const itemProfit = sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0) - coalesce(${schema.salesInvoiceItems.weight}, 0) * coalesce(${schema.salesInvoiceItems.silverRate}, 0)), 0)`
-    const bestSellerRows = await db!
-      .select({
-        sku: itemKey,
-        name: sql<string>`coalesce(max(${schema.salesInvoiceItems.product}), max(${schema.salesInvoiceItems.sku}), '')`,
-        qty: sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.qty}, 0)), 0)`,
-        revenue: sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0)), 0)`,
-        profit: itemProfit,
-      })
-      .from(schema.salesInvoiceItems)
-      .where(sql`${itemKey} <> ''`)
-      .groupBy(itemKey)
-      .orderBy(sql`${itemProfit} desc`)
-      .limit(10)
-    const bestSellers = bestSellerRows.map((r) => ({
-      sku: r.sku,
-      name: r.name,
-      qty: num(r.qty),
-      revenue: round2(num(r.revenue)),
-      profit: round2(num(r.profit)),
-    }))
+    const bestSellers = [...bestSellerMap.values()]
+      .map((row) => ({
+        sku: row.sku,
+        name: row.name,
+        variant: row.variant,
+        qty: row.qty,
+        revenue: round2(row.revenue),
+        profit: round2(row.revenue - row.cogs),
+      }))
+      .filter((row) => row.qty > 0 || row.revenue !== 0)
+      .sort((a, b) => b.profit - a.profit)
+      .slice(0, 10)
 
-    // Expense breakdown for the period (already grouped by month + category)
     const expenseBreakdown = [...expenseByCategory.entries()]
       .map(([category, amount]) => ({ category, amount: round2(amount) }))
       .sort((a, b) => b.amount - a.amount)
@@ -2666,26 +2870,44 @@ dashboardRouter.get('/dashboard/profit', async (req, res) => {
     const totals = monthly.reduce(
       (acc, m) => ({
         revenue: acc.revenue + m.revenue,
+        cogs: acc.cogs + m.cogs,
         grossProfit: acc.grossProfit + m.grossProfit,
         expenses: acc.expenses + m.expenses,
         netProfit: acc.netProfit + m.netProfit,
+        returns: acc.returns + m.returns,
+        uncostedLines: acc.uncostedLines + m.uncostedLines,
       }),
-      { revenue: 0, grossProfit: 0, expenses: 0, netProfit: 0 },
+      { revenue: 0, cogs: 0, grossProfit: 0, expenses: 0, netProfit: 0, returns: 0, uncostedLines: 0 },
     )
 
     res.json({
       months: monthly,
       totals: {
         revenue: round2(totals.revenue),
+        cogs: round2(totals.cogs),
         grossProfit: round2(totals.grossProfit),
         expenses: round2(totals.expenses),
         netProfit: round2(totals.netProfit),
+        returns: round2(totals.returns),
+        uncostedLines: totals.uncostedLines,
         grossMargin: totals.revenue > 0 ? round2((totals.grossProfit / totals.revenue) * 100) : 0,
       },
       bestSellers,
       expenseBreakdown,
+      costAnomalies: products
+        .filter((p) => num(p.costPrice) > 0 && num(p.sellingPrice) > 0 && num(p.costPrice) > num(p.sellingPrice))
+        .map((p) => ({
+          sku: String(p.sku ?? ''),
+          name: String(p.name ?? p.sku ?? ''),
+          costPrice: round2(num(p.costPrice)),
+          sellingPrice: round2(num(p.sellingPrice)),
+        })),
+      locationId: locationId || null,
+      basis: 'ex-gst',
+      expensesAreCompanyWide: true,
     })
-  } catch {
+  } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : String(err) }, 'profit analytics failed')
     res.status(500).json({ error: 'Internal server error' })
   }
 })

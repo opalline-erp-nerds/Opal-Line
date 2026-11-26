@@ -326,6 +326,8 @@ export interface ProfitMonthPoint {
   grossMargin: number
   expenses: number
   purchases: number
+  returns: number
+  uncostedLines: number
   netProfit: number
   invoices: number
 }
@@ -333,16 +335,37 @@ export interface ProfitMonthPoint {
 export interface BestSellerRow {
   sku: string
   name: string
+  variant: string | null
   qty: number
   revenue: number
   profit: number
 }
 
+export interface ProfitCostAnomaly {
+  sku: string
+  name: string
+  costPrice: number
+  sellingPrice: number
+}
+
 export interface ProfitAnalytics {
   months: ProfitMonthPoint[]
-  totals: { revenue: number; grossProfit: number; expenses: number; netProfit: number; grossMargin: number }
+  totals: {
+    revenue: number
+    cogs: number
+    grossProfit: number
+    expenses: number
+    netProfit: number
+    returns: number
+    uncostedLines: number
+    grossMargin: number
+  }
   bestSellers: BestSellerRow[]
   expenseBreakdown: Array<{ category: string; amount: number }>
+  costAnomalies: ProfitCostAnomaly[]
+  locationId: string | null
+  basis: 'ex-gst'
+  expensesAreCompanyWide: boolean
 }
 
 export interface PaymentStatusSegment {
