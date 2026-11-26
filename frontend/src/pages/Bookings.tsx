@@ -53,7 +53,7 @@ import {
 import {
   findVariantById,
   hasRealOptions,
-  variantFinalPrice,
+  variantEffectivePrice,
   variantLabel,
   variantOptions,
 } from '@/lib/productVariants'
@@ -82,12 +82,14 @@ interface DraftLine {
   qty: string
   /** PER-UNIT price, GST-inclusive — the sales_orders convention. */
   price: string
+  /** Variant "Add to price (₹)" already folded into `price`, kept for display. */
+  priceAdjustment?: number | null
 }
 
 const CUSTOM_PRODUCT = '__custom__'
 
 function newLine(): DraftLine {
-  return { key: crypto.randomUUID(), productId: '', variantId: '', title: '', sku: '', custom: false, qty: '1', price: '' }
+  return { key: crypto.randomUUID(), productId: '', variantId: '', title: '', sku: '', custom: false, qty: '1', price: '', priceAdjustment: undefined }
 }
 
 /** Untouched blank row — ignored by validation and by the payload. */
@@ -321,6 +323,9 @@ export function BookingDetailView({
                 <span className="min-w-0 flex-1 truncate">
                   <span className="font-medium text-foreground">{li.title || 'Item'}</span>
                   {li.sku ? <span className="ml-1.5 font-mono text-muted-foreground">{li.sku}</span> : null}
+                  {Number(li.priceAdjustment) > 0 ? (
+                    <span className="ml-1.5 text-violet-700">+₹{li.priceAdjustment} add-on</span>
+                  ) : null}
                 </span>
                 <span className="shrink-0 tabular-nums text-muted-foreground">
                   {li.quantity ?? 1} × {formatCurrency(li.price ?? 0)}
@@ -404,6 +409,7 @@ export function BookingLineAvailability({
   sku,
   variantName,
   sellingPrice,
+  priceAdjustment,
   required,
   availability,
   selectedLocationId,
@@ -411,6 +417,8 @@ export function BookingLineAvailability({
   sku: string
   variantName?: string | null
   sellingPrice?: number | null
+  /** Variant add-on already inside `sellingPrice`; shown for traceability. */
+  priceAdjustment?: number | null
   required: number
   /** Resolved data, `null` while in flight, `{ error }` when the call failed. */
   availability: LocationStockAvailability | null | { error: string } | undefined
@@ -476,6 +484,9 @@ export function BookingLineAvailability({
         </span>
         {sellingPrice != null ? (
           <span className="text-muted-foreground">· Selling {formatCurrency(sellingPrice)}</span>
+        ) : null}
+        {Number(priceAdjustment) > 0 ? (
+          <span className="font-medium text-violet-700">· Add-on ₹{priceAdjustment}</span>
         ) : null}
       </p>
 
@@ -832,6 +843,9 @@ export default function Bookings() {
             custom: !extra.productId && Boolean(li.title),
             qty: String(li.quantity ?? 1),
             price: li.price != null ? String(li.price) : '',
+            // The add-on is already in the per-unit price; keep the durable
+            // delta so re-open/save never adds it a second time.
+            priceAdjustment: li.priceAdjustment ?? undefined,
           }
         })
       : [newLine()]
@@ -910,7 +924,7 @@ export default function Bookings() {
    */
   const selectProduct = (key: string, value: string) => {
     if (value === CUSTOM_PRODUCT) {
-      setLine(key, { productId: '', variantId: '', title: '', sku: '', custom: true, price: '' })
+      setLine(key, { productId: '', variantId: '', title: '', sku: '', custom: true, price: '', priceAdjustment: undefined })
       return
     }
     const { productId, variantId } = parseSellableValue(value)
@@ -943,6 +957,9 @@ export default function Bookings() {
       sku: item.sku,
       custom: false,
       price: price != null ? String(price) : '',
+      // `sellableItemPrice` already includes this GST-inclusive delta; snapshot
+      // it on the line so a later silver-rate change cannot silently lose it.
+      priceAdjustment: item.priceAdjustment,
     })
   }
 
@@ -958,7 +975,7 @@ export default function Bookings() {
     const v = line.variantId ? findVariantById(p, line.variantId) : null
     return {
       variantName: v ? variantLabel(v) : null,
-      sellingPrice: (v ? variantFinalPrice(p.sellingPrice, v.sellingPrice, v.name) : p.sellingPrice) ?? null,
+      sellingPrice: (v ? variantEffectivePrice(p.sellingPrice, v) : p.sellingPrice) ?? null,
     }
   }
 
@@ -1407,6 +1424,9 @@ export default function Bookings() {
         sku: l.sku.trim() || undefined,
         qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
         price: Math.round((Number(l.price) || 0) * 100) / 100,
+        // Already folded into `price` by the picker — never re-added by the
+        // server. Kept so the booked line/converted invoice can name it.
+        ...(l.priceAdjustment != null ? { priceAdjustment: l.priceAdjustment } : {}),
         ...(l.productId ? { productId: l.productId } : {}),
         ...(l.variantId ? { variantId: l.variantId } : {}),
       }))
@@ -2042,6 +2062,7 @@ export default function Bookings() {
                             sku={l.sku}
                             variantName={identity.variantName}
                             sellingPrice={identity.sellingPrice}
+                            priceAdjustment={l.priceAdjustment}
                             required={qty}
                             availability={availability[availabilityKey]}
                             selectedLocationId={form.locationId}
@@ -2056,6 +2077,7 @@ export default function Bookings() {
               {fieldErrors.lines ? <p className="mt-1.5 text-[12px] text-red-600">{fieldErrors.lines}</p> : null}
               <p className="mt-1.5 text-[11px] text-muted-foreground">
                 Prices fill in from the catalogue at the managed silver rate, exactly as Sales Orders prices them, and stay editable.
+                A picked variant's GST-inclusive "Add to price (₹)" is already in the per-unit price and is snapshotted on the line, so a re-open or rate change cannot lose it or add it twice.
                 {' '}Stock is shown for EACH store separately (the cross-store total is informational) — booking never reserves or deducts inventory.
               </p>
             </div>

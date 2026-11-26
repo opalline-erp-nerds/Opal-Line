@@ -5,9 +5,10 @@ import { expect, test, type APIRequestContext } from '@playwright/test'
  * row, price it by the product's pricing mode, show ITS store stock and save
  * the variant relationship onto the booking.
  *
- * The fixture is a Piece Rate product (₹2,000/pc) with red/white variants,
- * created through the API here so the test runs on a fresh install — never
- * against a developer's catalogue. Everything it creates is removed again.
+ * The fixture is a Piece Rate product (₹2,000/pc) with a red variant carrying
+ * a durable ₹200 "Add to price" (effective ₹2,200), created through the API
+ * here so the test runs on a fresh install — never against a developer's
+ * catalogue. Everything it creates is removed again.
  */
 
 async function csrfHeaders(request: APIRequestContext): Promise<Record<string, string>> {
@@ -61,8 +62,10 @@ test('a variant SKU is searchable, priced by its mode and saved with its variant
       data: {
         options: [{ name: 'color', values: ['red', 'white'] }],
         variants: [
-          { title: 'red', optionValues: ['red'], sku: redSku, stock: 0 },
-          { title: 'white', optionValues: ['white'], sku: `${sku}-WHI`, stock: 0 },
+          // Red's selling_price is the EFFECTIVE ₹2,200; the add-on itself
+          // lives in priceAdjustment. White has no add-on.
+          { title: 'red', optionValues: ['red'], sku: redSku, sellingPrice: 2200, priceAdjustment: 200, stock: 0 },
+          { title: 'white', optionValues: ['white'], sku: `${sku}-WHI`, sellingPrice: 2000, priceAdjustment: 0, stock: 0 },
         ],
       },
     })
@@ -90,13 +93,16 @@ test('a variant SKU is searchable, priced by its mode and saved with its variant
     await option.click()
 
     // ── 2. The line carries the variant identity and its pricing mode: a
-    //    Piece Rate product opens at the fixed ₹/pc, never at
-    //    200 g × (silver rate + making). ─────────────────────────────────────
-    await expect(dialog.getByLabel('Price per unit for line 1 (incl. GST)')).toHaveValue('2000')
+    //    Piece Rate product opens at the fixed ₹/pc PLUS the variant's
+    //    GST-inclusive add-on (₹2,000 + ₹200 = ₹2,200), never at
+    //    200 g × (silver rate + making). Inventory prices are per-unit and
+    //    already include the add-on — the server must not add it again. ────
+    await expect(dialog.getByLabel('Price per unit for line 1 (incl. GST)')).toHaveValue('2200')
     await expect(dialog.locator('span.font-mono', { hasText: redSku })).toBeVisible()
 
     // ── 3. Stock for THIS variant, per store (bookings never deduct). ───────
     await expect(dialog.getByText('Required: 1')).toBeVisible({ timeout: 15000 })
+    await expect(dialog.getByText('Add-on ₹200', { exact: false })).toBeVisible({ timeout: 15000 })
     await expect(dialog.getByText(/available/).first()).toBeVisible({ timeout: 15000 })
 
     // ── 4. Save. ────────────────────────────────────────────────────────────
@@ -115,11 +121,14 @@ test('a variant SKU is searchable, priced by its mode and saved with its variant
     const saved = (list.data as Array<{ id: string; customer: string; lineItems?: Array<Record<string, unknown>> }>)
       .find((o) => o.customer === customer)
     expect(saved, 'the booking must be retrievable from the API').toBeTruthy()
-    const line = saved!.lineItems?.[0] as { sku?: string; variantId?: string; productId?: string; price?: number }
+    const line = saved!.lineItems?.[0] as {
+      sku?: string; variantId?: string; productId?: string; price?: number; priceAdjustment?: number
+    }
     expect(line.sku).toBe(redSku)
     expect(line.variantId, 'the stored line must carry variant_id').toBeTruthy()
     expect(line.productId).toBeTruthy()
-    expect(Number(line.price)).toBe(2000, 'the fixed piece rate is what got stored')
+    expect(Number(line.priceAdjustment)).toBe(200, 'the durable add-on is snapshotted on the booking line')
+    expect(Number(line.price)).toBe(2200, 'per-unit price already includes the add-on')
   } finally {
     // Bookings first (they name the product), then the fixture itself.
     const list = await (await request.get('/api/v1/db/sales-orders?limit=200')).json()

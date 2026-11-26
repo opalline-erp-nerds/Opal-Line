@@ -1002,7 +1002,15 @@ export interface ProductVariant {
   optionValues?: string[] | null
   sku: string
   barcode?: string | null
+  /** Effective price (base + add-on) as persisted by the variant save. */
   sellingPrice?: number | null
+  /**
+   * "Add to price (₹)" for a real option row: 0 = base, 200 = base + ₹200.
+   * Kept separate from the effective `sellingPrice` so a silver-rate reprice
+   * can rebuild base + add-on without losing the delta. Legacy rows without
+   * the column are read via `variantAddOn()`'s fallback.
+   */
+  priceAdjustment?: number | null
   compareAtPrice?: number | null
   costPrice?: number | null
   grossWeight?: number | null
@@ -1059,6 +1067,8 @@ export interface Invoice {
 export interface InvoiceItem {
   product: string
   sku: string
+  /** Variant "Add to price (₹)" carried onto the line, when one was set. */
+  priceAdjustment?: number | null
   hsn?: string
   qty: number
   weight: number
@@ -1098,6 +1108,8 @@ export interface SalesOrderLineItem {
    * line's `sku` is then the variant's own code.
    */
   variantId?: string
+  /** Variant "Add to price (₹)" snapshotted on the line, when one was set. */
+  priceAdjustment?: number | null
   /** Weight per piece (g) snapshotted on the line. */
   netWeight?: number | null
   /** Total line weight (g) = quantity × weight per piece (or a manual override). */
@@ -1657,6 +1669,8 @@ export interface QuotationItem {
   id?: string
   product: string
   sku: string
+  /** GST-inclusive variant "Add to price (₹)" carried onto the line. */
+  priceAdjustment?: number | null
   qty: number
   weight: number
   silverRate: number

@@ -62,33 +62,66 @@ test('totals round GST to two decimals', () => {
 // never applies to it. Mirrors `applyPieceRateItems` (routes/db.ts), which
 // rewrites the line the same way on the way into the database.
 
-test('a Piece Rate line bills qty × fixed price, never weight × (rate + making)', () => {
-  assert.equal(lineAmount({ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 1 }), 2000)
+test('a Piece Rate line bills qty × GST-inclusive fixed price backed out of tax', () => {
+  assert.equal(lineAmount({ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 1 }), 1941.75)
   // Even with weight/rates present on the line, the fixed price wins — that is
   // the whole point of the flag.
   assert.equal(
     lineAmount({ weight: 200, silverRatePerGram: 105, makingChargePerGram: 20, pieceRate: 2000, qty: 1 }),
-    2000,
+    1941.75,
   )
   // Quantity scales the FIXED price, not the weight.
-  assert.equal(lineAmount({ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 3 }), 6000)
+  assert.equal(lineAmount({ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 3 }), 5825.24)
 })
 
-test('a Piece Rate line carries no silver or making component', () => {
+test('a Piece Rate line keeps its whole taxable amount in the silver component', () => {
   const line = { weight: 200, silverRatePerGram: 105, makingChargePerGram: 20, pieceRate: 2000, qty: 1 }
-  assert.equal(lineSilverValue(line), 0)
+  assert.equal(lineSilverValue(line), lineAmount(line))
   assert.equal(lineMakingValue(line), 0)
 })
 
-test('totals put GST on top of a Piece Rate subtotal', () => {
+test('totals put 3% GST back on a Piece Rate subtotal exactly once', () => {
   const t = invoiceTotalsPreview(
     [{ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 1 }],
     3,
     0,
   )
-  assert.equal(t.subtotal, 2000)
-  assert.equal(t.gstAmount, 60)
-  assert.equal(t.grandTotal, 2060)
+  assert.equal(t.subtotal, 1941.75)
+  assert.equal(t.gstAmount, 58.25)
+  assert.equal(t.grandTotal, 2000)
+})
+
+// ── Variant "Add to price (₹)" ────────────────────────────────────────────────
+// The add-on is GST-INCLUSIVE. It reduces the taxable line amount by
+// addOn × qty ÷ 1.03; the header's 3% GST puts exactly the add-on back.
+
+test('a weight-based add-on is backed out of GST and returned by the total', () => {
+  const t = invoiceTotalsPreview(
+    [{ weight: 10, silverRatePerGram: 92.5, makingChargePerGram: 150, qty: 1, priceAdjustment: 200 }],
+    3,
+    0,
+  )
+  assert.equal(t.subtotal, 2619.17) // 2425 + 200 ÷ 1.03
+  assert.equal(t.gstAmount, 78.58)
+  assert.equal(t.grandTotal, 2697.75) // base + ₹200, once
+})
+
+test('a piece-rate add-on folds into the fixed price before backing out GST', () => {
+  const t = invoiceTotalsPreview(
+    [{ weight: 0, silverRatePerGram: 0, makingChargePerGram: 0, pieceRate: 2000, qty: 1, priceAdjustment: 200 }],
+    3,
+    0,
+  )
+  assert.equal(t.subtotal, 2135.92) // 2200 ÷ 1.03
+  assert.equal(t.gstAmount, 64.08)
+  assert.equal(t.grandTotal, 2200)
+})
+
+test('a zero add-on never zeroes a line', () => {
+  const line = { weight: 10, silverRatePerGram: 300, makingChargePerGram: 20, priceAdjustment: 0 }
+  assert.equal(lineAmount(line), 3200)
+  assert.equal(lineSilverValue(line), 3000)
+  assert.equal(lineMakingValue(line), 200)
 })
 
 function round2(n: number): number {

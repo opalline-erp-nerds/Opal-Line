@@ -3,6 +3,7 @@ import QRCode from 'qrcode'
 import { getRawClient } from './db/client'
 import { logger } from './logger'
 import { escapeHtml } from './htmlEscape'
+import { formatIstDate } from './istDate'
 
 export interface QuotationItem {
   name: string
@@ -96,8 +97,9 @@ export async function generateQuotationPDF(quotationId: string): Promise<Buffer 
     const items = await client.unsafe(`SELECT * FROM quotation_items WHERE quotation_id = $1`, [quotationId])
     const [settings] = await client.unsafe(`SELECT * FROM settings LIMIT 1`) as any[]
 
+    // Quotation print/email dates follow the same IST clock as invoice PDFs.
     const fmtDate = (d: unknown) =>
-      d ? new Date(d as string).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—'
+      d ? formatIstDate(d as string | number | Date) : '—'
 
     const itemData: QuotationItem[] = items.map((item: any) => ({
       name: item.product || 'Item',
@@ -164,7 +166,7 @@ export async function emailQuotationPDF(quotationId: string, recipientEmail: str
   const customer = row?.customer || 'Customer'
   const total = Number(row?.grand_total || 0)
   const validUntil = row?.valid_until
-    ? new Date(row.valid_until).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+    ? formatIstDate(row.valid_until)
     : 'the date agreed with you'
 
   return sendEmail({

@@ -83,6 +83,8 @@ export const createOrderSchema = z.object({
     // billed against a specific variant. Optional so flat products and every
     // existing client keep working unchanged.
     variantId: z.union([z.string().max(120), z.number()]).optional(),
+    /** The variant's GST-inclusive "Add to price (₹)" delta. */
+    priceAdjustment: z.number().min(0).max(1000000).optional(),
     // Weight & pricing snapshot from the order form. The catalogue stays the
     // source of truth (a supplied value only fills a product with no
     // configured weight), so these are optional — clients that don't send
@@ -206,7 +208,10 @@ export const productVariantSchema = z.object({
   title: z.string().min(1, 'Variant title is required').max(255),
   optionValues: z.array(z.string().min(1).max(100)).min(1).max(3),
   sku: z.string().min(1, 'Variant SKU is required').max(100),
+  /** Effective price (base + add-on). Recomputed server-side on save. */
   sellingPrice: z.number().min(0).optional(),
+  /** Shopify-style "Add to price (₹)" — the durable delta. */
+  priceAdjustment: z.number().min(0).optional(),
   compareAtPrice: z.number().min(0).optional(),
   costPrice: z.number().min(0).optional(),
   grossWeight: z.number().min(0).optional(),

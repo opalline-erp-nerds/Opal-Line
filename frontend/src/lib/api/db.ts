@@ -745,7 +745,7 @@ export const dbApi = {
       options: ProductOption[]
       variants: Array<
         Pick<ProductVariant, 'title' | 'optionValues' | 'sku' | 'stock'> &
-          Partial<Pick<ProductVariant, 'id' | 'sellingPrice' | 'compareAtPrice' | 'costPrice' | 'grossWeight' | 'reorderLevel' | 'status'>>
+          Partial<Pick<ProductVariant, 'id' | 'sellingPrice' | 'priceAdjustment' | 'compareAtPrice' | 'costPrice' | 'grossWeight' | 'reorderLevel' | 'status'>>
       >
     },
   ) =>

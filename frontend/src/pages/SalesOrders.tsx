@@ -117,6 +117,8 @@ interface OrderLineItem {
   productId: string
   /** Selected variant, when the product has variants. */
   variantId?: string | null
+  /** Variant "Add to price (₹)" snapshot — part of the line's unit price. */
+  priceAdjustment?: number | null
   title: string
   sku: string
   qty: number
@@ -698,6 +700,7 @@ export default function SalesOrdersPage() {
           sku,
           qty: li.quantity,
           price: li.price,
+          priceAdjustment: li.priceAdjustment ?? undefined,
           netWeight: weightPerPiece ?? undefined,
           makingCharge: makingCharge ?? undefined,
           totalWeight: positiveOrNull(li.weight) ?? derivedTotalWeight(li.quantity, weightPerPiece),
@@ -1110,6 +1113,7 @@ export default function SalesOrdersPage() {
               ...li,
               productId: item.productId,
               variantId: item.variantId,
+              priceAdjustment: item.priceAdjustment,
               title: item.variantName ? `${item.productName} — ${item.variantName}` : item.productName,
               sku: item.sku,
               price: price ?? li.price,
@@ -1195,6 +1199,7 @@ export default function SalesOrdersPage() {
       const fresh = {
         productId: item.productId,
         variantId: item.variantId,
+        priceAdjustment: item.priceAdjustment,
         title,
         sku: item.sku,
         price,
@@ -1223,16 +1228,21 @@ export default function SalesOrdersPage() {
    * itself as 200 × (rate + making) the moment qty or weight is touched.
    */
   const lineUnitPrice = (li: OrderLineItem): number | undefined => {
-    if (li.pieceRate && li.pieceRate > 0) return li.pieceRate
-    return perUnitLinePrice({
-      silverRate,
-      netWeight:
-        li.qty > 0 && li.totalWeight != null && li.totalWeight > 0
-          ? li.totalWeight / li.qty
-          : li.netWeight,
-      makingCharge: li.makingCharge,
-      fallback: null,
-    })
+    // The add-on is GST-inclusive and rides ON TOP of the recomputed base, so
+    // a live-rate or qty edit must add — never replace — it.
+    const addOn = li.priceAdjustment ?? 0
+    const base = li.pieceRate && li.pieceRate > 0
+      ? li.pieceRate
+      : perUnitLinePrice({
+          silverRate,
+          netWeight:
+            li.qty > 0 && li.totalWeight != null && li.totalWeight > 0
+              ? li.totalWeight / li.qty
+              : li.netWeight,
+          makingCharge: li.makingCharge,
+          fallback: null,
+        })
+    return base == null ? undefined : Math.round((base + addOn) * 100) / 100
   }
 
   const updateLineItem = (key: string, patch: Partial<OrderLineItem>) => {
@@ -1282,6 +1292,7 @@ export default function SalesOrdersPage() {
         sku: li.sku,
         quantity: Math.max(0, Math.floor(li.qty) || 0),
         price: Number(li.price) || 0,
+        ...(li.priceAdjustment != null ? { priceAdjustment: li.priceAdjustment } : {}),
         // Catalogue identity travels with the line: the exact product (so an
         // edit still knows which row to price/flag) and, for a variant line,
         // its variant. `sku` stays the code the line was sold under — the
@@ -1327,6 +1338,7 @@ export default function SalesOrdersPage() {
               String(oi.sku ?? '') !== cur.sku ||
               Number(oi.quantity ?? 0) !== cur.quantity ||
               Number(oi.price ?? 0) !== cur.price ||
+              Number(oi.priceAdjustment ?? 0) !== Number(cur.priceAdjustment ?? 0) ||
               // A weight-only edit must reach the API too — the stored line
               // keeps its own weight/making snapshot fields.
               Number(oi.netWeight ?? 0) !== Number(cur.netWeight ?? 0) ||
@@ -1600,7 +1612,14 @@ export default function SalesOrdersPage() {
 
       <AppDialog
         open={dialogOpen}
-        onOpenChange={setDialogOpen}
+        onOpenChange={(open) => {
+          // The customer editor is portalled to <body>, so clicking inside it
+          // looks like an outside interaction to this dialog. Keep the parent
+          // order form open until that nested save has finished; otherwise it
+          // vanishes mid-save and the caller can read stale customer data.
+          if (!open && custEditOpen) return
+          setDialogOpen(open)
+        }}
         size="lg"
         isDirty={dialogOpen && snapshotForm() !== formBaseline}
         title={editing ? `Edit Order ${editing.shopifyId}` : 'Create Manual Order'}

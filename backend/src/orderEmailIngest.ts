@@ -5,6 +5,7 @@ import { and, eq, or, sql } from 'drizzle-orm'
 import { db } from './db/client'
 import * as schema from './db/schema'
 import { invoiceTotals } from './invoiceTotals'
+import { normalizeInvoicePayment } from './invoicePayment'
 import { buildManualInvoiceLines } from './orderPricing'
 import { computeShopifyInvoiceAmounts } from './shopifyInvoiceAmounts'
 import { getLatestSilverRate } from './shopify'
@@ -84,6 +85,8 @@ export interface OrderEmailData {
     silverValue?: number
     makingValue?: number
     amount?: number
+    variantId?: string | null
+    priceAdjustment?: number | null
   }>
   paymentMethod: string
   date: string
@@ -861,6 +864,8 @@ type InvoiceArtifacts = {
     makingValue?: number
     /** The variant the line sold, when the order named one. */
     variantId?: string | null
+    /** Variant "Add to price (₹)" already folded into the line's price. */
+    priceAdjustment?: number | null
   }>
   payment: string
   subtotal: number
@@ -921,7 +926,10 @@ function buildInvoiceArtifacts(
   if (lineItems.length === 0) return null
 
   const { gstRate, silverRate, productMap } = scalars
-  const payment = order.payment === 'paid' ? 'Online' : order.payment === 'cod' ? 'COD' : 'Pending'
+  // `sales_orders.payment` is a STATE, not a method: only COD actually tells us
+  // how the customer paid. An online Shopify order has no gateway evidence on
+  // the order row, so leave the method empty rather than inventing "Online".
+  const payment = order.payment === 'cod' ? 'cod' : ''
   const discount = Number(order.discount ?? 0)
 
   let items: InvoiceArtifacts['items']
@@ -990,6 +998,7 @@ function buildInvoiceArtifacts(
         makingCharge: priced.makingCharge,
         tax: priced.tax,
         amount: priced.amount,
+        ...(li.priceAdjustment != null ? { priceAdjustment: li.priceAdjustment } : {}),
       }
     })
     subtotal = amounts.subtotal
@@ -1332,16 +1341,6 @@ export async function raiseInvoiceForOrder(
         gstAmount: lockedArt.gstAmount,
         discount: storedDiscount,
         grandTotal: lockedArt.grandTotal,
-        paymentMethod: lockedArt.payment,
-        paymentStatus: fresh.payment,
-        // The LOCKED row is authoritative (a concurrent edit must not leak a
-        // stale status); refunded is a real status, not just paid/issued.
-        status:
-          fresh.payment === 'paid'
-            ? 'paid'
-            : fresh.payment === 'refunded'
-              ? 'refunded'
-              : 'issued',
         currency: fresh.currency ?? 'INR',
         date: fresh.date ?? new Date().toISOString(),
       })

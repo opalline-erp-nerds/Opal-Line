@@ -1,17 +1,17 @@
 // Variant pricing contract: the ERP-calculated selling price is the BASE for
-// every variant and product_variants.selling_price stores only the ADDITIONAL
-// amount configured per row (base 618 + add-on 200 → Shopify 818.00). The
-// final price is recombined at push time from the two stored numbers and is
-// never written back, so a repeated push or an inbound pull can only re-derive
-// the same final price — it can never add the amount a second time.
+// every variant. The "Add to price (₹)" delta lives in the dedicated
+// product_variants.price_adjustment column, while selling_price is the
+// EFFECTIVE price (base + add-on). Rows saved before the column existed still
+// carry the delta in selling_price and must keep working. Final prices are
+// derived, never written back into the base, so a repeated push or inbound pull
+// can only re-derive the same price — it can never add the amount twice.
 //
 // Scenarios pinned here (faithful in-memory mock of the Admin REST API over a
 // throwaway database — no credentials, no network, no real store):
 //   1. create push sends 818.00 / 1018.00 for add-ons 200 / 400 on base 618
 //   2. the price push (the exact function the outbound price job runs) agrees
-//   3. repeated pushes + an inbound pull keep 818/1018 and stored add-ons 200/400
-//   4. a silver-rate style reprice (products.selling_price only) moves the
-//      finals to 900/1100 while the add-ons stay 200/400
+//   3. repeated pushes + an inbound mirror keep 818/1018 and the add-ons
+//   4. a silver-rate reprice moves the base and rebuilds base + add-on
 //   5. a flat single-variant product still pushes its base (500, not 1000)
 //   6. a legacy placeholder product (Title/Default Title options, absolute
 //      mirror row 4800 on base 4738) pushes 4738 — never 4738 + 4800 = 9538
@@ -454,7 +454,12 @@ test(
       assert.equal(
         shopify.variantPushPrice(618, { title: 'S', optionValues: ['S'], sellingPrice: 200 }),
         818,
-        'real option row: base + add-on',
+        'legacy real option row: the delta in selling_price is still the add-on',
+      )
+      assert.equal(
+        shopify.variantPushPrice(618, { title: 'S', optionValues: ['S'], sellingPrice: 818, priceAdjustment: 200 }),
+        818,
+        'new row: the effective sellingPrice is never added a second time',
       )
 
       // ── Product A: optioned, base 618, add-ons 200 / 400 ───────────────
@@ -631,6 +636,63 @@ test(
       const pricePushC = await shopify.pushProductPriceToShopify(pC)
       assert.equal(pricePushC.ok, true, pricePushC.errors.join('; '))
       assert.equal(mock.product(listingC).variants[0].price, '4738.00', 'the price push sends the base for a mirror row too')
+
+      // ── 7. Dedicated add-on column + mirror + real silver-rate reprice ───
+      const pD = randomUUID()
+      await db.insert(s.products).values({
+        id: pD,
+        name: 'Durable Add-on Ring',
+        sku: 'VAR-PRICE-DELTA',
+        category: 'Rings',
+        gst: 3,
+        netWeight: 10,
+        makingCharge: 0,
+        stock: 1,
+        shopifyStatus: 'not-listed',
+        status: 'active',
+        trackInventory: true,
+        chargeOnTax: true,
+        sellingPrice: 618,
+        options: [{ name: 'Size', values: ['S'] }],
+        createdAt: '2026-11-26',
+      })
+      const variantD = randomUUID()
+      await db.insert(s.productVariants).values({
+        id: variantD,
+        productId: pD,
+        title: 'S',
+        optionValues: ['S'],
+        sku: 'VAR-PRICE-DELTA-S',
+        sellingPrice: 818,
+        priceAdjustment: 200,
+        stock: 1,
+        status: 'active',
+      })
+      const pushD = await shopify.pushProductsToShopify([pD])
+      assert.equal(pushD.ok, true, `durable add-on push failed: ${pushD.errors.join('; ')}`)
+      const [listedD] = await db.select().from(s.products).where(eq(s.products.id, pD))
+      const listingD = Number(listedD.shopifyId)
+      assert.equal(mock.product(listingD).variants[0].price, '818.00', 'effective price is the price pushed, once')
+
+      // The two-way mirror used to copy 818 back into products.selling_price,
+      // so the next push displayed/pushed 1018 and compounded every 10 minutes.
+      const mirrored = await shopify.syncProductsToDb({ mirrorFromShopify: true })
+      assert.equal(mirrored.ok, true, mirrored.errors.join('; '))
+      const [afterMirror] = await db.select().from(s.products).where(eq(s.products.id, pD))
+      assert.equal(Number(afterMirror.sellingPrice), 618, 'a mirror never overwrites the ERP base')
+      const [variantAfterMirror] = await db.select().from(s.productVariants).where(eq(s.productVariants.id, variantD))
+      assert.equal(Number(variantAfterMirror.priceAdjustment), 200, 'the add-on survives the mirror')
+
+      // A real rate change recomputes the GST-inclusive base to ₹2,060
+      // (10 g × ₹200 × 1.03) and rebuilds the variant's effective price above
+      // it — +₹200, not +₹818.
+      const repriced = await shopify.applySilverRate(200, { source: 'manual' })
+      assert.ok(repriced.affected >= 1, `the rate change must reprice our new product: ${JSON.stringify(repriced)}`)
+      const [afterReprice] = await db.select().from(s.products).where(eq(s.products.id, pD))
+      assert.equal(Number(afterReprice.sellingPrice), 2060, 'the new GST-inclusive base comes from the new rate')
+      const [variantAfterReprice] = await db.select().from(s.productVariants).where(eq(s.productVariants.id, variantD))
+      assert.equal(Number(variantAfterReprice.priceAdjustment), 200, 'the durable delta is unchanged')
+      assert.equal(Number(variantAfterReprice.sellingPrice), 2260, 'effective = new base + add-on')
 
       assert.deepEqual(mock.unmatched, [], 'every Admin API endpoint the pushes touch is modelled by the mock')
     } finally {

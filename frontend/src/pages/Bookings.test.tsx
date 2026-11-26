@@ -39,7 +39,7 @@ const booking: SalesOrder = {
   tags: 'booking',
   currency: 'INR',
   discount: 0,
-  lineItems: [{ title: 'Silver Ring', sku: 'RING-925', quantity: 2, price: 5000 }],
+  lineItems: [{ title: 'Silver Ring', sku: 'RING-925', quantity: 2, price: 5000, priceAdjustment: 200 }],
   isBooking: true,
   advancePaid: 3000,
 }
@@ -90,6 +90,7 @@ test('the booked line items list with quantities and line totals', () => {
   assert.ok(html.includes('RING-925'), 'the SKU is listed')
   assert.ok(html.includes('×'), 'the quantity × price line is listed')
   assert.ok(html.includes('5,000'), 'the per-unit price is listed')
+  assert.ok(html.includes('+₹200 add-on'), 'the durable variant add-on is shown next to the line')
   assert.ok(html.includes('10,000'), 'the line total (qty × price) is listed')
   assert.ok(html.includes('product(s)'), 'the line count is summarised')
 })
@@ -181,7 +182,8 @@ test('a line shows the variant name, exact SKU and its selling price', () => {
       <BookingLineAvailability
         sku="OL-GIF-001-RED"
         variantName="red"
-        sellingPrice={4000}
+        sellingPrice={4200}
+        priceAdjustment={200}
         required={10}
         availability={twoStores}
       />,
@@ -189,7 +191,8 @@ test('a line shows the variant name, exact SKU and its selling price', () => {
   )
   assert.ok(html.includes('red'), 'the variant name is shown')
   assert.ok(html.includes('OL-GIF-001-RED'), 'the exact (variant) SKU is shown')
-  assert.ok(html.includes('4,000'), 'the catalogue selling price is shown')
+  assert.ok(html.includes('4,200'), 'the effective (base + add-on) selling price is shown')
+  assert.ok(html.includes('Add-on ₹200'), 'the add-on inside that price is named')
   assert.ok(html.includes('Required: 10'), 'the required quantity is stated next to availability')
 })
 

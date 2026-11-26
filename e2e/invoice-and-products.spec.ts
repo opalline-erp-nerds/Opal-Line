@@ -16,6 +16,7 @@ async function api() {
   return {
     get: (path: string) => ctx.get(path),
     post: (path: string, data: unknown) => ctx.post(path, { headers, data }),
+    put: (path: string, data: unknown) => ctx.put(path, { headers, data }),
     del: (path: string) => ctx.delete(path, { headers }),
     dispose: () => ctx.dispose(),
   }
@@ -366,11 +367,47 @@ test.describe('invoice mutations round-trip', () => {
     const stamp = Date.now()
     const customer = `E2E Manual Cust ${stamp}`
     const itemName = `E2E Manual Ring ${stamp}`
+    const variantProductName = `E2E Manual Variant ${stamp}`
+    const variantSku = `E2E-MIV-${stamp}`
+    const redSku = `${variantSku}-RED`
 
     const apiClient = await api()
     // The dialog refuses to bill without a managed silver rate — seed one so
     // the flow is exercised on a fresh install too.
     await ensureSilverRate(apiClient)
+    // A Piece Rate product (₹2,000/pc) with a durable ₹200 add-on on its red
+    // variant. NEW fixtures send priceAdjustment; sellingPrice is effective.
+    const variantCreated = await apiClient.post('/api/v1/db/products', {
+      name: variantProductName,
+      sku: variantSku,
+      category: 'Silver Jewels',
+      status: 'active',
+      shopifyStatus: 'not-listed',
+      pieceRateProduct: true,
+      fixedPieceRate: 2000,
+      sellingPrice: 2000,
+      netWeight: 200,
+      makingCharge: 20,
+      gst: 3,
+      hsn: '71131130',
+      purity: 92.5,
+      grossWeight: 0,
+      stoneWeight: 0,
+      supplier: '',
+      silverRate: 0,
+      stock: 0,
+      createdAt: new Date().toISOString(),
+    })
+    expect(variantCreated.status(), `variant fixture: ${await variantCreated.text()}`).toBe(201)
+    const variantProduct = (await variantCreated.json()) as { id: string }
+    const variantRows = await apiClient.put(`/api/v1/db/products/${variantProduct.id}/variants`, {
+      options: [{ name: 'color', values: ['red', 'white'] }],
+      variants: [
+        { title: 'red', optionValues: ['red'], sku: redSku, sellingPrice: 2200, priceAdjustment: 200, stock: 4 },
+        { title: 'white', optionValues: ['white'], sku: `${variantSku}-WHI`, sellingPrice: 2000, priceAdjustment: 0, stock: 2 },
+      ],
+    })
+    expect(variantRows.status(), `variant fixture rows: ${await variantRows.text()}`).toBe(200)
     try {
       await page.goto('/sales/invoices')
       await expect(page.getByRole('heading', { level: 1 }).first()).toBeVisible({ timeout: 20000 })
@@ -404,6 +441,39 @@ test.describe('invoice mutations round-trip', () => {
       await line.locator('td').nth(2).locator('input').fill('10') // net wt / pc (gm)
       await line.locator('td').nth(4).locator('input').fill('90') // making / gm (₹)
 
+      // Variant line: the picker must carry the durable ₹200 add-on into the
+      // preview. Fixed ₹2,000 + ₹200 is GST-INCLUSIVE, so its taxable line
+      // amount is ₹2,135.92 and the 3% header puts the ₹200 back once.
+      await dialog.getByRole('button', { name: 'Add line' }).click()
+      const variantLine = dialog.locator('table tbody tr').nth(1)
+      await variantLine.getByPlaceholder('Search name or SKU…').fill(redSku)
+      const escapeRegExp = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      // The picker's result list is rendered inside the ACTIVE row's cell, and
+      // the shared query also renders it under the first line — scope the hit
+      // to this row so the parent-product button cannot collide with it.
+      const variantHit = variantLine.getByRole('button', {
+        name: new RegExp(`${escapeRegExp(variantProductName)} - red \\(${escapeRegExp(redSku)}\\)`),
+      })
+      await expect(variantHit, 'the variant must be its own selectable row').toBeVisible({ timeout: 10000 })
+      await variantHit.click()
+      await expect(variantLine.getByText('+₹200 add-on')).toBeVisible()
+      await expect(variantLine.locator('td[title*="fixed piece rate"]')).toHaveAttribute(
+        'title',
+        '1 × (₹2000 + ₹200 add-on) ÷ 1.03 (fixed piece rate)',
+      )
+      await expect(variantLine.locator('td[title*="fixed piece rate"]')).toHaveText('₹2,135.92')
+
+      // Capture the POST body so the add-on can be checked in the payload as
+      // well as in the stored sales_invoice_items row.
+      const postedItems: Array<Record<string, unknown>> = []
+      page.on('request', (req) => {
+        if (req.method() !== 'POST' || !req.url().includes('/api/v1/db/invoices')) return
+        try {
+          const body = req.postDataJSON() as { items?: Array<Record<string, unknown>> }
+          if (Array.isArray(body.items)) postedItems.push(...body.items)
+        } catch { /* non-JSON request — ignore */ }
+      })
+
       await dialog.getByRole('button', { name: /Create invoice/ }).click()
 
       // The create dialog closes rather than navigating away.
@@ -422,6 +492,29 @@ test.describe('invoice mutations round-trip', () => {
       expect(saved, 'manually created invoice must exist in the API').toBeTruthy()
       expect(saved!.grandTotal, 'totals are computed from the line').toBeGreaterThan(0)
 
+      // The variant's add-on reaches the POST body and the stored line.
+      const postedVariant = postedItems.find((it) => it.sku === redSku)
+      expect(postedVariant, 'the picked variant line must be in the POST body').toBeTruthy()
+      expect(Number(postedVariant!.priceAdjustment)).toBe(200)
+      const withItems = (await (await apiClient.get('/api/v1/db/invoices/with-items?limit=200')).json()) as {
+        data: Array<{ id: string; customer: string; items?: Array<Record<string, unknown>> }>
+      }
+      const stored = withItems.data.find((r) => r.customer === customer)
+      expect(stored, 'invoice with items must exist in the API').toBeTruthy()
+      const storedVariant = (stored!.items ?? []).find((it) => it.sku === redSku) as
+        | { priceAdjustment?: number; amount?: number }
+        | undefined
+      expect(Number(storedVariant?.priceAdjustment)).toBe(200, 'sales_invoice_items.price_adjustment must persist')
+      expect(Number(storedVariant?.amount)).toBe(2135.92, '(₹2,000 + ₹200) ÷ 1.03')
+      // Comparing against the hand-typed line's stored amount proves the grand
+      // total carries the add-on exactly once (hand line + ₹2,200, then 3%).
+      const storedHand = (stored!.items ?? []).find((it) => it.product === itemName) as
+        | { amount?: number }
+        | undefined
+      const round2 = (v: number) => Math.round(v * 100) / 100
+      const expectedGrand = round2(round2(Number(storedHand?.amount) + 2135.92) * 1.03)
+      expect(Number(saved!.grandTotal)).toBe(expectedGrand, 'the add-on is billed exactly once')
+
       // …and the table renders it.
       await expect(page.locator('table tbody tr', { hasText: saved!.number })).toHaveCount(1, { timeout: 20000 })
     } finally {
@@ -433,6 +526,9 @@ test.describe('invoice mutations round-trip', () => {
           (r) => r.customer === customer,
         )
         for (const r of doomed) await apiClient.del(`/api/v1/db/invoices/${r.id}`)
+      } catch { /* nothing to clean up */ }
+      try {
+        await apiClient.del(`/api/v1/db/products/${variantProduct.id}`)
       } catch { /* nothing to clean up */ }
       await apiClient.dispose()
     }

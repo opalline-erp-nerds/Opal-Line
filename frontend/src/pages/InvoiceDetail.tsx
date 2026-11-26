@@ -30,7 +30,198 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { dbApi } from '@/lib/api'
 import type { AppSettings, EInvoiceStatus, Invoice } from '@/types'
-import { formatCurrency, formatDateTime } from '@/lib/format'
+import { formatCurrency, formatDateTime, formatWeight } from '@/lib/format'
+import {
+  displayInvoiceLines,
+  hasRealRazorpayPayment,
+  invoicePaymentState,
+  isRazorpayPaymentId,
+  lineMoney,
+  paymentMethodLabel,
+  paymentStateLabel,
+  type PaymentState,
+} from '@/lib/invoicePresentation'
+
+/** Every rupee on this screen uses the same two-decimal convention as print. */
+const rupees = (value: number | null | undefined) => formatCurrency(value, { decimals: true })
+
+/**
+ * Header badge: the real stored payment state, never a hard-coded PAID.
+ * Return states stay visible because they describe what happened to the goods,
+ * while every other state comes from paymentStatus / document status.
+ */
+export function InvoicePaymentBadge({ invoice }: { invoice: Invoice }) {
+  const documentStatus = String(invoice.status ?? '').trim().toLowerCase()
+  if (documentStatus === 'fully_returned') return <Badge variant="muted" dot>FULLY RETURNED</Badge>
+  if (documentStatus === 'partially_returned') return <Badge variant="warning" dot>PARTIALLY RETURNED</Badge>
+  const state = invoicePaymentState(invoice)
+  const variant: Record<PaymentState, 'success' | 'warning' | 'danger' | 'muted'> = {
+    paid: 'success',
+    partial: 'warning',
+    pending: 'warning',
+    failed: 'danger',
+    refunded: 'muted',
+    cancelled: 'muted',
+  }
+  return <Badge variant={variant[state]} dot>{paymentStateLabel(state).toUpperCase()}</Badge>
+}
+
+/**
+ * Payment card: a Razorpay gateway/settlement claim requires a real `pay_…`
+ * id. Cash, UPI, bank transfer and unpaid invoices get their own honest copy.
+ */
+export function InvoicePaymentCard({ invoice }: { invoice: Invoice }) {
+  const state = invoicePaymentState(invoice)
+  const method = paymentMethodLabel(invoice.paymentMethod)
+  const realRazorpay = hasRealRazorpayPayment(invoice)
+  const paymentId = isRazorpayPaymentId(invoice.paymentId) ? String(invoice.paymentId).trim() : ''
+  // A Razorpay method with no `pay_…` id is an unverified attempt, not proof
+  // of a captured Razorpay payment — the headline stays state-only.
+  const headlineMethod = method === 'Razorpay' && !realRazorpay ? '—' : method
+  const title = realRazorpay
+    ? `${paymentStateLabel(state)} via Razorpay`
+    : headlineMethod === '—'
+      ? paymentStateLabel(state)
+      : `${paymentStateLabel(state)} · ${headlineMethod}`
+  const subtitle = realRazorpay
+    ? paymentStateLabel(state) === 'Paid'
+      ? 'Razorpay payment captured for this invoice'
+      : `Razorpay payment recorded · ${paymentStateLabel(state).toLowerCase()}`
+    : {
+        paid: 'Payment recorded against this invoice',
+        partial: 'Part payment recorded against this invoice',
+        pending: 'No payment recorded yet',
+        failed: 'Payment attempt failed — no settled payment recorded',
+        refunded: 'Payment refunded on this invoice',
+        cancelled: 'Payment cancelled on this invoice',
+      }[state]
+  const tone = state === 'paid'
+    ? { box: 'border-success-100 bg-success-50/60', icon: 'bg-success-700 text-white', text: 'text-success-700' }
+    : state === 'partial'
+      ? { box: 'border-warning-100 bg-warning-50/60', icon: 'bg-warning-600 text-white', text: 'text-warning-700' }
+      : state === 'failed'
+        ? { box: 'border-red-100 bg-red-50/60', icon: 'bg-red-600 text-white', text: 'text-red-700' }
+        : { box: 'border-border bg-muted/40', icon: 'bg-muted-foreground text-white', text: 'text-foreground' }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm">Payment</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className={`flex items-center gap-3 rounded-lg border p-3 ${tone.box}`}>
+          <div className={`flex h-9 w-9 items-center justify-center rounded-md ${tone.icon}`}>
+            {state === 'paid' ? <CircleCheck className="h-5 w-5" /> : <FileText className="h-5 w-5" />}
+          </div>
+          <div>
+            <p className={`text-sm font-semibold ${tone.text}`}>{title}</p>
+            <p className={`text-[11px] ${tone.text} opacity-80`}>{subtitle}</p>
+          </div>
+        </div>
+        <div className="space-y-2 text-sm">
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Status</span>
+            <span className="font-medium text-foreground">{paymentStateLabel(state)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Payment Method</span>
+            <span className="font-medium text-foreground">{method}</span>
+          </div>
+          {paymentId ? (
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Payment ID</span>
+              <span className="font-mono text-xs font-medium text-foreground">{paymentId}</span>
+            </div>
+          ) : null}
+          {realRazorpay ? (
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Gateway</span>
+              <span className="font-medium text-foreground">Razorpay</span>
+            </div>
+          ) : null}
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Amount</span>
+            <span className="font-semibold tabular-nums text-foreground">{rupees(invoice.grandTotal)}</span>
+          </div>
+        </div>
+        {realRazorpay ? (
+          <Button variant="outline" size="sm" className="w-full gap-1.5" onClick={() => window.open('https://dashboard.razorpay.com/app/payments', '_blank', 'noopener')}>
+            <ExternalLink className="h-3.5 w-3.5" /> View on Razorpay
+          </Button>
+        ) : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+/** Invoice lines: the same taxable / GST / total split the paper shows. */
+export function InvoiceItemsCard({ invoice }: { invoice: Invoice }) {
+  const lines = displayInvoiceLines(invoice)
+  const count = lines.length
+  const totalQty = lines.reduce((a, i) => a + (Number(i.qty) || 0), 0)
+  const totalWeight = lines.reduce((a, i) => a + (Number(i.weight) || 0), 0)
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between space-y-0">
+        <div>
+          <CardTitle className="text-sm">Invoice Items</CardTitle>
+          <CardDescription>{count} line item{count === 1 ? '' : 's'} · 92.5% Sterling Silver</CardDescription>
+        </div>
+        <Badge variant="success">
+          <CircleCheck className="h-3 w-3" /> Ecommerce Sale
+        </Badge>
+      </CardHeader>
+      <CardContent className="p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Product</TableHead>
+              <TableHead className="text-right">Qty</TableHead>
+              <TableHead className="text-right">Weight</TableHead>
+              <TableHead className="text-right">Silver Rate</TableHead>
+              <TableHead className="text-right">Making</TableHead>
+              <TableHead className="text-right">GST</TableHead>
+              <TableHead className="text-right">Taxable (ex GST)</TableHead>
+              <TableHead className="text-right">Total (incl GST)</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {lines.map((item, i) => {
+              const lineMakingValue = (Number(item.weight) || 0) * (Number(item.makingCharge) || 0)
+              const { taxable, tax, total } = lineMoney(item)
+              return (
+                <TableRow key={i}>
+                  <TableCell>
+                    <div className="flex items-center gap-2.5">
+                      <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                        <FileText className="h-3.5 w-3.5" />
+                      </div>
+                      <div>
+                        <p className="font-medium text-foreground">{item.product}</p>
+                        <p className="text-[10.5px] text-muted-foreground">{item.sku}</p>
+                      </div>
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">{item.qty}</TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(item.weight)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-foreground">{Number(item.silverRate) > 0 ? `${rupees(Number(item.silverRate))}/g` : '—'}</TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-foreground">{Number(item.makingCharge) > 0 ? `${rupees(Number(item.makingCharge))}/g = ${rupees(lineMakingValue)}` : '—'}</TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-foreground">{tax > 0 ? rupees(tax) : '—'}</TableCell>
+                  <TableCell className="text-right tabular-nums text-foreground">{rupees(taxable)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums text-foreground">{rupees(total)}</TableCell>
+                </TableRow>
+              )
+            })}
+          </TableBody>
+        </Table>
+        <div className="flex justify-end gap-4 border-t bg-muted/30 px-5 py-3 text-xs text-muted-foreground">
+          <span>{totalQty} item{totalQty === 1 ? '' : 's'}</span>
+          <span>{formatWeight(totalWeight)}</span>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
 
 export default function InvoiceDetailPage() {
   const { id } = useParams()
@@ -256,15 +447,7 @@ export default function InvoiceDetailPage() {
             </div>
             <span>Sales Invoice</span>
             <span className="font-mono text-lg font-semibold text-primary-700">{invoice.number}</span>
-            {invoice.status === 'refunded' ? (
-              <Badge variant="muted" dot>REFUNDED</Badge>
-            ) : invoice.status === 'fully_returned' ? (
-              <Badge variant="muted" dot>FULLY RETURNED</Badge>
-            ) : invoice.status === 'partially_returned' ? (
-              <Badge variant="warning" dot>PARTIALLY RETURNED</Badge>
-            ) : (
-              <Badge variant="success" dot>PAID</Badge>
-            )}
+            <InvoicePaymentBadge invoice={invoice} />
           </span>
         }
         subtitle={`${invoice.shopifyOrder ? `Shopify Order ${invoice.shopifyOrder}` : 'Manual / Booking invoice'} · ${formatDateTime(invoice.date)}`}
@@ -289,62 +472,7 @@ export default function InvoiceDetailPage() {
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <div className="space-y-4 lg:col-span-2">
-          <Card>
-            <CardHeader className="flex-row items-center justify-between space-y-0">
-              <div>
-                <CardTitle className="text-sm">Invoice Items</CardTitle>
-                <CardDescription>{invoice.items.length} line items · 92.5% Sterling Silver</CardDescription>
-              </div>
-              <Badge variant="success">
-                <CircleCheck className="h-3 w-3" /> Ecommerce Sale
-              </Badge>
-            </CardHeader>
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Product</TableHead>
-                    <TableHead className="text-right">Qty</TableHead>
-                    <TableHead className="text-right">Weight</TableHead>
-                    <TableHead className="text-right">Silver Rate</TableHead>
-                    <TableHead className="text-right">Making</TableHead>
-                    <TableHead className="text-right">Tax</TableHead>
-                    <TableHead className="text-right">Amount</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {invoice.items.map((item, i) => {
-                    const lineMakingValue = item.weight * item.makingCharge
-                    return (
-                      <TableRow key={i}>
-                        <TableCell>
-                          <div className="flex items-center gap-2.5">
-                            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                              <FileText className="h-3.5 w-3.5" />
-                            </div>
-                            <div>
-                              <p className="font-medium text-foreground">{item.product}</p>
-                              <p className="text-[10.5px] text-muted-foreground">{item.sku}</p>
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-right tabular-nums">{item.qty}</TableCell>
-                        <TableCell className="text-right tabular-nums text-muted-foreground">{item.weight.toFixed(2)} gm</TableCell>
-                        <TableCell className="text-right tabular-nums text-muted-foreground">{item.silverRate > 0 ? `₹${item.silverRate.toFixed(2)}/g` : '—'}</TableCell>
-                        <TableCell className="text-right tabular-nums text-muted-foreground">{item.makingCharge > 0 ? `${formatCurrency(item.makingCharge)}/g = ${formatCurrency(lineMakingValue)}` : '—'}</TableCell>
-                        <TableCell className="text-right tabular-nums text-muted-foreground">{item.tax > 0 ? formatCurrency(item.tax) : '—'}</TableCell>
-                        <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatCurrency(item.amount)}</TableCell>
-                      </TableRow>
-                    )
-                  })}
-                </TableBody>
-              </Table>
-              <div className="flex justify-end gap-4 border-t bg-muted/30 px-5 py-3 text-xs text-muted-foreground">
-                <span>{invoice.items.reduce((a, i) => a + i.qty, 0)} items</span>
-                <span>{invoice.items.reduce((a, i) => a + i.weight, 0).toFixed(2)} gm</span>
-              </div>
-            </CardContent>
-          </Card>
+          <InvoiceItemsCard invoice={invoice} />
 
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <Card>
@@ -378,7 +506,7 @@ export default function InvoiceDetailPage() {
                   </div>
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Payment Method</span>
-                    <span className="font-medium text-foreground">{invoice.paymentMethod}</span>
+                    <span className="font-medium text-foreground">{paymentMethodLabel(invoice.paymentMethod)}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Invoice Date</span>
@@ -393,15 +521,15 @@ export default function InvoiceDetailPage() {
                 <CardTitle className="text-sm">Amount Summary</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2">
-                <SummaryRow label="Silver Value" value={invoice.silverValue > 0 ? formatCurrency(invoice.silverValue) : '—'} />
-                <SummaryRow label="Making Charge" value={invoice.makingCharge > 0 ? formatCurrency(invoice.makingCharge) : '—'} />
-                <SummaryRow label="Subtotal" value={formatCurrency(invoice.subtotal)} />
-                <SummaryRow label={`GST @ ${invoice.gst}%`} value={formatCurrency(invoice.gstAmount)} />
-                <SummaryRow label="Discount" value={`- ${formatCurrency(invoice.discount)}`} />
+                <SummaryRow label="Silver Value" value={invoice.silverValue > 0 ? rupees(invoice.silverValue) : '—'} />
+                <SummaryRow label="Making Charge" value={invoice.makingCharge > 0 ? rupees(invoice.makingCharge) : '—'} />
+                <SummaryRow label="Subtotal" value={rupees(invoice.subtotal)} />
+                <SummaryRow label={`GST @ ${invoice.gst}%`} value={rupees(invoice.gstAmount)} />
+                {Number(invoice.discount) > 0 ? <SummaryRow label="Discount" value={`- ${rupees(invoice.discount)}`} /> : null}
                 <Separator />
                 <div className="flex items-center justify-between pt-1">
                   <span className="text-sm font-semibold text-foreground">Grand Total</span>
-                  <span className="text-xl font-bold text-primary-700">{formatCurrency(invoice.grandTotal)}</span>
+                  <span className="text-xl font-bold text-primary-700">{rupees(invoice.grandTotal)}</span>
                 </div>
               </CardContent>
             </Card>
@@ -454,39 +582,7 @@ export default function InvoiceDetailPage() {
             }}
           />
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm">Payment</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex items-center gap-3 rounded-lg border border-success-100 bg-success-50/60 p-3">
-                <div className="flex h-9 w-9 items-center justify-center rounded-md bg-success-700 text-white">
-                  <CircleCheck className="h-5 w-5" />
-                </div>
-                <div>
-                  <p className="text-sm font-semibold text-success-700">Paid via Razorpay</p>
-                  <p className="text-[11px] text-success-700/80">Settled · reconciled with bank</p>
-                </div>
-              </div>
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Payment ID</span>
-                  <span className="font-mono text-xs font-medium text-foreground">{invoice.paymentId}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Amount</span>
-                  <span className="font-semibold tabular-nums text-foreground">{formatCurrency(invoice.grandTotal)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Gateway</span>
-                  <span className="font-medium text-foreground">Razorpay</span>
-                </div>
-              </div>
-              <Button variant="outline" size="sm" className="w-full gap-1.5" onClick={() => window.open('https://dashboard.razorpay.com/app/payments', '_blank', 'noopener')}>
-                <ExternalLink className="h-3.5 w-3.5" /> View on Razorpay
-              </Button>
-            </CardContent>
-          </Card>
+          <InvoicePaymentCard invoice={invoice} />
 
           <Card>
             <CardHeader>
@@ -500,8 +596,8 @@ export default function InvoiceDetailPage() {
                 </Link>
               </div>
               <div className="flex justify-between">
-                <span className="text-muted-foreground">Fulfillment</span>
-                <span className="font-medium text-foreground">{invoice.paymentStatus ?? 'Pending'}</span>
+                <span className="text-muted-foreground">Payment Status</span>
+                <span className="font-medium text-foreground">{paymentStateLabel(invoicePaymentState(invoice))}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">GST</span>

@@ -16,7 +16,7 @@ import {
   startOrderAutoSync,
   stopOrderAutoSync,
 } from './orderAutoSync'
-import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, DraftOrderResult, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, resolveShopifyVariantTargets, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
+import { applyPriceSync, applySilverRate, createShopifyDraftOrder, DraftOrderAddressInput, DraftOrderResult, draftOrderInputLines, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, isDefaultVariantRow, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, resolveShopifyVariantTargets, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
 import { buildPricedOrder, fixedPieceRateFor, ORDER_GST_RATE, type OrderCatalogueRow, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
@@ -1020,11 +1020,11 @@ app.post('/api/v1/shopify/products/:id/pull', requirePermission('shopify', 'edit
 
     const price = Number(shop.price)
     await dbh.update(dbMod.schema.products).set({
-      // A Piece Rate Product's price is fixed — a Shopify pull may refresh
-      // stock and the title, but never the selling price.
-      sellingPrice: local.pieceRateProduct
-        ? local.sellingPrice
-        : Number.isFinite(price) ? price : local.sellingPrice,
+      // Shopify's `price` is the FINAL first-variant price — ERP base + the
+      // variant's "Add to price" delta. It must never overwrite the ERP BASE:
+      // doing so compounded the add-on on every pull (618+200 → base 818 →
+      // display 1018 → …). Piece-rate products were already protected; this
+      // protects every variant product the same way. The base is ERP-owned.
       // Stock is deliberately NOT written here: only the difference to what
       // the ledger already holds is posted below, so per-location and
       // per-variant balances stay intact instead of being overwritten by one
@@ -2110,7 +2110,14 @@ async function loadOrderProductData(codes: Array<string | null | undefined>): Pr
   const skus = [...new Set(codes.map((c) => String(c ?? '').trim()).filter(Boolean))]
   if (skus.length === 0 || !db) return []
   const variantRows = await db
-    .select({ sku: schema.productVariants.sku, productId: schema.productVariants.productId })
+    .select({
+      sku: schema.productVariants.sku,
+      productId: schema.productVariants.productId,
+      title: schema.productVariants.title,
+      optionValues: schema.productVariants.optionValues,
+      priceAdjustment: schema.productVariants.priceAdjustment,
+      sellingPrice: schema.productVariants.sellingPrice,
+    })
     .from(schema.productVariants)
     .where(inArray(schema.productVariants.sku, skus))
   const parentIds = [...new Set(variantRows.map((v) => v.productId))]
@@ -2143,8 +2150,17 @@ async function loadOrderProductData(codes: Array<string | null | undefined>): Pr
   for (const v of variantRows) {
     const parent = byId.get(v.productId)
     // The variant's own code answers with the parent's pricing inputs: a
-    // variant carries no weight/charge/flag columns of its own.
-    if (parent) out.push({ ...toRow(parent), sku: v.sku })
+    // variant carries no weight/charge/flag columns of its own. Its ADD-ON is
+    // the one exception, and travels with the alias so a scan (which sends
+    // only the variant SKU) still prices at base + add-on.
+    if (parent) {
+      const legacyAddOn = isDefaultVariantRow(v.title, v.optionValues) ? 0 : v.sellingPrice
+      out.push({
+        ...toRow(parent),
+        sku: v.sku,
+        priceAdjustment: v.priceAdjustment ?? legacyAddOn,
+      })
+    }
   }
   return out
 }
@@ -2525,6 +2541,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
           const formWeightPerPiece = Number(li.netWeight ?? 0)
           const netWeight = formWeightPerPiece > 0 ? formWeightPerPiece : Number(product.netWeight ?? 0)
           const isPieceRate = fixedPieceRateFor(product) != null
+          const addOn = Math.round((Number(li.priceAdjustment ?? product.priceAdjustment ?? 0) || 0) * 100) / 100
           const makingCharge =
             li.makingCharge === undefined || li.makingCharge === null
               ? Number(product.makingCharge ?? 0)
@@ -2555,6 +2572,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
             sku,
             quantity,
             price,
+            priceAdjustment: addOn,
             makingCharge: isPieceRate ? 0 : makingCharge,
             ...(netWeight > 0 ? { netWeight } : {}),
             ...(weight > 0 ? { weight, silverRate: isPieceRate ? 0 : currentRate } : { silverRate: 0 }),

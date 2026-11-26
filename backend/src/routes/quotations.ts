@@ -7,6 +7,8 @@ import { requirePermission } from '../rbac'
 import { recordActivity } from '../activity'
 import { actorFromRequest } from '../activity'
 import { applyPieceRateInvoiceItems, num, round2 } from './db'
+import { invoiceComponentTotals, weightTaxableAmount } from '../variantPricing'
+import { normalizeInvoicePayment } from '../invoicePayment'
 import { routeParam } from '../lib/routeParams'
 import { applyStockMovement, assertStockAvailable, InsufficientStockError } from '../stock'
 
@@ -120,13 +122,17 @@ export function normalizeQuotationItems(raw: unknown): Array<Record<string, unkn
       const silverRate = num(item.silverRate, 0)
       const makingChargePerGram = num(item.makingCharge, 0)
       const qty = Math.max(1, Math.floor(num(item.qty, 1)))
+      // The add-on is GST-inclusive; back it out of the taxable line value so
+      // the 3% added by computeTotals gives the customer base + add-on once.
+      const addOn = round2(num(item.priceAdjustment, 0))
       const amount =
         weight > 0 && silverRate > 0
-          ? round2(weight * silverRate + weight * makingChargePerGram)
+          ? weightTaxableAmount(weight, silverRate, makingChargePerGram, addOn, qty)
           : num(item.amount, 0)
       return {
         product: String(item.product ?? item.title ?? '').trim(),
         sku: String(item.sku ?? '').trim(),
+        priceAdjustment: addOn > 0 ? addOn : null,
         qty,
         weight,
         silverRate,
@@ -466,6 +472,7 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
         items.map((it) => ({
           product: it.product ?? '',
           sku: it.sku ?? '',
+          priceAdjustment: it.priceAdjustment ?? null,
           qty: it.qty ?? 1,
           weight: it.weight ?? 0,
           silverRate: it.silverRate ?? 0,
@@ -495,6 +502,7 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
       const gstAmount = round2((subtotal * gstRate) / 100)
       const discount = num(quote.discount, 0)
       const grandTotal = round2(subtotal + gstAmount - discount)
+      const components = invoiceComponentTotals(invoiceItems)
 
       const invoiceId = crypto.randomUUID()
       await db.transaction(async (tx) => {
@@ -514,16 +522,14 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
           customerCity: quote.customerCity ?? '',
           customerState: quote.customerState ?? '',
           customerPincode: quote.customerPincode ?? '',
-          silverValue: round2(invoiceItems.reduce((a, it) => a + (it.weight ?? 0) * (it.silverRate ?? 0), 0)),
-          makingCharge: round2(invoiceItems.reduce((a, it) => a + (it.makingCharge ?? 0), 0)),
+          silverValue: components.silverValue,
+          makingCharge: components.makingCharge,
           subtotal,
           gst: gstRate,
           gstAmount,
           discount,
           grandTotal,
-          paymentMethod: 'Pending',
-          paymentStatus: 'pending',
-          status: 'issued',
+          ...normalizeInvoicePayment({ paymentStatus: 'pending', status: 'issued' }),
           date: new Date().toISOString(),
         })
         for (const it of invoiceItems) {
@@ -589,13 +595,20 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
       const items = await db.select().from(s.quotationItems).where(eq(s.quotationItems.quotationId, quote.id))
       if (items.length === 0) { res.status(400).json({ error: 'Quotation has no line items' }); return }
 
+      // Quotation line amounts are taxable/ex-GST; sales orders store a
+      // PER-UNIT, GST-INCLUSIVE price. Grow the stored amount back by the
+      // quotation's GST rate — the add-on is already in that amount, so it
+      // must never be added here a second time.
+      const orderGstRate = num(quote.gst, 3)
       const lineItems = items.map((it) => {
         const qty = Math.max(1, Number(it.qty ?? 1))
+        const taxablePerUnit = round2(Number(it.amount ?? 0) / qty)
         return {
           title: it.product ?? '',
           sku: it.sku ?? '',
           quantity: Math.max(0, Number(it.qty ?? 0)),
-          price: round2(Number(it.amount ?? 0) / qty),
+          price: round2(taxablePerUnit * (1 + orderGstRate / 100)),
+          priceAdjustment: it.priceAdjustment ?? null,
         }
       })
 

@@ -33,7 +33,7 @@ import { DialogFooter } from '@/components/ui/dialog'
 import { dbApi, backupApi, formatApiError } from '@/lib/api'
 import { SalesFollowUpsCard } from '@/components/sales-follow-ups-card'
 import { useSilverRate } from '@/lib/silver-rate-context'
-import { productHasVariants, productVariants, variantLabel } from '@/lib/productVariants'
+import { productHasVariants, productVariants, variantAddOn, variantLabel } from '@/lib/productVariants'
 import {
   parseQuotationQty,
   quotationLineAmount,
@@ -99,11 +99,16 @@ interface ItemForm {
   silverRate: string
   makingCharge: string
   pieceRate: string
+  /** GST-inclusive variant "Add to price (₹)" snapshotted from the picked row. */
+  priceAdjustment: string
   /** Chosen explicitly via the "custom line" option — no catalogue SKU. */
   custom: boolean
 }
 
-const emptyItem: ItemForm = { product: '', sku: '', qty: '1', netWeight: '', silverRate: '', makingCharge: '', pieceRate: '', custom: false }
+const emptyItem: ItemForm = {
+  product: '', sku: '', qty: '1', netWeight: '', silverRate: '', makingCharge: '', pieceRate: '',
+  priceAdjustment: '', custom: false,
+}
 
 const isPieceRateForm = (it: ItemForm) => !it.custom && Number(it.pieceRate) > 0
 
@@ -115,6 +120,7 @@ function toLineInput(it: ItemForm, qtyOverride?: number): QuotationLineInput {
     silverRatePerGram: Number(it.silverRate) || 0,
     makingChargePerGram: Number(it.makingCharge) || 0,
     fixedPieceRate: isPieceRateForm(it) ? Number(it.pieceRate) : 0,
+    priceAdjustment: Number(it.priceAdjustment) || 0,
   }
 }
 
@@ -281,7 +287,9 @@ export default function QuotationsPage() {
         grandTotal: q.grandTotal,
         date: q.date,
         items: items.map((i) => ({
-          product: i.product,
+          // The print doc item shape has no dedicated add-on column yet; keep
+          // the durable delta visible on the printed line instead of dropping it.
+          product: Number(i.priceAdjustment) > 0 ? `${i.product} (+₹${i.priceAdjustment})` : i.product,
           sku: i.sku,
           qty: i.qty,
           weight: i.weight,
@@ -376,10 +384,19 @@ export default function QuotationsPage() {
             const weightTotal = Number(it.weight ?? 0)
             const perPiece = qty > 0 ? Math.round((weightTotal / qty) * 1000) / 1000 : 0
             // Piece-rate lines are stored with every rate component zeroed and
-            // amount = fixed × qty (applyPieceRateItems) — recover the fixed
-            // rate so the preview prices the line the way the server did.
+            // amount = (fixed + addOn) × qty ÷ 1.03 (applyPieceRateItems).
+            // Recover the catalogue fixed rate — NEVER amount/qty, which would
+            // bake the GST-inclusive add-on into the base and add it twice on
+            // re-save. The stored amount is only the fallback for a delisted SKU.
             const pieceShaped =
               !weightTotal && !Number(it.silverRate ?? 0) && !Number(it.makingCharge ?? 0) && Number(it.amount ?? 0) > 0
+            const addOn = Math.max(0, Number(it.priceAdjustment) || 0)
+            const pieceProduct = products.find((p) => p.sku.trim().toLowerCase() === it.sku?.trim().toLowerCase())
+            const catalogueFixed = Number(pieceProduct?.fixedPieceRate) > 0 ? Number(pieceProduct?.fixedPieceRate) : 0
+            const gst = Number(q.gst ?? 3) || 0
+            const fallbackFixed = addOn > 0
+              ? Math.max(0, round2((Number(it.amount) / qty) * (1 + gst / 100) - addOn))
+              : round2(Number(it.amount) / qty)
             const rateSeed = (v: number | null | undefined) =>
               Number(v) > 0 ? String(v) : ratePerGram > 0 ? String(ratePerGram) : ''
             return {
@@ -389,7 +406,8 @@ export default function QuotationsPage() {
               netWeight: perPiece ? String(perPiece) : '',
               silverRate: pieceShaped ? '' : rateSeed(it.silverRate),
               makingCharge: pieceShaped ? '' : rateSeed(it.makingCharge),
-              pieceRate: pieceShaped ? String(round2(Number(it.amount) / qty)) : '',
+              pieceRate: pieceShaped ? String(catalogueFixed > 0 ? catalogueFixed : fallbackFixed) : '',
+              priceAdjustment: addOn > 0 ? String(addOn) : '',
               custom: false,
             }
           })
@@ -427,6 +445,7 @@ export default function QuotationsPage() {
       makingCharge: isPieceRate ? '' : Number(product.makingCharge) > 0 ? String(Math.round(product.makingCharge * 100) / 100) : '',
       silverRate: isPieceRate ? '' : ratePerGram > 0 ? String(ratePerGram) : '',
       pieceRate: isPieceRate ? String(product.fixedPieceRate) : '',
+      priceAdjustment: variant ? String(variantAddOn(variant)) : '',
     })
     closeSearch()
   }
@@ -434,7 +453,7 @@ export default function QuotationsPage() {
   /** Explicit "keep the typed name, no catalogue SKU" option.
    * Nothing invalid is ever silently accepted — this is the user's choice. */
   const pickCustomLine = (idx: number) => {
-    setItem(idx, { product: productSearch.query.trim(), sku: '', custom: true, pieceRate: '' })
+    setItem(idx, { product: productSearch.query.trim(), sku: '', custom: true, pieceRate: '', priceAdjustment: '' })
     closeSearch()
   }
 
@@ -442,7 +461,7 @@ export default function QuotationsPage() {
   const typeProduct = (idx: number, value: string) => {
     setItem(idx, {
       product: value,
-      ...(items[idx]?.sku ? { sku: '', custom: false, pieceRate: '' } : {}),
+      ...(items[idx]?.sku ? { sku: '', custom: false, pieceRate: '', priceAdjustment: '' } : {}),
     })
     setProductSearch({ line: idx, query: value })
   }
@@ -470,6 +489,7 @@ export default function QuotationsPage() {
       silverRate: number
       makingCharge: number
       amount: number
+      priceAdjustment?: number | null
     }> = []
     items.forEach((it, i) => {
       if (!it.product.trim() && !it.sku.trim()) return // untouched empty line
@@ -505,6 +525,9 @@ export default function QuotationsPage() {
         silverRate: piece ? 0 : Number(it.silverRate) || 0,
         makingCharge: piece ? 0 : Number(it.makingCharge) || 0,
         amount: quotationLineAmount(toLineInput(it, qty)),
+        // Durable GST-inclusive delta. The server snapshots it on the line and
+        // backs it out of the taxable amount once — no double count on reopen.
+        priceAdjustment: Number(it.priceAdjustment) || 0,
       })
     })
     if (problems.length > 0) { setError(problems.join('\n')); return }
@@ -1035,6 +1058,7 @@ export default function QuotationsPage() {
               </div>
               {items.map((it, idx) => {
                 const piece = isPieceRateForm(it)
+                const addOn = Number(it.priceAdjustment) || 0
                 const lineTotal = quotationLineAmount(toLineInput(it, parseQuotationQty(it.qty) ?? 0))
                 const searching = productSearch.line === idx
                 // Keep the line's search panel open while that line is being
@@ -1057,6 +1081,9 @@ export default function QuotationsPage() {
                         placeholder="Search name or SKU…"
                         autoComplete="off"
                       />
+                      {addOn > 0 ? (
+                        <span className="mt-0.5 block text-[10px] font-semibold text-violet-700">+₹{addOn} variant add-on (GST inclusive)</span>
+                      ) : null}
                       {showDropdown && (
                         <div className="absolute z-20 mt-1 max-h-44 w-full overflow-auto rounded-md border border-border/60 bg-card p-1 shadow-md">
                           {productSearch.query.trim() !== '' && productSearch.query.trim() !== resolvedProductQuery ? (
@@ -1155,7 +1182,9 @@ export default function QuotationsPage() {
                     <div className="col-span-2 flex items-center justify-between sm:col-span-12">
                       <div className="flex items-center gap-3 text-xs text-muted-foreground">
                         <span className="font-semibold text-foreground">
-                          Line ({piece ? `₹${Number(it.pieceRate)} × ${parseQuotationQty(it.qty) ?? 0}` : `${totalWeightOf(it, parseQuotationQty(it.qty) ?? 0)}g × (rate + making)`}): {formatCurrency(lineTotal)}
+                          Line ({piece
+                            ? `(₹${Number(it.pieceRate)}${addOn > 0 ? ` + ₹${addOn}` : ''}) × ${parseQuotationQty(it.qty) ?? 0} ÷ 1.03`
+                            : `${totalWeightOf(it, parseQuotationQty(it.qty) ?? 0)}g × (rate + making)${addOn > 0 ? ` + ${parseQuotationQty(it.qty) ?? 0} × ₹${addOn} ÷ 1.03` : ''}`}): {formatCurrency(lineTotal)}
                         </span>
                       </div>
                       {items.length > 1 && (
@@ -1168,7 +1197,9 @@ export default function QuotationsPage() {
                 )
               })}
               <p className="text-[11px] text-muted-foreground">
-                Amount = net wt × qty × (rate ₹/g + making ₹/g). Fixed-price (Piece Rate) products bill their fixed rate × qty. {ratePerGram > 0 ? `Managed silver rate: ₹${ratePerGram}/g.` : 'Silver rate not loaded yet — set it in Silver Rate Management.'}
+                Amount = net wt × qty × (rate ₹/g + making ₹/g), plus a picked variant's GST-INCLUSIVE add-on backed out
+                as add-on × qty ÷ 1.03. Piece Rate products bill (fixed + add-on) × qty ÷ 1.03; the header's 3% GST puts
+                the add-on back exactly once. {ratePerGram > 0 ? `Managed silver rate: ₹${ratePerGram}/g.` : 'Silver rate not loaded yet — set it in Silver Rate Management.'}
               </p>
             </div>
 
@@ -1238,7 +1269,10 @@ export default function QuotationsPage() {
                 <div className="space-y-1.5">
                   {(viewQuote.items ?? []).map((it, i) => (
                     <div key={it.id ?? i} className="flex justify-between text-xs">
-                      <span>{it.product || it.sku} × {it.qty}{it.weight ? ` · ${it.weight}g` : ''}</span>
+                      <span>
+                        {it.product || it.sku} × {it.qty}{it.weight ? ` · ${it.weight}g` : ''}
+                        {Number(it.priceAdjustment) > 0 ? ` · +₹${it.priceAdjustment} add-on` : ''}
+                      </span>
                       <span className="tabular-nums">{formatCurrency(it.amount)}</span>
                     </div>
                   ))}

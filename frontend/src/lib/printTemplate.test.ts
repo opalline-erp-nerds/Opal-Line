@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildPrintHtml, exportHtmlPdf, invoicePrintDoc, mergePrintConfig, printHtmlToPrinter } from '@/lib/printTemplate'
+import { buildPrintHtml, exportHtmlPdf, formatPrintDate, invoicePrintDoc, mergePrintConfig, printHtmlToPrinter } from '@/lib/printTemplate'
 import type { Invoice } from '@/types'
 
 // The invoice screen and the printed page must show the SAME persisted values.
@@ -60,6 +60,25 @@ function itemRow(html: string, product: string): string {
   const rows = html.split('<tr').filter((r) => r.includes(product))
   assert.equal(rows.length, 1, `expected exactly one row for ${product}`)
   return rows[0]
+}
+
+/** Visible text of each <td>/<th> in a fragment, in document order. */
+function colTexts(fragment: string, tag: 'th' | 'td'): string[] {
+  return fragment.split(`<${tag}`).slice(1).map((chunk) => {
+    const inner = chunk.slice(chunk.indexOf('>') + 1)
+    return inner.slice(0, inner.indexOf(`</${tag}>`)).replace(/<br\s*\/?>/g, ' ').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
+  })
+}
+
+function headerOf(html: string): string[] {
+  return colTexts(html.slice(html.indexOf('<thead>') + '<thead>'.length, html.indexOf('</thead>')), 'th')
+}
+
+/** The single info box built by the shared template for payment state. */
+function paymentBox(html: string): string {
+  const boxes = html.split('<div class="info-box">').filter((b) => b.includes('Payment Status'))
+  assert.equal(boxes.length, 1, 'expected exactly one Payment Status info box')
+  return boxes[0]
 }
 
 test('invoicePrintDoc maps the persisted invoice onto the print document without recalculating', () => {
@@ -128,12 +147,15 @@ test('printed totals match the details response and add up to the grand total', 
     rupees(grand),
   )
 
-  // The items-table footer total shows the SAME grand total the totals box
-  // shows — not the GST-exclusive subtotal sum of the Amount column.
+  // The items-table footer reconciles the explicit money columns: taxable
+  // (ex GST), GST and grand total, each under its own named column.
   const foot = html.slice(html.indexOf('<tfoot>'), html.indexOf('</tfoot>'))
   const fmtIn = (n: number) => `₹${n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-  assert.ok(foot.includes(fmtIn(invoice.grandTotal)), 'table footer must show the calculated grand total')
-  assert.ok(!foot.includes(fmtIn(invoice.subtotal)), 'table footer must not repeat the GST-exclusive subtotal')
+  const footCells = colTexts(foot, 'td')
+  assert.ok(footCells.includes(fmtIn(invoice.subtotal)), 'footer taxable cell must equal the stored subtotal')
+  assert.ok(footCells.includes(fmtIn(invoice.gstAmount)), 'footer GST cell must equal the stored GST')
+  assert.ok(footCells.includes(fmtIn(invoice.grandTotal)), 'footer total cell must equal the stored grand total')
+  assert.ok(foot.includes('Total: 3 items'), 'footer count must be singular/plural correct')
   assert.ok(html.includes(fmtIn(invoice.subtotal)), 'the subtotal must still print as the Taxable Value row')
 })
 
@@ -383,17 +405,6 @@ test('header and row cells stay in the same column order, with and without image
     grandTotal: 7503.14,
   })
 
-  /** Cell texts of a <thead>/<tr> fragment, in DOM order. */
-  const colTexts = (fragment: string, tag: 'th' | 'td'): string[] =>
-    fragment.split(`<${tag}`).slice(1).map((chunk) => {
-      const inner = chunk.slice(chunk.indexOf('>') + 1)
-      return inner.slice(0, inner.indexOf(`</${tag}>`)).replace(/<br\s*\/?>/g, ' ').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
-    })
-  const headerOf = (html: string): string[] => {
-    const start = html.indexOf('<thead>') + '<thead>'.length
-    return colTexts(html.slice(start, html.indexOf('</thead>')), 'th')
-  }
-
   // 1) Image column reserved, product has NO image — the bug condition.
   const noImageHtml = buildPrintHtml(
     invoicePrintDoc(invoice, { imagesBySku: new Map() }),
@@ -403,7 +414,10 @@ test('header and row cells stay in the same column order, with and without image
   const ths = headerOf(noImageHtml)
   assert.deepEqual(
     ths,
-    ['', 'Product', 'HSN', 'Qty', 'Weight (g)', 'Rate (₹/g)', 'Making Value (₹)', 'GST AMOUNT (₹)', 'Amount (₹)'],
+    [
+      '', 'Product', 'HSN', 'Qty', 'Weight (g)', 'Rate (₹/g)', 'Making Value (₹)',
+      'Taxable (ex GST) (₹)', 'GST AMOUNT (₹)', 'Total (incl GST) (₹)',
+    ],
     'header column order must match the invoice table contract',
   )
   const tds = colTexts(itemRow(noImageHtml, 'Twisted Rope Chain 22 inch'), 'td')
@@ -422,7 +436,8 @@ test('header and row cells stay in the same column order, with and without image
   assert.equal(under('Rate (₹/g)'), '₹125.00')
   assert.equal(under('Making Value (₹)'), '₹1,004.77', 'Making Value must show weight × making charge')
   assert.equal(under('GST AMOUNT (₹)'), '₹218.54', 'GST AMOUNT must show the allocated line GST')
-  assert.equal(under('Amount (₹)'), '₹7,503.14', 'Amount must show the gross line total: taxable ₹7,284.60 + GST ₹218.54')
+  assert.equal(under('Taxable (ex GST) (₹)'), '₹7,284.60', 'Taxable must be the stored ex-GST line amount')
+  assert.equal(under('Total (incl GST) (₹)'), '₹7,503.14', 'Total must be taxable + this line’s GST')
 
   // 2) Same invoice WITH an image: still one cell per header column.
   const withImageHtml = buildPrintHtml(
@@ -436,6 +451,87 @@ test('header and row cells stay in the same column order, with and without image
   const plainHtml = printInvoice(invoice)
   const plainThs = headerOf(plainHtml)
   assert.equal(colTexts(itemRow(plainHtml, 'Twisted Rope Chain 22 inch'), 'td').length, plainThs.length)
+})
+
+test('print dates use Asia/Kolkata, including naive stored timestamps', () => {
+  // SI202611268668: the detail screen showed 11:27 am while the print showed
+  // 5:57 am because the renderer used the host's UTC clock. A naive stored
+  // timestamp is UTC in this ERP, so IST adds 5h30m — exactly the gap reported.
+  assert.match(formatPrintDate('2026-11-26T05:57:00'), /26 Nov 2026, 11:27\s?am/i)
+  assert.match(formatPrintDate('2026-11-26T05:57:00Z'), /26 Nov 2026, 11:27\s?am/i)
+  assert.match(formatPrintDate('2026-11-26 05:57:00'), /26 Nov 2026, 11:27\s?am/i)
+
+  const html = printInvoice(makeInvoice({ date: '2026-11-26T05:57:00' }))
+  assert.match(html, /26 Nov 2026, 11:27\s?am/i, 'the printed date box must use IST too')
+  assert.doesNotMatch(html, /26 Nov 2026, 5:57\s?am/i, 'the UTC drift must be gone')
+})
+
+test('the print payment box shows the real state and never repeats a status as a method', () => {
+  // Legacy Shopify rows stored the word "Pending" in payment_method. The old
+  // template printed it in both the method and status slots.
+  const unpaid = printInvoice(makeInvoice({
+    paymentMethod: 'Pending',
+    paymentStatus: 'pending',
+    status: 'issued',
+  }))
+  const box = paymentBox(unpaid)
+  assert.match(box, /Payment Status<\/div><div class="value">Pending<\/div>/)
+  assert.match(box, /Payment Method: —/, 'a status word must render as —, not be repeated')
+  assert.doesNotMatch(box, /Payment Method: Pending/, 'Pending is a status, never a method')
+
+  const cash = printInvoice(makeInvoice({ paymentMethod: 'Cash', paymentStatus: 'paid', status: 'paid' }))
+  assert.match(paymentBox(cash), /Payment Status<\/div><div class="value">Paid<\/div>/)
+  assert.match(paymentBox(cash), /Payment Method: Cash/)
+
+  const razorpay = printInvoice(makeInvoice({ paymentMethod: 'Razorpay', paymentStatus: 'paid', status: 'paid' }))
+  assert.match(paymentBox(razorpay), /Payment Status<\/div><div class="value">Paid<\/div>/)
+  assert.match(paymentBox(razorpay), /Payment Method: Razorpay/)
+})
+
+test('weight-based and piece-rate lines reconcile taxable, GST and gross money', () => {
+  const weightBased = makeInvoice({
+    items: [
+      { product: 'Twisted Rope Chain', sku: 'OL-CHN-003', hsn: '7113', qty: 1, weight: 50.2385, silverRate: 125, makingCharge: 20, tax: 218.54, amount: 7284.6 },
+    ],
+    subtotal: 7284.6,
+    gstAmount: 218.54,
+    discount: 0,
+    grandTotal: 7503.14,
+  })
+  const weightHtml = printInvoice(weightBased)
+  const weightHeaders = headerOf(weightHtml)
+  const weightCells = colTexts(itemRow(weightHtml, 'Twisted Rope Chain'), 'td')
+  const weightUnder = (label: string) => weightCells[weightHeaders.indexOf(label)]
+  assert.equal(weightUnder('Weight (g)'), '50.24')
+  assert.equal(weightUnder('Making Value (₹)'), '₹1,004.77')
+  assert.equal(weightUnder('Taxable (ex GST) (₹)'), '₹7,284.60')
+  assert.equal(weightUnder('GST AMOUNT (₹)'), '₹218.54')
+  assert.equal(weightUnder('Total (incl GST) (₹)'), '₹7,503.14')
+
+  // The reported SI202611268668 shape: a fixed piece-rate line with no weight
+  // or rate snapshot must dash those cells while the money still reconciles.
+  const pieceRate = makeInvoice({
+    items: [
+      { product: 'Fixed Price Pendant', sku: 'OL-FIX-001', hsn: '7113', qty: 1, weight: 0, silverRate: 0, makingCharge: 0, tax: 5.83, amount: 194.17 },
+    ],
+    subtotal: 194.17,
+    gstAmount: 5.83,
+    discount: 0,
+    grandTotal: 200,
+  })
+  const pieceHtml = printInvoice(pieceRate)
+  const pieceHeaders = headerOf(pieceHtml)
+  const pieceCells = colTexts(itemRow(pieceHtml, 'Fixed Price Pendant'), 'td')
+  const pieceUnder = (label: string) => pieceCells[pieceHeaders.indexOf(label)]
+  assert.equal(pieceUnder('Weight (g)'), '—')
+  assert.equal(pieceUnder('Rate (₹/g)'), '—')
+  assert.equal(pieceUnder('Making Value (₹)'), '—')
+  assert.equal(pieceUnder('Taxable (ex GST) (₹)'), '₹194.17')
+  assert.equal(pieceUnder('GST AMOUNT (₹)'), '₹5.83')
+  assert.equal(pieceUnder('Total (incl GST) (₹)'), '₹200.00')
+  assert.equal(rupees(rowValue(pieceHtml, 'Taxable Value')), pieceRate.subtotal)
+  assert.equal(rupees(rowValue(pieceHtml, 'Total GST')), pieceRate.gstAmount)
+  assert.equal(rupees(rowValue(pieceHtml, 'GRAND TOTAL')), pieceRate.grandTotal)
 })
 
 // ── Hand-off to the browser ───────────────────────────────────────────────────

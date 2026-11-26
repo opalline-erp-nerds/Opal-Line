@@ -6,7 +6,8 @@ import { ensureSilverRate } from './fixtures'
  * on the shared `lib/sellableItems` helper:
  *
  *  - a variant is its OWN row: typing `…-RED` selects `silver toy - red (…-RED)`;
- *  - a Piece Rate product prices from its fixed ₹/pc (₹2,000), never from
+ *  - a Piece Rate product prices from its fixed ₹/pc (₹2,000) plus the
+ *    variant's GST-inclusive "Add to price" (₹200), never from
  *    `net wt × (silver rate + making)`;
  *  - stock is validated and deducted against the VARIANT (red has 4 while the
  *    parent holds 6 — an over-quantity of 5 must be refused);
@@ -43,7 +44,7 @@ interface ToyFixture {
   whiteSku: string
 }
 
-/** A Piece Rate product (₹2,000/pc) with red/white variants holding stock. */
+/** A Piece Rate product (₹2,000/pc) with red (+₹200)/white (+₹0) variants holding stock. */
 async function createVariantToy(apiClient: ApiClient, stamp: number): Promise<ToyFixture> {
   const sku = `E2E-SV-${stamp}`
   const name = `E2E Sellable Toy ${stamp}`
@@ -53,8 +54,9 @@ async function createVariantToy(apiClient: ApiClient, stamp: number): Promise<To
     category: 'Silver Jewels',
     status: 'active',
     shopifyStatus: 'not-listed',
-    // Piece Rate: sellingPrice/fixedPieceRate are the ₹2,000 the pickers fill
-    // in; netWeight exists so a weight-based mis-price would be obvious.
+    // Piece Rate: fixedPieceRate is the ₹2,000 base the pickers add the
+    // variant's add-on to; netWeight exists so a weight-based mis-price
+    // would be obvious.
     pieceRateProduct: true,
     fixedPieceRate: 2000,
     sellingPrice: 2000,
@@ -73,12 +75,14 @@ async function createVariantToy(apiClient: ApiClient, stamp: number): Promise<To
   expect(created.status(), `product fixture: ${await created.text()}`).toBe(201)
   const product = (await created.json()) as { id: string }
 
-  // Per-variant stock: red 4, white 2 (parent rollup becomes 6).
+  // Per-variant stock: red 4, white 2 (parent rollup becomes 6). The red
+  // variant carries a durable ₹200 add-on; its selling_price is the EFFECTIVE
+  // ₹2,200, while white is the plain ₹2,000 base.
   const variants = await apiClient.put(`/api/v1/db/products/${product.id}/variants`, {
     options: [{ name: 'color', values: ['red', 'white'] }],
     variants: [
-      { title: 'red', optionValues: ['red'], sku: `${sku}-RED`, stock: 4 },
-      { title: 'white', optionValues: ['white'], sku: `${sku}-WHI`, stock: 2 },
+      { title: 'red', optionValues: ['red'], sku: `${sku}-RED`, sellingPrice: 2200, priceAdjustment: 200, stock: 4 },
+      { title: 'white', optionValues: ['white'], sku: `${sku}-WHI`, sellingPrice: 2000, priceAdjustment: 0, stock: 2 },
     ],
   })
   expect(variants.status(), `variant fixture: ${await variants.text()}`).toBe(200)
@@ -140,13 +144,20 @@ test.describe('sellable variants on invoices and manual orders', () => {
 
       // ── 2. Pricing mode: Piece Rate, so no weight/rate maths. ─────────────
       await expect(dialog.getByText('₹2000 / pc')).toBeVisible()
+      await expect(dialog.getByText('+₹200 add-on')).toBeVisible()
       await expect(dialog.getByLabel('Net weight per piece for line 1 (g)')).toBeDisabled()
       await expect(dialog.getByLabel('Making charge for line 1 (₹/g)')).toBeDisabled()
-      // Amount cell = qty × fixed (title says so), and GST rides on top:
-      // 1 × ₹2,000 → subtotal ₹2,000 → grand total ₹2,060. formatCurrency
-      // drops decimals for whole amounts, hence "₹2,000" and not "₹2,000.00".
-      await expect(dialog.locator('td[title*="fixed piece rate"]')).toHaveText('₹2,000')
-      await expect(dialog.getByText('₹2,060')).toBeVisible()
+      // The add-on is GST-inclusive: taxable = (₹2,000 + ₹200) ÷ 1.03 =
+      // ₹2,135.92, and the header's 3% puts the ₹200 back exactly once, so
+      // the customer pays ₹2,200 (not ₹2,406). formatCurrency drops decimals
+      // for whole amounts, hence "₹2,200" and not "₹2,200.00".
+      await expect(dialog.locator('td[title*="fixed piece rate"]')).toHaveText('₹2,135.92')
+      await expect(dialog.locator('td[title*="fixed piece rate"]')).toHaveAttribute(
+        'title',
+        '1 × (₹2000 + ₹200 add-on) ÷ 1.03 (fixed piece rate)',
+      )
+      await expect(dialog.getByText('₹64.08'), '3% of the ₹2,135.92 taxable amount').toBeVisible()
+      await expect(dialog.getByText('₹2,200')).toBeVisible()
 
       // ── 3. Save. ──────────────────────────────────────────────────────────
       await dialog.getByRole('button', { name: /Create invoice/ }).click()
@@ -155,17 +166,24 @@ test.describe('sellable variants on invoices and manual orders', () => {
       await page.keyboard.press('Escape')
       await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 5000 })
 
-      // ── 4. What got stored: the variant, its SKU and the fixed amount. ────
+      // ── 4. What got stored: the variant, its SKU and the add-on. ──────────
       const list = (await (await apiClient.get('/api/v1/db/invoices/with-items?limit=200')).json()) as {
-        data: Array<{ id: string; customer: string; grandTotal: number; items?: Array<Record<string, unknown>> }>
+        data: Array<{
+          id: string; customer: string; grandTotal: number; gstAmount: number
+          items?: Array<Record<string, unknown>>
+        }>
       }
       const saved = list.data.find((r) => r.customer === customer)
       expect(saved, 'the invoice must exist in the API').toBeTruthy()
-      expect(saved!.grandTotal).toBe(2060, '1 × ₹2,000 + 3% GST')
-      const line = saved!.items?.[0] as { sku?: string; variantId?: string; amount?: number; product?: string }
+      expect(Number(saved!.gstAmount)).toBe(64.08, '3% of the ₹2,135.92 taxable amount')
+      expect(saved!.grandTotal).toBe(2200, '(₹2,000 + ₹200 add-on) once, with 3% GST')
+      const line = saved!.items?.[0] as {
+        sku?: string; variantId?: string; amount?: number; priceAdjustment?: number; product?: string
+      }
       expect(line.sku).toBe(toy.redSku, 'the line carries the VARIANT sku')
       expect(line.variantId, 'sales_invoice_items.variant_id must be persisted').toBeTruthy()
-      expect(Number(line.amount)).toBe(2000, 'the fixed piece rate, not weight × (rate + making)')
+      expect(Number(line.priceAdjustment)).toBe(200, 'the durable add-on is snapshotted on the line')
+      expect(Number(line.amount)).toBe(2135.92, '(₹2,000 + ₹200) ÷ 1.03, not weight × (rate + making)')
       expect(String(line.product)).toContain('red', 'the variant name reaches the stored line')
 
       // ── 5. Stock moved from the VARIANT, not the parent total. ────────────
@@ -232,7 +250,10 @@ test.describe('sellable variants on invoices and manual orders', () => {
 
       // ── 1. The Product dropdown resolves the variant code. ────────────────
       await pickOption(dialog, page, 'Select product', toy.redSku)
-      await expect(dialog.getByLabel('Unit price for line 1 (₹)')).toHaveValue('2000', 'Piece Rate price, not 200 g × (rate + making)')
+      // Inventory lines store the PER-UNIT GST-INCLUSIVE price: the fixed
+      // ₹2,000 plus the variant's ₹200 add-on. The add-on is never added again
+      // when the order's value is derived.
+      await expect(dialog.getByLabel('Unit price for line 1 (₹)')).toHaveValue('2200', 'fixed ₹2,000 + ₹200 add-on, not 200 g × (rate + making)')
 
       // ── 2. The scanner resolves the OTHER variant by its code. ────────────
       const scan = dialog.getByPlaceholder('Scan a label QR or type a SKU, then press Enter')
@@ -265,7 +286,7 @@ test.describe('sellable variants on invoices and manual orders', () => {
           id: string
           customer: string
           value: number
-          lineItems?: Array<{ sku?: string; variantId?: string; productId?: string; price?: number }>
+          lineItems?: Array<{ sku?: string; variantId?: string; productId?: string; price?: number; priceAdjustment?: number }>
         }>
       }
       const saved = list.data.find((r) => r.customer === customer)
@@ -274,9 +295,11 @@ test.describe('sellable variants on invoices and manual orders', () => {
       expect(saved!.lineItems?.[0]?.sku).toBe(toy.redSku)
       expect(saved!.lineItems?.[0]?.variantId, 'the line carries variant_id').toBeTruthy()
       expect(saved!.lineItems?.[0]?.productId, 'the line carries product_id').toBeTruthy()
-      expect(Number(saved!.lineItems?.[0]?.price)).toBe(2000, 'the fixed piece rate as the unit price')
+      expect(Number(saved!.lineItems?.[0]?.priceAdjustment)).toBe(200, 'the red add-on is snapshotted on the line')
+      expect(Number(saved!.lineItems?.[0]?.price)).toBe(2200, 'per-unit price already includes the add-on')
       expect(saved!.lineItems?.[1]?.sku).toBe(toy.whiteSku, 'the scanned variant landed as its own line')
-      expect(Math.abs(Number(saved!.value) - 4000)).toBeLessThanOrEqual(0.02, '2 × ₹2,000')
+      expect(Number(saved!.lineItems?.[1]?.price)).toBe(2000, 'white has no add-on')
+      expect(Math.abs(Number(saved!.value) - 4200)).toBeLessThanOrEqual(0.02, '₹2,200 + ₹2,000, add-on counted once')
 
       // ── 6. Both variants were deducted. ───────────────────────────────────
       const stocks = await variantStocks(apiClient, toy.id)

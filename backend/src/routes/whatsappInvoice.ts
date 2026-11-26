@@ -8,6 +8,7 @@ import { requirePermission } from '../rbac'
 import { sendWhatsAppMessage, isWhatsAppConfigured } from '../whatsapp'
 import { logger } from '../logger'
 import { routeParam } from '../lib/routeParams'
+import { formatIstDate } from '../istDate'
 
 /**
  * POST /api/v1/whatsapp/invoice/:id
@@ -84,7 +85,7 @@ export function registerWhatsappInvoiceRoutes(app: Express) {
         .join('\n')
       const more = items.length > 8 ? `\n…and ${items.length - 8} more item(s)` : ''
       const validity = quote.validUntil
-        ? new Date(quote.validUntil).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+        ? formatIstDate(quote.validUntil)
         : 'the date agreed with you'
       const message =
         `\uD83D\uDCCB *Quotation ${quote.number}*\n` +

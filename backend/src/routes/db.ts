@@ -41,10 +41,16 @@ import {
   type AgingBucketKey,
 } from '../lib/stockAging'
 import { invoiceTotals } from '../invoiceTotals'
+import { normalizeInvoicePayment, normalizeInvoicePaymentPatch } from '../invoicePayment'
 import { fixedPieceRateFor } from '../orderPricing'
+import {
+  invoiceComponentTotals,
+  pieceRateTaxableAmount,
+  weightTaxableAmount,
+} from '../variantPricing'
 import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
 import { splitQtyAcrossVariants } from '../lib/variantSplit'
-import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
+import { pushInventoryToShopify, getLatestSilverRate, isDefaultVariantRow } from '../shopify'
 import { queueProductOutbound } from '../shopifyOutbound'
 import { fetchStoreLocations, isShopifyLocationId, type ShopifyStoreLocation } from '../shopifyLocations'
 import { escapeHtml } from '../htmlEscape'
@@ -1742,6 +1748,11 @@ export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number):
       // was drawn from, not just a SKU string.
       row.variantId = String(item.variantId ?? '').trim() || null
       row.qty = Math.max(1, Math.floor(num(item.qty, 1)))
+      // The variant "Add to price (₹)" is snapshotted on the line. It is GST-
+      // INCLUSIVE, so it is backed out of the taxable amount below — never
+      // added to an already-inclusive per-unit price a second time.
+      const addOn = round2(num(item.priceAdjustment, 0))
+      row.priceAdjustment = addOn > 0 ? addOn : null
       row.weight = num(item.weight, 0)
       // The rate from Silver Rate Management is AUTHORITATIVE whenever one is
       // available: a client-supplied number is only used as a last-resort
@@ -1758,11 +1769,11 @@ export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number):
       const weight = num(item.weight, 0)
       const makingChargePerGram = num(item.makingCharge, 0)
       if (weight > 0 && effectiveSilverRate > 0) {
-        // Correct formula: amount = (silverRate + makingChargePerGram) × weight
-        // This matches computeSellingPrice: (rate + makingCharge) × netWeight × 1.03 (without GST)
-        const silverValue = round2(weight * effectiveSilverRate)
-        const makingValue = round2(weight * makingChargePerGram)
-        row.amount = round2(silverValue + makingValue)
+        // Correct formula: amount = weight × (silverRate + makingChargePerGram)
+        // + the add-on's share of the taxable value (addOn × qty ÷ 1.03). This
+        // matches computeSellingPrice's ex-GST base and keeps the customer's
+        // final payable exactly base + add-on once GST is re-added by totals.
+        row.amount = weightTaxableAmount(weight, effectiveSilverRate, makingChargePerGram, addOn, row.qty)
       } else {
         row.amount = num(item.amount, 0)
       }
@@ -1771,24 +1782,37 @@ export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number):
     .filter((it) => String(it.sku) !== '' || String(it.product) !== '')
 }
 
+/** A Piece Rate Product's fixed ₹/pc plus its variant's durable add-on. */
+export interface PieceRateResolution {
+  fixed: number
+  addOn: number
+}
+
 /**
- * Piece-rate override for invoice lines, given the fixed piece rates keyed by
- * lowercased SKU.
+ * Piece-rate override for invoice lines, keyed by lowercased SKU.
  *
  * A Piece Rate Product bills at its fixed rate × qty: the silver-rate
- * calculation (weight × rate + making charge) that normally produces the line
- * amount does not apply, so the components are cleared with it and the invoice
- * header sums (silverValue / makingCharge) stay consistent with the total.
+ * calculation (weight × rate + making charge) does not apply. The add-on is
+ * GST-INCLUSIVE and rides on the same fixed price, so the taxable amount is
+ * `(fixed + addOn) × qty ÷ 1.03`; header totals add the 3% back.
  */
 export function applyPieceRateItems<T extends Record<string, unknown>>(
   items: T[],
-  fixedRatesBySku: Map<string, number>,
-): T[] {
-  if (fixedRatesBySku.size === 0) return items
+  ratesBySku: Map<string, PieceRateResolution>,
+): Array<T & { priceAdjustment?: number | null }> {
+  if (ratesBySku.size === 0) return items as Array<T & { priceAdjustment?: number | null }>
   return items.map((it) => {
-    const fixed = fixedRatesBySku.get(String(it.sku ?? '').trim().toLowerCase())
-    if (fixed == null || !(fixed > 0)) return it
-    return { ...it, silverRate: 0, makingCharge: 0, amount: round2(fixed * num(it.qty, 1)) } as T
+    const resolution = ratesBySku.get(String(it.sku ?? '').trim().toLowerCase())
+    if (!resolution || !(resolution.fixed > 0)) return it
+    const qty = Math.max(1, Math.floor(num(it.qty, 1)))
+    const addOn = round2(resolution.addOn)
+    return {
+      ...it,
+      silverRate: 0,
+      makingCharge: 0,
+      priceAdjustment: addOn > 0 ? addOn : null,
+      amount: pieceRateTaxableAmount(resolution.fixed, addOn, qty),
+    } as T & { priceAdjustment?: number | null }
   })
 }
 
@@ -1811,19 +1835,40 @@ export function pieceRateMapFor(
     fixedPieceRate?: number | string | null
     sellingPrice?: number | string | null
   }>,
-  variants: Array<{ sku: string | null; productId: string | null }>,
-): Map<string, number> {
+  variants: Array<{
+    sku: string | null
+    productId: string | null
+    title?: string | null
+    optionValues?: unknown
+    sellingPrice?: number | string | null
+    priceAdjustment?: number | string | null
+  }>,
+): Map<string, PieceRateResolution> {
   const wanted = new Set(codes.map((c) => String(c).trim().toLowerCase()).filter(Boolean))
   const byId = new Map(products.map((p) => [p.id, p]))
-  const rates = new Map<string, number>()
-  const consider = (code: string | null | undefined, product: (typeof products)[number] | undefined) => {
+  const rates = new Map<string, PieceRateResolution>()
+  const consider = (
+    code: string | null | undefined,
+    product: (typeof products)[number] | undefined,
+    variant?: (typeof variants)[number],
+  ) => {
     const key = String(code ?? '').trim().toLowerCase()
     if (!key || !wanted.has(key) || rates.has(key) || !product) return
-    const rate = fixedPieceRateFor(product)
-    if (rate != null) rates.set(key, rate)
+    const fixed = fixedPieceRateFor(product)
+    if (fixed == null || !(fixed > 0)) return
+    // Explicit priceAdjustment wins. A pre-column row stored the add-on in
+    // selling_price; for a piece-rate variant that value is now EFFECTIVE, so
+    // the delta is the excess over the fixed rate. Default-Title mirror rows
+    // are absolute and never contribute an add-on.
+    const explicit = variant?.priceAdjustment != null ? Number(variant.priceAdjustment) : NaN
+    const legacy = variant && !isDefaultVariantRow(variant.title, variant.optionValues)
+      ? Math.max(0, round2(num(variant.sellingPrice, fixed) - fixed))
+      : 0
+    const addOn = Number.isFinite(explicit) ? Math.max(0, round2(explicit)) : legacy
+    rates.set(key, { fixed, addOn })
   }
   for (const p of products) consider(p.sku, p)
-  for (const v of variants) consider(v.sku, v.productId ? byId.get(v.productId) : undefined)
+  for (const v of variants) consider(v.sku, v.productId ? byId.get(v.productId) : undefined, v)
   return rates
 }
 
@@ -1844,9 +1889,23 @@ export async function applyPieceRateInvoiceItems<T extends Record<string, unknow
   if (skus.length === 0) return items
   // Typed explicitly: the shared client is `any`, and an untyped callback
   // parameter is exactly how an `any` silently becomes an untestable `any`.
-  type VariantCodeRow = { sku: string | null; productId: string | null }
+  type VariantCodeRow = {
+    sku: string | null
+    productId: string | null
+    title: string | null
+    optionValues: unknown
+    sellingPrice: number | null
+    priceAdjustment: number | null
+  }
   const variants: VariantCodeRow[] = await client
-    .select({ sku: s.productVariants.sku, productId: s.productVariants.productId })
+    .select({
+      sku: s.productVariants.sku,
+      productId: s.productVariants.productId,
+      title: s.productVariants.title,
+      optionValues: s.productVariants.optionValues,
+      sellingPrice: s.productVariants.sellingPrice,
+      priceAdjustment: s.productVariants.priceAdjustment,
+    })
     .from(s.productVariants)
     .where(inArray(s.productVariants.sku, skus))
   const parentIds: string[] = [
@@ -1910,9 +1969,7 @@ dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), a
         gstAmount: source.gstAmount,
         discount: source.discount,
         grandTotal: source.grandTotal,
-        paymentMethod: 'Pending',
-        paymentStatus: 'pending',
-        status: 'draft',
+        ...normalizeInvoicePayment({ paymentStatus: 'pending', status: 'draft' }),
         date: new Date().toISOString(),
       }).returning()
       for (const it of sourceItems) {
@@ -1963,6 +2020,9 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     const clean = sanitize(body, s.salesInvoices)
     delete clean.id
     delete clean.items
+    // Never copy a status word into payment_method; map every payment field
+    // (including a real Razorpay id) through the shared normaliser.
+    Object.assign(clean, normalizeInvoicePayment(body))
     // Manual (dialog-raised) invoices carry no number — mint one on the server
     // using the same settings-driven prefix and stamp as order-raised invoices,
     // so both flows share one numbering scheme and the client never invents it.
@@ -1979,9 +2039,13 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     const totals = invoiceTotals(subtotal, gst, discount)
     const gstAmount = hasItems ? totals.gstAmount : num(clean.gstAmount, totals.gstAmount)
     const grandTotal = hasItems ? totals.grandTotal : num(clean.grandTotal, totals.grandTotal)
-    const silverValue = hasItems ? round2(items.reduce((a, it) => a + num(it.weight, 0) * num(it.silverRate, 0), 0)) : num(clean.silverValue, 0)
-    // makingCharge in items is per-gram; header total must multiply by weight
-    const makingCharge = hasItems ? round2(items.reduce((a, it) => a + num(it.makingCharge, 0) * num(it.weight, 0), 0)) : num(clean.makingCharge, 0)
+    // Keep the header components equal to the subtotal even when a variant
+    // add-on (or a fixed piece rate) is folded into the line amount.
+    const components = hasItems
+      ? invoiceComponentTotals(items)
+      : { silverValue: num(clean.silverValue, 0), makingCharge: num(clean.makingCharge, 0) }
+    const silverValue = components.silverValue
+    const makingCharge = components.makingCharge
 
     const id = randomUUID()
     const row = await db!.transaction(async (tx) => {
@@ -2069,6 +2133,10 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     const row = await db!.transaction(async (tx) => {
       const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
       if (!existing) return null
+      // A PATCH only touches payment columns the caller actually sent. Passing
+      // the locked row lets a refund/status change update the state without
+      // erasing a real method or gateway id that was saved earlier.
+      Object.assign(clean, normalizeInvoicePaymentPatch(body, existing))
       const items = await applyPieceRateInvoiceItems(normalizeInvoiceItems(body.items, silverRate), tx)
       if (items.length > 0) {
         // First, restore old stock — each line back to THE STORE IT WAS
@@ -2124,9 +2192,9 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         const subtotal = round2(items.reduce((a, it) => a + num(it.amount, 0), 0))
         const discount = num(body.discount, num(existing.discount, 0))
         const { gstAmount, grandTotal } = invoiceTotals(subtotal, gst, discount)
-        const silverValue = round2(items.reduce((a, it) => a + num(it.weight, 0) * num(it.silverRate, 0), 0))
-        // makingCharge in items is per-gram; header total must multiply by weight
-        const makingCharge = round2(items.reduce((a, it) => a + num(it.makingCharge, 0) * num(it.weight, 0), 0))
+        const components = invoiceComponentTotals(items)
+        const silverValue = components.silverValue
+        const makingCharge = components.makingCharge
         clean.subtotal = subtotal
         clean.gst = gst
         clean.gstAmount = gstAmount
@@ -6966,7 +7034,7 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
   const { options, variants } = parsed.data
   try {
     const [product] = await db!
-      .select({ id: s.products.id, sku: s.products.sku, stock: s.products.stock, shopifyId: s.products.shopifyId })
+      .select({ id: s.products.id, sku: s.products.sku, stock: s.products.stock, shopifyId: s.products.shopifyId, sellingPrice: s.products.sellingPrice })
       .from(s.products)
       .where(eq(s.products.id, routeParam(req.params.id)))
       .limit(1)
@@ -6996,12 +7064,29 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
     // save must not wipe it: keep each row's stored barcode, keyed by variant
     // id first (stable across re-ordering) and by SKU as the fallback.
     const prevVariants = await db!
-      .select({ id: s.productVariants.id, sku: s.productVariants.sku, barcode: s.productVariants.barcode })
+      .select({
+        id: s.productVariants.id,
+        sku: s.productVariants.sku,
+        barcode: s.productVariants.barcode,
+        sellingPrice: s.productVariants.sellingPrice,
+        priceAdjustment: s.productVariants.priceAdjustment,
+      })
       .from(s.productVariants)
       .where(eq(s.productVariants.productId, product.id))
     const prevBarcodeById = new Map(prevVariants.map((r) => [r.id, r.barcode]))
     const prevBarcodeBySku = new Map(
       prevVariants.map((r) => [String(r.sku ?? '').trim().toUpperCase(), r.barcode]),
+    )
+    // Old rows have no price_adjustment — their selling_price WAS the add-on.
+    // Keeping both old shapes here lets an edit round-trip without losing the
+    // delta or adding it a second time.
+    const prevAddOnById = new Map(prevVariants.map((r) => [r.id, r.priceAdjustment]))
+    const prevAddOnBySku = new Map(
+      prevVariants.map((r) => [String(r.sku ?? '').trim().toUpperCase(), r.priceAdjustment]),
+    )
+    const prevPriceById = new Map(prevVariants.map((r) => [r.id, r.sellingPrice]))
+    const prevPriceBySku = new Map(
+      prevVariants.map((r) => [String(r.sku ?? '').trim().toUpperCase(), r.sellingPrice]),
     )
 
     // What the LEDGER holds today, per variant and per location. The dialog
@@ -7026,22 +7111,47 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
 
     // Ids are decided up front so the movements below can name the rows the
     // replace is about to write.
-    const planned = variants.map((v) => ({
-      id: v.id?.trim() || randomUUID(),
-      productId: product.id,
-      title: v.title.trim(),
-      optionValues: v.optionValues,
-      sku: v.sku.trim(),
-      barcode: (v.id?.trim() && prevBarcodeById.get(v.id.trim())) || prevBarcodeBySku.get(v.sku.trim().toUpperCase()) || null,
-      sellingPrice: v.sellingPrice ?? null,
-      compareAtPrice: v.compareAtPrice ?? null,
-      costPrice: v.costPrice ?? null,
-      grossWeight: v.grossWeight ?? null,
-      stock: Math.max(0, Math.floor(v.stock)),
-      reorderLevel: v.reorderLevel ?? null,
-      status: v.status ?? 'active',
-      createdAt: new Date().toISOString(),
-    }))
+    const roundMoney = (value: number) => Math.round(value * 100) / 100
+    const basePrice = Number(product.sellingPrice ?? 0) || 0
+    const planned = variants.map((v) => {
+      const id = v.id?.trim() || randomUUID()
+      const skuKey = v.sku.trim().toUpperCase()
+      const defaultRow = isDefaultVariantRow(v.title, v.optionValues)
+      const previousAddOn = (v.id?.trim() ? prevAddOnById.get(v.id.trim()) : undefined) ?? prevAddOnBySku.get(skuKey)
+      const previousPrice = (v.id?.trim() ? prevPriceById.get(v.id.trim()) : undefined) ?? prevPriceBySku.get(skuKey)
+      // The dialog now sends BOTH fields. The explicit delta always wins;
+      // rows saved before the column existed fall back to the stored add-on.
+      const legacyAddOn = v.sellingPrice ?? previousPrice
+      const addOn = defaultRow
+        ? 0
+        : v.priceAdjustment != null
+          ? Math.max(0, roundMoney(Number(v.priceAdjustment) || 0))
+          : previousAddOn != null
+            ? Math.max(0, roundMoney(Number(previousAddOn) || 0))
+            : Math.max(0, roundMoney(Number(legacyAddOn) || 0))
+      // selling_price is the EFFECTIVE price on real rows. A Default-Title
+      // mirror keeps its legacy absolute value (the base alone).
+      const effectivePrice = defaultRow
+        ? roundMoney(Number(v.sellingPrice ?? previousPrice ?? basePrice) || 0)
+        : roundMoney(basePrice + addOn)
+      return {
+        id,
+        productId: product.id,
+        title: v.title.trim(),
+        optionValues: v.optionValues,
+        sku: v.sku.trim(),
+        barcode: (v.id?.trim() && prevBarcodeById.get(v.id.trim())) || prevBarcodeBySku.get(skuKey) || null,
+        sellingPrice: effectivePrice,
+        priceAdjustment: addOn,
+        compareAtPrice: v.compareAtPrice ?? null,
+        costPrice: v.costPrice ?? null,
+        grossWeight: v.grossWeight ?? null,
+        stock: Math.max(0, Math.floor(v.stock)),
+        reorderLevel: v.reorderLevel ?? null,
+        status: v.status ?? 'active',
+        createdAt: new Date().toISOString(),
+      }
+    })
 
     await db!.transaction(async (tx) => {
       await tx.delete(s.productVariants).where(eq(s.productVariants.productId, product.id))

@@ -4,16 +4,18 @@ import { round2 } from '@/lib/utils'
  * Canonical quotation money math — mirrors the backend one-for-one:
  *
  *   - `normalizeQuotationItems` (routes/quotations.ts):
- *       amount = weight × (silverRate + makingChargePerGram), making charge PER GRAM
- *   - `applyPieceRateInvoiceItems`: piece-rate lines bill fixedPieceRate × qty
- *     and carry weight / silverRate / makingCharge = 0
- *   - `computeTotals`: GST on the subtotal (pre-discount); discount comes off
- *     the grand total.
+ *       amount = weight × (rate + making) + addOn × qty ÷ 1.03
+ *   - `applyPieceRateInvoiceItems`: piece-rate lines bill
+ *       (fixed + addOn) × qty ÷ 1.03 and zero the rate components
+ *   - `computeTotals`: GST on the subtotal; discount comes off the grand total
  *
- * The dialog previews with exactly these formulas so what the user sees is
- * what the server stores — the mismatch this module replaces (flat making
- * charge and a qty-blind line total) is pinned by quotationPricing.test.ts.
+ * The variant "Add to price (₹)" is GST-INCLUSIVE. It is backed out of the
+ * taxable line amount here and put back exactly once by the header's 3% GST,
+ * so the customer pays the base plus the add-on — never the add-on twice.
  */
+
+/** Standard GST rate for silver jewellery. */
+const GST_RATE_DIVISOR = 1.03
 
 /** One editable quotation line, numeric fields already parsed. */
 export interface QuotationLineInput {
@@ -24,8 +26,10 @@ export interface QuotationLineInput {
   silverRatePerGram: number
   /** Making charge PER GRAM (catalogue value, editable). */
   makingChargePerGram: number
-  /** Fixed price per piece for Piece Rate Products; 0 = silver-rate line. */
+  /** Fixed GST-inclusive price per piece for Piece Rate Products; 0 = weight line. */
   fixedPieceRate: number
+  /** GST-inclusive variant "Add to price (₹)" snapshotted on the line. */
+  priceAdjustment?: number
 }
 
 /** Total billable weight for a line = per-piece net weight × qty. */
@@ -43,8 +47,14 @@ export function isPieceRateLine(line: QuotationLineInput): boolean {
 /** Line amount exactly as the backend computes it, rounded to the paisa. */
 export function quotationLineAmount(line: QuotationLineInput): number {
   const qty = Math.max(0, line.qty)
-  if (isPieceRateLine(line)) return round2(line.fixedPieceRate * qty)
-  return round2(quotationLineWeight(line) * (line.silverRatePerGram + line.makingChargePerGram))
+  const addOn = round2(line.priceAdjustment ?? 0)
+  if (isPieceRateLine(line)) {
+    return round2(((line.fixedPieceRate + addOn) * qty) / GST_RATE_DIVISOR)
+  }
+  return round2(
+    quotationLineWeight(line) * (line.silverRatePerGram + line.makingChargePerGram) +
+    round2((addOn * qty) / GST_RATE_DIVISOR),
+  )
 }
 
 export interface QuotationTotals {

@@ -27,6 +27,8 @@ export interface OrderItemInput {
   price?: number
   /** The exact variant the line sold, when the product has variants. */
   variantId?: string | null
+  /** The variant's GST-inclusive "Add to price (₹)" delta. */
+  priceAdjustment?: number | string | null
   /** Weight per piece (g) entered on the order form; only fills a product with no configured weight. */
   netWeight?: number | null
   /** Total line weight (g): qty × weight-per-piece, or a manual override from the form. */
@@ -48,6 +50,8 @@ export interface ValidatedOrderItem extends OrderItemInput {
 export interface PricedOrderItem {
   /** PER-UNIT, GST-inclusive — see the module comment. */
   price: number
+  /** The GST-inclusive variant add-on carried by this line. */
+  priceAdjustment: number
   quantity: number
   netWeight: number
   makingCharge: number
@@ -78,6 +82,8 @@ export interface OrderCatalogueRow {
   fixedPieceRate?: number | string | null
   /** Legacy carrier of the same number on rows saved before the column existed. */
   sellingPrice?: number | string | null
+  /** Variant add-on answered for a variant-SKU row. */
+  priceAdjustment?: number | string | null
 }
 
 /**
@@ -106,7 +112,12 @@ export function buildPricedOrder<T extends OrderItemInput>(
   const productMap = new Map(
     productData.map((p) => [
       String(p.sku ?? '').trim(),
-      { netWeight: Number(p.netWeight ?? 0), makingCharge: Number(p.makingCharge ?? 0), pieceRate: fixedPieceRateFor(p) },
+      {
+        netWeight: Number(p.netWeight ?? 0),
+        makingCharge: Number(p.makingCharge ?? 0),
+        pieceRate: fixedPieceRateFor(p),
+        priceAdjustment: Number(p.priceAdjustment ?? 0) || 0,
+      },
     ]),
   )
 
@@ -118,7 +129,15 @@ export function buildPricedOrder<T extends OrderItemInput>(
   //   grandTotal  = Σ amount + 3% GST
   const lines = items.map((li) => {
     const sku = String(li.productSku ?? li.sku ?? '').trim()
-    const product = productMap.get(sku) ?? { netWeight: 0, makingCharge: 0, pieceRate: null as number | null }
+    const product = productMap.get(sku) ?? {
+      netWeight: 0,
+      makingCharge: 0,
+      pieceRate: null as number | null,
+      priceAdjustment: 0,
+    }
+    // The line's snapshot wins; a scan that omitted it still gets the add-on
+    // from the variant row the catalogue looked up.
+    const addOn = roundMoney(Number(li.priceAdjustment ?? product.priceAdjustment ?? 0) || 0)
     // A weight entered on the form wins (it must round-trip through
     // save/refresh); the catalogue fills in when the form sent none — which
     // covers every client that predates weight editing. Never invents a
@@ -150,10 +169,14 @@ export function buildPricedOrder<T extends OrderItemInput>(
     //    sums and the invoice raised from this order stay consistent.
     const pieceRate = product.pieceRate
     if (pieceRate != null) {
-      const amount = qty > 0 ? roundMoney((pieceRate * qty) / (1 + ORDER_GST_RATE / 100)) : 0
+      // Fixed ₹/pc is GST-inclusive, so is the add-on: the whole unit price is
+      // backed out to a taxable amount before the 3% is added back by totals.
+      const unitPrice = roundMoney(pieceRate + addOn)
+      const amount = qty > 0 ? roundMoney((unitPrice * qty) / (1 + ORDER_GST_RATE / 100)) : 0
       return {
         ...li,
-        price: pieceRate,
+        price: unitPrice,
+        priceAdjustment: addOn,
         quantity: qty,
         netWeight,
         makingCharge: 0,
@@ -167,7 +190,11 @@ export function buildPricedOrder<T extends OrderItemInput>(
 
     const itemSilverRate = weight > 0 ? silverRate : 0
     const itemMakingCharge = weight > 0 ? makingChargePerGram : 0
-    const silverValue = weight > 0 ? roundMoney(weight * itemSilverRate) : 0
+    // The add-on is an amount ON TOP of a GST-inclusive selling price. Back it
+    // out of the taxable value exactly like the base: addOn × qty ÷ 1.03. It
+    // is carried in silverValue so subtotal = Σ silverValue + makingValue.
+    const taxableAddOn = qty > 0 ? roundMoney((addOn * qty) / (1 + ORDER_GST_RATE / 100)) : 0
+    const silverValue = roundMoney((weight > 0 ? weight * itemSilverRate : 0) + taxableAddOn)
     const makingValue = weight > 0 ? roundMoney(weight * itemMakingCharge) : 0
     const amount = roundMoney(silverValue + makingValue)
     // Same GST-inclusive line price the Shopify draft order receives, split
@@ -176,6 +203,7 @@ export function buildPricedOrder<T extends OrderItemInput>(
     return {
       ...li,
       price: qty > 0 ? roundMoney(gstInclusiveLine / qty) : gstInclusiveLine,
+      priceAdjustment: addOn,
       quantity: qty,
       netWeight,
       makingCharge: makingChargePerGram,
@@ -214,6 +242,8 @@ export interface StoredOrderLine {
   amount?: number | null
   /** The exact variant the line sold — carried onto the invoice it becomes. */
   variantId?: string | null
+  /** The variant add-on folded into `price`; persisted for the line breakdown. */
+  priceAdjustment?: number | null
 }
 
 /** One `sales_invoice_items` row raised from a stored order line. */
@@ -232,6 +262,8 @@ export interface ManualInvoiceLine {
   makingValue: number
   /** NULL on flat lines — kept so the invoice keeps naming its variant. */
   variantId?: string | null
+  /** The variant add-on folded into this line's price. */
+  priceAdjustment?: number | null
 }
 
 /**
@@ -291,6 +323,7 @@ export function buildManualInvoiceLines(lines: StoredOrderLine[], gstRate: numbe
       // The variant travels with the line: the invoice must keep naming the
       // exact variant its stock was deducted from, not just its SKU string.
       ...(li.variantId ? { variantId: li.variantId } : {}),
+      ...(li.priceAdjustment != null ? { priceAdjustment: li.priceAdjustment } : {}),
     }
   })
 }
