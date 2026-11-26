@@ -208,8 +208,23 @@ test.describe('sales order weight & customer editing', () => {
       await modal.getByPlaceholder('Street address, P.O. box').fill('101 Marine Drive')
       await modal.getByPlaceholder('City').fill('Mumbai')
       await modal.getByPlaceholder('PIN code').fill('400001')
+
+      // Wait on the actual save response, not on the dialog count: the customer
+      // editor is a portalled sibling dialog, so a click inside it can dismiss
+      // the parent order dialog while this PATCH is still in flight.
+      const customerPatch = page.waitForResponse(
+        (r) => r.url().endsWith(`/api/v1/db/customers/${customer.id}`) && r.request().method() === 'PATCH',
+      )
       await modal.getByRole('button', { name: 'Save Changes' }).click()
+      const patchResponse = await customerPatch
+      const patchBody = await patchResponse.text()
+      expect(patchResponse.status(), `customer save: ${patchBody}`).toBe(200)
+      const savedCustomer = JSON.parse(patchBody) as { phone: string; email: string; city: string }
+      expect(savedCustomer.phone).toBe(editedPhone)
+      expect(savedCustomer.email).toBe(editedEmail)
+      expect(savedCustomer.city).toBe('Mumbai')
       await expect(page.getByRole('dialog')).toHaveCount(1, { timeout: 10000 }) // modal closed
+      await expect(page.getByRole('dialog').first().getByText('Customer Details', { exact: true })).toBeVisible()
 
       // The existing customer record was updated — no duplicate created.
       const custs = ((await (await apiClient.get('/api/v1/db/customers?limit=200')).json()) as {

@@ -1567,7 +1567,14 @@ export default function SalesOrdersPage() {
 
       <AppDialog
         open={dialogOpen}
-        onOpenChange={setDialogOpen}
+        onOpenChange={(open) => {
+          // The customer editor is portalled to <body>, so clicking inside it
+          // looks like an outside interaction to this dialog. Keep the parent
+          // order form open until that nested save has finished; otherwise it
+          // vanishes mid-save and the caller can read stale customer data.
+          if (!open && custEditOpen) return
+          setDialogOpen(open)
+        }}
         size="lg"
         isDirty={dialogOpen && snapshotForm() !== formBaseline}
         title={editing ? `Edit Order ${editing.shopifyId}` : 'Create Manual Order'}
