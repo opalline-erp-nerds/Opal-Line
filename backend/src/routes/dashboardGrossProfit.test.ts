@@ -12,9 +12,12 @@ import type { Server } from 'node:http'
 //
 // Assertions are deltas against baselines fetched before the marker invoices
 // are inserted, so leftovers from an earlier crashed run cannot make the test
-// lie. The analytics margin is asserted stable when an invoice without a basis
-// arrives (the costed subset did not change) — an exact recompute would need
-// the baseline sums and would duplicate the SQL under test.
+// lie. A costed baseline invoice is inserted FIRST: on an empty scratch DB the
+// KPI reads "N/A" (no cost basis exists), and comparing the new ₹1,050 against
+// a non-numeric baseline would be meaningless. The analytics margin is asserted
+// stable when an invoice without a basis arrives (the costed subset did not
+// change) — an exact recompute would need the baseline sums and would duplicate
+// the SQL under test.
 //
 // Skipped unless DASHBOARD_TEST_DATABASE_URL points at a scratch database with
 // the schema applied — the same contract as dashboardSecurity.test.ts.
@@ -55,6 +58,7 @@ test(
     assert.ok(db, 'test database client did not initialize')
 
     const marker = `gp-${Date.now()}`
+    const baselineId = `${marker}-baseline` // basis present: gives the KPI a numeric starting value
     const costedId = `${marker}-costed` // basis present: profit 1200-100-50 = 1050
     const uncostedId = `${marker}-uncosted` // no basis: must add nothing to profit
 
@@ -73,6 +77,18 @@ test(
       const stat = (body: unknown, label: string) =>
         (body as Array<{ label: string; value: string }>).find((s) => s.label === label)
 
+      const now = localNaive(new Date())
+      await db!.insert(schema.salesInvoices).values({
+        id: baselineId,
+        number: `${marker}-BASELINE`,
+        grandTotal: 500,
+        silverValue: 100,
+        makingCharge: 50,
+        paymentStatus: 'paid',
+        status: 'paid',
+        date: now,
+      })
+
       const baseK = await get('/dashboard/kpis?period=last30')
       assert.equal(baseK.status, 200)
       const baseA = await get('/dashboard/analytics?period=last30')
@@ -82,7 +98,6 @@ test(
       const baseInvoices = rupees(kpi(baseK.body, 'invoices')?.value)
       const baseMargin = stat(baseA.body, 'Gross Profit Margin')?.value
 
-      const now = localNaive(new Date())
       await db!.insert(schema.salesInvoices).values({
         id: uncostedId,
         number: `${marker}-UNCOSTED`,
@@ -133,7 +148,7 @@ test(
       assert.ok(caption.x <= caption.y, 'basis never exceeds the invoice count')
     } finally {
       const { inArray } = await import('drizzle-orm')
-      await db!.delete(schema.salesInvoices).where(inArray(schema.salesInvoices.id, [costedId, uncostedId]))
+      await db!.delete(schema.salesInvoices).where(inArray(schema.salesInvoices.id, [baselineId, costedId, uncostedId]))
       server?.close()
       await getRawClient()?.end({ timeout: 5 })
     }
