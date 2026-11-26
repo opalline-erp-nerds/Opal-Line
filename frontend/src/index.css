@@ -31,7 +31,7 @@
     --secondary: 165 24% 96%;
     --secondary-foreground: 190 20% 24%;
     --muted: 165 24% 96%;
-    --muted-foreground: 190 8% 44%;
+    --muted-foreground: 190 8% 43%;
     --accent: 162 52% 94%;
     --accent-foreground: 172 100% 22%;
     --destructive: 0 72% 51%;
@@ -103,7 +103,11 @@
     --popover: 165.88 20% 16.67%;
     --popover-foreground: 150 16.67% 95.29%;
     --primary: 163.97 55.27% 46.47%;
-    --primary-foreground: 0 0% 100%;
+    /* Dark mode labels sit in the same deep ink light mode already uses on
+     * primary fills: white on this bright green only reaches 2.49:1, while
+     * the ink clears 4.5:1 without changing the accent colour itself. */
+    --primary-foreground: 172 100% 3%;
+    --on-green: 172 100% 3%;
     --primary-50: 166 30% 15%;
     --primary-100: 166 30% 19%;
     --primary-200: 165 30% 28%;
@@ -170,7 +174,7 @@
     --sidebar-muted: 153.33 11.25% 68.63%;
     --sidebar-border: 163.33 15.79% 22.35%;
     --sidebar-active: 163.97 55.27% 46.47%;
-    --sidebar-active-foreground: 0 0% 100%;
+    --sidebar-active-foreground: 172 100% 3%;
     --sidebar-hover: 165.88 20% 16.67%;
   }
 
@@ -625,14 +629,14 @@
 @media print {
   /* Printing always happens on white paper — force light palette even in dark mode */
   html.dark {
-    --background: 165 20% 99%;
+    --background: 165 25% 97%;
     --foreground: 190 25% 12%;
     --card: 0 0% 100%;
     --card-foreground: 190 25% 12%;
     --popover: 0 0% 100%;
     --popover-foreground: 190 25% 12%;
     --muted: 165 24% 96%;
-    --muted-foreground: 190 8% 44%;
+    --muted-foreground: 190 8% 43%;
     --secondary: 165 24% 96%;
     --secondary-foreground: 190 20% 24%;
     --border: 190 14% 91%;
