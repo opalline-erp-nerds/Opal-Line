@@ -44,6 +44,10 @@ async function previewGeometry(page: import('@playwright/test').Page) {
   })
 }
 
+async function previewText(page: import('@playwright/test').Page): Promise<string> {
+  return page.locator(PREVIEW).evaluate((el) => (el as HTMLIFrameElement).contentDocument?.body?.textContent ?? '')
+}
+
 test('label designer preview tracks size, selection and content settings', async ({ page, request }) => {
   const { cleanup } = await seedProducts(await csrfApi(request), { prefix: 'E2E-LBL', count: 2 })
   seededCleanup = cleanup
@@ -124,4 +128,48 @@ test('selecting another product swaps the rendered label data', async ({ page, r
   const second = await previewGeometry(page)
   // And the QR must still render for the new SKU.
   expect(second!.qrSvg).toBe(true)
+})
+
+test('Net weight toggle shows and hides grams on the Normal label preview', async ({ page, request }) => {
+  const { cleanup } = await seedProducts(await csrfApi(request), { prefix: 'E2E-LBL-WT', count: 1 })
+  seededCleanup = cleanup
+  await page.setViewportSize({ width: 1650, height: 900 })
+  await page.goto('/inventory/barcode')
+
+  // The designer opens on the reference "Normal label" template.
+  await page.locator('.divide-y > div').first().click()
+  const toggle = page.getByText('Net weight', { exact: true }).locator('..').getByRole('switch')
+  if (!(await toggle.isChecked())) await toggle.click()
+
+  // Seeded products are weight-based (netWeight: 10), so the reference chip
+  // prints clean grams — never a raw floating-point value.
+  await expect.poll(() => previewText(page), { timeout: 15000 }).toContain('Wt: 10g')
+  const layout = await page.locator(PREVIEW).evaluate((el) => {
+    const doc = (el as HTMLIFrameElement).contentDocument
+    if (!doc) return null
+    const weight = [...doc.querySelectorAll('div')].find((d) => d.textContent?.startsWith('Wt:'))
+    const qr = doc.querySelector('.qr')
+    const label = doc.querySelector('.lbl')
+    if (!weight || !qr || !label) return null
+    const w = weight.getBoundingClientRect()
+    const q = qr.getBoundingClientRect()
+    const l = label.getBoundingClientRect()
+    return {
+      inside: w.left >= l.left && w.right <= l.right && w.top >= l.top && w.bottom <= l.bottom,
+      beforeQr: w.right <= q.left + 1,
+    }
+  })
+  expect(layout).toEqual({ inside: true, beforeQr: true })
+
+  await toggle.click()
+  await expect(toggle).not.toBeChecked()
+  await expect.poll(() => previewText(page)).not.toContain('Wt:')
+
+  await toggle.click()
+  await expect(toggle).toBeChecked()
+  await expect.poll(() => previewText(page)).toContain('Wt: 10g')
+
+  // Jewellery Tag keeps its own grams row and its existing "10 g" format.
+  await page.getByRole('button', { name: /Jewellery Tag/ }).click()
+  await expect.poll(() => previewText(page), { timeout: 15000 }).toContain('10 g')
 })

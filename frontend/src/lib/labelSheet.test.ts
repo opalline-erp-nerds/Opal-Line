@@ -6,6 +6,7 @@ import {
   computeGrid,
   configFromPreset,
   expandLabels,
+  formatLabelWeight,
   isTagLabel,
   labelCellSize,
   labelBrandText,
@@ -349,6 +350,36 @@ test('content toggles hide the same lines the PDF hides', () => {
   assert.ok(shown.includes('Code: OL-RNG-001'), 'code shown by default')
   assert.ok(shown.includes('Rate: 588.00/-'), 'rate shown by default')
   assert.ok(shown.includes('<svg'), 'QR shown by default')
+})
+
+test('reference labels print formatted net weight only when toggled on and positive', () => {
+  assert.equal(formatLabelWeight(2.619047619), '2.62')
+  assert.equal(formatLabelWeight(20), '20')
+  assert.equal(formatLabelWeight(2.5), '2.5')
+  assert.equal(formatLabelWeight(0), null)
+  assert.equal(formatLabelWeight(undefined), null)
+
+  const cfg = configFromPreset('label-50x40')
+  const weighted: LabelProduct = { ...product, collection: undefined, weight: 2.619047619 }
+  const print = buildLabelSheet([weighted], cfg, { mode: 'print' }).html
+  const preview = buildLabelSheet([weighted], cfg, { mode: 'preview', paper: 'label' }).html
+  assert.ok(print.includes('Wt: 2.62g'), 'print output carries the formatted grams')
+  assert.ok(preview.includes('Wt: 2.62g'), 'live preview carries the same grams')
+  const design = labelDesignFor(50, 40)!
+  assert.ok(
+    print.includes(
+      `left:${design.qr.x}mm;top:${qrTopMm(design)}mm;width:${design.qr.size}mm;height:${design.qr.size}mm`,
+    ),
+    'the QR keeps its reference position',
+  )
+
+  const off = buildLabelSheet([weighted], { ...cfg, showWeight: false }, { mode: 'print' }).html
+  assert.ok(!off.includes('Wt:'), 'toggle off hides the weight')
+  const pieceRate = buildLabelSheet([{ ...weighted, weight: 0 }], cfg, { mode: 'print' }).html
+  assert.ok(!pieceRate.includes('Wt:'), 'zero weight prints no line')
+
+  const withCollection = buildLabelSheet([product], cfg, { mode: 'print' }).html
+  assert.ok(withCollection.includes('BW · Wt: 5.2g'), 'a collection keeps its chip alongside the weight')
 })
 
 test('brand resolves to OPAL LINE unless a custom company name replaces it', () => {
