@@ -1,6 +1,6 @@
 import { request } from '@playwright/test'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdirSync } from 'node:fs'
+import { clearAuthRateLimitCounters } from './db'
 
 // Keep in sync with playwright.config.ts — dev stack serves the UI on 47195.
 const BASE_URL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:47195'
@@ -19,33 +19,11 @@ export const E2E_PASSWORD = process.env.E2E_PASSWORD ?? 'Opal@2026'
  * login below still reports a clear 429/401 error when something is wrong.
  */
 async function clearAuthRateLimit(): Promise<void> {
-  let url = process.env.DATABASE_URL?.trim() || ''
-  if (!url && process.env.APPDATA) {
-    // Installed desktop app: bundled PostgreSQL on 47193, password stored
-    // next to the data directory (the same file the CI reset step reads).
-    const pwFile = join(process.env.APPDATA, 'Opal Line Billing', '.pg-password')
-    try {
-      if (existsSync(pwFile)) {
-        const pw = readFileSync(pwFile, 'utf8').trim()
-        if (pw) url = `postgres://postgres:${encodeURIComponent(pw)}@127.0.0.1:47193/opal_line`
-      }
-    } catch { /* fall through to skip */ }
-  }
-  if (!url) {
-    console.log('[global-setup] no DATABASE_URL or .pg-password found — skipping rate-limit reset')
-    return
-  }
-  try {
-    const postgres = (await import('postgres')).default
-    const sql = postgres(url, { max: 1, connect_timeout: 5 })
-    try {
-      const result = await sql`DELETE FROM rate_limit_hits WHERE key LIKE 'auth:%'`
-      console.log(`[global-setup] cleared ${result.count} login rate-limit counter(s)`)
-    } finally {
-      await sql.end({ timeout: 5 })
-    }
-  } catch (err) {
-    console.warn(`[global-setup] rate-limit reset skipped: ${err instanceof Error ? err.message : String(err)}`)
+  const result = await clearAuthRateLimitCounters()
+  if (result.ok) {
+    console.log(`[global-setup] cleared ${result.cleared} login rate-limit counter(s) from ${result.target}`)
+  } else {
+    console.warn(`[global-setup] rate-limit reset skipped: ${result.error}`)
   }
 }
 
