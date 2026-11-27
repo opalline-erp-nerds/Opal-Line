@@ -681,7 +681,7 @@ export default function BarcodeLabelsPage() {
               {designActive && (
                 <p className="text-xs text-muted-foreground">
                   Reference template active — field positions and type sizes come from the approved layout, so it
-                  always prints brand, name, rate, code and QR.
+                  always prints brand, name, rate, code and QR, plus net weight when available and toggled on.
                 </p>
               )}
             </CardContent>

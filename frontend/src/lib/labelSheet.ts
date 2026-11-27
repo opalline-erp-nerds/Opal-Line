@@ -298,11 +298,24 @@ export function textEmWidth(text: string): number {
   return counted === 0 ? text.length * 0.556 : sum / 1000
 }
 
+/** Grams for a printed attribute chip: at most two decimals, no trailing zeroes. */
+export function formatLabelWeight(weight?: number): string | null {
+  if (typeof weight !== 'number' || !Number.isFinite(weight) || weight <= 0) return null
+  return String(Number(weight.toFixed(2)))
+}
+
 export function labelAttributes(product: { category?: string; collection?: string; weight?: number }, opts: { showWeight?: boolean; showCategory?: boolean }): string[] {
   const out: string[] = []
   if (opts.showCategory !== false && product.category) out.push(String(product.category))
   if (product.collection) out.push(String(product.collection))
-  else if (opts.showWeight !== false && product.weight) out.push(`${product.weight}g`)
+  const grams = opts.showWeight !== false ? formatLabelWeight(product.weight) : null
+  if (grams) {
+    const chip = `Wt: ${grams}g`
+    // The reference has exactly two chip slots. Keep the collection in its
+    // slot and share it with the weight rather than dropping either value.
+    if (out.length >= 2) out[1] = `${out[1]} · ${chip}`
+    else out.push(chip)
+  }
   return out
 }
 
