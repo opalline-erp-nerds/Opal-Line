@@ -164,6 +164,34 @@ test('all six reference template keys keep their brand and code layout in ZPL', 
   }
 })
 
+test('all six post-compact presets keep the reference-style layout in ZPL', () => {
+  const presets = [
+    { key: 'label-50x22', width: 50, height: 22 },
+    { key: 'avery-5160', width: 63.5, height: 25.4 },
+    { key: 'avery-8160', width: 38.1, height: 21.2 },
+    { key: 'dymo-30256', width: 51, height: 25 },
+    { key: 'zlabel-50x30', width: 50, height: 30 },
+    { key: 'zlabel-40x25', width: 40, height: 25 },
+  ]
+  for (const preset of presets) {
+    const zpl = zplLabel(product, zplOptionsForPreset(preset.key))
+    assert.ok(zpl, preset.key)
+    assert.ok(zpl!.includes(`^PW${Math.round(preset.width * ZPL_DOTS_PER_MM)}`), `${preset.key} width`)
+    assert.ok(zpl!.includes(`^LL${Math.round(preset.height * ZPL_DOTS_PER_MM)}`), `${preset.key} length`)
+    for (const text of [
+      '^FDOPAL LINE^FS',
+      '^FDDIAMOND RING^FS',
+      '^FDRate: 1234.50/-^FS',
+      '^FDCode: OL-RNG-001^FS',
+      '^FDWt: 3.2g^FS',
+      '^FDLA,OL-RNG-001^FS',
+    ]) {
+      assert.ok(zpl!.includes(text), `${preset.key} emits ${text}`)
+    }
+    assert.ok(!zpl!.includes('^BC'), `${preset.key} has no linear barcode`)
+  }
+})
+
 test('missing optional fields never produce an empty ZPL field', () => {
   const zpl = zplLabel({ name: '', sku: '', price: 0 }, { width: 50, height: 25, brand: '' })
   assert.ok(zpl)
