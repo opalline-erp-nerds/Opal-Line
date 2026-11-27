@@ -237,6 +237,60 @@ export const LABEL_DESIGNS: LabelDesign[] = [
   },
 ]
 
+/**
+ * The remaining rectangular presets use the same reference-style artwork as
+ * the transcribed 50×25 design, scaled to their own physical footprint. The
+ * hardcoded entries above are deliberately left alone: those six presets have
+ * approved geometry and must never move.
+ */
+const PROPORTIONAL_DESIGN_SIZES: ReadonlyArray<readonly [number, number]> = [
+  [50, 22],
+  [63.5, 25.4],
+  [38.1, 21.2],
+  [51, 25],
+  [50, 30],
+  [40, 25],
+]
+
+function proportionalDesign(width: number, height: number): LabelDesign {
+  const base = LABEL_DESIGNS[1] // 50×25 reference: brand/name/rate/code/two chips + right-hand QR
+  const sx = width / base.width
+  const sy = height / base.height
+  const round = (n: number): number => Math.round(n * 1000) / 1000
+  const fields = base.fields.map((field) => ({
+    kind: field.kind,
+    x: round(field.x * sx),
+    baseline: round(field.baseline * sy),
+    capHeight: round(field.capHeight * sy),
+    maxWidth: round(field.maxWidth * sx),
+    refWidth: round(field.refWidth * sx),
+  }))
+  // Round the QR to whole 203-dpi dots so PDF, preview and ZPL all draw the
+  // same physical symbol. The quiet zone stays inside the label footprint.
+  const rawSize = base.qr.size * Math.min(sx, sy)
+  const magnification = Math.max(2, Math.round((rawSize / base.qr.modules) * 8))
+  const moduleMm = magnification / 8
+  const size = round(moduleMm * base.qr.modules)
+  const rightMm = base.width - (base.qr.x + base.qr.size)
+  const bottomMm = base.height - base.qr.bottom
+  return {
+    width,
+    height,
+    fields,
+    qr: {
+      x: round(width - rightMm * sx - size),
+      bottom: round(height - bottomMm * sy),
+      size,
+      magnification,
+      modules: base.qr.modules,
+    },
+  }
+}
+
+for (const [width, height] of PROPORTIONAL_DESIGN_SIZES) {
+  LABEL_DESIGNS.push(proportionalDesign(width, height))
+}
+
 export function labelDesignFor(width: number, height: number): LabelDesign | null {
   if (!Number.isFinite(width) || !Number.isFinite(height)) return null
   const tol = 0.15

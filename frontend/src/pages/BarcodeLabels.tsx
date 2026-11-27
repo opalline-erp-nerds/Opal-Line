@@ -533,7 +533,7 @@ export default function BarcodeLabelsPage() {
         })}
       </div>
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[320px_minmax(0,1fr)_360px]">
+      <div className="grid min-h-0 flex-1 grid-cols-1 items-start gap-4 lg:grid-cols-[320px_minmax(0,1fr)_360px]">
         <div className="min-h-0 space-y-4 overflow-y-auto pr-1">
           <Card>
             <CardHeader>
@@ -688,7 +688,7 @@ export default function BarcodeLabelsPage() {
           </Card>
         </div>
 
-        <Card className="flex min-h-0 flex-col">
+        <Card className="flex h-[min(560px,calc(100vh-14rem))] min-h-0 flex-col lg:sticky lg:top-4">
           <CardHeader className="flex-row items-center justify-between space-y-0 border-b">
             <div>
               <CardTitle className="flex items-center gap-2 text-sm">
@@ -790,7 +790,7 @@ export default function BarcodeLabelsPage() {
           </CardContent>
         </Card>
 
-        <Card className="flex min-h-0 flex-col">
+        <Card className="flex max-h-[calc(100vh-14rem)] min-h-0 flex-col">
           <CardHeader className="space-y-3">
             <div className="flex items-center justify-between">
               <CardTitle className="text-sm">Products</CardTitle>
