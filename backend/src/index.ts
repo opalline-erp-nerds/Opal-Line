@@ -142,14 +142,14 @@ function verifyCsrfToken(token: string): boolean {
     const [storedSessionId, timestamp, signature] = decoded.split(':')
     const payload = `${storedSessionId}:${timestamp}`
     const expectedSignature = createHmac('sha256', CSRF_SECRET).update(payload).digest('hex')
-    
+
     const sigBuf = Buffer.from(signature, 'hex')
     const expBuf = Buffer.from(expectedSignature, 'hex')
     if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) return false
-    
+
     const tokenAge = Date.now() - parseInt(timestamp)
     if (tokenAge > 3600000) return false
-    
+
     return true
   } catch {
     return false
@@ -180,13 +180,13 @@ const csrfProtection = (req: express.Request, res: express.Response, next: expre
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     return next()
   }
-  
+
   if (PUBLIC_AUTH_PATHS.has(req.path)) {
     return next()
   }
-  
+
   const token = req.headers[CSRF_HEADER] as string || req.body?.csrfToken
-  
+
   if (!token || !verifyCsrfToken(token)) {
     return res.status(403).json({ error: 'Invalid CSRF token' })
   }
@@ -478,8 +478,15 @@ app.use('/api/v1/db', requireAuth, dashboardRouter)
 app.get('/api/v1/sales/followups', requireAuth, requirePermission('sales', 'view'), async (req, res) => {
   try {
     const { collectSalesFollowUps, summariseSalesFollowUps } = await import('./salesFollowups')
-    const customer = typeof req.query.customer === 'string' && req.query.customer.trim() ? req.query.customer.trim() : null
-    const followUps = await collectSalesFollowUps(customer)
+    const query = (key: string) => String(req.query[key] ?? '').trim()
+    const customer = query('customer')
+    const followUps = await collectSalesFollowUps({
+      customerId: query('customerId'),
+      shopifyId: query('shopifyId'),
+      email: query('email'),
+      phone: query('phone'),
+      name: customer || query('name'),
+    })
     const summary = await summariseSalesFollowUps(followUps)
     res.json({ followUps, summary, customer })
   } catch (err) {
@@ -2313,31 +2320,74 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       // Accept any id form (bare numeric or gid://shopify/Customer/…) and
       // store/match only the bare numeric form — mixed formats defeat the
       // shopifyId identity match and duplicate customers.
-      const identityConditions = []
-      if (email) identityConditions.push(eq(schema.customers.email, email))
-      if (phone) identityConditions.push(eq(schema.customers.phone, phone))
-      const [existing] = identityConditions.length
-        ? await tx.select().from(schema.customers).where(or(...identityConditions)).limit(1)
+
+      // Resolve the customer conservatively. Never choose an arbitrary row
+      // when email and phone match different customers or either is duplicated.
+      const normalizedEmail = String(email ?? '').trim().toLowerCase()
+      const normalizedPhone = String(phone ?? '').replace(/\D/g, '')
+
+      const emailMatches = normalizedEmail
+        ? await tx
+            .select()
+            .from(schema.customers)
+            .where(
+              sql`lower(btrim(coalesce(${schema.customers.email}, ''))) = ${normalizedEmail}`,
+            )
+            .limit(2)
         : []
+
+      const phoneMatches = normalizedPhone
+        ? await tx
+            .select()
+            .from(schema.customers)
+            .where(
+              sql`regexp_replace(coalesce(${schema.customers.phone}, ''), '\\D', '', 'g') = ${normalizedPhone}`,
+            )
+            .limit(2)
+        : []
+
+      if (emailMatches.length > 1) {
+        throw new Error('Customer email matches multiple records. Resolve the duplicate customer records before creating this order.')
+      }
+
+      if (phoneMatches.length > 1) {
+        throw new Error('Customer phone matches multiple records. Resolve the duplicate customer records before creating this order.')
+      }
+
+      const emailCustomer = emailMatches[0]
+      const phoneCustomer = phoneMatches[0]
+
+      if (
+        emailCustomer &&
+        phoneCustomer &&
+        emailCustomer.id !== phoneCustomer.id
+      ) {
+        throw new Error('Customer email and phone belong to different records. Resolve the customer identity before creating this order.')
+      }
+
+      const existing = emailCustomer ?? phoneCustomer
+
       if (existing) {
         orderCustomerId = existing.id
+
         await tx
           .update(schema.customers)
           .set({
             name: customer,
-            ...(email ? { email } : {}),
-            ...(phone ? { phone } : {}),
+            ...(normalizedEmail ? { email: normalizedEmail } : {}),
+            ...(phone ? { phone: String(phone).trim() } : {}),
             ...(customerCity ? { city: customerCity } : {}),
             status: existing.status ?? 'active',
           })
           .where(eq(schema.customers.id, existing.id))
       } else {
         orderCustomerId = randomUUID()
+
         await tx.insert(schema.customers).values({
           id: orderCustomerId,
           name: customer,
-          email: email ?? null,
-          phone: phone ?? null,
+          email: normalizedEmail || null,
+          phone: phone ? String(phone).trim() : null,
           city: customerCity ?? null,
           shopifyId: null,
           orders: 0,
@@ -2346,6 +2396,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
           joined: now.toISOString().slice(0, 10),
         })
       }
+
     })
   } catch (err) {
     // Log the driver error whole (code, constraint, column, detail) and give the
