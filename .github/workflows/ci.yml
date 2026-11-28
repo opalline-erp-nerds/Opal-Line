@@ -9,7 +9,7 @@ on:
 # Master runs are never cancelled — releases watch them to completion.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  cancel-in-progress: false
 
 jobs:
   checks:

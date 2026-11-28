@@ -75,7 +75,7 @@ const TYPE_OPTIONS = [
 ]
 
 const TIER_COLORS: Record<string, string> = {
-  Platinum: 'bg-violet-100 dark:bg-violet-950/40 text-violet-700',
+  Platinum: 'bg-primary-100 text-primary-700 dark:bg-primary-100/60 dark:text-primary-300',
   Gold: 'bg-amber-100 text-amber-700',
   Silver: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
   Bronze: 'bg-orange-50 dark:bg-orange-950/40 text-orange-700',
@@ -724,12 +724,12 @@ export default function LoyaltyPage() {
       value: points(summary.enrolledCustomers),
       hint: summary.lastActivityAt ? `Last activity ${formatDate(summary.lastActivityAt)}` : 'No activity yet',
       icon: Users,
-      tone: 'bg-violet-50 text-violet-700 dark:bg-violet-950/40 dark:text-violet-300',
+      tone: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300',
     },
   ]
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Customer Loyalty"
         subtitle="Manage loyalty points — earn, redeem, and track customer rewards."
@@ -875,7 +875,7 @@ export default function LoyaltyPage() {
                 </div>
               </div>
               {syncStatus.recentErrors.length > 0 && (
-                <div className="space-y-1 rounded-md border border-red-200 bg-red-50/60 p-2 text-[11px] text-red-800">
+                <div className="space-y-1 rounded-md border border-red-200 bg-red-50/60 p-2 text-[11px] text-red-800 dark:border-red-500/30">
                   {syncStatus.recentErrors.map((e, index) => (
                     <p key={`${e.time}-${index}`} className="truncate">
                       {e.time ? formatDateTime(e.time) : 'Unknown time'} — {e.error ?? 'Unknown error'}

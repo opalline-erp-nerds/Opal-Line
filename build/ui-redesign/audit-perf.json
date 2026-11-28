@@ -1,0 +1,967 @@
+{
+  "base": "http://127.0.0.1:47195",
+  "origins": [
+    "http://127.0.0.1:47195"
+  ],
+  "producedAt": "2026-11-20T07:00:21.443Z",
+  "results": [
+    {
+      "name": "login + auth bootstrap",
+      "heapMB": 17.7,
+      "longTasks": {
+        "count": 1,
+        "totalMs": 98,
+        "maxMs": 98
+      },
+      "counts": {
+        "requests": 94,
+        "api": 9,
+        "apiDupes": 3,
+        "slowestApiMs": 175,
+        "apiTotalMs": 263
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/auth/me",
+          "count": 3,
+          "avgMs": 17,
+          "maxMs": 20,
+          "kb": 3.3,
+          "statuses": "401,200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 2,
+          "avgMs": 16,
+          "maxMs": 20,
+          "kb": 2,
+          "statuses": "401"
+        },
+        {
+          "path": "/api/v1/csrf-token",
+          "count": 1,
+          "avgMs": 5,
+          "maxMs": 5,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/users?limit=200&page=1",
+          "count": 1,
+          "avgMs": null,
+          "maxMs": null,
+          "kb": 0,
+          "statuses": "pending"
+        },
+        {
+          "path": "/api/v1/rbac/users/76214e90-2a03-4e81-830c-dc33ca472c47/permissions",
+          "count": 1,
+          "avgMs": null,
+          "maxMs": null,
+          "kb": 0,
+          "statuses": "pending"
+        }
+      ]
+    },
+    {
+      "name": "dashboard initial load (8s)",
+      "heapMB": 34.6,
+      "longTasks": {
+        "count": 8,
+        "totalMs": 1261,
+        "maxMs": 511
+      },
+      "counts": {
+        "requests": 157,
+        "api": 48,
+        "apiDupes": 24,
+        "slowestApiMs": 529,
+        "apiTotalMs": 11235
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/db/notifications/feed",
+          "count": 2,
+          "avgMs": 440,
+          "maxMs": 529,
+          "kb": 5.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/kpis?period=today",
+          "count": 2,
+          "avgMs": 498,
+          "maxMs": 522,
+          "kb": 2.9,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities",
+          "count": 2,
+          "avgMs": 439,
+          "maxMs": 517,
+          "kb": 3.9,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities?period=today&scope=latest",
+          "count": 2,
+          "avgMs": 435,
+          "maxMs": 511,
+          "kb": 3.9,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/analytics?period=today",
+          "count": 2,
+          "avgMs": 352,
+          "maxMs": 508,
+          "kb": 2.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-products?period=today&source=all",
+          "count": 2,
+          "avgMs": 392,
+          "maxMs": 508,
+          "kb": 2.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/payment-status?period=today&source=all",
+          "count": 2,
+          "avgMs": 433,
+          "maxMs": 507,
+          "kb": 2.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/requests?status=pending",
+          "count": 2,
+          "avgMs": 398,
+          "maxMs": 479,
+          "kb": 1.9,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/low-stock",
+          "count": 2,
+          "avgMs": 355,
+          "maxMs": 427,
+          "kb": 5.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/sales-insights?period=today",
+          "count": 2,
+          "avgMs": 286,
+          "maxMs": 383,
+          "kb": 3.7,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/shopify/status",
+          "count": 2,
+          "avgMs": 224,
+          "maxMs": 322,
+          "kb": 2.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/summary?period=today",
+          "count": 2,
+          "avgMs": 180,
+          "maxMs": 276,
+          "kb": 2.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/sales-overview?period=today",
+          "count": 2,
+          "avgMs": 182,
+          "maxMs": 276,
+          "kb": 5.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-category?period=today",
+          "count": 2,
+          "avgMs": 180,
+          "maxMs": 275,
+          "kb": 2.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/financial?period=last12m",
+          "count": 2,
+          "avgMs": 140,
+          "maxMs": 178,
+          "kb": 3.9,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/silver-history?days=7",
+          "count": 2,
+          "avgMs": 119,
+          "maxMs": 171,
+          "kb": 1.9,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/purchase-orders?period=today",
+          "count": 2,
+          "avgMs": 110,
+          "maxMs": 151,
+          "kb": 1.9,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/order-summary?grain=week&month=2026-11",
+          "count": 2,
+          "avgMs": 111,
+          "maxMs": 148,
+          "kb": 2.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/recent-invoices?period=today&source=all",
+          "count": 2,
+          "avgMs": 115,
+          "maxMs": 143,
+          "kb": 4.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/supplier-payments?period=today&status=all",
+          "count": 2,
+          "avgMs": 105,
+          "maxMs": 136,
+          "kb": 3.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 2,
+          "avgMs": 32,
+          "maxMs": 50,
+          "kb": 2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/users?limit=200&page=1",
+          "count": 2,
+          "avgMs": 42,
+          "maxMs": 44,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/rbac/users/76214e90-2a03-4e81-830c-dc33ca472c47/permissions",
+          "count": 2,
+          "avgMs": 35,
+          "maxMs": 39,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/auth/me",
+          "count": 2,
+          "avgMs": 20,
+          "maxMs": 30,
+          "kb": 1.8,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "dashboard idle 26s (polling)",
+      "heapMB": 34.7,
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "counts": {
+        "requests": 5,
+        "api": 5,
+        "apiDupes": 2,
+        "slowestApiMs": 34,
+        "apiTotalMs": 134
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/db/notifications/feed",
+          "count": 2,
+          "avgMs": 28,
+          "maxMs": 34,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities",
+          "count": 2,
+          "avgMs": 29,
+          "maxMs": 29,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 1,
+          "avgMs": 21,
+          "maxMs": 21,
+          "kb": 0.9,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "sales-invoices load (6s)",
+      "heapMB": 38.5,
+      "longTasks": {
+        "count": 4,
+        "totalMs": 1041,
+        "maxMs": 841
+      },
+      "counts": {
+        "requests": 117,
+        "api": 18,
+        "apiDupes": 9,
+        "slowestApiMs": 135,
+        "apiTotalMs": 1182
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/silver/requests?status=pending",
+          "count": 2,
+          "avgMs": 108,
+          "maxMs": 135,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/notifications/feed",
+          "count": 2,
+          "avgMs": 114,
+          "maxMs": 134,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities",
+          "count": 2,
+          "avgMs": 109,
+          "maxMs": 133,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/customers?limit=200&page=1",
+          "count": 2,
+          "avgMs": 59,
+          "maxMs": 87,
+          "kb": 18.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 2,
+          "avgMs": 48,
+          "maxMs": 66,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/users?limit=200&page=1",
+          "count": 2,
+          "avgMs": 48,
+          "maxMs": 54,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/rbac/users/76214e90-2a03-4e81-830c-dc33ca472c47/permissions",
+          "count": 2,
+          "avgMs": 40,
+          "maxMs": 45,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/invoices?limit=200&page=1",
+          "count": 2,
+          "avgMs": 35,
+          "maxMs": 45,
+          "kb": 45.6,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/auth/me",
+          "count": 2,
+          "avgMs": 32,
+          "maxMs": 40,
+          "kb": 1.8,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "products load (6s)",
+      "heapMB": 31.3,
+      "longTasks": {
+        "count": 5,
+        "totalMs": 812,
+        "maxMs": 318
+      },
+      "counts": {
+        "requests": 142,
+        "api": 32,
+        "apiDupes": 19,
+        "slowestApiMs": 280,
+        "apiTotalMs": 3922
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/db/inventory/categories",
+          "count": 4,
+          "avgMs": 146,
+          "maxMs": 280,
+          "kb": 6.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/settings",
+          "count": 4,
+          "avgMs": 101,
+          "maxMs": 221,
+          "kb": 5.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/suppliers?limit=200&page=1",
+          "count": 4,
+          "avgMs": 99,
+          "maxMs": 220,
+          "kb": 5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/notifications/feed",
+          "count": 2,
+          "avgMs": 190,
+          "maxMs": 265,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities",
+          "count": 2,
+          "avgMs": 189,
+          "maxMs": 262,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products/last-day-prices",
+          "count": 2,
+          "avgMs": 228,
+          "maxMs": 258,
+          "kb": 8.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/requests?status=pending",
+          "count": 2,
+          "avgMs": 177,
+          "maxMs": 255,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products/duplicates",
+          "count": 2,
+          "avgMs": 222,
+          "maxMs": 248,
+          "kb": 1.9,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products?limit=200&page=1",
+          "count": 2,
+          "avgMs": 144,
+          "maxMs": 199,
+          "kb": 25.7,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/users?limit=200&page=1",
+          "count": 2,
+          "avgMs": 35,
+          "maxMs": 49,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 2,
+          "avgMs": 35,
+          "maxMs": 45,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/rbac/users/76214e90-2a03-4e81-830c-dc33ca472c47/permissions",
+          "count": 2,
+          "avgMs": 26,
+          "maxMs": 33,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/auth/me",
+          "count": 2,
+          "avgMs": 26,
+          "maxMs": 31,
+          "kb": 1.8,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "sales-orders load (6s)",
+      "heapMB": 39.8,
+      "longTasks": {
+        "count": 5,
+        "totalMs": 2003,
+        "maxMs": 932
+      },
+      "counts": {
+        "requests": 142,
+        "api": 34,
+        "apiDupes": 17,
+        "slowestApiMs": 237,
+        "apiTotalMs": 3721
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/db/dashboard/activities",
+          "count": 2,
+          "avgMs": 198,
+          "maxMs": 237,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/print-templates/default/order",
+          "count": 2,
+          "avgMs": 170,
+          "maxMs": 230,
+          "kb": 3.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/notifications/feed",
+          "count": 2,
+          "avgMs": 188,
+          "maxMs": 218,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/print-templates/default/packing-slip",
+          "count": 2,
+          "avgMs": 154,
+          "maxMs": 217,
+          "kb": 3.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/print-templates/default/pick-list",
+          "count": 2,
+          "avgMs": 161,
+          "maxMs": 217,
+          "kb": 3.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/requests?status=pending",
+          "count": 2,
+          "avgMs": 186,
+          "maxMs": 217,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/inventory/locations?limit=200&page=1",
+          "count": 2,
+          "avgMs": 183,
+          "maxMs": 216,
+          "kb": 2.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/inventory/categories",
+          "count": 2,
+          "avgMs": 112,
+          "maxMs": 175,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/settings",
+          "count": 2,
+          "avgMs": 115,
+          "maxMs": 174,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products?limit=200&page=1",
+          "count": 2,
+          "avgMs": 76,
+          "maxMs": 110,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/suppliers?limit=200&page=1",
+          "count": 2,
+          "avgMs": 62,
+          "maxMs": 89,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/sales-orders?limit=200&page=1",
+          "count": 2,
+          "avgMs": 64,
+          "maxMs": 89,
+          "kb": 93,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/customers?limit=200&page=1",
+          "count": 2,
+          "avgMs": 60,
+          "maxMs": 86,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 2,
+          "avgMs": 38,
+          "maxMs": 56,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/users?limit=200&page=1",
+          "count": 2,
+          "avgMs": 38,
+          "maxMs": 39,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/auth/me",
+          "count": 2,
+          "avgMs": 27,
+          "maxMs": 38,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/rbac/users/76214e90-2a03-4e81-830c-dc33ca472c47/permissions",
+          "count": 2,
+          "avgMs": 30,
+          "maxMs": 31,
+          "kb": 1.8,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "3x in-app nav cycles (dashboard/invoices/products)",
+      "heapMB": 43.2,
+      "longTasks": {
+        "count": 26,
+        "totalMs": 6731,
+        "maxMs": 690
+      },
+      "counts": {
+        "requests": 363,
+        "api": 218,
+        "apiDupes": 186,
+        "slowestApiMs": 439,
+        "apiTotalMs": 34914
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/db/settings",
+          "count": 12,
+          "avgMs": 119,
+          "maxMs": 211,
+          "kb": 11.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/inventory/categories",
+          "count": 12,
+          "avgMs": 116,
+          "maxMs": 210,
+          "kb": 11.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/suppliers?limit=200&page=1",
+          "count": 12,
+          "avgMs": 105,
+          "maxMs": 209,
+          "kb": 11.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/payment-status?period=today&source=all",
+          "count": 8,
+          "avgMs": 310,
+          "maxMs": 439,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/summary?period=today",
+          "count": 8,
+          "avgMs": 200,
+          "maxMs": 407,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-products?period=today&source=all",
+          "count": 8,
+          "avgMs": 303,
+          "maxMs": 407,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/sales-insights?period=today",
+          "count": 8,
+          "avgMs": 288,
+          "maxMs": 400,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/analytics?period=today",
+          "count": 8,
+          "avgMs": 257,
+          "maxMs": 384,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/sales-overview?period=today",
+          "count": 8,
+          "avgMs": 207,
+          "maxMs": 380,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/shopify/status",
+          "count": 8,
+          "avgMs": 244,
+          "maxMs": 344,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities?period=today&scope=latest",
+          "count": 8,
+          "avgMs": 208,
+          "maxMs": 334,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-category?period=today",
+          "count": 8,
+          "avgMs": 195,
+          "maxMs": 323,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/kpis?period=today",
+          "count": 8,
+          "avgMs": 174,
+          "maxMs": 311,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/low-stock",
+          "count": 8,
+          "avgMs": 184,
+          "maxMs": 294,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/financial?period=last12m",
+          "count": 8,
+          "avgMs": 128,
+          "maxMs": 200,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/supplier-payments?period=today&status=all",
+          "count": 8,
+          "avgMs": 104,
+          "maxMs": 196,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/recent-invoices?period=today&source=all",
+          "count": 8,
+          "avgMs": 126,
+          "maxMs": 196,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/purchase-orders?period=today",
+          "count": 8,
+          "avgMs": 120,
+          "maxMs": 195,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/silver-history?days=7",
+          "count": 8,
+          "avgMs": 111,
+          "maxMs": 190,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/order-summary?grain=week&month=2026-11",
+          "count": 8,
+          "avgMs": 108,
+          "maxMs": 190,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products/last-day-prices",
+          "count": 6,
+          "avgMs": 112,
+          "maxMs": 169,
+          "kb": 5.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products/duplicates",
+          "count": 6,
+          "avgMs": 107,
+          "maxMs": 161,
+          "kb": 5.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products?limit=200&page=1",
+          "count": 6,
+          "avgMs": 90,
+          "maxMs": 135,
+          "kb": 5.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/invoices?limit=200&page=1",
+          "count": 6,
+          "avgMs": 37,
+          "maxMs": 51,
+          "kb": 5.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/customers?limit=200&page=1",
+          "count": 6,
+          "avgMs": 36,
+          "maxMs": 51,
+          "kb": 5.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/notifications/feed",
+          "count": 3,
+          "avgMs": 245,
+          "maxMs": 423,
+          "kb": 2.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities",
+          "count": 3,
+          "avgMs": 216,
+          "maxMs": 421,
+          "kb": 2.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/requests?status=pending",
+          "count": 2,
+          "avgMs": 349,
+          "maxMs": 414,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 2,
+          "avgMs": 52,
+          "maxMs": 70,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/users?limit=200&page=1",
+          "count": 2,
+          "avgMs": 53,
+          "maxMs": 61,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/auth/me",
+          "count": 2,
+          "avgMs": 31,
+          "maxMs": 42,
+          "kb": 1.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/rbac/users/76214e90-2a03-4e81-830c-dc33ca472c47/permissions",
+          "count": 2,
+          "avgMs": 36,
+          "maxMs": 41,
+          "kb": 1.8,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "heap after 3 more dashboard reloads",
+      "heapMB": [
+        35.2,
+        35.3,
+        35.2
+      ]
+    }
+  ]
+}

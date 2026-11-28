@@ -11,6 +11,7 @@ import {
 } from 'recharts'
 import type { StockRunningProduct } from '@/pages/StockRunning'
 import { ChartTooltipBox } from './chart-tooltip'
+import { INCOME } from './chart-theme'
 
 const DEMAND_COLORS: Record<StockRunningProduct['demandLevel'], string> = {
   high: '#16a34a',
@@ -57,7 +58,7 @@ export function StockDemandBarChart({ products }: { products: StockRunningProduc
             tick={{ fill: '#52525b', fontSize: 11 }}
           />
           <Tooltip
-            cursor={{ fill: 'rgba(124,58,237,0.06)' }}
+            cursor={{ fill: 'rgba(0,143,120,0.06)' }}
             content={({ active, payload }) => {
               if (!active || !payload?.length) return null
               const p = payload[0].payload as (typeof data)[number]
@@ -65,7 +66,7 @@ export function StockDemandBarChart({ products }: { products: StockRunningProduc
                 <ChartTooltipBox
                   title={p.name}
                   rows={[
-                    { label: 'Avg Daily Sales', value: `${p.avgDailySales}/day`, color: '#7c3aed' },
+                    { label: 'Avg Daily Sales', value: `${p.avgDailySales}/day`, color: INCOME },
                     { label: 'Current Stock', value: p.stock, color: '#71717a' },
                     { label: 'Days of Stock', value: p.days >= 999 ? '—' : `${p.days}d`, color: '#16a34a' },
                   ]}
@@ -73,7 +74,7 @@ export function StockDemandBarChart({ products }: { products: StockRunningProduc
               )
             }}
           />
-          <Bar dataKey="avgDailySales" fill="#7c3aed" radius={[0, 4, 4, 0]} barSize={14} />
+          <Bar dataKey="avgDailySales" fill={INCOME} radius={[0, 4, 4, 0]} barSize={14} />
         </BarChart>
       </ResponsiveContainer>
     </div>

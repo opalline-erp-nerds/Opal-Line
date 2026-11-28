@@ -21,7 +21,7 @@ const moduleTint: Record<string, string> = {
   Shopify: 'bg-info-50 text-info-700',
   Sales: 'bg-success-50 text-success-700',
   Payments: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300',
-  Products: 'bg-purple-50 dark:bg-purple-950/40 text-purple-700',
+  Products: 'bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300',
   Inventory: 'bg-info-50 text-info-700',
   Accounting: 'bg-success-50 text-success-700',
   Purchase: 'bg-warning-50 text-warning-700',
@@ -136,7 +136,7 @@ export default function AuditLogsPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Audit Logs"
         subtitle="Immutable trail of every action taken across modules — who, what, when and where."

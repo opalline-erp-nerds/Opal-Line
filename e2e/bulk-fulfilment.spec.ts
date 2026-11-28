@@ -65,19 +65,24 @@ test.describe('bulk fulfilment printing and pipeline moves', () => {
       expect(html).toContain('Deliver To')
       expect(html).toContain('Packed By')
     }
-    // At least one of the two must render a thumbnail <img>. Only meaningful
-    // when the products actually carry photos: the dev store syncs Shopify
-    // images, but a seeded database has none, and asserting a thumbnail there
-    // only proved the seed lacks images rather than that printing works.
-    const hasImagery = await page.evaluate(async () => {
+    // Thumbnails are only possible for the products ON these slips, so the
+    // check is scoped to the SKUs each document actually contains. (Testing
+    // the whole catalogue would fail whenever the two printed orders happen to
+    // hold products without photos.)
+    const imagedSkus = await page.evaluate(async () => {
       const res = await fetch('/api/v1/db/products?limit=200')
-      if (!res.ok) return false
-      const body = await res.json() as { data?: Array<{ image?: string | null }> }
-      const rows = body.data ?? []
-      return rows.some((p) => typeof p.image === 'string' && p.image.length > 0)
+      if (!res.ok) return [] as string[]
+      const body = await res.json() as { data?: Array<{ sku?: string | null; image?: string | null }> }
+      return (body.data ?? [])
+        .filter((p) => typeof p.image === 'string' && p.image.length > 0 && p.sku)
+        .map((p) => String(p.sku))
     })
-    if (hasImagery) {
-      expect(printed.some((html) => html.includes('<img')), 'thumbnail img rendered for imaged products').toBe(true)
+    const slipsWithImagedItem = printed.filter((html) => imagedSkus.some((sku) => html.includes(sku)))
+    if (slipsWithImagedItem.length > 0) {
+      expect(
+        slipsWithImagedItem.some((html) => html.includes('<img')),
+        'thumbnail img rendered for imaged products',
+      ).toBe(true)
     }
   })
 

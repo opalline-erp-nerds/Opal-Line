@@ -303,7 +303,7 @@ export default function InvoiceDetailPage() {
 
   if (loading) {
     return (
-      <div className="mx-auto w-full max-w-[1300px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+      <div className="mx-auto w-full max-w-[1300px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
         <Skeleton className="h-10 w-64" />
         <Skeleton className="h-10 w-80" />
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -430,7 +430,7 @@ export default function InvoiceDetailPage() {
   const customerInitial = invoice.customer.split(' ').map((n) => n[0]).join('').slice(0, 2)
 
   return (
-    <div className="mx-auto w-full max-w-[1300px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1300px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <Link to="/sales/invoices" className="flex items-center gap-1 hover:text-primary-700">
           <ArrowLeft className="h-3 w-3" /> Sales Invoices

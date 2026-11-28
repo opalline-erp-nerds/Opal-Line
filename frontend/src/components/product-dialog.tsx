@@ -1061,7 +1061,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   // Validation + duplicate panels live in the footer so they are always
   // visible — the body of this dialog scrolls, the footer does not.
   const duplicatePanel = duplicate ? (
-    <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50/60 px-3 py-2 text-sm text-amber-900">
+    <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50/60 px-3 py-2 text-sm text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-200">
       <p>
         <span className="font-medium">SKU</span>{' '}
         <span className="font-mono">{form.sku}</span> is already used
@@ -1088,7 +1088,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   ) : null
 
   const errorPanel = error ? (
-    <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-3 py-2 text-sm text-red-700">
+    <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-3 py-2 text-sm text-red-700 dark:border-red-700/60 dark:bg-red-950/40 dark:text-red-200">
       <span className="mt-0.5 block h-2 w-2 shrink-0 rounded-full bg-red-600" />
       <p>{error}</p>
     </div>

@@ -1,4 +1,4 @@
-import express from 'express'
+﻿import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
@@ -56,6 +56,8 @@ import { mountFrontend, resolveFrontendDist } from './frontendStatic'
 import { HostedConfigError, isPublicHost, publicHostStartupError } from './hostedMode'
 import { routeParam } from './lib/routeParams'
 import { dbErrorInfo, describeDbError } from './lib/dbErrors'
+import type { CustomerIdentityInput } from './lib/customerIdentity'
+
 
 const app = express()
 
@@ -142,14 +144,14 @@ function verifyCsrfToken(token: string): boolean {
     const [storedSessionId, timestamp, signature] = decoded.split(':')
     const payload = `${storedSessionId}:${timestamp}`
     const expectedSignature = createHmac('sha256', CSRF_SECRET).update(payload).digest('hex')
-    
+
     const sigBuf = Buffer.from(signature, 'hex')
     const expBuf = Buffer.from(expectedSignature, 'hex')
     if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) return false
-    
+
     const tokenAge = Date.now() - parseInt(timestamp)
     if (tokenAge > 3600000) return false
-    
+
     return true
   } catch {
     return false
@@ -180,13 +182,13 @@ const csrfProtection = (req: express.Request, res: express.Response, next: expre
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     return next()
   }
-  
+
   if (PUBLIC_AUTH_PATHS.has(req.path)) {
     return next()
   }
-  
+
   const token = req.headers[CSRF_HEADER] as string || req.body?.csrfToken
-  
+
   if (!token || !verifyCsrfToken(token)) {
     return res.status(403).json({ error: 'Invalid CSRF token' })
   }
@@ -478,8 +480,16 @@ app.use('/api/v1/db', requireAuth, dashboardRouter)
 app.get('/api/v1/sales/followups', requireAuth, requirePermission('sales', 'view'), async (req, res) => {
   try {
     const { collectSalesFollowUps, summariseSalesFollowUps } = await import('./salesFollowups')
-    const customer = typeof req.query.customer === 'string' && req.query.customer.trim() ? req.query.customer.trim() : null
-    const followUps = await collectSalesFollowUps(customer)
+    const query = (key: string) => String(req.query[key] ?? '').trim()
+    const customer = query('customer')
+    const identity: CustomerIdentityInput = {
+      customerId: query('customerId'),
+      shopifyId: query('shopifyId'),
+      email: query('email'),
+      phone: query('phone'),
+      name: customer || query('name'),
+    }
+    const followUps = await collectSalesFollowUps(identity)
     const summary = await summariseSalesFollowUps(followUps)
     res.json({ followUps, summary, customer })
   } catch (err) {
@@ -1648,9 +1658,16 @@ app.patch('/api/v1/orders/pipeline/:id/tracking', requirePermission('sales', 'ed
 
 app.post('/api/v1/orders/pipeline/:id/cancel', requirePermission('sales', 'edit'), async (req, res) => {
   try {
-    const { cancelOrderInShopify } = await import('./shopifyOrderActions')
+    const { cancelOrderInShopify, isCancelReason, CANCEL_REASONS } = await import('./shopifyOrderActions')
+    const reason = String(req.body?.reason ?? 'OTHER').trim().toUpperCase()
+    if (!isCancelReason(reason)) {
+      return res.status(400).json({ ok: false, error: `reason must be one of: ${CANCEL_REASONS.join(', ')}` })
+    }
+    if (req.body?.restock !== undefined && typeof req.body.restock !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'restock must be a boolean' })
+    }
     const result = await cancelOrderInShopify(String(routeParam(req.params.id) ?? '').trim(), {
-      reason: typeof req.body?.reason === 'string' ? req.body.reason : 'OTHER',
+      reason,
       restock: req.body?.restock === true,
       refund: req.body?.refund === true,
       notifyCustomer: req.body?.notifyCustomer === true,
@@ -2281,7 +2298,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
           payment: payment ?? 'pending',
           fulfillment: fulfillment ?? 'unfulfilled',
           invoice: null,
-          status: status ?? 'confirmed',
+          status: String(status ?? '').trim() || 'confirmed',
           date: date ? new Date(date).toISOString() : now.toISOString(),
           items: itemCount,
           tags: 'manual-order',
@@ -2306,31 +2323,74 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       // Accept any id form (bare numeric or gid://shopify/Customer/…) and
       // store/match only the bare numeric form — mixed formats defeat the
       // shopifyId identity match and duplicate customers.
-      const identityConditions = []
-      if (email) identityConditions.push(eq(schema.customers.email, email))
-      if (phone) identityConditions.push(eq(schema.customers.phone, phone))
-      const [existing] = identityConditions.length
-        ? await tx.select().from(schema.customers).where(or(...identityConditions)).limit(1)
+
+      // Resolve the customer conservatively. Never choose an arbitrary row
+      // when email and phone match different customers or either is duplicated.
+      const normalizedEmail = String(email ?? '').trim().toLowerCase()
+      const normalizedPhone = String(phone ?? '').replace(/\D/g, '')
+
+      const emailMatches = normalizedEmail
+        ? await tx
+            .select()
+            .from(schema.customers)
+            .where(
+              sql`lower(btrim(coalesce(${schema.customers.email}, ''))) = ${normalizedEmail}`,
+            )
+            .limit(2)
         : []
+
+      const phoneMatches = normalizedPhone
+        ? await tx
+            .select()
+            .from(schema.customers)
+            .where(
+              sql`regexp_replace(coalesce(${schema.customers.phone}, ''), '\\D', '', 'g') = ${normalizedPhone}`,
+            )
+            .limit(2)
+        : []
+
+      if (emailMatches.length > 1) {
+        throw new Error('Customer email matches multiple records. Resolve the duplicate customer records before creating this order.')
+      }
+
+      if (phoneMatches.length > 1) {
+        throw new Error('Customer phone matches multiple records. Resolve the duplicate customer records before creating this order.')
+      }
+
+      const emailCustomer = emailMatches[0]
+      const phoneCustomer = phoneMatches[0]
+
+      if (
+        emailCustomer &&
+        phoneCustomer &&
+        emailCustomer.id !== phoneCustomer.id
+      ) {
+        throw new Error('Customer email and phone belong to different records. Resolve the customer identity before creating this order.')
+      }
+
+      const existing = emailCustomer ?? phoneCustomer
+
       if (existing) {
         orderCustomerId = existing.id
+
         await tx
           .update(schema.customers)
           .set({
             name: customer,
-            ...(email ? { email } : {}),
-            ...(phone ? { phone } : {}),
+            ...(normalizedEmail ? { email: normalizedEmail } : {}),
+            ...(phone ? { phone: String(phone).trim() } : {}),
             ...(customerCity ? { city: customerCity } : {}),
             status: existing.status ?? 'active',
           })
           .where(eq(schema.customers.id, existing.id))
       } else {
         orderCustomerId = randomUUID()
+
         await tx.insert(schema.customers).values({
           id: orderCustomerId,
           name: customer,
-          email: email ?? null,
-          phone: phone ?? null,
+          email: normalizedEmail || null,
+          phone: phone ? String(phone).trim() : null,
           city: customerCity ?? null,
           shopifyId: null,
           orders: 0,
@@ -2339,6 +2399,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
           joined: now.toISOString().slice(0, 10),
         })
       }
+
     })
   } catch (err) {
     // Log the driver error whole (code, constraint, column, detail) and give the
@@ -2352,13 +2413,27 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     return res.status(400).json({ error: `Could not save the order: ${describeDbError(err)}` })
   }
 
+  // A manual order explicitly created as cancelled never becomes a Shopify
+  // order. Its stock was deducted a moment ago, so release it exactly once and
+  // stamp the cancellation instead of leaving an unmarked cancelled row.
+  const cancelledOnCreate = String((order as Record<string, unknown> | null)?.status ?? '').toLowerCase() === 'cancelled'
+  if (cancelledOnCreate) {
+    const id = String((order as Record<string, unknown> | null)?.id ?? '')
+    if (id) {
+      const { cancelLocalOrderOnce } = await import('./shopifyOrderActions')
+      await cancelLocalOrderOnce(id, { restoreEvenIfCancelled: true })
+      const [fresh] = await db.select().from(schema.salesOrders).where(eq(schema.salesOrders.id, id)).limit(1)
+      if (fresh) order = fresh as unknown as Record<string, unknown>
+    }
+  }
+
   // ── Shopify sync (after the order is stored) ────────────────────────────
   // The local order is the source of truth. Only once it exists do we push it
   // to Shopify with the payment mode the operator picked (`payment` drives
   // draftOrderComplete's paymentPending), then record the Shopify identity on
   // the row. A sync failure is reported, never rolled back over the sale.
   let shopifySync: DraftOrderResult | null = null
-  if (syncToShopify) {
+  if (syncToShopify && !cancelledOnCreate) {
     const draft = await createShopifyDraftOrder({
       customerName: customer,
       customerEmail: email,
@@ -2400,6 +2475,38 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     }
   }
 
+  // The ERP sale owns its invoice: raise it in the same request through the
+  // same idempotent pipeline the Shopify import uses. Stock was already
+  // deducted above, so the invoice must not move it a second time. A cancelled
+  // (or booking) order is never invoiced; the order itself stays at the stage
+  // the operator chose.
+  let autoInvoice: string | null = null
+  let autoInvoiceError: string | null = null
+  {
+    const savedRow = order as typeof schema.salesOrders.$inferSelect | null
+    if (savedRow && String(savedRow.status ?? '').toLowerCase() !== 'cancelled' && !savedRow.isBooking) {
+      try {
+        if (savedRow.invoice) {
+          autoInvoice = savedRow.invoice
+        } else {
+          const { createInvoiceForOrderRow } = await import('./orderEmailIngest')
+          autoInvoice = await createInvoiceForOrderRow(savedRow, { deductStock: false })
+        }
+        if (autoInvoice) {
+          const [fresh] = await db
+            .select()
+            .from(schema.salesOrders)
+            .where(eq(schema.salesOrders.id, savedRow.id))
+            .limit(1)
+          if (fresh) order = fresh as unknown as Record<string, unknown>
+        }
+      } catch (err) {
+        autoInvoiceError = err instanceof Error ? err.message : 'Invoice generation failed'
+        logger.error({ err, orderId: savedRow.id }, 'ERP order auto-invoice failed')
+      }
+    }
+  }
+
   // Stats are derived, never accumulated: recount from real orders so the
   // numbers can never drift from the underlying data.
   try {
@@ -2424,7 +2531,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     ip: actor.ip,
   })
 
-  res.status(201).json({ order, shopifySync })
+  res.status(201).json({ order, shopifySync, autoInvoice, autoInvoiceError })
 })
 
 app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), validate(updateOrderSchema), async (req, res) => {
@@ -2445,11 +2552,26 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
     // Normalize payment and fulfillment values
     const payment = rawPayment === 'Online' || rawPayment === 'online' ? 'paid' : rawPayment
     const fulfillment = rawFulfillment === 'pending' ? 'unfulfilled' : rawFulfillment
+    const requestedStatus = status === undefined ? null : String(status).trim().toLowerCase()
+    const cancelling = requestedStatus === 'cancelled'
+    const wasCancelled = String(existing.status ?? '').toLowerCase() === 'cancelled'
+
+    // The edit dialog used to write status='cancelled' straight to the row:
+    // no Shopify cancellation, no stock restore and no cancelled_at. Route the
+    // transition through the same lifecycle as the dedicated Cancel action.
+    if (cancelling && !wasCancelled) {
+      const { cancelOrderLifecycle } = await import('./shopifyOrderActions')
+      const cancelled = await cancelOrderLifecycle(existing.id)
+      if (!cancelled.ok) return res.status(502).json({ error: cancelled.error ?? 'Order could not be cancelled' })
+    }
 
     let value = Number(existing.value ?? 0)
     let itemCount = Number(existing.items ?? 0)
     let mappedLineItems: Array<Record<string, unknown>> | null = null
-    if (items) {
+    // A cancellation restores the existing lines exactly once. Applying edited
+    // lines first would deduct the new basket and then restock it, leaving the
+    // cancelled order's stock wrong.
+    if (items && !cancelling) {
       // Lines carry their weight & pricing snapshot — the order→invoice
       // generator reads weight/silverValue/makingValue/amount straight off
       // manual orders, so an edit must keep that snapshot coherent instead of
@@ -2530,6 +2652,11 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
       value,
       items: itemCount,
       ...(mappedLineItems ? { lineItems: mappedLineItems } : {}),
+      ...(cancelling
+        ? { cancelledAt: new Date().toISOString() }
+        : wasCancelled
+          ? { cancelledAt: null }
+          : {}),
     }
     if (date) updates.date = new Date(String(date)).toISOString()
     // Contact & address edits made in the order dialog must survive the save
@@ -2591,7 +2718,7 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
     }
 
     let shopifySync: DraftOrderResult | null = null
-    if (syncToShopify) {
+    if (syncToShopify && !cancelling) {
       const storedShopifyId = typeof updated.shopifyId === 'string' ? updated.shopifyId : ''
       if (storedShopifyId.startsWith('#')) {
         const result = await updateShopifyOrder({

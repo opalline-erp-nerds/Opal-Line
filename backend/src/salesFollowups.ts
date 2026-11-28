@@ -1,10 +1,14 @@
-import { and, asc, eq, inArray } from 'drizzle-orm'
+
+import { and, asc, eq, inArray, or, sql } from 'drizzle-orm'
 import { db } from './db/client'
 import * as schema from './db/schema'
 import { logger } from './logger'
 import { recordActivity } from './activity'
 import { expireStaleQuotations, quotationIsExpired } from './routes/quotations'
 import { createScheduler } from './lib/scheduler'
+import type { CustomerIdentityInput } from './lib/customerIdentity'
+import { normalizeShopifyCustomerId } from './shopifyDataEnhance'
+
 
 /**
  * Sales follow-ups — the "what needs chasing today?" list.
@@ -57,17 +61,146 @@ function daysUntil(value: string): number {
   return Math.ceil((then - Date.now()) / 86_400_000)
 }
 
-/**
- * Build the follow-up list. Pass a customer name to scope it to one customer
- * (used by the customer 360 page).
- */
-export async function collectSalesFollowUps(customer?: string | null): Promise<SalesFollowUp[]> {
-  if (!db) return []
-  const out: SalesFollowUp[] = []
-  const customerFilter = customer ? eq(schema.salesOrders.customer, customer) : undefined
 
-  // ── Quotations awaiting a decision ────────────────────────────────────────
-  const quotes = await db
+/**
+ * Build the follow-up list.
+ * Accepts customer identity fields for accurate Customer 360 filtering.
+ * Calling without an identity returns the complete follow-up list.
+ */
+export async function collectSalesFollowUps(
+  customerInput?: CustomerIdentityInput | string | null,
+): Promise<SalesFollowUp[]> {
+  if (!db) return []
+
+  const out: SalesFollowUp[] = []
+
+  
+  // Backward compatibility for callers that pass a customer name.
+  const identity: CustomerIdentityInput =
+    typeof customerInput === 'string'
+      ? { name: customerInput }
+      : customerInput ?? {}
+
+  const customerId = identity.customerId?.trim() ?? ''
+  const shopifyId = identity.shopifyId
+    ? normalizeShopifyCustomerId(identity.shopifyId.trim())
+    : ''
+  const email = identity.email?.trim().toLowerCase() ?? ''
+  const phone = identity.phone?.replace(/\D/g, '') ?? ''
+  const name = identity.name?.trim() ?? ''
+
+  const hasStrongIdentity = Boolean(customerId || shopifyId || email || phone)
+  const hasIdentity = hasStrongIdentity || Boolean(name)
+
+  const orderIdentityConditions = []
+  const quotationIdentityConditions = []
+
+  if (hasIdentity) {
+    const customerConditions = []
+
+    if (customerId) {
+      customerConditions.push(eq(schema.customers.id, customerId))
+    }
+    if (shopifyId) {
+      customerConditions.push(eq(schema.customers.shopifyId, shopifyId))
+    }
+    if (email) {
+      customerConditions.push(
+        sql`lower(btrim(coalesce(${schema.customers.email}, ''))) = ${email}`,
+      )
+    }
+    if (phone) {
+      customerConditions.push(
+        sql`regexp_replace(coalesce(${schema.customers.phone}, ''), '\\D', '', 'g') = ${phone}`,
+      )
+    }
+
+    const matchedCustomers = customerConditions.length
+      ? await db
+          .select({
+            id: schema.customers.id,
+            name: schema.customers.name,
+            shopifyId: schema.customers.shopifyId,
+            email: schema.customers.email,
+            phone: schema.customers.phone,
+          })
+          .from(schema.customers)
+          .where(or(...customerConditions))
+      : []
+
+    // Do not combine records when identifiers are ambiguous or conflicting.
+    if (matchedCustomers.length > 1) {
+      logger.warn(
+        { matchedCustomerCount: matchedCustomers.length },
+        'Sales follow-up identity is ambiguous or conflicting',
+      )
+      return []
+    }
+
+    const matchedCustomer = matchedCustomers[0]
+
+    // Strong identifiers must resolve to a customer record.
+    if (hasStrongIdentity && !matchedCustomer) {
+      logger.warn(
+        'Sales follow-up customer identity could not be resolved',
+      )
+      return []
+    }
+
+    // Use the resolved record's canonical details.
+    const resolvedShopifyId = matchedCustomer?.shopifyId
+      ? normalizeShopifyCustomerId(matchedCustomer.shopifyId)
+      : ''
+    const resolvedEmail =
+      matchedCustomer?.email?.trim().toLowerCase() ?? ''
+    const resolvedPhone =
+      matchedCustomer?.phone?.replace(/\D/g, '') ?? ''
+    const resolvedName = matchedCustomer?.name ?? name
+
+    if (resolvedShopifyId) {
+      orderIdentityConditions.push(
+        eq(schema.salesOrders.customerShopifyId, resolvedShopifyId),
+      )
+    }
+
+    if (resolvedEmail) {
+      orderIdentityConditions.push(
+        sql`lower(btrim(coalesce(${schema.salesOrders.customerEmail}, ''))) = ${resolvedEmail}`,
+      )
+      quotationIdentityConditions.push(
+        sql`lower(btrim(coalesce(${schema.quotations.customerEmail}, ''))) = ${resolvedEmail}`,
+      )
+    }
+
+    if (resolvedPhone) {
+      orderIdentityConditions.push(
+        sql`regexp_replace(coalesce(${schema.salesOrders.customerPhone}, ''), '\\D', '', 'g') = ${resolvedPhone}`,
+      )
+      quotationIdentityConditions.push(
+        sql`regexp_replace(coalesce(${schema.quotations.customerPhone}, ''), '\\D', '', 'g') = ${resolvedPhone}`,
+      )
+    }
+
+    // Name-only searches are retained for backward compatibility.
+    if (!hasStrongIdentity && resolvedName) {
+      orderIdentityConditions.push(
+        eq(schema.salesOrders.customer, resolvedName),
+      )
+      quotationIdentityConditions.push(
+        eq(schema.quotations.customer, resolvedName),
+      )
+    }
+
+    // Never let an identified customer request become an unfiltered query.
+    if (
+      orderIdentityConditions.length === 0 &&
+      quotationIdentityConditions.length === 0
+    ) {
+      return []
+    }
+  }
+
+    const quotes = await db
     .select({
       id: schema.quotations.id,
       number: schema.quotations.number,
@@ -80,14 +213,22 @@ export async function collectSalesFollowUps(customer?: string | null): Promise<S
     })
     .from(schema.quotations)
     .where(
-      customer
-        ? and(inArray(schema.quotations.status, ['sent', 'approved']), eq(schema.quotations.customer, customer))
-        : inArray(schema.quotations.status, ['sent', 'approved']),
+      and(
+        inArray(schema.quotations.status, ['sent', 'approved']),
+        quotationIdentityConditions.length
+          ? or(...quotationIdentityConditions)
+          : undefined,
+      ),
     )
     .orderBy(asc(schema.quotations.validUntil))
 
-  const expiryWarningAt = new Date(Date.now() + QUOTE_EXPIRY_WARNING_DAYS * 86_400_000).toISOString()
-  const nudgeCutoff = new Date(Date.now() - QUOTE_NUDGE_DAYS * 86_400_000).toISOString()
+  const expiryWarningAt = new Date(
+    Date.now() + QUOTE_EXPIRY_WARNING_DAYS * 86_400_000,
+  ).toISOString()
+
+  const nudgeCutoff = new Date(
+    Date.now() - QUOTE_NUDGE_DAYS * 86_400_000,
+  ).toISOString()
 
   for (const q of quotes) {
     if (quotationIsExpired(q)) continue
@@ -95,7 +236,14 @@ export async function collectSalesFollowUps(customer?: string | null): Promise<S
     const value = Number(q.grandTotal ?? 0)
     const expiringSoon = Boolean(q.validUntil && q.validUntil <= expiryWarningAt)
     const waiting = daysSince(touched)
-    if (!expiringSoon && (waiting < QUOTE_NUDGE_DAYS || (touched !== null && touched > nudgeCutoff))) continue
+
+    if (
+      !expiringSoon &&
+      (waiting < QUOTE_NUDGE_DAYS || (touched !== null && touched > nudgeCutoff))
+    ) {
+      continue
+    }
+
     out.push({
       kind: expiringSoon ? 'quotation-expiring' : 'quotation',
       id: q.id,
@@ -111,10 +259,9 @@ export async function collectSalesFollowUps(customer?: string | null): Promise<S
     })
   }
 
-  // ── Pipeline orders + bookings ────────────────────────────────────────────
-  const orders = await db
-    .select({
-      id: schema.salesOrders.id,
+const orders = await db
+  .select({
+    id: schema.salesOrders.id,
       internalId: schema.salesOrders.internalId,
       customer: schema.salesOrders.customer,
       status: schema.salesOrders.status,
@@ -127,11 +274,15 @@ export async function collectSalesFollowUps(customer?: string | null): Promise<S
     })
     .from(schema.salesOrders)
     .where(
-      customer
-        ? and(inArray(schema.salesOrders.status, OPEN_ORDER_STATUSES), customerFilter)
-        : inArray(schema.salesOrders.status, OPEN_ORDER_STATUSES),
+      and(
+        inArray(schema.salesOrders.status, OPEN_ORDER_STATUSES),
+        orderIdentityConditions.length
+          ? or(...orderIdentityConditions)
+          : undefined,
+      ),
     )
     .orderBy(asc(schema.salesOrders.date))
+
 
   for (const o of orders) {
     const age = daysSince(o.date)

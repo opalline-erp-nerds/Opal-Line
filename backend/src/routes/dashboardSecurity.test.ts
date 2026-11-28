@@ -41,11 +41,28 @@ test(
     const activityId = `${marker}-activity`
 
     let server: Server | null = null
+    // Captured before the policy is enabled so the finally block can restore it.
+    let priorSettings: { enabled: boolean | null } | undefined
     try {
       await db!.insert(schema.users).values([
         { id: adminId, name: 'Sec Test Admin', email: `${marker}-admin@test.local`, role: 'Admin', status: 'active' },
         { id: mgrId, name: 'Sec Test Viewer', email: `${marker}-mgr@test.local`, role: 'Manager', status: 'active' },
       ])
+
+      // Locked accounts are only counted while the install's lockout policy is
+      // enabled (the endpoint reports zero otherwise, exactly like
+      // checkLockout() at login), so enable it and remember what was there.
+      const { eq } = await import('drizzle-orm')
+      const [settingsRow] = await db!
+        .select({ enabled: schema.settings.loginLockoutEnabled })
+        .from(schema.settings)
+        .where(eq(schema.settings.id, 'app'))
+        .limit(1)
+      priorSettings = settingsRow
+      await db!
+        .insert(schema.settings)
+        .values({ id: 'app', loginLockoutEnabled: true })
+        .onConflictDoUpdate({ target: schema.settings.id, set: { loginLockoutEnabled: true } })
 
       const app = express()
       app.use((req, _res, next) => {
@@ -142,7 +159,16 @@ test(
         'the audit_logs failure appears in the recent list',
       )
     } finally {
-      const { inArray } = await import('drizzle-orm')
+      const { eq, inArray } = await import('drizzle-orm')
+      if (priorSettings) {
+        await db!
+          .update(schema.settings)
+          .set({ loginLockoutEnabled: priorSettings.enabled ?? false })
+          .where(eq(schema.settings.id, 'app'))
+          .catch(() => undefined)
+      } else {
+        await db!.delete(schema.settings).where(eq(schema.settings.id, 'app')).catch(() => undefined)
+      }
       await db!.delete(schema.users).where(inArray(schema.users.id, [adminId, mgrId]))
       await db!.delete(schema.loginAttempts).where(inArray(schema.loginAttempts.identifier, [staleId, freshId]))
       await db!.delete(schema.auditLogs).where(inArray(schema.auditLogs.id, [auditId]))

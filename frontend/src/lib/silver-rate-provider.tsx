@@ -3,7 +3,7 @@ import { dbApi } from '@/lib/api'
 import type { SilverRate } from '@/types'
 import { SilverRateContext } from './silver-rate-context'
 
-const POLL_INTERVAL_MS = 30_000
+const POLL_INTERVAL_MS = 60_000
 
 export function SilverRateProvider({ children }: { children: React.ReactNode }) {
   const [rate, setRate] = useState<SilverRate | null>(null)

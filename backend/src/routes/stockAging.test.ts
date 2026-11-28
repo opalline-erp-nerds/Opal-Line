@@ -83,7 +83,9 @@ test(
       })
       await db!.insert(schema.products).values(products)
       // Give the products that have ledger history a balance too.
-      await db!.update(schema.products).set({ stock: 3 }).where(inArray(schema.products.id, [oldProduct, recentProduct, agedProduct, cancelledProduct]))
+      await db!.update(schema.products).set({ stock: 3 }).where(inArray(schema.products.id, [oldProduct, recentProduct, cancelledProduct]))
+      // Its ledger holds exactly the two units it still has on hand.
+      await db!.update(schema.products).set({ stock: 2 }).where(inArray(schema.products.id, [agedProduct]))
       await db!.insert(schema.stockMovements).values(movements)
       await db!.insert(schema.salesInvoices).values([
         { id: invoiceId, number: `${marker}-INV`, status: 'paid', date: ago(60) },

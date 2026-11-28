@@ -145,7 +145,8 @@ test.describe('shared AppDialog contract', () => {
     await expect(dialog.getByRole('heading', { name: /loyalty program settings/i })).toBeVisible({ timeout: 10000 })
     // The shared AppDialog footer carries a dismiss action and the primary
     // save. It used to close with a "Done" button; the dialog now persists the
-    // rules, so the footer is Cancel + Save Settings.
+    // rules, so the footer is Cancel + Save Settings (Cancel closes without
+    // writing).
     await expect(dialog.getByRole('button', { name: /cancel/i })).toBeVisible()
     await expect(dialog.getByRole('button', { name: /save settings/i })).toBeVisible()
     await expect(dialog.locator('.overflow-y-auto')).toHaveCount(1)

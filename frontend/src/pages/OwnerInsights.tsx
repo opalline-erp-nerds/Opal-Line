@@ -46,7 +46,7 @@ export default function OwnerInsightsPage() {
 
   if (loading) {
     return (
-      <div className="mx-auto w-full max-w-[1300px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+      <div className="mx-auto w-full max-w-[1300px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
         <Skeleton className="h-10 w-72" />
         <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
           {[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-28 rounded-lg" />)}
@@ -79,7 +79,7 @@ export default function OwnerInsightsPage() {
   const hasDataIssues = data.costAnomalies.length > 0 || data.totals.uncostedLines > 0
 
   return (
-    <div className="mx-auto w-full max-w-[1300px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1300px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
         <Link to="/" className="flex items-center gap-1 hover:text-primary-700">
           <ArrowLeft className="h-3 w-3" /> Dashboard

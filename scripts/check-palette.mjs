@@ -1,4 +1,4 @@
-// Verifies the navy+gold palette against WCAG, reading the real values out of
+// Verifies the emerald-teal palette against WCAG, reading the real values out of
 // the source CSS so it cannot drift from what ships.
 // Run: node scripts/check-palette.mjs
 import fs from 'node:fs'

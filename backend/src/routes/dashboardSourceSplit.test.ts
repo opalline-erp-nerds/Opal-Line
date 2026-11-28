@@ -41,6 +41,9 @@ test(
     const shopOrder = `${marker}-order-shop`
     const erpOrder = `${marker}-order-erp`
     const invoicedErpOrder = `${marker}-order-erp-invoiced`
+    const zeroInvoice = `${marker}-inv-zero`
+    const zeroOrder = `${marker}-order-zero`
+    const openShopifyOrder = `${marker}-order-open`
 
     // Magnitudes sit far above real catalogue revenue so the marker SKUs rank
     // inside the limited top-products payload on any database.
@@ -48,6 +51,8 @@ test(
     const ERP_INVOICE = 5_000_000
     const ERP_ORDER_VALUE = 3_000_000 // uninvoiced: revenue lives on the order
     const ALREADY_INVOICED = 1_000_000 // order value that must not be added again
+    const ZERO_INVOICE_ORDER = 2_000_000 // Shopify order whose invoice is ₹0
+    const UNINVOICED_SHOPIFY = 1_500_000 // Shopify order with no invoice at all
 
     const invoices = [
       {
@@ -68,6 +73,17 @@ test(
         grandTotal: ERP_INVOICE,
         status: 'issued',
         paymentStatus: 'pending',
+        date: now,
+      },
+      {
+        // The original bug: a real Shopify order linked to a ₹0 invoice.
+        id: zeroInvoice,
+        number: `${marker}-ZERO`,
+        shopifyOrder: `#${marker}-zero`,
+        customer: `${marker} Zero Invoice Buyer`,
+        grandTotal: 0,
+        status: 'paid',
+        paymentStatus: 'paid',
         date: now,
       },
       {
@@ -114,6 +130,36 @@ test(
         date: now,
         items: 3,
         lineItems: [{ sku: erpSku, title: 'Split ERP Chain', quantity: 3, weight: 30, amount: ERP_ORDER_VALUE }],
+      },
+      {
+        // Shopify order whose linked invoice carries no amount. Its own total
+        // is authoritative, so the sale must still be revenue.
+        id: zeroOrder,
+        shopifyId: `#${marker}-zero`,
+        internalId: `SO-${marker}-zero`,
+        customer: `${marker} Zero Invoice Buyer`,
+        value: ZERO_INVOICE_ORDER,
+        payment: 'paid',
+        invoice: `${marker}-ZERO`,
+        status: 'imported',
+        date: now,
+        items: 1,
+        lineItems: [],
+      },
+      {
+        // Shopify order that has not been invoiced yet. Its total lives only
+        // on the order row and must be counted once, like an ERP order.
+        id: openShopifyOrder,
+        shopifyId: `#${marker}-open`,
+        internalId: `SO-${marker}-open`,
+        customer: `${marker} Open Shopify Buyer`,
+        value: UNINVOICED_SHOPIFY,
+        payment: 'pending',
+        invoice: null,
+        status: 'imported',
+        date: now,
+        items: 1,
+        lineItems: [],
       },
       {
         // ERP order that already owns an invoice: its order value and lines
@@ -172,20 +218,28 @@ test(
       const points = await get('/dashboard/sales-overview?period=last30')
       const after = totals(points)
 
-      assert.equal(delta(base.shopifyRevenue, after.shopifyRevenue), SHOP_REVENUE, 'Shopify revenue is the Shopify invoice only')
+      assert.equal(
+        delta(base.shopifyRevenue, after.shopifyRevenue),
+        SHOP_REVENUE + ZERO_INVOICE_ORDER + UNINVOICED_SHOPIFY,
+        'Shopify revenue follows the order totals, including a ₹0 invoice and an uninvoiced order',
+      )
       assert.equal(
         delta(base.erpRevenue, after.erpRevenue),
         ERP_INVOICE + ERP_ORDER_VALUE,
         'ERP revenue is its invoices plus uninvoiced orders, and never the already-invoiced order value',
       )
-      assert.equal(delta(base.shopifyOrders, after.shopifyOrders), 1, 'one Shopify order')
+      assert.equal(
+        delta(base.shopifyOrders, after.shopifyOrders),
+        3,
+        'three Shopify orders: invoiced, zero-invoice and uninvoiced',
+      )
       assert.equal(delta(base.erpOrders, after.erpOrders), 2, 'two ERP orders, including the invoiced one (as an order, not as extra revenue)')
       assert.equal(
         delta(base.revenue, after.revenue),
-        SHOP_REVENUE + ERP_INVOICE + ERP_ORDER_VALUE,
+        SHOP_REVENUE + ZERO_INVOICE_ORDER + UNINVOICED_SHOPIFY + ERP_INVOICE + ERP_ORDER_VALUE,
         'All Sales is Shopify + ERP revenue with every sale counted once',
       )
-      assert.equal(delta(base.orders, after.orders), 3, 'All Sales is Shopify + ERP order counts')
+      assert.equal(delta(base.orders, after.orders), 5, 'All Sales is Shopify + ERP order counts')
       assert.equal(
         Math.round((after.shopifyRevenue + after.erpRevenue - after.revenue) * 100) / 100,
         0,

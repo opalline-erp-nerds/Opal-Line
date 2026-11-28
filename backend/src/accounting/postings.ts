@@ -101,7 +101,11 @@ export async function postExpenseJournal(expenseId: string, createdBy?: string |
   const [exp] = await db.select().from(schema.expenses).where(eq(schema.expenses.id, expenseId)).limit(1)
   if (!exp) return null
   const amount = n(exp.amount)
-  if (amount <= 0) {
+  // Only an approved expense is a committed cost. A pending or rejected row
+  // stays an operational record, and any journal from an earlier approval is
+  // reversed when the status moves back.
+  const status = String(exp.status ?? '').toLowerCase()
+  if (status !== 'approved' || amount <= 0) {
     await removeJournalEntry('expense', expenseId, createdBy ?? null).catch(() => undefined)
     return null
   }

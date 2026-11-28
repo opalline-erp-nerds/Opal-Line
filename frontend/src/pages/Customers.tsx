@@ -445,7 +445,7 @@ export default function CustomersPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Customers"
         subtitle="Ecommerce customers who purchased through the Opal Line Shopify store."
@@ -649,7 +649,7 @@ export default function CustomersPage() {
                   </Button>
                 </div>
               </div>
-              <div className={`rounded-md border px-2 py-1.5 text-center ${loyaltyBalance && loyaltyBalance > 0 ? 'border-violet-500/40 bg-violet-500/10' : 'border-border/60 bg-muted/30'}`}>
+              <div className={`rounded-md border px-2 py-1.5 text-center ${loyaltyBalance && loyaltyBalance > 0 ? 'border-primary/40 bg-primary/10' : 'border-border/60 bg-muted/30'}`}>
                 <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Available Balance</p>
                 <p className="text-lg font-semibold tabular-nums text-foreground">
                   {loyaltyBalance === null ? '—' : `${loyaltyBalance.toLocaleString('en-IN')} pts`}

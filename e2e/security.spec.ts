@@ -1,35 +1,6 @@
-import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { expect, request, test } from '@playwright/test'
-
-/**
- * Best-effort cleanup of a probe identifier's lockout counter so repeated
- * local runs start from a clean slate. Uses the same DATABASE_URL resolution
- * as global-setup and never fails the test — a leftover row is ignored
- * while lockout is off (the shipped default this suite restores).
- */
-async function clearProbeAttempts(identifier: string): Promise<void> {
-  let url = process.env.DATABASE_URL?.trim() || ''
-  if (!url && process.env.APPDATA) {
-    const pwFile = join(process.env.APPDATA, 'Opal Line Billing', '.pg-password')
-    try {
-      if (existsSync(pwFile)) {
-        const pw = readFileSync(pwFile, 'utf8').trim()
-        if (pw) url = `postgres://postgres:${encodeURIComponent(pw)}@127.0.0.1:47193/opal_line`
-      }
-    } catch { /* fall through */ }
-  }
-  if (!url) return
-  try {
-    const postgres = (await import('postgres')).default
-    const sql = postgres(url, { max: 1, connect_timeout: 5 })
-    try {
-      await sql`DELETE FROM login_attempts WHERE identifier = ${identifier}`
-    } finally {
-      await sql.end({ timeout: 5 })
-    }
-  } catch { /* best effort */ }
-}
+import { clearLoginAttempts } from './db'
 
 /**
  * Security regression suite for the Opal Line Billing backend.
@@ -191,11 +162,14 @@ test.describe('anonymous requests', () => {
     // defaults (off, 5 / 15) so later tests and manual runs see the shipped
     // behaviour.
     //
-    // Two hard-won details: the settings endpoint is state-changing, so the
+    // Three hard-won details: the settings endpoint is state-changing, so the
     // CSRF header is required (without it the PUT 403s and the lockout
-    // silently stays off), and the bare `request` fixture does not pick up
-    // the config's storageState here — build an authenticated context
-    // explicitly (global setup has written e2e/.auth/state.json by now).
+    // silently stays off); the bare `request` fixture does not pick up the
+    // config's storageState here — build an authenticated context explicitly
+    // (global setup has written e2e/.auth/state.json by now); and the probe
+    // identifier must be unique per run, because a lockout row left by an
+    // interrupted earlier run would otherwise make the FIRST attempt 429
+    // instead of 401.
     const baseURL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:47195'
     const ctx = await request.newContext({ baseURL, storageState: 'e2e/.auth/state.json' })
     try {
@@ -215,8 +189,13 @@ test.describe('anonymous requests', () => {
       }
       expect(row.lockoutThreshold, 'custom attempts value is stored as-is').toBe(3)
       expect(row.lockoutDurationMinutes, 'custom minutes value is stored as-is').toBe(10)
+      // Unique per run: cleanup is best-effort (the DB may be unreachable from
+      // the test process), so isolation must not depend on it succeeding. The
+      // previous fixed name made a re-run inside the 10-minute window start at
+      // 429 — the exact failure this test used to report.
+      const probe = `e2e-lockout-probe-${randomUUID()}`
       try {
-        const data = { username: 'e2e-lockout-probe', password: 'definitely-wrong' }
+        const data = { username: probe, password: 'definitely-wrong' }
         // With a threshold of 3 the first failures are ordinary 401s…
         const first = await ctx.post('/api/v1/auth/login', { data })
         expect(first.status(), 'first failure is a plain 401').toBe(401)
@@ -233,7 +212,8 @@ test.describe('anonymous requests', () => {
           data: { loginLockoutEnabled: false, lockoutThreshold: 5, lockoutDurationMinutes: 15 },
         })
         expect(restore.status(), 'restoring the defaults must succeed').toBeLessThan(300)
-        await clearProbeAttempts('e2e-lockout-probe')
+        const cleanup = await clearLoginAttempts(probe)
+        if (!cleanup.ok) console.warn(`[security] lockout probe cleanup skipped: ${cleanup.error}`)
       }
     } finally {
       await ctx.dispose()

@@ -125,12 +125,23 @@ export default function SystemStatusPage() {
 
   useEffect(() => {
     if (!autoRefresh) return
-    const t = setInterval(() => {
+    // Four requests every 5s is only useful while someone is watching this
+    // page. Pause the timer in a hidden tab and refresh once on return.
+    const tick = () => {
+      if (document.visibilityState !== 'visible') return
       loadLogs(activeLog)
       loadStatus()
       loadPorts()
-    }, 5000)
-    return () => clearInterval(t)
+    }
+    const t = setInterval(tick, 5000)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') tick()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(t)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [autoRefresh, activeLog, loadLogs, loadPorts, loadStatus])
 
   useEffect(() => {
@@ -179,7 +190,7 @@ export default function SystemStatusPage() {
   const badgeCls = `inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${phase?.cls ?? 'bg-muted text-muted-foreground'}`
 
   return (
-    <div className="mx-auto w-full max-w-[1200px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="System Status"
         subtitle="Live server health, software updates and server logs."

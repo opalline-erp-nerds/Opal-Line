@@ -42,8 +42,8 @@ export default function LoginPage() {
 
   if (authLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[#15110d]">
-        <Loader2 className="h-6 w-6 animate-spin text-[#d8b36a]" />
+      <div className="flex min-h-screen items-center justify-center bg-sidebar">
+        <Loader2 className="h-6 w-6 animate-spin text-primary" />
       </div>
     )
   }
@@ -51,8 +51,8 @@ export default function LoginPage() {
   return (
     <AuthLayout>
       <div>
-        <h1 className="text-[28px] font-bold leading-tight tracking-tight text-white sm:text-3xl">Welcome back</h1>
-        <p className="mt-2 text-sm text-[#cdc0ad]">Sign in to your account</p>
+        <h1 className="text-[26px] font-semibold leading-tight tracking-tight text-foreground sm:text-[28px]">Welcome back</h1>
+        <p className="mt-2 text-[13px] text-muted-foreground">Sign in to your account</p>
       </div>
 
       <form
@@ -92,7 +92,7 @@ export default function LoginPage() {
             <button
               type="button"
               onClick={() => setShowPassword((s) => !s)}
-              className="absolute right-2 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-md text-[#6b5f4f] hover:text-[#231c14] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#b8903f]"
+              className="absolute right-2 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
               aria-label={showPassword ? 'Hide password' : 'Show password'}
               aria-pressed={showPassword}
             >
@@ -102,14 +102,14 @@ export default function LoginPage() {
         </div>
 
         {error ? (
-          <p role="alert" className="rounded-md border border-[#ffb4a8]/30 bg-[#3a1d18]/60 px-3 py-2 text-sm text-[#ffc3b8]">
+          <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-300">
             {error}
           </p>
         ) : null}
 
         <Button
           type="submit"
-          className="h-11 w-full rounded-lg bg-gold text-[15px] font-semibold text-gold-foreground shadow-lg shadow-black/30 hover:bg-gold/90 focus-visible:ring-2 focus-visible:ring-[#e6c16f] focus-visible:ring-offset-2 focus-visible:ring-offset-[#15110d]"
+          className="h-11 w-full rounded-lg bg-primary text-[15px] font-semibold text-primary-foreground shadow-sm hover:bg-primary-700 focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:ring-offset-2"
           disabled={!identifier.trim() || !password || signingIn}
         >
           {signingIn ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}

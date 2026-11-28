@@ -79,7 +79,7 @@ export default function DayBookPage() {
   const totals = data?.totals
 
   return (
-    <div className="mx-auto w-full max-w-[1100px] space-y-5 px-4 py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-6 lg:px-7">
       <PageHeader
         title="Day Book"
         subtitle="Everything that happened on this day — invoices, orders, payments, expenses and dispatches on one printable page."

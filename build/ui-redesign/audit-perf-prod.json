@@ -1,0 +1,643 @@
+{
+  "base": "http://127.0.0.1:47210",
+  "bundle": "frontend/dist (production build)",
+  "producedAt": "2026-11-20T07:21:04.877Z",
+  "results": [
+    {
+      "name": "login + auth bootstrap",
+      "commits": 7,
+      "heapMB": 5.2,
+      "longTasks": {
+        "count": 1,
+        "totalMs": 50,
+        "maxMs": 50
+      },
+      "counts": {
+        "requests": 43,
+        "api": 7,
+        "uniqueEndpoints": 5,
+        "duplicateGetRequests": 1,
+        "apiTotalMs": 278,
+        "slowestApiMs": 199
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/auth/me",
+          "count": 2,
+          "avgMs": 11,
+          "maxMs": 14,
+          "kb": 2.4,
+          "statuses": "401,200"
+        },
+        {
+          "path": "/api/v1/db/users?limit=200&page=1",
+          "count": 1,
+          "avgMs": 23,
+          "maxMs": 23,
+          "kb": 4.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/rbac/users/76214e90-2a03-4e81-830c-dc33ca472c47/permissions",
+          "count": 1,
+          "avgMs": 16,
+          "maxMs": 16,
+          "kb": 2.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/csrf-token",
+          "count": 1,
+          "avgMs": 11,
+          "maxMs": 11,
+          "kb": 1.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 1,
+          "avgMs": 8,
+          "maxMs": 8,
+          "kb": 1.1,
+          "statuses": "401"
+        }
+      ]
+    },
+    {
+      "name": "dashboard initial load (production bundle)",
+      "commits": 131,
+      "heapMB": 11,
+      "longTasks": {
+        "count": 3,
+        "totalMs": 409,
+        "maxMs": 230
+      },
+      "counts": {
+        "requests": 59,
+        "api": 24,
+        "uniqueEndpoints": 24,
+        "duplicateGetRequests": 0,
+        "apiTotalMs": 2270,
+        "slowestApiMs": 222
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/db/dashboard/payment-status?period=today&source=all",
+          "count": 1,
+          "avgMs": 222,
+          "maxMs": 222,
+          "kb": 1.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-products?period=today&source=all",
+          "count": 1,
+          "avgMs": 204,
+          "maxMs": 204,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/analytics?period=today",
+          "count": 1,
+          "avgMs": 190,
+          "maxMs": 190,
+          "kb": 1.6,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/sales-insights?period=today",
+          "count": 1,
+          "avgMs": 188,
+          "maxMs": 188,
+          "kb": 2.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/requests?status=pending",
+          "count": 1,
+          "avgMs": 153,
+          "maxMs": 153,
+          "kb": 1.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/notifications/feed",
+          "count": 1,
+          "avgMs": 152,
+          "maxMs": 152,
+          "kb": 4.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities",
+          "count": 1,
+          "avgMs": 146,
+          "maxMs": 146,
+          "kb": 3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/shopify/status",
+          "count": 1,
+          "avgMs": 127,
+          "maxMs": 127,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities?period=today&scope=latest",
+          "count": 1,
+          "avgMs": 83,
+          "maxMs": 83,
+          "kb": 3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-category?period=today",
+          "count": 1,
+          "avgMs": 81,
+          "maxMs": 81,
+          "kb": 1.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/supplier-payments?period=today&status=all",
+          "count": 1,
+          "avgMs": 74,
+          "maxMs": 74,
+          "kb": 2.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/purchase-orders?period=today",
+          "count": 1,
+          "avgMs": 72,
+          "maxMs": 72,
+          "kb": 1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/kpis?period=today",
+          "count": 1,
+          "avgMs": 68,
+          "maxMs": 68,
+          "kb": 2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/financial?period=last12m",
+          "count": 1,
+          "avgMs": 66,
+          "maxMs": 66,
+          "kb": 3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/low-stock",
+          "count": 1,
+          "avgMs": 62,
+          "maxMs": 62,
+          "kb": 4.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/summary?period=today",
+          "count": 1,
+          "avgMs": 60,
+          "maxMs": 60,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/sales-overview?period=today",
+          "count": 1,
+          "avgMs": 60,
+          "maxMs": 60,
+          "kb": 4.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 1,
+          "avgMs": 54,
+          "maxMs": 54,
+          "kb": 1.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/order-summary?grain=week&month=2026-11",
+          "count": 1,
+          "avgMs": 50,
+          "maxMs": 50,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/silver-history?days=7",
+          "count": 1,
+          "avgMs": 48,
+          "maxMs": 48,
+          "kb": 1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/recent-invoices?period=today&source=all",
+          "count": 1,
+          "avgMs": 47,
+          "maxMs": 47,
+          "kb": 3.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/users?limit=200&page=1",
+          "count": 1,
+          "avgMs": 25,
+          "maxMs": 25,
+          "kb": 4.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/auth/me",
+          "count": 1,
+          "avgMs": 20,
+          "maxMs": 20,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/rbac/users/76214e90-2a03-4e81-830c-dc33ca472c47/permissions",
+          "count": 1,
+          "avgMs": 18,
+          "maxMs": 18,
+          "kb": 2.3,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "dashboard idle 70s (all polling incl. 60s refresh)",
+      "commits": 4,
+      "heapMB": 11.1,
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "counts": {
+        "requests": 3,
+        "api": 3,
+        "uniqueEndpoints": 3,
+        "duplicateGetRequests": 0,
+        "apiTotalMs": 86,
+        "slowestApiMs": 32
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/silver/rate",
+          "count": 1,
+          "avgMs": 32,
+          "maxMs": 32,
+          "kb": 1.1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/notifications/feed",
+          "count": 1,
+          "avgMs": 32,
+          "maxMs": 32,
+          "kb": 4.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities",
+          "count": 1,
+          "avgMs": 22,
+          "maxMs": 22,
+          "kb": 3,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "6x sales-source toggles (chart re-render)",
+      "commits": 575,
+      "heapMB": 13,
+      "longTasks": {
+        "count": 1,
+        "totalMs": 55,
+        "maxMs": 55
+      },
+      "counts": {
+        "requests": 9,
+        "api": 9,
+        "uniqueEndpoints": 9,
+        "duplicateGetRequests": 0,
+        "apiTotalMs": 495,
+        "slowestApiMs": 98
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/db/dashboard/payment-status?period=today&source=shopify",
+          "count": 1,
+          "avgMs": 98,
+          "maxMs": 98,
+          "kb": 1.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-products?period=today&source=shopify",
+          "count": 1,
+          "avgMs": 80,
+          "maxMs": 80,
+          "kb": 1.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/payment-status?period=today&source=all",
+          "count": 1,
+          "avgMs": 65,
+          "maxMs": 65,
+          "kb": 1.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-products?period=today&source=all",
+          "count": 1,
+          "avgMs": 64,
+          "maxMs": 64,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/payment-status?period=today&source=erp",
+          "count": 1,
+          "avgMs": 45,
+          "maxMs": 45,
+          "kb": 1.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/recent-invoices?period=today&source=all",
+          "count": 1,
+          "avgMs": 42,
+          "maxMs": 42,
+          "kb": 3.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-products?period=today&source=erp",
+          "count": 1,
+          "avgMs": 38,
+          "maxMs": 38,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/recent-invoices?period=today&source=shopify",
+          "count": 1,
+          "avgMs": 35,
+          "maxMs": 35,
+          "kb": 2.7,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/recent-invoices?period=today&source=erp",
+          "count": 1,
+          "avgMs": 28,
+          "maxMs": 28,
+          "kb": 3,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "3x in-app nav cycles (production)",
+      "commits": 433,
+      "heapMB": 15.4,
+      "longTasks": {
+        "count": 9,
+        "totalMs": 812,
+        "maxMs": 140
+      },
+      "counts": {
+        "requests": 60,
+        "api": 25,
+        "uniqueEndpoints": 25,
+        "duplicateGetRequests": 0,
+        "apiTotalMs": 1728,
+        "slowestApiMs": 186
+      },
+      "endpoints": [
+        {
+          "path": "/api/v1/db/dashboard/sales-insights?period=today",
+          "count": 1,
+          "avgMs": 186,
+          "maxMs": 186,
+          "kb": 2.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/analytics?period=today",
+          "count": 1,
+          "avgMs": 141,
+          "maxMs": 141,
+          "kb": 1.6,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/shopify/status",
+          "count": 1,
+          "avgMs": 108,
+          "maxMs": 108,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/sales-overview?period=today",
+          "count": 1,
+          "avgMs": 102,
+          "maxMs": 102,
+          "kb": 4.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/summary?period=today",
+          "count": 1,
+          "avgMs": 95,
+          "maxMs": 95,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/low-stock",
+          "count": 1,
+          "avgMs": 91,
+          "maxMs": 91,
+          "kb": 4.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/activities?period=today&scope=latest",
+          "count": 1,
+          "avgMs": 90,
+          "maxMs": 90,
+          "kb": 3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/supplier-payments?period=today&status=all",
+          "count": 1,
+          "avgMs": 86,
+          "maxMs": 86,
+          "kb": 2.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/kpis?period=today",
+          "count": 1,
+          "avgMs": 74,
+          "maxMs": 74,
+          "kb": 2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/purchase-orders?period=today",
+          "count": 1,
+          "avgMs": 74,
+          "maxMs": 74,
+          "kb": 1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/silver-history?days=7",
+          "count": 1,
+          "avgMs": 67,
+          "maxMs": 67,
+          "kb": 1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/financial?period=last12m",
+          "count": 1,
+          "avgMs": 66,
+          "maxMs": 66,
+          "kb": 3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/order-summary?grain=week&month=2026-11",
+          "count": 1,
+          "avgMs": 64,
+          "maxMs": 64,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-category?period=today",
+          "count": 1,
+          "avgMs": 59,
+          "maxMs": 59,
+          "kb": 1.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products/last-day-prices",
+          "count": 1,
+          "avgMs": 56,
+          "maxMs": 56,
+          "kb": 7.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/payment-status?period=today&source=all",
+          "count": 1,
+          "avgMs": 51,
+          "maxMs": 51,
+          "kb": 1.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products/duplicates",
+          "count": 1,
+          "avgMs": 50,
+          "maxMs": 50,
+          "kb": 1,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/products?limit=200&page=1",
+          "count": 1,
+          "avgMs": 48,
+          "maxMs": 48,
+          "kb": 24.8,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/top-products?period=today&source=all",
+          "count": 1,
+          "avgMs": 40,
+          "maxMs": 40,
+          "kb": 1.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/inventory/categories",
+          "count": 1,
+          "avgMs": 34,
+          "maxMs": 34,
+          "kb": 3.4,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/suppliers?limit=200&page=1",
+          "count": 1,
+          "avgMs": 32,
+          "maxMs": 32,
+          "kb": 2.3,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/customers?limit=200&page=1",
+          "count": 1,
+          "avgMs": 31,
+          "maxMs": 31,
+          "kb": 17.5,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/dashboard/recent-invoices?period=today&source=all",
+          "count": 1,
+          "avgMs": 30,
+          "maxMs": 30,
+          "kb": 3.2,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/invoices?limit=200&page=1",
+          "count": 1,
+          "avgMs": 27,
+          "maxMs": 27,
+          "kb": 44.7,
+          "statuses": "200"
+        },
+        {
+          "path": "/api/v1/db/settings",
+          "count": 1,
+          "avgMs": 26,
+          "maxMs": 26,
+          "kb": 2.4,
+          "statuses": "200"
+        }
+      ]
+    },
+    {
+      "name": "heap after 3 dashboard reloads (post-GC)",
+      "heapMB": [
+        11,
+        11,
+        11
+      ]
+    }
+  ]
+}

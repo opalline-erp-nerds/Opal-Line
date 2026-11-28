@@ -23,13 +23,41 @@ feedRouter.get('/notifications/feed', requirePermission('dashboard', 'view'), as
     type FeedItem = { type: string; title: string; detail: string | null; at: string | null; href: string }
     const items: FeedItem[] = []
 
-    // Low stock (not time-based — current state; shared default reorder level)
-    const low = await db
-      .select({ id: schema.products.id, name: schema.products.name, sku: schema.products.sku, stock: schema.products.stock, reorder: schema.products.reorderLevel })
-      .from(schema.products)
-      .where(lowStockWhere())
-      .orderBy(sql`${schema.products.stock} asc`)
-      .limit(8)
+    // All four sources are independent, so issue them together instead of
+    // paying four sequential round trips on every 60s poll. The optional
+    // tables keep their old swallow-on-error behaviour.
+    const [low, orders, syncResult, notifResult] = await Promise.all([
+      // Low stock (not time-based — current state; shared default reorder level)
+      db
+        .select({ id: schema.products.id, name: schema.products.name, sku: schema.products.sku, stock: schema.products.stock, reorder: schema.products.reorderLevel })
+        .from(schema.products)
+        .where(lowStockWhere())
+        .orderBy(sql`${schema.products.stock} asc`)
+        .limit(8),
+      // New Shopify orders (last 24h)
+      db
+        .select({ id: schema.salesOrders.id, internalId: schema.salesOrders.internalId, customer: schema.salesOrders.customer, value: schema.salesOrders.value, date: schema.salesOrders.date })
+        .from(schema.salesOrders)
+        .where(sql`${schema.salesOrders.shopifyId} is not null and ${schema.salesOrders.date} >= ${since}`)
+        .orderBy(desc(schema.salesOrders.date))
+        .limit(8),
+      db
+        .select({ id: schema.syncLogs.id, entity: schema.syncLogs.entity, action: schema.syncLogs.action, error: schema.syncLogs.error, time: schema.syncLogs.time })
+        .from(schema.syncLogs)
+        .where(sql`${schema.syncLogs.status} = 'failed' and ${schema.syncLogs.time} >= ${since}`)
+        .orderBy(desc(schema.syncLogs.time))
+        .limit(6)
+        .then((rows) => ({ ok: true as const, rows }))
+        .catch(() => ({ ok: false as const, rows: [] })),
+      db
+        .select({ id: schema.notificationLog.id, kind: schema.notificationLog.kind, recipient: schema.notificationLog.recipient, error: schema.notificationLog.error, createdAt: schema.notificationLog.createdAt })
+        .from(schema.notificationLog)
+        .where(sql`${schema.notificationLog.status} = 'failed' and ${schema.notificationLog.createdAt} >= ${since}`)
+        .orderBy(desc(schema.notificationLog.createdAt))
+        .limit(6)
+        .then((rows) => ({ ok: true as const, rows }))
+        .catch(() => ({ ok: false as const, rows: [] })),
+    ])
     for (const p of low) {
       items.push({
         type: 'low-stock',
@@ -40,13 +68,6 @@ feedRouter.get('/notifications/feed', requirePermission('dashboard', 'view'), as
       })
     }
 
-    // New Shopify orders (last 24h)
-    const orders = await db
-      .select({ id: schema.salesOrders.id, internalId: schema.salesOrders.internalId, customer: schema.salesOrders.customer, value: schema.salesOrders.value, date: schema.salesOrders.date })
-      .from(schema.salesOrders)
-      .where(sql`${schema.salesOrders.shopifyId} is not null and ${schema.salesOrders.date} >= ${since}`)
-      .orderBy(desc(schema.salesOrders.date))
-      .limit(8)
     for (const o of orders) {
       items.push({
         type: 'new-order',
@@ -57,15 +78,10 @@ feedRouter.get('/notifications/feed', requirePermission('dashboard', 'view'), as
       })
     }
 
-    // Failed syncs (last 24h) — sync_logs uses `time` column
-    try {
-      const syncs = await db
-        .select({ id: schema.syncLogs.id, entity: schema.syncLogs.entity, action: schema.syncLogs.action, error: schema.syncLogs.error, time: schema.syncLogs.time })
-        .from(schema.syncLogs)
-        .where(sql`${schema.syncLogs.status} = 'failed' and ${schema.syncLogs.time} >= ${since}`)
-        .orderBy(desc(schema.syncLogs.time))
-        .limit(6)
-      for (const s of syncs) {
+    // Failed syncs (last 24h) — sync_logs uses `time` column. Skipped when the
+    // table does not exist yet.
+    if (syncResult.ok) {
+      for (const s of syncResult.rows) {
         items.push({
           type: 'sync-failed',
           title: `Sync failed: ${s.entity ?? s.action ?? 'unknown'}`,
@@ -74,17 +90,11 @@ feedRouter.get('/notifications/feed', requirePermission('dashboard', 'view'), as
           href: '/shopify/logs',
         })
       }
-    } catch { /* sync_logs table may not exist yet */ }
+    }
 
     // Failed notification sends (last 24h)
-    try {
-      const notifs = await db
-        .select({ id: schema.notificationLog.id, kind: schema.notificationLog.kind, recipient: schema.notificationLog.recipient, error: schema.notificationLog.error, createdAt: schema.notificationLog.createdAt })
-        .from(schema.notificationLog)
-        .where(sql`${schema.notificationLog.status} = 'failed' and ${schema.notificationLog.createdAt} >= ${since}`)
-        .orderBy(desc(schema.notificationLog.createdAt))
-        .limit(6)
-      for (const n of notifs) {
+    if (notifResult.ok) {
+      for (const n of notifResult.rows) {
         items.push({
           type: 'notify-failed',
           title: `Notification failed: ${n.kind}`,
@@ -93,7 +103,7 @@ feedRouter.get('/notifications/feed', requirePermission('dashboard', 'view'), as
           href: '/system/notification-log',
         })
       }
-    } catch { /* notification_log may not exist yet */ }
+    }
 
     // Sort by time desc (low-stock items have no time, they go last within group)
     items.sort((a, b) => (b.at ?? '').localeCompare(a.at ?? ''))

@@ -20,6 +20,7 @@ import { CONSTANTS } from './constants'
 import { logger } from './logger'
 import { recordAudit } from './activity'
 import { listLocationMappings, resolveErpLocationForShopify } from './shopifyLocations'
+import { importedErpStatus } from './shopifyOrderPipeline'
 import { applyStockMovement, resolveMovementLocation, setStockTotalTo } from './stock'
 function escapeHtml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -4532,14 +4533,12 @@ function mapImportedFulfillment(status: string | null | undefined): string {
   }
 }
 
-function mapImportedStatus(raw: any): string {
-  if (raw.cancelled_at || String(raw.financial_status ?? '') === 'voided') return 'cancelled'
-  if (raw.fulfillment_status === 'fulfilled') return 'fulfilled'
-  if (raw.fulfillment_status === 'partial') return 'processing'
-  // Shopify closed_at means archived, not fulfilled. Archive is persisted in
-  // its own column and does not change the ERP's manual processing stage.
-  return 'imported'
-}
+// NOTE: the old `mapImportedStatus(raw)` helper is intentionally gone. Both
+// import call sites (row status and the cancelled-before-invoicing check) now
+// derive from the canonical parsed snapshot via `importedErpStatus`, so a
+// `financial_status=voided` payload no longer cancels an order on its own —
+// only a parsed Shopify cancellation timestamp does (see
+// shopifyOrderPipeline.test.ts).
 
 type ShopifyStockClient = Pick<NonNullable<typeof db>, 'select'>
 
@@ -4932,7 +4931,10 @@ async function importShopifyOrdersUncoalesced(options?: { updatedAtMin?: string 
                 payment,
                 fulfillment,
                 invoice: null,
-                status: mapImportedStatus(o),
+                // The same canonical snapshot as `cancelledAt` below: status
+                // and cancellation can never disagree, and only a parsed
+                // Shopify cancellation date cancels a new order.
+                status: importedErpStatus(orderSnapshot),
                 shopifyGid: orderSnapshot.gid,
                 shopifyFinancialStatus: orderSnapshot.financialStatus,
                 shopifyFulfillmentStatus: orderSnapshot.fulfillmentStatus,
@@ -5128,7 +5130,9 @@ async function importShopifyOrdersUncoalesced(options?: { updatedAtMin?: string 
       // left alone (zero-amount invoices are repaired after the loop), and the
       // import already moved stock on insert, so the invoice must not move it
       // again.
-      if (!linkedFromGid && mapImportedStatus(o) !== 'cancelled' && payment !== 'refunded' && value > 0) {
+      // Same canonical cancellation check as the row status: only a parsed
+      // Shopify cancellation timestamp skips invoicing.
+      if (!linkedFromGid && !orderSnapshot.cancelledAt && payment !== 'refunded' && value > 0) {
         try {
           const [orderRow] = await db
             .select()
@@ -5203,7 +5207,7 @@ async function importShopifyOrdersUncoalesced(options?: { updatedAtMin?: string 
           direction: 'out',
           action: 'Invoice Amount Repaired',
           status: 'success',
-          error: `${repair.repaired} zero-value Shopify invoice(s) repaired from their order totals`,
+          error: `${repair.repaired} Shopify invoice(s) reconciled to their order totals`,
         })
       }
       invoiceFailures.push(...repair.failed)

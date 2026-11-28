@@ -53,10 +53,16 @@ test(
     const sku = `RECON-${marker}`
     const category = `Recon Cat ${marker}`
     const productId = `${marker}-product`
-    const paidId = `${marker}-inv-paid` // GT 1000, item 400 → counts everywhere
-    const refundedId = `${marker}-inv-refunded-ps` // GT 500, status paid, payment refunded → sales must skip, payment shows refunded
-    const cancelledId = `${marker}-inv-cancelled` // GT 700 → counts nowhere
-    const returnId = `${marker}-return` // 300 against the paid invoice
+    // Magnitudes sit far above any real catalogue revenue so the marker SKU is
+    // guaranteed to appear in the limited top-products payload on any database.
+    const PAID_GT = 9_000_000 // counts everywhere
+    const REFUNDED_GT = 5_000_000 // status paid, payment refunded → sales must skip, payment shows refunded
+    const CANCELLED_GT = 7_000_000 // counts nowhere
+    const RETURN = 3_000_000 // against the paid invoice
+    const paidId = `${marker}-inv-paid`
+    const refundedId = `${marker}-inv-refunded-ps`
+    const cancelledId = `${marker}-inv-cancelled`
+    const returnId = `${marker}-return`
 
     const invoiceIds = [paidId, refundedId, cancelledId]
 
@@ -99,20 +105,20 @@ test(
       })
       const now = localNaive(new Date())
       await db!.insert(schema.salesInvoices).values([
-        { id: paidId, number: `${marker}-PAID`, grandTotal: 1000, paymentStatus: 'paid', status: 'paid', date: now },
-        { id: refundedId, number: `${marker}-REFUNDED-PS`, grandTotal: 500, paymentStatus: 'refunded', status: 'paid', date: now },
-        { id: cancelledId, number: `${marker}-CANCELLED`, grandTotal: 700, paymentStatus: 'pending', status: 'cancelled', date: now },
+        { id: paidId, number: `${marker}-PAID`, grandTotal: PAID_GT, paymentStatus: 'paid', status: 'paid', date: now },
+        { id: refundedId, number: `${marker}-REFUNDED-PS`, grandTotal: REFUNDED_GT, paymentStatus: 'refunded', status: 'paid', date: now },
+        { id: cancelledId, number: `${marker}-CANCELLED`, grandTotal: CANCELLED_GT, paymentStatus: 'pending', status: 'cancelled', date: now },
       ])
       await db!.insert(schema.salesInvoiceItems).values([
-        { id: `${marker}-item-paid`, invoiceId: paidId, product: `Recon Product ${marker}`, sku, qty: 2, weight: 10, amount: 400 },
-        { id: `${marker}-item-refunded`, invoiceId: refundedId, product: `Recon Product ${marker}`, sku, qty: 1, weight: 5, amount: 500 },
-        { id: `${marker}-item-cancelled`, invoiceId: cancelledId, product: `Recon Product ${marker}`, sku, qty: 3, weight: 15, amount: 600 },
+        { id: `${marker}-item-paid`, invoiceId: paidId, product: `Recon Product ${marker}`, sku, qty: 2, weight: 10, amount: PAID_GT },
+        { id: `${marker}-item-refunded`, invoiceId: refundedId, product: `Recon Product ${marker}`, sku, qty: 1, weight: 5, amount: REFUNDED_GT },
+        { id: `${marker}-item-cancelled`, invoiceId: cancelledId, product: `Recon Product ${marker}`, sku, qty: 3, weight: 15, amount: CANCELLED_GT },
       ])
       await db!.insert(schema.salesReturns).values({
         id: returnId,
         number: `${marker}-RETURN`,
         invoiceId: paidId,
-        amount: 300,
+        amount: RETURN,
         status: 'completed',
         date: now,
       })
@@ -126,28 +132,28 @@ test(
       const refundedD = seg(after.pay, 'refunded') - seg(before.pay, 'refunded')
       const paidD = seg(after.pay, 'paid') - seg(before.pay, 'paid')
       const chartD = after.chart - before.chart
-      const RETURNS = 300
 
       // Sales KPI: paid invoice only, less the return — refunded/cancelled skip it.
-      assert.equal(salesD, 1000 - RETURNS, 'Sales KPI counts the paid invoice minus the return only')
+      assert.equal(salesD, PAID_GT - RETURN, 'Sales KPI counts the paid invoice minus the return only')
 
       assert.equal(after.totalSales - before.totalSales, salesD, 'analytics Total Sales uses the same basis as the Sales KPI')
       assert.equal(after.netRevenue - before.netRevenue, salesD, 'Financial Net Revenue uses the same basis as the Sales KPI')
       assert.equal(chartD, salesD, 'the Sales Overview chart sums back to the Sales KPI')
 
-      assert.equal(payD, 1500, 'payment total covers the paid and refunded-by-payment invoices (cancelled excluded)')
-      assert.equal(paidD, 1000, 'paid segment grew by the paid invoice only')
-      assert.equal(refundedD, 500, 'the payment_status=refunded invoice lands in the Refunded segment')
+      assert.equal(payD, PAID_GT + REFUNDED_GT, 'payment total covers the paid and refunded-by-payment invoices (cancelled excluded)')
+      assert.equal(paidD, PAID_GT, 'paid segment grew by the paid invoice only')
+      assert.equal(refundedD, REFUNDED_GT, 'the payment_status=refunded invoice lands in the Refunded segment')
       assert.equal(
-        salesD + RETURNS,
+        salesD + RETURN,
         payD - refundedD,
         'Sales KPI + returns == payment total − refunded: the two widgets describe one set of invoices',
       )
 
-      assert.equal(after.topProduct - before.topProduct, 400, 'top products rank only the invoice the Sales KPI counts')
-      assert.equal(after.topCategory - before.topCategory, 400, 'top category follows the same invoices as top products')
+      assert.equal(after.topProduct - before.topProduct, PAID_GT, 'top products rank only the invoice the Sales KPI counts')
+      assert.equal(after.topCategory - before.topCategory, PAID_GT, 'top category follows the same invoices as top products')
     } finally {
       const { inArray } = await import('drizzle-orm')
+      await db!.delete(schema.salesInvoiceItems).where(inArray(schema.salesInvoiceItems.invoiceId, invoiceIds))
       await db!.delete(schema.salesInvoices).where(inArray(schema.salesInvoices.id, invoiceIds))
       await db!.delete(schema.salesReturns).where(inArray(schema.salesReturns.id, [returnId]))
       await db!.delete(schema.products).where(inArray(schema.products.id, [productId]))

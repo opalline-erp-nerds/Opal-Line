@@ -109,9 +109,10 @@ test('donut charts render their centre label and value', () => {
 })
 
 test('palette tokens follow the agreed chart colours', () => {
-  assert.equal(SLICE_COLORS[0], INCOME, 'first expense slice shares the income purple')
-  assert.equal(AGING_COLORS[0], EXPENSE, 'the current band uses the healthy green')
-  assert.equal(PROFIT, EXPENSE, 'surplus reuses the expense green')
+  assert.equal(SLICE_COLORS[0], INCOME, 'first expense slice shares the income teal')
+  assert.equal(AGING_COLORS[0], INCOME, 'the current band uses the primary teal')
+  assert.equal(PROFIT, INCOME, 'surplus reuses the primary teal')
+  assert.notEqual(INCOME, EXPENSE, 'income and expense stay distinguishable')
   assert.notEqual(LOSS, PROFIT, 'deficit is distinct from surplus')
   assert.equal(new Set(SLICE_COLORS).size, SLICE_COLORS.length, 'expense palette has no duplicates')
   assert.equal(new Set(AGING_COLORS).size, AGING_COLORS.length, 'aging palette has no duplicates')

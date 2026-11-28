@@ -1,7 +1,7 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ColumnDef } from '@/lib/table'
-import { Banknote, CheckCircle2, HandCoins, Loader2, Plus, RefreshCcw, RotateCcw, Trash2, Wallet, WalletCards } from 'lucide-react'
+import { Banknote, CheckCircle2, HandCoins, Loader2, Plus, RefreshCcw, RotateCcw, Trash2, Wallet } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -297,12 +297,10 @@ export default function PaymentsPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Payments"
         subtitle="Razorpay and gateway payments received against sales invoices, tracked for reconciliation."
-        icon={<WalletCards className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />}
-        iconTileClassName="bg-[#7547F5] text-white ring-[#7547F5] dark:bg-[#7547F5] dark:text-white dark:ring-[#7547F5]"
         actions={
           <Button size="sm" onClick={openDialog}>
             <Plus className="h-4 w-4" /> Add Payment

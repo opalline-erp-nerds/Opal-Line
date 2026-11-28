@@ -53,13 +53,17 @@ const RETURN_STATUS: Record<string, { label: string; variant: BadgeVariant }> = 
   requested: { label: 'Requested', variant: 'warning' },
   approved: { label: 'Approved', variant: 'info' },
   in_transit: { label: 'In transit', variant: 'info' },
-  received: { label: 'Received', variant: 'purple' },
+  received: { label: 'Received', variant: 'brand' },
   completed: { label: 'Completed', variant: 'success' },
   rejected: { label: 'Rejected', variant: 'muted' },
   cancelled: { label: 'Cancelled', variant: 'muted' },
   // Credit notes raised by the older invoice-return flow: goods came back and
   // were credited, so they read as completed history rather than disappearing.
   processed: { label: 'Completed (credit note)', variant: 'success' },
+  // Statuses already present in older/seeded rows. Without a mapping they fell
+  // through to the raw identifier in lowercase, which read like an error.
+  pending: { label: 'Pending', variant: 'warning' },
+  refunded: { label: 'Refunded', variant: 'success' },
 }
 
 const REFUND_STATUS: Record<string, { label: string; variant: BadgeVariant }> = {
@@ -522,7 +526,7 @@ export default function ReturnsPage() {
         header: 'Source',
         meta: { align: 'center' as const },
         cell: ({ row }) => (
-          <Badge variant={row.original.source === 'shopify' ? 'purple' : 'outline'}>
+          <Badge variant={row.original.source === 'shopify' ? 'brand' : 'outline'}>
             {row.original.source === 'shopify' ? 'Shopify' : 'ERP'}
           </Badge>
         ),
@@ -621,7 +625,7 @@ export default function ReturnsPage() {
   const refundsPages = Math.max(1, Math.ceil(refundsTotal / limit))
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Returns & Refunds"
         subtitle="Returned goods and money refunded, kept in step with Shopify."
@@ -992,7 +996,7 @@ export default function ReturnsPage() {
                       <Badge variant={(REFUND_STATUS[refund.status] ?? REFUND_STATUS.pending).variant} dot>
                         {(REFUND_STATUS[refund.status] ?? REFUND_STATUS.pending).label}
                       </Badge>
-                      <Badge variant={refund.source === 'shopify' ? 'purple' : 'outline'}>
+                      <Badge variant={refund.source === 'shopify' ? 'brand' : 'outline'}>
                         {refund.source === 'shopify' ? 'Shopify' : 'ERP'}
                       </Badge>
                       <span className="text-muted-foreground">{refund.paymentMethod ?? '—'}</span>
@@ -1419,7 +1423,7 @@ export function ReturnsView({ returns, loading, error, stats, onStatusChange }: 
   const columns = useMemo(() => returnsColumns(onStatusChange), [onStatusChange])
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Sales Returns"
         subtitle="Returns requested against Shopify orders — approve and refund through Razorpay."

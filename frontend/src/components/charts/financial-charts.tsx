@@ -12,7 +12,7 @@ import {
   YAxis,
 } from 'recharts'
 import type { ExpenseCategorySlice, FinancialAgingBand, FinancialPoint } from '@/types'
-import { AGING_COLORS, EXPENSE, INCOME, LOSS, PROFIT, SLICE_COLORS, useChartTheme, inr, rupeeTick } from './chart-theme'
+import { AGING_COLORS, DONUT_TRACK, EXPENSE, INCOME, LOSS, PROFIT, SLICE_COLORS, useChartTheme, inr, rupeeTick } from './chart-theme'
 import { ChartTooltipBox } from './chart-tooltip'
 
 /**
@@ -96,8 +96,8 @@ export function IncomeExpenseChart({
             )
           }}
         />
-        <Bar dataKey="income" name="Income" fill={INCOME} radius={[3, 3, 0, 0]} maxBarSize={22} />
-        <Bar dataKey="expense" name="Expense" fill={EXPENSE} radius={[3, 3, 0, 0]} maxBarSize={22} />
+        <Bar dataKey="income" name="Income" fill={INCOME} radius={[8, 8, 0, 0]} maxBarSize={20} />
+        <Bar dataKey="expense" name="Expense" fill={EXPENSE} radius={[8, 8, 0, 0]} maxBarSize={20} />
       </BarChart>
     </ChartShell>
   )
@@ -192,13 +192,23 @@ export function ReceivableAgingChart({
           }}
         />
         <Pie
+          data={[{ label: 'track', key: 'track', value: 1, count: 0 }]}
+          dataKey="value"
+          nameKey="label"
+          innerRadius={56}
+          outerRadius={82}
+          fill={DONUT_TRACK}
+          strokeWidth={0}
+          isAnimationActive={false}
+        />
+        <Pie
           data={data}
           dataKey="value"
           nameKey="label"
           innerRadius={56}
-          outerRadius={80}
-          paddingAngle={3}
-          cornerRadius={4}
+          outerRadius={82}
+          paddingAngle={4}
+          cornerRadius={8}
           strokeWidth={0}
         >
           {data.map((b) => (
@@ -247,13 +257,23 @@ export function ExpenseDonutChart({
           }}
         />
         <Pie
+          data={[{ category: 'track', amount: 1, share: 0 }]}
+          dataKey="amount"
+          nameKey="category"
+          innerRadius={56}
+          outerRadius={82}
+          fill={DONUT_TRACK}
+          strokeWidth={0}
+          isAnimationActive={false}
+        />
+        <Pie
           data={slices}
           dataKey="amount"
           nameKey="category"
           innerRadius={56}
-          outerRadius={80}
-          paddingAngle={3}
-          cornerRadius={4}
+          outerRadius={82}
+          paddingAngle={4}
+          cornerRadius={8}
           strokeWidth={0}
         >
           {slices.map((s, i) => (

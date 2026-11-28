@@ -130,7 +130,7 @@ export default function StockOverviewPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Stock Overview"
         subtitle="Live view of product stock levels, weights and valuation across all locations."
@@ -147,7 +147,7 @@ export default function StockOverviewPage() {
       />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-        <StatCard icon={Boxes} title="Total Products" value={overview ? formatNumber(overview.totalProducts) : '—'} accent="purple" support="SKUs in catalogue" />
+        <StatCard icon={Boxes} title="Total Products" value={overview ? formatNumber(overview.totalProducts) : '—'} accent="teal" support="SKUs in catalogue" />
         <StatCard icon={Package} title="Total Quantity" value={overview ? `${formatNumber(overview.totalQuantity)} pcs` : '—'} accent="blue" support="All locations" />
         <StatCard icon={Weight} title="Total Weight" value={overview ? formatWeight(overview.totalWeight) : '—'} accent="green" support="Net weight" />
         <StatCard icon={TrendingUp} title="Inventory Value" value={overview ? formatCurrency(overview.inventoryValue) : '—'} accent="orange" support={rate ? `@ ₹${rate.rate.toFixed(2)}/g` : '@ current rate'} />

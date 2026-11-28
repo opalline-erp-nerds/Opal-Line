@@ -69,9 +69,9 @@ import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatDateTime, todayIST } from '@/lib/format'
 import { perUnitLinePrice, orderLinesTotal } from '@/lib/orderPricing'
 
-const statusMeta: Record<OrderStatus, { label: string; variant: 'success' | 'warning' | 'danger' | 'muted' | 'info' | 'purple' }> = {
+const statusMeta: Record<OrderStatus, { label: string; variant: 'success' | 'warning' | 'danger' | 'muted' | 'info' | 'brand' }> = {
   imported: { label: 'Imported', variant: 'info' },
-  confirmed: { label: 'Confirmed', variant: 'purple' },
+  confirmed: { label: 'Confirmed', variant: 'brand' },
   processing: { label: 'Processing', variant: 'warning' },
   fulfilled: { label: 'Fulfilled', variant: 'success' },
   cancelled: { label: 'Cancelled', variant: 'muted' },
@@ -79,12 +79,14 @@ const statusMeta: Record<OrderStatus, { label: string; variant: 'success' | 'war
   refunded: { label: 'Refunded', variant: 'muted' },
 }
 
-const paymentMeta: Record<string, { label: string; variant: 'success' | 'warning' | 'muted' | 'info' }> = {
+const paymentMeta: Record<string, { label: string; variant: 'success' | 'warning' | 'muted' | 'info' | 'danger' }> = {
   paid: { label: 'Paid', variant: 'success' },
   pending: { label: 'Pending', variant: 'warning' },
   cod: { label: 'COD', variant: 'warning' },
   bank: { label: 'Bank Transfer', variant: 'info' },
   refunded: { label: 'Refunded', variant: 'muted' },
+  failed: { label: 'Failed', variant: 'danger' },
+  partial: { label: 'Partial', variant: 'warning' },
   Online: { label: 'Paid', variant: 'success' },
   online: { label: 'Paid', variant: 'success' },
   partially_paid: { label: 'Partial', variant: 'warning' },
@@ -518,6 +520,43 @@ export default function SalesOrdersPage() {
     }
   }, [])
 
+  const fulfillOrder = useCallback(async (o: SalesOrder) => {
+    if (!(await confirmDialog({ title: `Fulfill order ${o.shopifyId}?` }))) return
+    setInvoiceSavingId(o.id)
+    try {
+      const gid = (o as { shopifyGid?: string | null }).shopifyGid
+      const linkedToShopify = Boolean(gid) || (o.shopifyId ?? '').startsWith('#')
+      if (!linkedToShopify) {
+        // A manual ERP order has no Shopify fulfilment to create; record the
+        // local pipeline stage instead of inventing a shipment.
+        await dbApi.update('sales-orders', o.id, { fulfillment: 'fulfilled', status: 'fulfilled' })
+        setOrders((prev) => prev.map((x) => (x.id === o.id ? { ...x, fulfillment: 'fulfilled', status: 'fulfilled' } : x)))
+        toast.success('Order marked fulfilled')
+        return
+      }
+      const read = await dbApi.getOrderShopifyState(o.id)
+      if (!read.ok || !read.state) throw new Error(read.error ?? 'Could not read this order from Shopify')
+      if ((read.state as { fulfillmentDataAvailable?: boolean }).fulfillmentDataAvailable === false) {
+        throw new Error('Shopify has not granted fulfillmentOrders access. Add read_fulfillments and write_fulfillments to the Shopify app.')
+      }
+      const items = (read.state.lines ?? [])
+        .filter((line) => Number(line.remaining) > 0)
+        .map((line) => ({ sku: line.sku, quantity: Math.floor(Number(line.remaining)) }))
+      if (items.length === 0) {
+        toast.info('Nothing left to fulfill on this order')
+        return
+      }
+      const result = await dbApi.fulfillOrder(o.id, { items })
+      if (!result.ok) throw new Error(result.error ?? 'Shopify fulfillment failed')
+      toast.success(result.message ?? 'Fulfillment created in Shopify')
+      setOrders(await dbApi.getSalesOrders())
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not fulfill order')
+    } finally {
+      setInvoiceSavingId(null)
+    }
+  }, [])
+
   const refreshFromShopify = useCallback(async (o: SalesOrder) => {
     setInvoiceSavingId(o.id)
     try {
@@ -905,6 +944,12 @@ export default function SalesOrdersPage() {
                   <RefreshCw className={`h-3.5 w-3.5 ${invoiceSavingId === row.original.id ? 'animate-spin' : ''}`} /> Refresh from Shopify
                 </DropdownMenuItem>
               )}
+              <DropdownMenuItem
+                disabled={invoiceSavingId === row.original.id || row.original.status === 'cancelled' || row.original.fulfillment === 'fulfilled'}
+                onClick={() => fulfillOrder(row.original)}
+              >
+                <Package className="h-3.5 w-3.5" /> Fulfill Order
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => cancelOrder(row.original)}>Cancel Order</DropdownMenuItem>
             </DropdownMenuContent>
@@ -914,7 +959,7 @@ export default function SalesOrdersPage() {
         ),
       },
     ],
-    [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder],
+    [navigate, cancelOrder, fulfillOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder],
   )
 
   const snapshotForm = () =>
@@ -1432,7 +1477,7 @@ export default function SalesOrdersPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-6 lg:px-7">
       <PageHeader
         title="Sales Orders"
         subtitle="Shopify orders imported into the ERP — tracked through confirmation, fulfillment and invoicing."
@@ -1460,7 +1505,7 @@ export default function SalesOrdersPage() {
           className={`flex items-center justify-between gap-3 rounded-md border px-3 py-2 text-xs ${
             syncMsg.ok
               ? 'border-success-100 bg-success-50/70 text-success-700'
-              : 'border-red-200 bg-red-50/60 text-red-700'
+              : 'border-red-200 bg-red-50/60 text-red-700 dark:border-red-500/30'
           }`}
         >
           <span className="flex items-center gap-2">
@@ -2073,11 +2118,15 @@ export default function SalesOrdersPage() {
                         : 'Create the order on Shopify with the selected payment status'}
                     </p>
                   </div>
-                  <Switch checked={syncToShopify} onCheckedChange={setSyncToShopify} />
+                  <Switch
+                    checked={syncToShopify}
+                    onCheckedChange={setSyncToShopify}
+                    className="sync-shopify-switch"
+                  />
                 </div>
 
                 {formError ? (
-                  <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
+                  <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700 dark:border-red-500/30">
                     <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     <span>{formError}</span>
                   </div>

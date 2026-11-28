@@ -97,13 +97,18 @@ test(
       assert.equal(audRow.detail, 'from audit_logs')
 
       // The dashboard widget asks for scope=latest: the date filter is ignored
-      // there, so an older row is still in the feed (the activity page keeps
-      // its range filter).
-      const latestRes = await get('/dashboard/activities?period=today&scope=latest')
+      // there, so the 24h-old row still counts towards the feed total (the
+      // activity page keeps its range filter). Totals are compared rather than
+      // page contents because a shared scratch database can hold more recent
+      // rows than one page, which would push the marker row past the limit.
+      const latestRes = await get('/dashboard/activities?period=today&scope=latest&limit=1')
+      const rangedRes = await get('/dashboard/activities?period=today&limit=1')
       assert.equal(latestRes.status, 200)
-      const latestBody = Array.isArray(latestRes.body) ? latestRes.body : latestRes.body?.items
-      const latestTitles: string[] = latestBody.map((r: { title: string }) => String(r.title))
-      assert.ok(latestTitles.some((t) => t.includes(`${marker}-old`)), 'scope=latest ignores the date filter')
+      assert.equal(rangedRes.status, 200)
+      assert.ok(
+        Number(latestRes.body.total) >= Number(rangedRes.body.total) + 1,
+        'scope=latest ignores the date filter',
+      )
     } finally {
       const { inArray } = await import('drizzle-orm')
       await db!.delete(schema.activityLogs).where(inArray(schema.activityLogs.id, [activityId]))

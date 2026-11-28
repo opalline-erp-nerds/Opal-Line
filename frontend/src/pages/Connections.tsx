@@ -28,7 +28,7 @@ const DEFAULT_CONNECTIONS: ConnectionSettings = {
 export default function ConnectionsPage() {
   return (
     <RequireModule module="system">
-      <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+      <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
         <PageHeader
           title="Connections"
           subtitle="Shopify, database, email, WhatsApp, payments and off-site backup — configure everything from here, no backend access needed."

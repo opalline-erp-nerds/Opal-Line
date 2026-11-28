@@ -75,7 +75,7 @@ const UpdatesPage = lazy(() => import('@/pages/Updates'))
 
 function NotFound() {
   return (
-    <div className="mx-auto w-full max-w-[1100px] px-4 py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] px-5 py-6 lg:px-7">
       <div className="rounded-lg border bg-card shadow-card">
         <EmptyState
           icon={FileQuestion}

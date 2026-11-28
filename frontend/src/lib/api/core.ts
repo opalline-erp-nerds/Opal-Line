@@ -20,6 +20,29 @@ let csrfToken: string | null = null
 let csrfTokenTime: number = 0
 const CSRF_TOKEN_MAX_AGE = 30 * 60 * 1000 // 30 minutes
 
+// ---- Shared GET cache ------------------------------------------------------
+// Pages own their fetchers, so route changes re-request the same reference
+// data (settings, categories, suppliers, dashboard widgets). Successful GETs
+// are shared for a short window, and concurrent identical GETs share a single
+// request. Any successful write clears the cache so a mutation is never hidden.
+const GET_CACHE_TTL_MS = 20_000
+const GET_CACHE_MAX_ENTRIES = 200
+
+interface GetCacheEntry {
+  at: number
+  value: unknown
+}
+
+const getCache = new Map<string, GetCacheEntry>()
+const inFlightGets = new Map<string, Promise<unknown>>()
+let cacheGeneration = 0
+
+export function invalidateApiCache(): void {
+  cacheGeneration += 1
+  getCache.clear()
+  inFlightGets.clear()
+}
+
 async function fetchCsrfToken(): Promise<string> {
   if (csrfToken && (Date.now() - csrfTokenTime) < CSRF_TOKEN_MAX_AGE) return csrfToken
   csrfToken = null
@@ -85,6 +108,19 @@ export class ApiError extends Error {
 }
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const cacheable = method === 'GET' && init?.body == null
+
+  if (cacheable) {
+    const cached = getCache.get(path)
+    if (cached && Date.now() - cached.at < GET_CACHE_TTL_MS) return cached.value as T
+    const pending = inFlightGets.get(path)
+    if (pending) return pending as Promise<T>
+  }
+
+  const generation = cacheGeneration
+  const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(method)
+  const run = async (): Promise<T> => {
   const isFormData = init?.body instanceof FormData
   const isStateChanging = init?.method && !['GET', 'HEAD', 'OPTIONS'].includes(init.method)
   // Remember which session generation this request belongs to: a 401 is only
@@ -116,6 +152,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       if (!retryRes.ok) {
         const body = (await retryRes.json().catch(() => null)) as ApiErrorDetail | null
         if (retryRes.status === 401 && !path.startsWith('/auth/')) {
+          invalidateApiCache()
           notifyUnauthorized(requestEpoch)
         }
         throw new ApiError(retryRes.status, body?.message ?? body?.error ?? `API error ${retryRes.status}`, {
@@ -126,6 +163,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
           location: body?.location,
         })
       }
+      if (isWrite) invalidateApiCache()
       return retryRes.json() as Promise<T>
     }
   }
@@ -136,6 +174,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // router moves to /login, so a burst of failing requests does not reload
     // the page (and a stale request cannot sign out a newer session).
     if (res.status === 401 && !path.startsWith('/auth/')) {
+      invalidateApiCache()
       notifyUnauthorized(requestEpoch)
     }
     throw new ApiError(res.status, body?.message ?? body?.error ?? `API error ${res.status}`, {
@@ -146,7 +185,30 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       location: body?.location,
     })
   }
+  if (isWrite) invalidateApiCache()
   return res.json() as Promise<T>
+  }
+
+  if (!cacheable) return run()
+
+  const promise = run()
+    .then((value) => {
+      if (generation === cacheGeneration) {
+        if (getCache.size >= GET_CACHE_MAX_ENTRIES) {
+          const oldest = getCache.keys().next().value
+          if (oldest !== undefined) getCache.delete(oldest)
+        }
+        getCache.set(path, { at: Date.now(), value })
+      }
+      return value
+    })
+    .finally(() => {
+      // An older request may settle after invalidation and a newer request for
+      // this path has started. Only remove the entry this request installed.
+      if (inFlightGets.get(path) === promise) inFlightGets.delete(path)
+    })
+  inFlightGets.set(path, promise)
+  return promise
 }
 
 /**

@@ -210,9 +210,12 @@ backend. That is the e2e layer.
 every test. Tests must never log in individually — that is what exhausts the
 auth budget and makes the suite fail with HTTP 429.
 
-The setup also clears the Postgres-backed `auth:*` rate-limit counters when a
-`DATABASE_URL` (or the desktop app's `.pg-password`) is reachable, because
-those counters survive restarts by design.
+The setup also clears the Postgres-backed `auth:*` rate-limit counters, because
+those counters survive restarts by design. It connects to the database of the
+stack under test: an explicit `DATABASE_URL` first, then `backend/.env` for the
+dev stack (cluster on 47194), or the desktop app's `.pg-password` for a run
+against the installed app (cluster on 47193). If no database is reachable the
+reset is skipped with a warning, and the first login will report the 429.
 
 ```bash
 # against the dev stack

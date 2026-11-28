@@ -6,7 +6,7 @@
  * Chromium already installed for the repo's audit scripts — no extra image
  * tooling required.
  *
- * Each size is rendered on a brand-purple rounded tile with the mark knocked
+ * Each size is rendered on a brand-teal rounded tile with the mark knocked
  * out to white, screenshotted to PNG (ICO entries may hold PNG data since
  * Vista), and packed into a single multi-size .ico.
  *
@@ -31,7 +31,7 @@ function pageHtml(size, svgDataUrl) {
   const glyph = Math.round(size * 0.66)
   return `<!doctype html><html><body style="margin:0;background:transparent">
 <div id="tile" style="width:${size}px;height:${size}px;border-radius:${radius}px;
-background:linear-gradient(135deg,#9a5cff 0%,#863bff 45%,#6d28d9 100%);
+background:linear-gradient(135deg,#10B981 0%,#008F78 45%,#006B5B 100%);
 display:flex;align-items:center;justify-content:center;overflow:hidden">
 <img src="${svgDataUrl}" style="width:${glyph}px;height:${glyph}px;object-fit:contain;
 filter:brightness(0) invert(1) drop-shadow(0 1px 1px rgba(0,0,0,.15))" />

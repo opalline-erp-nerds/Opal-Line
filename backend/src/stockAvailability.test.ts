@@ -90,6 +90,7 @@ test(
     const sku = `${marker}-A`
     const productId = `${marker}-prod`
     const userId = `${marker}-admin`
+    const rateId = `${marker}-rate`
 
     let server: Server | null = null
     try {
@@ -102,6 +103,11 @@ test(
       })
       await db!.insert(schema.products).values({ id: productId, name: 'Invoice Ring', sku, category: 'Tests' })
       await applyStockMovement({ sku, qty: 2, type: 'opening' })
+      // Invoice creation prices from Silver Rate Management: without a current
+      // rate the route stops with 400 before it ever validates stock.
+      await db!
+        .insert(schema.silverRates)
+        .values({ id: rateId, rate: 100, purity: 999, updatedAt: new Date().toISOString() })
 
       const app = express()
       app.use(express.json())
@@ -154,6 +160,7 @@ test(
       await db!.delete(schema.salesInvoiceItems).where(eq(schema.salesInvoiceItems.sku, sku)).catch(() => undefined)
       await db!.delete(schema.salesInvoices).where(eq(schema.salesInvoices.customer, 'Test Buyer')).catch(() => undefined)
       await db!.delete(schema.products).where(eq(schema.products.id, productId)).catch(() => undefined)
+      await db!.delete(schema.silverRates).where(eq(schema.silverRates.id, rateId)).catch(() => undefined)
     }
   },
 )

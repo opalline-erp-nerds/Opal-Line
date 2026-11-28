@@ -68,7 +68,7 @@ export default function ShopifyDashboardPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[1400px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Shopify Dashboard"
         subtitle="Live connection to your Shopify store via the Opal Line Node backend."
@@ -86,7 +86,7 @@ export default function ShopifyDashboardPage() {
       />
 
       {error ? (
-        <Card className="border-red-200 bg-red-50/50">
+        <Card className="border-red-200 bg-red-50/50 dark:border-red-500/30">
           <CardContent className="flex items-center gap-3 p-4 text-sm text-red-700">
             <AlertCircle className="h-4 w-4 shrink-0" />
             <p>{error}. Is the backend running? Start it with <code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs">npm run dev --prefix backend</code>.</p>
@@ -133,7 +133,7 @@ export default function ShopifyDashboardPage() {
           </div>
 
           <div className="grid grid-cols-2 gap-3 sm:gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard icon={ShoppingBag} title="Orders Synced" value={formatNumber(status.totals.orders)} accent="purple" support={lastSyncLabel(status.lastSync.orders)} />
+            <StatCard icon={ShoppingBag} title="Orders Synced" value={formatNumber(status.totals.orders)} accent="teal" support={lastSyncLabel(status.lastSync.orders)} />
             <StatCard icon={Package} title="Products Synced" value={formatNumber(status.totals.products)} accent="blue" support={lastSyncLabel(status.lastSync.products)} />
             <StatCard icon={Users} title="Customers Synced" value={formatNumber(status.totals.customers)} accent="green" support={lastSyncLabel(status.lastSync.customers)} />
             <StatCard icon={Boxes} title="Inventory Lines" value={formatNumber(status.totals.inventory)} accent="orange" support={lastSyncLabel(status.lastSync.inventory)} />

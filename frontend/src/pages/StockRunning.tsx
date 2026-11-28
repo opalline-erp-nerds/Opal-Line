@@ -232,7 +232,7 @@ export default function StockRunningPage() {
   const atRiskCount = data?.products.filter(p => p.daysOfStock > 0 && p.daysOfStock <= 7).length || 0
 
   return (
-    <div className="mx-auto w-full max-w-[1800px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1800px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Stock Running / Demand Analytics"
         subtitle="Track which products sell fastest, forecast stockouts, and prioritize reorders."

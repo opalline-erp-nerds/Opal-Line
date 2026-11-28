@@ -325,7 +325,7 @@ export default function PrintDesignerPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[1560px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1560px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Print Designer"
         subtitle="Design your own invoices, quotations and order printouts — the saved design applies to every future printout of that document type."

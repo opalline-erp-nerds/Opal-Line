@@ -267,7 +267,7 @@ export default function InventoryCollectionsPage() {
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Collections & Categories"
         subtitle="Group the catalogue for pricing. Silver Jewels keeps silver-rate pricing; Other Products is the fixed-price collection and can be renamed at any time."
@@ -300,7 +300,7 @@ export default function InventoryCollectionsPage() {
                 >
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-semibold text-foreground">{collection.name}</span>
-                    <Badge variant={collection.pricingType === 'fixed' ? 'info' : 'purple'} dot>
+                    <Badge variant={collection.pricingType === 'fixed' ? 'info' : 'brand'} dot>
                       {PRICING_LABEL[collection.pricingType] ?? collection.pricingType}
                     </Badge>
                     {collection.isSystem ? (
@@ -489,7 +489,7 @@ export default function InventoryCollectionsPage() {
         </div>
 
         {categoryError ? (
-          <p className="mt-3 rounded-md border border-red-200 bg-red-50/60 px-3 py-2 text-sm text-red-700">
+          <p className="mt-3 rounded-md border border-red-200 bg-red-50/60 px-3 py-2 text-sm text-red-700 dark:border-red-500/30">
             {categoryError}
           </p>
         ) : null}

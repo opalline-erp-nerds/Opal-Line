@@ -18,12 +18,12 @@ import { dbApi, backupApi } from '@/lib/api'
 
 export default function ImportDataPage() {
   return (
-    <div className="mx-auto w-full max-w-[1200px] space-y-5 px-4 py-4 sm:py-6 lg:px-6">
+    <div className="mx-auto w-full max-w-[1600px] space-y-5 px-5 py-5 sm:py-6 lg:px-7">
       <PageHeader
         title="Import Data"
         subtitle="Bulk import products and customers from CSV files"
         icon={<FileUp className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />}
-        iconTileClassName="bg-[#7547F5] text-white ring-[#7547F5] dark:bg-[#7547F5] dark:text-white dark:ring-[#7547F5]"
+        iconTileClassName="bg-primary text-primary-foreground ring-primary dark:bg-primary dark:text-primary-foreground dark:ring-primary"
       />
       <Tabs defaultValue="products">
         <TabsList>

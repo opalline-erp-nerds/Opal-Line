@@ -33,9 +33,12 @@ const localNaive = (d: Date) =>
 
 const rupees = (v: string | undefined): number => {
   // KPI money strings carry paise now (₹1,48,382.44) and a Unicode minus for
-  // negatives; parse the displayed amount, not just its digits.
+  // negatives; parse the displayed amount, not just its digits. "N/A" is what
+  // the KPI shows before any invoice carries a cost basis, and it means zero.
   const cleaned = (v ?? '').replace(/[₹,\s]/g, '').replace('−', '-')
-  return cleaned === '' ? 0 : Number(cleaned)
+  if (cleaned === '') return 0
+  const parsed = Number(cleaned)
+  return Number.isFinite(parsed) ? parsed : 0
 }
 
 const basis = (label: string | null | undefined): { x: number; y: number } | null => {
