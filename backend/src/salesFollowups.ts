@@ -200,6 +200,7 @@ export async function collectSalesFollowUps(
     }
   }
 
+    const quotes = await db
     .select({
       id: schema.quotations.id,
       number: schema.quotations.number,
@@ -258,9 +259,9 @@ export async function collectSalesFollowUps(
     })
   }
 
- const quotes = await db
+const orders = await db
   .select({
-    id: schema.quotations.id,
+    id: schema.salesOrders.id,
       internalId: schema.salesOrders.internalId,
       customer: schema.salesOrders.customer,
       status: schema.salesOrders.status,
