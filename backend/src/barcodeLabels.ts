@@ -192,6 +192,60 @@ export const LABEL_DESIGNS: LabelDesign[] = [
   },
 ]
 
+/**
+ * The remaining rectangular presets use the same reference-style artwork as
+ * the transcribed 50×25 design, scaled to their own physical footprint. The
+ * hardcoded entries above are deliberately left alone: those six presets have
+ * approved geometry and must never move.
+ */
+const PROPORTIONAL_DESIGN_SIZES: ReadonlyArray<readonly [number, number]> = [
+  [50, 22],
+  [63.5, 25.4],
+  [38.1, 21.2],
+  [51, 25],
+  [50, 30],
+  [40, 25],
+]
+
+function proportionalDesign(width: number, height: number): LabelDesign {
+  const base = LABEL_DESIGNS[1] // 50×25 reference: brand/name/rate/code/two chips + right-hand QR
+  const sx = width / base.width
+  const sy = height / base.height
+  const round = (n: number): number => Math.round(n * 1000) / 1000
+  const fields = base.fields.map((field) => ({
+    kind: field.kind,
+    x: round(field.x * sx),
+    baseline: round(field.baseline * sy),
+    capHeight: round(field.capHeight * sy),
+    maxWidth: round(field.maxWidth * sx),
+    refWidth: round(field.refWidth * sx),
+  }))
+  // Round the QR to whole 203-dpi dots so PDF, preview and ZPL all draw the
+  // same physical symbol. The quiet zone stays inside the label footprint.
+  const rawSize = base.qr.size * Math.min(sx, sy)
+  const magnification = Math.max(2, Math.round((rawSize / base.qr.modules) * 8))
+  const moduleMm = magnification / 8
+  const size = round(moduleMm * base.qr.modules)
+  const rightMm = base.width - (base.qr.x + base.qr.size)
+  const bottomMm = base.height - base.qr.bottom
+  return {
+    width,
+    height,
+    fields,
+    qr: {
+      x: round(width - rightMm * sx - size),
+      bottom: round(height - bottomMm * sy),
+      size,
+      magnification,
+      modules: base.qr.modules,
+    },
+  }
+}
+
+for (const [width, height] of PROPORTIONAL_DESIGN_SIZES) {
+  LABEL_DESIGNS.push(proportionalDesign(width, height))
+}
+
 /** Look up the transcribed reference design for a physical label size. */
 export function labelDesignFor(width: number, height: number): LabelDesign | null {
   if (!Number.isFinite(width) || !Number.isFinite(height)) return null
@@ -293,11 +347,24 @@ export function textEmWidth(text: string): number {
  * samples). They are filled from real product data only — a missing value
  * simply leaves the slot empty, so no placeholder is ever printed.
  */
+/** Grams for a printed attribute chip: at most two decimals, no trailing zeroes. */
+export function formatLabelWeight(weight?: number): string | null {
+  if (typeof weight !== 'number' || !Number.isFinite(weight) || weight <= 0) return null
+  return String(Number(weight.toFixed(2)))
+}
+
 export function labelAttributes(product: LabelLineInput, opts: LabelLineOptions): string[] {
   const out: string[] = []
   if (opts.showCategory !== false && product.category) out.push(String(product.category))
   if (product.collection) out.push(String(product.collection))
-  else if (opts.showWeight !== false && product.weight) out.push(`${product.weight}g`)
+  const grams = opts.showWeight !== false ? formatLabelWeight(product.weight) : null
+  if (grams) {
+    const chip = `Wt: ${grams}g`
+    // The reference has exactly two chip slots. Keep the collection in its
+    // slot and share it with the weight rather than dropping either value.
+    if (out.length >= 2) out[1] = `${out[1]} · ${chip}`
+    else out.push(chip)
+  }
   return out
 }
 
@@ -363,7 +430,8 @@ export function designFieldTexts(
 //
 // The six reference templates cover four physical sizes; the three 50×10
 // templates share the recorded geometry but retain their own brand/code rules.
-// Remaining entries stay available for backwards compatibility.
+// The remaining rectangular presets reuse the same reference-style artwork at
+// their own physical size (see `PROPORTIONAL_DESIGN_SIZES`).
 interface LabelPresetOptions extends Partial<LabelOptions> {
   label?: string
   reference?: boolean
@@ -960,8 +1028,8 @@ export async function generateLabelsPDF(
 
   const labelW = mmToPt(resolved.width)
   const labelH = mmToPt(resolved.height)
-  // The four supplied sizes print from their transcribed reference design; any
-  // other (legacy) size keeps the adaptive layout it has always used.
+  // The supplied sizes print from their transcribed reference design; the
+  // remaining rectangular presets use a proportional version of that design.
   const design = labelDesignFor(resolved.width, resolved.height)
   const geometry = computeLabelGeometry(labelW, labelH, resolved.showQR)
 

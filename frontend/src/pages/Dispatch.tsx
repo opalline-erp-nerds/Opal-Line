@@ -28,7 +28,7 @@ export default function DispatchPage() {
   const [tracking, setTracking] = useState('')
   const [expected, setExpected] = useState('')
   const [saving, setSaving] = useState(false)
-  // Snapshot taken when the dialog opens; isDirty compares the live fields to
+  // Snapshot taken when the dialog opens; isDirty compa
   // it so Cancel only warns when something actually changed (an always-on
   // courier preset made the old check warn on untouched dialogs too).
   const [baseline, setBaseline] = useState('')

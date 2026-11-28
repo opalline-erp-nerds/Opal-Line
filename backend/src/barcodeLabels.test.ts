@@ -3,15 +3,29 @@ import assert from 'node:assert/strict'
 import {
   LABEL_PRESET_LIST,
   LABEL_PRESETS,
+  ZPL_CAP_RATIO,
   computeLabelGeometry,
   computeLabelLines,
   designFieldTexts,
+  fieldMaxWidthMm,
   formatLabelRate,
   generateLabelQrBuffer,
   generateLabelsPDF,
   labelCode,
+  qrQuietMm,
+  qrTopMm,
   resolveLabelPreset,
 } from './barcodeLabels'
+
+// Every rectangular preset listed after 50×10 mm · Compact.
+const POST_COMPACT_PRESETS = [
+  ['label-50x22', 50, 22],
+  ['avery-5160', 63.5, 25.4],
+  ['avery-8160', 38.1, 21.2],
+  ['dymo-30256', 51, 25],
+  ['zlabel-50x30', 50, 30],
+  ['zlabel-40x25', 40, 25],
+] as const
 
 // Reference-size templates ---------------------------------------------------
 
@@ -78,6 +92,59 @@ test('all six reference presets default to OPAL LINE and retain complete geometr
     assert.equal(preset.design!.height, preset.height)
     assert.ok(preset.design!.fields.length > 0, `${preset.key} fields`)
     assert.ok(preset.design!.qr.size > 0, `${preset.key} QR size`)
+  }
+})
+
+test('the post-compact presets expose a complete proportional design', () => {
+  assert.deepEqual(
+    LABEL_PRESET_LIST.slice(6).map((preset) => preset.key),
+    POST_COMPACT_PRESETS.map(([key]) => key),
+  )
+  const byKey = new Map(LABEL_PRESET_LIST.map((preset) => [preset.key, preset]))
+  for (const [key, width, height] of POST_COMPACT_PRESETS) {
+    const preset = byKey.get(key)
+    assert.ok(preset, `missing preset ${key}`)
+    assert.ok(preset!.design, `${key} must expose printable geometry`)
+    const design = preset!.design!
+    assert.equal(design.width, width, `${key} design width`)
+    assert.equal(design.height, height, `${key} design height`)
+    assert.deepEqual(
+      design.fields.map((field) => field.kind),
+      ['brand', 'name', 'rate', 'code', 'attr1', 'attr2'],
+      `${key} field arrangement`,
+    )
+
+    const quiet = qrQuietMm(design)
+    const qrBoxTop = qrTopMm(design) - quiet
+    for (const field of design.fields) {
+      const capTop = field.baseline - field.capHeight * ZPL_CAP_RATIO
+      const room = fieldMaxWidthMm(design, field, true)
+      assert.ok(capTop >= -0.001, `${key} ${field.kind} top`)
+      assert.ok(field.baseline <= height + 0.001, `${key} ${field.kind} baseline`)
+      assert.ok(field.x + room <= width + 0.001, `${key} ${field.kind} right edge`)
+      const crossesQr = Math.min(field.baseline, design.qr.bottom) - Math.max(capTop, qrBoxTop)
+      if (crossesQr > field.capHeight * ZPL_CAP_RATIO * 0.25 + 0.001) {
+        assert.ok(field.x + room <= design.qr.x - quiet + 0.001, `${key} ${field.kind} QR quiet zone`)
+      }
+    }
+    assert.ok(qrBoxTop >= -0.001, `${key} QR quiet top`)
+    assert.ok(design.qr.x >= 0, `${key} QR left`)
+    assert.ok(design.qr.x + design.qr.size <= width + 0.001, `${key} QR right`)
+    assert.ok(design.qr.bottom <= height + 0.001, `${key} QR bottom`)
+
+    const texts = designFieldTexts(product, resolveLabelPreset(key), design)
+    assert.deepEqual(
+      texts.map((field) => field.text),
+      [
+        'OPAL LINE',
+        'DIAMOND RING',
+        'Rate: 1234.50/-',
+        'Code: SKU-1',
+        'Rings',
+        'Classic · Wt: 3.2g',
+      ],
+      `${key} live field text`,
+    )
   }
 })
 
@@ -226,6 +293,14 @@ test('PDF print rendering accepts each of the six selected reference template ID
     const pdf = await generateLabelsPDF([product], { preset: preset.key })
     assert.ok(pdf && pdf.length > 500, `${preset.key} should produce a PDF`)
     assert.equal(pdf!.subarray(0, 5).toString('latin1'), '%PDF-', `${preset.key} PDF signature`)
+  }
+})
+
+test('PDF print rendering accepts every post-compact rectangular preset', async () => {
+  for (const [key] of POST_COMPACT_PRESETS) {
+    const pdf = await generateLabelsPDF([product], { preset: key })
+    assert.ok(pdf && pdf.length > 500, `${key} should produce a PDF`)
+    assert.equal(pdf!.subarray(0, 5).toString('latin1'), '%PDF-', `${key} PDF signature`)
   }
 })
 

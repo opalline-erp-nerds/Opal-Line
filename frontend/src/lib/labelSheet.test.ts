@@ -1,16 +1,21 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import {
   DEFAULT_LABEL_CONFIG,
+  ZPL_CAP_RATIO,
   buildLabelSheet,
   computeGrid,
   configFromPreset,
   expandLabels,
+  fieldMaxWidthMm,
+  formatLabelWeight,
   isTagLabel,
   labelCellSize,
   labelBrandText,
   labelDesignFor,
   qrPayload,
+  qrQuietMm,
   qrSvg,
   qrTopMm,
   tagStem,
@@ -62,6 +67,15 @@ function tagConfig(overrides: Partial<LabelConfig> = {}): LabelConfig {
 
 function plainConfig(overrides: Partial<LabelConfig> = {}): LabelConfig {
   return { ...configFromPreset('zlabel-50x30'), ...overrides }
+}
+
+/**
+ * The generic adaptive card only survives for dimensions outside every preset;
+ * `zlabel-50x30` now shares the reference-style artwork like the other legacy
+ * preset keys.
+ */
+function legacyConfig(overrides: Partial<LabelConfig> = {}): LabelConfig {
+  return { ...configFromPreset('custom'), widthMm: 45, heightMm: 28, ...overrides }
 }
 
 // ─── Stem geometry ─────────────────────────────────────────────────────────
@@ -320,6 +334,115 @@ for (const [key, w, h] of REFERENCE_TEMPLATES) {
   })
 }
 
+// The six approved presets share four transcribed physical layouts. Hash the
+// complete preview and print HTML so any drift in coordinates, text sizes or
+// field order fails here instead of silently changing a label that is already
+// signed off.
+const APPROVED_OUTPUT_HASHES: Record<string, Record<'print' | 'preview', string>> = {
+  'label-50x40': {
+    print: 'd6786bf2b90f4479370ebe3da59a66600a1edc6c2f97fe3396b5739088ee54cd',
+    preview: '198b1a43b2c1959e66f9a85c92525cd6bc41b7b887fc194fa85678e6b19b712c',
+  },
+  'label-50x25': {
+    print: '4d76bc457fd27fa23e3f2219a84895ea0b46bcd2e8b8bb2ca2f326b2ad7afbdc',
+    preview: 'ba2479e05a6f400cf727e81b2dcd91c87a2c7bb1c2040b786ada5eb509f2c6fa',
+  },
+  'label-35x22': {
+    print: '9ba52829ba94b4fa4a8f0897cd8621f1f8c40ef9f015e582689528f08cc59420',
+    preview: '5049f3ff85c94b5e951b794c3bef2c3b44ebd36451fed23bf69b6a3dde47e65b',
+  },
+  'label-50x10': {
+    print: 'eae893c1e042202b625283adabc7cdd8ae3d269e82ecd7a3afc47e57dbfb2d48',
+    preview: 'cc1996f69f9c032210a3921594790713fd46abb687ff09dade689d9e421f46b1',
+  },
+  'label-50x10-loni': {
+    print: 'eae893c1e042202b625283adabc7cdd8ae3d269e82ecd7a3afc47e57dbfb2d48',
+    preview: 'cc1996f69f9c032210a3921594790713fd46abb687ff09dade689d9e421f46b1',
+  },
+  'label-50x10-compact': {
+    print: 'eae893c1e042202b625283adabc7cdd8ae3d269e82ecd7a3afc47e57dbfb2d48',
+    preview: 'cc1996f69f9c032210a3921594790713fd46abb687ff09dade689d9e421f46b1',
+  },
+}
+
+test('the first six presets keep their approved layout output', () => {
+  for (const [key, modes] of Object.entries(APPROVED_OUTPUT_HASHES)) {
+    for (const mode of ['print', 'preview'] as const) {
+      const html = buildLabelSheet([product], configFromPreset(key), { mode }).html
+      assert.equal(
+        createHash('sha256').update(html).digest('hex'),
+        modes[mode],
+        `${key} ${mode} output drifted`,
+      )
+    }
+  }
+})
+
+// Every rectangular preset listed after 50×10 mm · Compact.
+const POST_COMPACT_PRESETS = [
+  ['label-50x22', 50, 22],
+  ['avery-5160', 63.5, 25.4],
+  ['avery-8160', 38.1, 21.2],
+  ['dymo-30256', 51, 25],
+  ['zlabel-50x30', 50, 30],
+  ['zlabel-40x25', 40, 25],
+] as const
+
+for (const [key, w, h] of POST_COMPACT_PRESETS) {
+  test(`${key} renders the reference layout inside its physical bounds`, () => {
+    const design = labelDesignFor(w, h)
+    assert.ok(design, `${key} design exists`)
+    assert.deepEqual(
+      design!.fields.map((field) => field.kind),
+      ['brand', 'name', 'rate', 'code', 'attr1', 'attr2'],
+      `${key} field arrangement`,
+    )
+
+    const quiet = qrQuietMm(design!)
+    const boxTop = qrTopMm(design!) - quiet
+    for (const field of design!.fields) {
+      const capTop = field.baseline - field.capHeight * ZPL_CAP_RATIO
+      const room = fieldMaxWidthMm(design!, field, true)
+      assert.ok(capTop >= -0.001, `${key} ${field.kind} top`)
+      assert.ok(field.baseline <= h + 0.001, `${key} ${field.kind} baseline`)
+      assert.ok(field.x + room <= w + 0.001, `${key} ${field.kind} right edge`)
+      // Match the renderer's own tolerance: a line only yields to the QR when
+      // it crosses a quarter of its cap height into the quiet zone.
+      const crossesQr = Math.min(field.baseline, design!.qr.bottom) - Math.max(capTop, boxTop)
+      if (crossesQr > field.capHeight * ZPL_CAP_RATIO * 0.25 + 0.001) {
+        assert.ok(
+          field.x + room <= design!.qr.x - quiet + 0.001,
+          `${key} ${field.kind} reaches into the QR quiet zone`,
+        )
+      }
+    }
+    assert.ok(boxTop >= -0.001, `${key} QR quiet top`)
+    assert.ok(design!.qr.x >= 0, `${key} QR left`)
+    assert.ok(design!.qr.x + design!.qr.size <= w + 0.001, `${key} QR right`)
+    assert.ok(design!.qr.bottom <= h + 0.001, `${key} QR bottom`)
+
+    const { html } = buildLabelSheet([product], configFromPreset(key), { mode: 'preview' })
+    for (const text of [
+      'OPAL LINE',
+      'DIAMOND RING',
+      'Rate: 588.00/-',
+      'Code: OL-RNG-001',
+      'Rings',
+      'Wt: 5.2g',
+    ]) {
+      assert.ok(html.includes(text), `${key} renders ${text}`)
+    }
+    assert.ok(html.includes('<svg'), `${key} QR symbol`)
+    assert.ok(!html.includes('class="body"'), `${key} no generic stacked layout`)
+    assert.ok(
+      html.includes(
+        `left:${design!.qr.x}mm;top:${qrTopMm(design!)}mm;width:${design!.qr.size}mm;height:${design!.qr.size}mm`,
+      ),
+      `${key} QR placement`,
+    )
+  })
+}
+
 test('the rendered QR symbol is exactly the encoder output for the SKU', () => {
   const { html } = buildLabelSheet([product], configFromPreset('label-50x40'))
   const expected = qrSvg(qrPayload(product))
@@ -349,6 +472,36 @@ test('content toggles hide the same lines the PDF hides', () => {
   assert.ok(shown.includes('Code: OL-RNG-001'), 'code shown by default')
   assert.ok(shown.includes('Rate: 588.00/-'), 'rate shown by default')
   assert.ok(shown.includes('<svg'), 'QR shown by default')
+})
+
+test('reference labels print formatted net weight only when toggled on and positive', () => {
+  assert.equal(formatLabelWeight(2.619047619), '2.62')
+  assert.equal(formatLabelWeight(20), '20')
+  assert.equal(formatLabelWeight(2.5), '2.5')
+  assert.equal(formatLabelWeight(0), null)
+  assert.equal(formatLabelWeight(undefined), null)
+
+  const cfg = configFromPreset('label-50x40')
+  const weighted: LabelProduct = { ...product, collection: undefined, weight: 2.619047619 }
+  const print = buildLabelSheet([weighted], cfg, { mode: 'print' }).html
+  const preview = buildLabelSheet([weighted], cfg, { mode: 'preview', paper: 'label' }).html
+  assert.ok(print.includes('Wt: 2.62g'), 'print output carries the formatted grams')
+  assert.ok(preview.includes('Wt: 2.62g'), 'live preview carries the same grams')
+  const design = labelDesignFor(50, 40)!
+  assert.ok(
+    print.includes(
+      `left:${design.qr.x}mm;top:${qrTopMm(design)}mm;width:${design.qr.size}mm;height:${design.qr.size}mm`,
+    ),
+    'the QR keeps its reference position',
+  )
+
+  const off = buildLabelSheet([weighted], { ...cfg, showWeight: false }, { mode: 'print' }).html
+  assert.ok(!off.includes('Wt:'), 'toggle off hides the weight')
+  const pieceRate = buildLabelSheet([{ ...weighted, weight: 0 }], cfg, { mode: 'print' }).html
+  assert.ok(!pieceRate.includes('Wt:'), 'zero weight prints no line')
+
+  const withCollection = buildLabelSheet([product], cfg, { mode: 'print' }).html
+  assert.ok(withCollection.includes('BW · Wt: 5.2g'), 'a collection keeps its chip alongside the weight')
 })
 
 test('brand resolves to OPAL LINE unless a custom company name replaces it', () => {
@@ -390,7 +543,7 @@ test('reference labels print borderless; the legacy layout keeps the border togg
 
   const legacy = buildLabelSheet(
     [product],
-    { ...configFromPreset('zlabel-50x30'), showBorder: true },
+    legacyConfig({ showBorder: true }),
     { mode: 'print' },
   ).html
   assert.ok(legacy.includes('border:0.15mm solid #9aa1ad;'), 'legacy border on')
@@ -399,7 +552,7 @@ test('reference labels print borderless; the legacy layout keeps the border togg
   assert.ok(legacy.includes('class="name"'), 'legacy name slot')
   const legacyNoBorder = buildLabelSheet(
     [product],
-    { ...configFromPreset('zlabel-50x30'), showBorder: false },
+    legacyConfig({ showBorder: false }),
   ).html
   assert.ok(legacyNoBorder.includes('border:none;'), 'legacy border off')
 })

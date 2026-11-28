@@ -16,10 +16,19 @@ import {
 // fails here instead of silently printing two different labels.
 
 const SIZES = [
+  // The six approved presets cover these four physical sizes.
   [50, 40],
   [50, 25],
   [35, 22],
   [50, 10],
+  // Every rectangular preset after 50×10 · Compact uses the same artwork,
+  // scaled to its own physical footprint.
+  [50, 22],
+  [63.5, 25.4],
+  [38.1, 21.2],
+  [51, 25],
+  [50, 30],
+  [40, 25],
 ] as const
 
 const product = {
@@ -50,10 +59,10 @@ test('frontend and backend share one transcribed geometry per reference size', (
     assert.ok(frontend, `frontend design ${w}x${h}`)
     assert.deepEqual(frontend, backend, `${w}x${h} geometry drifted between renderers`)
   }
-  // Sizes outside the reference set must fall back to the adaptive layout in
-  // BOTH renderers — never one design and one legacy card.
-  assert.equal(frontendDesignFor(50, 22), null, 'frontend has no design for 50x22')
-  assert.equal(backendDesignFor(50, 22), null, 'backend has no design for 50x22')
+  // Unknown sizes still fall back to the adaptive layout in BOTH renderers —
+  // never one design and one legacy card.
+  assert.equal(frontendDesignFor(Number.NaN, 40), null, 'frontend rejects invalid sizes')
+  assert.equal(backendDesignFor(Number.NaN, 40), null, 'backend rejects invalid sizes')
 })
 
 test('frontend and backend resolve identical field texts for every reference size', () => {
