@@ -29,6 +29,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Skeleton } from '@/components/ui/skeleton'
 import { ProductDialog } from '@/components/product-dialog'
 import { productImageGallery } from '@/lib/product-image'
+import { sanitizeProductDescription } from '@/lib/sanitizeHtml'
 import { variantEffectivePrice } from '@/lib/productVariants'
 import { rowLocationLabel } from '@/lib/locations'
 import { dbApi, shopifyApi } from '@/lib/api'
@@ -317,7 +318,7 @@ export default function ProductDetailPage() {
                     <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Description</p>
                     <div
                       className="mt-1 text-sm text-foreground [&_b]:font-semibold [&_em]:italic [&_li]:ml-4 [&_li]:list-disc [&_p]:mb-1 [&_strong]:font-semibold [&_ul]:list-inside"
-                      dangerouslySetInnerHTML={{ __html: product.description }}
+                      dangerouslySetInnerHTML={{ __html: sanitizeProductDescription(product.description) }}
                     />
                   </div>
                 ) : null}

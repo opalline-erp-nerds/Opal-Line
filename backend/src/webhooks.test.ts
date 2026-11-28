@@ -3,12 +3,14 @@ import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import type { NextFunction, Request, Response } from 'express'
 import {
+  captureWebhookRawBody,
   forgetWebhookId,
   isWebhookIdSeen,
   rememberWebhookId,
   resetWebhookDedupe,
   REPLAY_WINDOW_MS,
   verifyShopifyWebhook,
+  WEBHOOK_BODY_PATHS,
 } from './webhooks'
 
 describe('webhook replay dedupe', () => {
@@ -70,7 +72,7 @@ describe('shopify webhook HMAC', () => {
     process.env.SHOPIFY_WEBHOOK_SECRET = SECRET
   })
 
-  const run = (rawBody: string, signature: string | null) => {
+  const run = async (rawBody: string, signature: string | null, secret: string | null = SECRET) => {
     const headers: Record<string, string> = { 'x-shopify-topic': 'refunds/create' }
     if (signature !== null) headers['x-shopify-hmac-sha256'] = signature
     const req = { headers, rawBody: Buffer.from(rawBody, 'utf8') } as unknown as Request
@@ -85,41 +87,56 @@ describe('shopify webhook HMAC', () => {
         return this
       },
     } as unknown as Response
-    verifyShopifyWebhook(req, res, (() => {
+    await verifyShopifyWebhook(req, res, (() => {
       passed = true
-    }) as NextFunction)
+    }) as NextFunction, async () => secret)
     return { status, passed, req }
   }
 
   const sign = (body: string) => createHmac('sha256', SECRET).update(body, 'utf8').digest('base64')
 
-  test('a correctly signed delivery passes and exposes the topic', () => {
+  test('a correctly signed delivery passes and exposes the topic', async () => {
     const body = JSON.stringify({ id: 9001, order_id: 1027 })
-    const { status, passed, req } = run(body, sign(body))
+    const { status, passed, req } = await run(body, sign(body))
     assert.equal(status, 200)
     assert.equal(passed, true)
     assert.equal(req.shopifyWebhook?.topic, 'refunds/create')
   })
 
-  test('a tampered body is rejected', () => {
+  test('a valid signature over non-canonical JSON whitespace passes unchanged', async () => {
+    // Shopify signs the exact bytes it sent. Re-stringifying req.body would
+    // change `\n  ` and key spacing, so this must succeed against raw bytes.
+    const body = '{\n  "id": 9001,  "note": "two spaces"\n}'
+    assert.notEqual(body, JSON.stringify(JSON.parse(body)))
+    const { status, passed } = await run(body, sign(body))
+    assert.equal(status, 200)
+    assert.equal(passed, true)
+  })
+
+  test('a tampered body is rejected', async () => {
     const body = JSON.stringify({ id: 9001 })
-    const { status, passed } = run(`${body} `, sign(body))
+    const { status, passed } = await run(`${body} `, sign(body))
     assert.equal(status, 401)
     assert.equal(passed, false)
   })
 
-  test('a missing signature is rejected', () => {
-    const { status, passed } = run(JSON.stringify({ id: 9001 }), null)
+  test('an invalid signature is rejected', async () => {
+    const body = JSON.stringify({ id: 9001 })
+    const { status, passed } = await run(body, sign('a different body'))
     assert.equal(status, 401)
     assert.equal(passed, false)
   })
 
-  test('no configured secret fails closed', () => {
-    process.env.SHOPIFY_WEBHOOK_SECRET = ''
-    delete process.env.SHOPIFY_WEBHOOK_SECRET
+  test('a missing signature is rejected', async () => {
+    const { status, passed } = await run(JSON.stringify({ id: 9001 }), null)
+    assert.equal(status, 401)
+    assert.equal(passed, false)
+  })
+
+  test('no configured secret fails closed', async () => {
     const body = JSON.stringify({ id: 9001 })
-    const { status, passed } = run(body, sign(body))
-    assert.equal(status, 500)
+    const { status, passed } = await run(body, sign(body), null)
+    assert.equal(status, 503)
     assert.equal(passed, false)
   })
 
@@ -127,5 +144,14 @@ describe('shopify webhook HMAC', () => {
     if (previous === undefined) delete process.env.SHOPIFY_WEBHOOK_SECRET
     else process.env.SHOPIFY_WEBHOOK_SECRET = previous
     assert.ok(true)
+  })
+
+  test('raw body capture covers both signed webhook routes', () => {
+    const payload = '{  "order_name": "#1001"  }'
+    for (const path of WEBHOOK_BODY_PATHS) {
+      const req = { path } as Parameters<typeof captureWebhookRawBody>[0]
+      captureWebhookRawBody(req, {}, Buffer.from(payload, 'utf8'))
+      assert.equal(req.rawBody?.toString('utf8'), payload, path)
+    }
   })
 })

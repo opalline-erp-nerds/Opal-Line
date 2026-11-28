@@ -42,6 +42,26 @@ function resetCsrfToken(): void {
 
 export { resetCsrfToken }
 
+/**
+ * One CSRF token refresh + retry, shared by JSON and text requests. A 403 can
+ * mean the cached token expired or the server rotated its CSRF secret; both
+ * callers need the same reset-and-retry behaviour.
+ */
+async function retryWithFreshCsrfToken(
+  path: string,
+  init: RequestInit | undefined,
+  headers: Record<string, string>,
+): Promise<Response | null> {
+  resetCsrfToken()
+  const newToken = await fetchCsrfToken()
+  if (!newToken) return null
+  return fetch(`${API_BASE}${path}`, {
+    ...init,
+    credentials: 'include',
+    headers: { ...headers, 'X-CSRF-Token': newToken, ...(init?.headers as Record<string, string> | undefined) },
+  })
+}
+
 export interface ApiErrorDetail {
   error?: string
   code?: string
@@ -105,14 +125,8 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   
   if (res.status === 403 && isStateChanging) {
-    resetCsrfToken()
-    const newToken = await fetchCsrfToken()
-    if (newToken) {
-      const retryRes = await fetch(`${API_BASE}${path}`, {
-        ...init,
-        credentials: 'include',
-        headers: { ...headers, 'X-CSRF-Token': newToken, ...(init?.headers as Record<string, string> | undefined) },
-      })
+    const retryRes = await retryWithFreshCsrfToken(path, init, headers)
+    if (retryRes) {
       if (!retryRes.ok) {
         const body = (await retryRes.json().catch(() => null)) as ApiErrorDetail | null
         if (retryRes.status === 401 && !path.startsWith('/auth/')) {
@@ -166,6 +180,17 @@ export async function requestText(path: string, init?: RequestInit): Promise<str
     credentials: 'include',
     headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
   })
+  if (res.status === 403 && isStateChanging) {
+    const retryRes = await retryWithFreshCsrfToken(path, init, headers)
+    if (retryRes) {
+      if (!retryRes.ok) {
+        const body = (await retryRes.json().catch(() => null)) as { error?: string } | null
+        if (retryRes.status === 401 && !path.startsWith('/auth/')) notifyUnauthorized(requestEpoch)
+        throw new ApiError(retryRes.status, body?.error ?? `API error ${retryRes.status}`)
+      }
+      return retryRes.text()
+    }
+  }
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
     if (res.status === 401 && !path.startsWith('/auth/')) notifyUnauthorized(requestEpoch)

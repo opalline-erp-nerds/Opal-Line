@@ -8,7 +8,6 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
-import { decryptSecret } from './lib/crypto'
 import {
   getOrderAutoSyncStatus,
   getOrderSyncIntervalSeconds,
@@ -37,7 +36,7 @@ import { logger } from './logger'
 import { CONSTANTS } from './constants'
 import { applyTrustProxy } from './proxyTrust'
 import { PgRateLimitStore, pruneExpiredRateLimits } from './pgRateLimitStore'
-import { verifyShopifyWebhook, rejectReplayedWebhook, releaseWebhookId } from './webhooks'
+import { captureWebhookRawBody, verifyShopifyWebhook, rejectReplayedWebhook, releaseWebhookId } from './webhooks'
 import { recountCustomerStats } from './customerStats'
 import { startAutoBackup, startDailySummary } from './autoBackup'
 import { startOrderEmailIngest, stopOrderEmailIngest, pollOrderMailbox, isEmailIngestConfigured } from './orderEmailIngest'
@@ -185,8 +184,9 @@ const csrfProtection = (req: express.Request, res: express.Response, next: expre
     return next()
   }
   
-  const token = req.headers[CSRF_HEADER] as string || req.body?.csrfToken
-  
+  const rawToken = req.headers[CSRF_HEADER]
+  const token = typeof rawToken === 'string' ? rawToken : ''
+
   if (!token || !verifyCsrfToken(token)) {
     return res.status(403).json({ error: 'Invalid CSRF token' })
   }
@@ -205,13 +205,8 @@ app.use(csrfProtection)
 
 const jsonBodyParser = express.json({
   limit: CONSTANTS.REQUEST_SIZE_LIMIT,
-  verify: (req, _res, buf) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const r = req as any
-    if (r.path === '/api/v1/webhooks/shopify') {
-      r.rawBody = buf
-    }
-  },
+  // Capture the exact bytes for both signed webhook routes before JSON parsing.
+  verify: captureWebhookRawBody,
 })
 // Image-upload routes carry up to 25mb data-URL bodies and register their own
 // express.json({ limit: '25mb' }); the global 1mb parser must not reject them
@@ -268,13 +263,8 @@ const emailSendLimiter = rateLimit({
   // express-rate-limit ERR_ERL_KEY_GEN_IPV6 fired on every boot).
   keyGenerator: (req) => (req.userId != null ? String(req.userId) : ipKeyGenerator(req.ip ?? 'unknown')),
 })
-app.use('/api/v1/backup/email', emailSendLimiter)
-app.use('/api/v1/backup/email-separate', emailSendLimiter)
-app.use('/api/v1/backup/notifications', emailSendLimiter)
-app.use('/api/v1/db/dues/email', emailSendLimiter)
-app.use('/api/v1/db/notifications/resend', emailSendLimiter)
-
-
+// Mounted after session resolution (below) so `req.userId` is present and
+// these budgets are per user, not per IP.
 
 app.get('/api/v1/health', async (_req, res) => {
   const dbHealth = await checkDbHealth()
@@ -459,6 +449,9 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
 app.post('/api/v1/uploads/image', requireAuth, requirePermission('inventory', 'edit'), express.json({ limit: '25mb' }), uploadImageHandler)
 
 app.use('/api/v1/db', requireAuth, enforceRbac)
+// Per-user email budgets: session is already resolved by the mount above.
+app.use('/api/v1/db/dues/email', emailSendLimiter)
+app.use('/api/v1/db/notifications/resend', emailSendLimiter)
 import { feedRouter } from './notificationFeed'
 app.use('/api/v1/db', feedRouter)
 import { registerEnvConfigRoutes } from './routes/envConfig'
@@ -489,6 +482,10 @@ app.get('/api/v1/sales/followups', requireAuth, requirePermission('sales', 'view
   }
 })
 app.use('/api/v1/rbac', requireAuth, rbacRouter)
+// Resolve the session before the limiter so these are per-user budgets.
+app.use('/api/v1/backup/email', requireAuth, emailSendLimiter)
+app.use('/api/v1/backup/email-separate', requireAuth, emailSendLimiter)
+app.use('/api/v1/backup/notifications', requireAuth, emailSendLimiter)
 app.use('/api/v1/backup', requireAuth, enforceRbac, backupRouter)
 app.use('/api/v1/print-templates', requireAuth, enforceRbac, printTemplatesRouter)
 app.use('/api/v1/auth', authRouter)
@@ -500,34 +497,11 @@ app.use('/api/v1/silver', requireAuth, enforceRbac)
 // caller, session or not.
 app.use('/api/v1/gold', requireAuth, enforceRbac)
 
-// Shopify Flow webhook — must be BEFORE requireAuth since it's called from Shopify servers (no browser session)
-app.post('/api/v1/shopify/flow-webhook', express.json({
-  limit: '1mb',
-  // Shopify signs the exact bytes it sent. Re-stringifying req.body breaks the
-  // signature whenever whitespace/key order differs, so keep the raw payload.
-  verify: (req, _res, buf) => { (req as unknown as express.Request).rawBody = buf },
-}), async (req, res) => {
+// Shopify Flow webhook — must be BEFORE requireAuth since it's called from Shopify servers (no browser session).
+// The shared verifier hashes the raw bytes captured by the global JSON parser;
+// there is no "skip verification when unconfigured" path.
+app.post('/api/v1/shopify/flow-webhook', verifyShopifyWebhook, async (req, res) => {
   try {
-    // ── HMAC signature verification ────────────────────────────────────────
-    const SHOPIFY_WEBHOOK_SECRET = decryptSecret(process.env.SHOPIFY_WEBHOOK_SECRET?.trim())
-    if (SHOPIFY_WEBHOOK_SECRET) {
-      const hmacHeader = req.headers['x-shopify-hmac-sha256'] as string | undefined
-      if (!hmacHeader) {
-        logger.warn('Flow webhook missing X-Shopify-Hmac-SHA256 header')
-        return res.status(401).json({ ok: false, error: 'Unauthorized' })
-      }
-      const rawBody = req.rawBody ?? Buffer.from(JSON.stringify(req.body ?? {}))
-      const expected = createHmac('sha256', SHOPIFY_WEBHOOK_SECRET).update(rawBody).digest('base64')
-      const sigBuf = Buffer.from(hmacHeader, 'base64')
-      const expBuf = Buffer.from(expected, 'base64')
-      if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
-        logger.warn('Flow webhook HMAC mismatch')
-        return res.status(401).json({ ok: false, error: 'Unauthorized' })
-      }
-    } else {
-      logger.warn('SHOPIFY_WEBHOOK_SECRET not set — flow-webhook HMAC verification skipped')
-    }
-
     const body = req.body
 
     // ── Input validation ───────────────────────────────────────────────────

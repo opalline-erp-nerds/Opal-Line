@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { ApiError, formatApiError } from './core'
+import { ApiError, formatApiError, requestText, resetCsrfToken } from './core'
 
 // The booking→invoice stock guard answers with the structured 409 this
 // formatter expands. The toast a user sees on a blocked conversion is built
@@ -108,4 +108,32 @@ test('an incomplete-allocation refusal surfaces the exact line detail', () => {
   assert.ok(msg.includes('not fully allocated'), 'the refusal reason survives')
   assert.ok(msg.includes('4 of 10'), 'the exact quantities survive')
   assert.ok(msg.includes('P4-RED'), 'the SKU survives')
+})
+
+test('requestText refreshes the CSRF token and retries a 403', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; headers?: HeadersInit }> = []
+  resetCsrfToken()
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      calls.push({ url, headers: init?.headers })
+      if (url.endsWith('/csrf-token')) {
+        return new Response(JSON.stringify({ csrfToken: 'fresh-token' }), { status: 200 })
+      }
+      const apiCalls = calls.filter((c) => c.url.endsWith('/labels/zpl'))
+      if (apiCalls.length === 1) {
+        return new Response(JSON.stringify({ error: 'Invalid CSRF token' }), { status: 403 })
+      }
+      return new Response('%BCD^', { status: 200 })
+    }) as typeof fetch
+
+    const text = await requestText('/db/products/labels/zpl', { method: 'POST', body: '{}' })
+
+    assert.equal(text, '%BCD^', 'the retried text body is returned')
+    assert.equal(calls.filter((c) => c.url.endsWith('/labels/zpl')).length, 2, 'the state-changing request is retried once')
+  } finally {
+    globalThis.fetch = originalFetch
+    resetCsrfToken()
+  }
 })

@@ -18,6 +18,7 @@ import type { SilverRateStepLog, SilverRateStepRecord } from './db/schema'
 import type { SyncCustomer, SyncLogEntry, SyncOrder, SyncPrice, SyncProduct, SyncResource, SyncStore } from './types'
 import { CONSTANTS } from './constants'
 import { logger } from './logger'
+import { FetchTimeoutError, fetchWithTimeout } from './lib/fetchTimeout'
 import { recordAudit } from './activity'
 import { listLocationMappings, resolveErpLocationForShopify } from './shopifyLocations'
 import { applyStockMovement, resolveMovementLocation, setStockTotalTo } from './stock'
@@ -160,6 +161,18 @@ class ShopifyError extends Error {
   }
 }
 
+const SHOPIFY_REQUEST_TIMEOUT_MS = 20_000
+
+/** Every Admin API call gets a deadline; a timeout becomes a clear 502-class error. */
+async function shopifyFetch(input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> {
+  try {
+    return await fetchWithTimeout(input, init, SHOPIFY_REQUEST_TIMEOUT_MS, 'Shopify')
+  } catch (err) {
+    if (err instanceof FetchTimeoutError) throw new ShopifyError(err.message, 504)
+    throw err
+  }
+}
+
 function apiPath(version: string, resource: string) {
   return `https://${config.shop}.myshopify.com/admin/api/${version}/${resource}.json`
 }
@@ -186,7 +199,7 @@ async function shopifyRequest<T>(resource: string, query = '', _attempt = 0): Pr
   const baseDelay = CONSTANTS.SHOPIFY_BASE_RETRY_DELAY_MS
 
   for (let tryNum = 0; tryNum <= maxRetries; tryNum++) {
-    const res = await fetch(url, {
+    const res = await shopifyFetch(url, {
       headers: {
         'X-Shopify-Access-Token': config.accessToken,
         'Content-Type': 'application/json',
@@ -245,7 +258,7 @@ async function adminFetch(input: RequestInfo | URL, init?: RequestInit): Promise
   const maxRetries = CONSTANTS.SHOPIFY_MAX_RETRIES
   const baseDelay = CONSTANTS.SHOPIFY_BASE_RETRY_DELAY_MS
   for (let tryNum = 0; tryNum <= maxRetries; tryNum++) {
-    const res = await fetch(input, init)
+    const res = await shopifyFetch(input, init)
     const retryable = res.status === 429 || res.status >= 500
     if (!retryable || tryNum === maxRetries) return res
     // Drain the body before waiting so the connection is released.
@@ -314,7 +327,7 @@ export async function testShopifyConnection(overrides?: {
   try {
     const start = Date.now()
     const url = `https://${shop}.myshopify.com/admin/api/${config.apiVersion}/shop.json`
-    const res = await fetch(url, {
+    const res = await shopifyFetch(url, {
       headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json', Accept: 'application/json' },
     })
     if (res.status === 401) {
@@ -333,7 +346,7 @@ export async function testShopifyConnection(overrides?: {
     // mid-flow, so name the gaps here, at configuration time. Token types
     // that cannot answer simply skip this check.
     try {
-      const scopesRes = await fetch(
+      const scopesRes = await shopifyFetch(
         `https://${shop}.myshopify.com/admin/api/${config.apiVersion}/access_scopes.json`,
         { headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json', Accept: 'application/json' } },
       )
@@ -1948,7 +1961,7 @@ async function syncPrices(): Promise<number> {
 
 async function setVariantPrice(variantId: number, price: number) {
   const url = new URL(apiPath(config.apiVersion, `variants/${variantId}`))
-  const res = await fetch(url, {
+  const res = await shopifyFetch(url, {
     method: 'PUT',
     headers: {
       'X-Shopify-Access-Token': config.accessToken,
@@ -2181,7 +2194,7 @@ export async function pushProductPriceToShopify(localProductId: string): Promise
     const body: Record<string, unknown> = { id: variantId, price: amount.toFixed(2) }
     if (Number.isFinite(cmp) && cmp > 0) body.compare_at_price = cmp.toFixed(2)
     const url = new URL(apiPath(config.apiVersion, `variants/${variantId}`))
-    const put = await fetch(url, {
+    const put = await shopifyFetch(url, {
       method: 'PUT',
       headers: {
         'X-Shopify-Access-Token': config.accessToken,
@@ -2446,7 +2459,7 @@ async function createShopifyProduct(local: LocalProductForPush): Promise<{
     body.product = { ...(body.product as object), images }
   }
 
-  const res = await fetch(url, {
+  const res = await shopifyFetch(url, {
     method: 'POST',
     headers: {
       'X-Shopify-Access-Token': config.accessToken,
@@ -2507,7 +2520,7 @@ async function updateShopifyProductContent(local: LocalProductForPush): Promise<
   let previousCollection: string | null = null
   let listingVariants: Array<{ id?: number; sku?: string | null }> = []
   try {
-    const get = await fetch(url, {
+    const get = await shopifyFetch(url, {
       headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' },
     })
     if (get.ok) {
@@ -2542,7 +2555,7 @@ async function updateShopifyProductContent(local: LocalProductForPush): Promise<
     tags: buildShopifyTags(local),
   }
 
-  const res = await fetch(url, {
+  const res = await shopifyFetch(url, {
     method: 'PUT',
     headers: {
       'X-Shopify-Access-Token': config.accessToken,
@@ -2596,7 +2609,7 @@ async function updateShopifyProductContent(local: LocalProductForPush): Promise<
       }
       return entry
     })
-    const variantRes = await fetch(url, {
+    const variantRes = await shopifyFetch(url, {
       method: 'PUT',
       headers: {
         'X-Shopify-Access-Token': config.accessToken,
@@ -2620,7 +2633,7 @@ async function updateShopifyProductContent(local: LocalProductForPush): Promise<
     for (const v of listingVariants) {
       if (!v.id || keptSkus.has(String(v.id))) continue
       try {
-        await fetch(new URL(apiPath(config.apiVersion, `variants/${v.id}`)), {
+        await shopifyFetch(new URL(apiPath(config.apiVersion, `variants/${v.id}`)), {
           method: 'DELETE',
           headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' },
         })
@@ -2634,7 +2647,7 @@ async function updateShopifyProductContent(local: LocalProductForPush): Promise<
     if (img.attachment) image.attachment = img.attachment
     if (img.src) image.src = img.src
     if (img.alt) image.alt = img.alt
-    const r = await fetch(new URL(apiPath(config.apiVersion, `products/${id}/images`)), {
+    const r = await shopifyFetch(new URL(apiPath(config.apiVersion, `products/${id}/images`)), {
       method: 'POST',
       headers: {
         'X-Shopify-Access-Token': config.accessToken,
@@ -2701,7 +2714,7 @@ export async function reconcileListingImages(
     }
   }
   try {
-    const get = await fetch(url, {
+    const get = await shopifyFetch(url, {
       headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' },
     })
     if (get.ok) {
@@ -2741,7 +2754,7 @@ export async function reconcileListingImages(
         for (let r = 0; r < 4 && has(finalImgs) < justAddedPathnames.size; r++) {
           await new Promise((res) => setTimeout(res, 1500))
           try {
-            const g2 = await fetch(url, { headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' } })
+            const g2 = await shopifyFetch(url, { headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' } })
             if (g2.ok) {
               const j2 = (await g2.json()) as { product?: { images?: Array<{ src?: string }> } }
               finalImgs = j2.product?.images ?? []
@@ -2773,7 +2786,7 @@ async function writebackShopifyImageUrls(
   try {
     let imgs = prefetched
     if (!imgs) {
-      const res = await fetch(apiPath(config.apiVersion, `products/${id}`), {
+      const res = await shopifyFetch(apiPath(config.apiVersion, `products/${id}`), {
         headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' },
       })
       if (!res.ok) return
@@ -2804,7 +2817,7 @@ export async function deleteShopifyImageWithRetry(productId: number, imageId: nu
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt) await new Promise((r) => setTimeout(r, 500 * attempt))
     try {
-      const res = await fetch(url, {
+      const res = await shopifyFetch(url, {
         method: 'DELETE',
         headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' },
       })
@@ -2821,7 +2834,7 @@ export async function deleteShopifyImageWithRetry(productId: number, imageId: nu
 
 export async function deleteShopifyProduct(productId: number): Promise<void> {
   const url = new URL(apiPath(config.apiVersion, `products/${productId}`))
-  const res = await fetch(url, {
+  const res = await shopifyFetch(url, {
     method: 'DELETE',
     headers: {
       'X-Shopify-Access-Token': config.accessToken,
@@ -3057,7 +3070,7 @@ export interface ShopifyInventoryPushResult {
 
 async function setInventoryItemTracked(inventoryItemId: number) {
   const url = new URL(apiPath(config.apiVersion, `inventory_items/${inventoryItemId}`))
-  const res = await fetch(url, {
+  const res = await shopifyFetch(url, {
     method: 'PUT',
     headers: {
       'X-Shopify-Access-Token': config.accessToken,
@@ -3074,7 +3087,7 @@ async function setInventoryItemTracked(inventoryItemId: number) {
 
 async function setInventoryLevel(inventoryItemId: number, locationId: number, available: number) {
   const url = new URL(apiPath(config.apiVersion, 'inventory_levels/set'))
-  const res = await fetch(url, {
+  const res = await shopifyFetch(url, {
     method: 'POST',
     headers: {
       'X-Shopify-Access-Token': config.accessToken,
@@ -4075,7 +4088,7 @@ interface ResolveCustomerInput {
 async function findShopifyCustomerId(query: string): Promise<string | undefined> {
   try {
     const url = `https://${config.shop}.myshopify.com/admin/api/${config.apiVersion}/customers/search.json?limit=5&query=${encodeURIComponent(query)}`
-    const res = await fetch(url, {
+    const res = await shopifyFetch(url, {
       headers: {
         'X-Shopify-Access-Token': config.accessToken,
         'Content-Type': 'application/json',
@@ -4119,7 +4132,7 @@ async function createShopifyCustomer(input: ResolveCustomerInput): Promise<strin
   }
   try {
     const url = `https://${config.shop}.myshopify.com/admin/api/${config.apiVersion}/customers.json`
-    const res = await fetch(url, {
+    const res = await shopifyFetch(url, {
       method: 'POST',
       headers: {
         'X-Shopify-Access-Token': config.accessToken,
@@ -4234,7 +4247,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
   }`
 
   try {
-    const res = await fetch(url, {
+    const res = await shopifyFetch(url, {
       method: 'POST',
       headers: {
         'X-Shopify-Access-Token': config.accessToken,
@@ -4284,7 +4297,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
     let completionError: string | null = null
 
     try {
-      const completeRes = await fetch(url, {
+      const completeRes = await shopifyFetch(url, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': config.accessToken,
@@ -4394,7 +4407,7 @@ async function findShopifyOrderIdByName(name: string): Promise<string | undefine
   }
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await fetch(url, {
+      const res = await shopifyFetch(url, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -4440,7 +4453,7 @@ export async function updateShopifyOrder(payload: ShopifyOrderUpdateInput): Prom
     if (Object.keys(input).length <= 1) return { ok: true, errors: [] }
 
     const url = `https://${config.shop}.myshopify.com/admin/api/${config.apiVersion}/graphql.json`
-    const res = await fetch(url, {
+    const res = await shopifyFetch(url, {
       method: 'POST',
       headers: {
         'X-Shopify-Access-Token': config.accessToken,
