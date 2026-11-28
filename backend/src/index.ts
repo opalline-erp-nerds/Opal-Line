@@ -56,6 +56,7 @@ import { mountFrontend, resolveFrontendDist } from './frontendStatic'
 import { HostedConfigError, isPublicHost, publicHostStartupError } from './hostedMode'
 import { routeParam } from './lib/routeParams'
 import { dbErrorInfo, describeDbError } from './lib/dbErrors'
+import type { CustomerIdentityInput } from './lib/customerIdentity'
 
 const app = express()
 
@@ -480,13 +481,14 @@ app.get('/api/v1/sales/followups', requireAuth, requirePermission('sales', 'view
     const { collectSalesFollowUps, summariseSalesFollowUps } = await import('./salesFollowups')
     const query = (key: string) => String(req.query[key] ?? '').trim()
     const customer = query('customer')
-    const followUps = await collectSalesFollowUps({
+    const identity: CustomerIdentityInput = {
       customerId: query('customerId'),
       shopifyId: query('shopifyId'),
       email: query('email'),
       phone: query('phone'),
       name: customer || query('name'),
-    })
+    }
+    const followUps = await collectSalesFollowUps(identity)
     const summary = await summariseSalesFollowUps(followUps)
     res.json({ followUps, summary, customer })
   } catch (err) {
