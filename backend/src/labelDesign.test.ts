@@ -187,13 +187,19 @@ test('the printed capitals are a fixed fraction of the reference h', () => {
   assert.equal(ZPL_EM_RATIO, 0.925)
 })
 
-test('the QR symbol sits exactly where the samples print it', () => {
-  // Ink top measured from the rasterised samples, in dots.
+test('the QR symbol sits exactly where the four transcribed samples print it', () => {
+  // Ink top measured from the rasterised samples, in dots. The generated
+  // proportional presets have no sample stream; their bounds are covered by
+  // the physical-label tests above instead.
   const measured: Record<string, number> = { '50x40': 140, '50x25': 77, '35x22': 91, '50x10': 3 }
   for (const design of LABEL_DESIGNS) {
     const key = `${design.width}x${design.height}`
+    const expected = measured[key]
+    if (expected === undefined) continue
     const top = qrTopMm(design) * DOTS
-    assert.ok(near(top, measured[key], 1.2), `${key} qr top ${top} != ${measured[key]}`)
+    assert.ok(near(top, expected, 1.2), `${key} qr top ${top} != ${expected}`)
+  }
+  for (const design of LABEL_DESIGNS) {
     // Quiet zone below the symbol, straight from the samples.
     assert.ok(near(design.qr.bottom - qrTopMm(design), design.qr.size + qrQuietMm(design)))
     assert.equal(QR_QUIET_MODULES, 3)
@@ -408,16 +414,19 @@ test('a missing brand or price simply drops the line', () => {
   assert.equal(texts.find((t) => t.kind === 'name')?.text, 'PLAIN')
 })
 
-test('a design only exists for the four physical reference sizes', () => {
-  assert.ok(labelDesignFor(50, 40))
-  assert.ok(labelDesignFor(50, 25))
-  assert.ok(labelDesignFor(50, 10))
-  assert.ok(labelDesignFor(35, 22))
-  // Other label stock (and anything else) falls back to the adaptive layout.
-  assert.equal(labelDesignFor(50, 22), null)
-  assert.equal(labelDesignFor(63.5, 25.4), null)
+test('approved reference sizes and proportional preset sizes share one design set', () => {
+  for (const [w, h] of [[50, 40], [50, 25], [35, 22], [50, 10]] as const) {
+    assert.ok(labelDesignFor(w, h), `${w}x${h} approved design`)
+  }
+  for (const [w, h] of [[50, 22], [63.5, 25.4], [38.1, 21.2], [51, 25], [50, 30], [40, 25]] as const) {
+    const design = labelDesignFor(w, h)
+    assert.ok(design, `${w}x${h} proportional preset design`)
+    assert.deepEqual(design!.fields.map((f) => f.kind), ['brand', 'name', 'rate', 'code', 'attr1', 'attr2'])
+  }
+  // Sizes outside the preset set still fall back to the adaptive layout.
   assert.equal(labelDesignFor(Number.NaN, 40), null)
-  assert.equal(LABEL_DESIGNS.length, 4)
+  assert.equal(labelDesignFor(999, 999), null)
+  assert.equal(LABEL_DESIGNS.length, 10)
 })
 
 // ─── The emitted ZPL stream ───────────────────────────────────────────────────
