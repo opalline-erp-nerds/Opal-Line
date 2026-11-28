@@ -1,7 +1,9 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
+import type { IncomingMessage } from 'node:http'
+import { eq } from 'drizzle-orm'
 import type { Request, Response, NextFunction } from 'express'
 import { logger } from './logger'
-import { decryptSecret } from './lib/crypto'
+import { decrypt, decryptSecret } from './lib/crypto'
 import { getRawClient } from './db/client'
 
 declare global {
@@ -17,10 +19,64 @@ declare global {
   }
 }
 
-export function verifyShopifyWebhook(req: Request, res: Response, next: NextFunction): void {
-  const secret = decryptSecret(process.env.SHOPIFY_WEBHOOK_SECRET)
+/**
+ * Both Shopify webhook routes must hash the exact bytes Shopify signed. The
+ * parser's `verify` callback sees the buffer before JSON parsing rewrites it,
+ * so it is shared here instead of being duplicated per route.
+ */
+export const WEBHOOK_BODY_PATHS = new Set([
+  '/api/v1/webhooks/shopify',
+  '/api/v1/shopify/flow-webhook',
+])
+
+export function captureWebhookRawBody(
+  req: IncomingMessage & { path?: string; rawBody?: Buffer },
+  _res: unknown,
+  buf: Buffer,
+): void {
+  if (req.path && WEBHOOK_BODY_PATHS.has(req.path)) {
+    // Copy the buffer: body-parser may reuse its scratch buffer after verify.
+    req.rawBody = Buffer.from(buf)
+  }
+}
+
+/**
+ * Shared secret resolution for every Shopify webhook route.
+ *
+ * `loadSecretsFromDb()` copies a UI-saved secret from settings into
+ * `process.env.SHOPIFY_WEBHOOK_SECRET` at startup, so the env value (possibly
+ * `encV1:`-encrypted) is the normal path. The DB read below is a fallback for
+ * deliveries that arrive before that startup step finishes.
+ */
+export async function resolveWebhookSecret(): Promise<string | null> {
+  const fromEnv = decryptSecret(process.env.SHOPIFY_WEBHOOK_SECRET)
+  if (fromEnv) return fromEnv
+
+  try {
+    const { db, schema } = await import('./db/client')
+    if (!db) return null
+    const rows = await db
+      .select({ secret: schema.settings.webhookSecretEncrypted })
+      .from(schema.settings)
+      .where(eq(schema.settings.id, 'app'))
+      .limit(1)
+    const encrypted = rows[0]?.secret
+    return encrypted ? decrypt(encrypted) || null : null
+  } catch {
+    // A DB outage must not turn into an unauthenticated pass-through.
+    return null
+  }
+}
+
+export async function verifyShopifyWebhook(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+  resolveSecret: () => Promise<string | null> = resolveWebhookSecret,
+): Promise<void> {
+  const secret = await resolveSecret()
   if (!secret) {
-    res.status(500).json({ error: 'Webhook secret not configured' })
+    res.status(503).json({ error: 'Webhook secret not configured' })
     return
   }
 
@@ -36,9 +92,10 @@ export function verifyShopifyWebhook(req: Request, res: Response, next: NextFunc
     return
   }
 
-  const body = rawBody.toString('utf-8')
+  // Hash the captured bytes directly — converting to a string and back can
+  // alter non-UTF-8 bytes and breaks signatures on non-canonical payloads.
   const generatedHmac = createHmac('sha256', secret)
-    .update(body, 'utf8')
+    .update(rawBody)
     .digest('base64')
 
   let providedHmac: Buffer

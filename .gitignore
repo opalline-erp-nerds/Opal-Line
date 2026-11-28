@@ -68,6 +68,10 @@ start-server.cmd
 opencode.json
 .csrf-secret
 
+# Scratch/backup source files
+*.broken
+*.tmp
+
 # Electron
 dist-electron
 electron/dist

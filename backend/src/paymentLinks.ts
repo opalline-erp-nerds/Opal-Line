@@ -1,4 +1,7 @@
 import { logger } from './logger'
+import { fetchWithTimeout } from './lib/fetchTimeout'
+
+const RAZORPAY_REQUEST_TIMEOUT_MS = 15_000
 
 /**
  * Generate a Razorpay payment link for a given customer/amount.
@@ -21,30 +24,35 @@ export async function createRazorpayPaymentLink(opts: {
 
   try {
     const auth = Buffer.from(`${keyId}:${keySecret}`).toString('base64')
-    const res = await fetch('https://api.razorpay.com/v1/payment_links', {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${auth}`,
-        'Content-Type': 'application/json',
+    const res = await fetchWithTimeout(
+      'https://api.razorpay.com/v1/payment_links',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${auth}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          amount: Math.round(opts.amount * 100), // paise
+          currency: 'INR',
+          accept_partial: false,
+          description: opts.description,
+          customer: {
+            name: opts.customer,
+            contact: opts.customer,
+          },
+          notify: {
+            sms: false,
+            email: true,
+          },
+          reference_id: opts.referenceId ?? `PL-${Date.now().toString(36).toUpperCase()}`,
+          callback_url: opts.callbackUrl ?? undefined,
+          callback_method: opts.callbackUrl ? 'get' : undefined,
+        }),
       },
-      body: JSON.stringify({
-        amount: Math.round(opts.amount * 100), // paise
-        currency: 'INR',
-        accept_partial: false,
-        description: opts.description,
-        customer: {
-          name: opts.customer,
-          contact: opts.customer,
-        },
-        notify: {
-          sms: false,
-          email: true,
-        },
-        reference_id: opts.referenceId ?? `PL-${Date.now().toString(36).toUpperCase()}`,
-        callback_url: opts.callbackUrl ?? undefined,
-        callback_method: opts.callbackUrl ? 'get' : undefined,
-      }),
-    })
+      RAZORPAY_REQUEST_TIMEOUT_MS,
+      'Razorpay',
+    )
     const data = await res.json() as Record<string, unknown>
     if (res.ok && data.short_url) {
       return { url: data.short_url as string, id: data.id as string }

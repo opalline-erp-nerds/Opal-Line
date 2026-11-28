@@ -1,5 +1,8 @@
 import type { Store, Options,  IncrementResponse } from 'express-rate-limit'
 import { getRawClient } from './db/client'
+import { logger } from './logger'
+
+type RateLimitClientProvider = () => ReturnType<typeof getRawClient>
 
 /**
  * Postgres-backed hit counter store for express-rate-limit.
@@ -24,7 +27,10 @@ export class PgRateLimitStore implements Store {
   /** Distinct per-limiter key prefix (required public member of Store). */
   readonly prefix: string
 
-  constructor(prefix: string) {
+  constructor(
+    prefix: string,
+    private readonly getClient: RateLimitClientProvider = getRawClient,
+  ) {
     // Distinct prefix per limiter so login and password-reset budgets don't
     // share keys in the same table.
     this.prefix = prefix
@@ -35,29 +41,36 @@ export class PgRateLimitStore implements Store {
   }
 
   async increment(key: string): Promise<IncrementResponse> {
-    const client = getRawClient()
+    const client = this.getClient()
     if (!client || !this.windowMs) {
       // No DB: fail open with a count that never blocks.
       return { totalHits: 0, resetTime: undefined }
     }
     const fullKey = `${this.prefix}:${key}`
     const windowEnd = new Date(Date.now() + this.windowMs)
-    const rows = await client`
-      INSERT INTO rate_limit_hits (key, count, reset_at)
-      VALUES (${fullKey}, 1, ${windowEnd.toISOString()})
-      ON CONFLICT (key) DO UPDATE SET
-        count = CASE WHEN rate_limit_hits.reset_at > now() THEN rate_limit_hits.count + 1 ELSE 1 END,
-        reset_at = CASE WHEN rate_limit_hits.reset_at > now() THEN rate_limit_hits.reset_at ELSE ${windowEnd.toISOString()}::timestamptz END
-      RETURNING count, reset_at
-    `
-    const row = rows[0] as { count: number | string; reset_at: Date | string } | undefined
-    const totalHits = Number(row?.count ?? 1)
-    const resetTime = row?.reset_at ? new Date(row.reset_at) : windowEnd
-    return { totalHits, resetTime }
+    try {
+      const rows = await client`
+        INSERT INTO rate_limit_hits (key, count, reset_at)
+        VALUES (${fullKey}, 1, ${windowEnd.toISOString()})
+        ON CONFLICT (key) DO UPDATE SET
+          count = CASE WHEN rate_limit_hits.reset_at > now() THEN rate_limit_hits.count + 1 ELSE 1 END,
+          reset_at = CASE WHEN rate_limit_hits.reset_at > now() THEN rate_limit_hits.reset_at ELSE ${windowEnd.toISOString()}::timestamptz END
+        RETURNING count, reset_at
+      `
+      const row = rows[0] as { count: number | string; reset_at: Date | string } | undefined
+      const totalHits = Number(row?.count ?? 1)
+      const resetTime = row?.reset_at ? new Date(row.reset_at) : windowEnd
+      return { totalHits, resetTime }
+    } catch (err) {
+      // Documented fail-open contract: a DB outage must not lock every user
+      // out. The credential lockout in login_attempts remains in force.
+      logger.warn({ err, prefix: this.prefix }, 'Rate-limit DB query failed — failing open')
+      return { totalHits: 0, resetTime: undefined }
+    }
   }
 
   async decrement(key: string): Promise<void> {
-    const client = getRawClient()
+    const client = this.getClient()
     if (!client) return
     const fullKey = `${this.prefix}:${key}`
     await client`
@@ -68,13 +81,13 @@ export class PgRateLimitStore implements Store {
   }
 
   async resetKey(key: string): Promise<void> {
-    const client = getRawClient()
+    const client = this.getClient()
     if (!client) return
     await client`DELETE FROM rate_limit_hits WHERE key = ${`${this.prefix}:${key}`}`.catch(() => undefined)
   }
 
   async resetAll(): Promise<void> {
-    const client = getRawClient()
+    const client = this.getClient()
     if (!client) return
     await client`DELETE FROM rate_limit_hits WHERE key LIKE ${`${this.prefix}:%`}`.catch(() => undefined)
   }
